@@ -136,6 +136,16 @@ func (handler *Handler) Logout(c *fiber.Ctx) error {
 		handler.logSecurityError(c, "auth.logout", spec)
 		return handler.respondMappedError(c, spec)
 	}
+	if handler.authService.CheckAndRecordLogoutAttempt(
+		[]byte(handler.secretKey),
+		c.IP(),
+		strconv.FormatUint(uint64(user.ID), 10),
+		time.Now(),
+	) {
+		spec := tooManyLogoutAttemptsErrorSpec()
+		handler.logSecurityError(c, "auth.logout", spec)
+		return handler.respondMappedError(c, spec)
+	}
 	if err := handler.authService.RevokeAuthSessions(user.ID); err != nil {
 		handler.clearAuthRelatedCookies(c)
 		spec := authSessionRevokeErrorSpec()

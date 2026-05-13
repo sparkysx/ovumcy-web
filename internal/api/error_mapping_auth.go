@@ -140,6 +140,10 @@ func authSessionRevokeErrorSpec() APIErrorSpec {
 	return globalErrorSpec(fiber.StatusInternalServerError, APIErrorCategoryInternal, "failed to revoke session")
 }
 
+func tooManyLogoutAttemptsErrorSpec() APIErrorSpec {
+	return globalErrorSpec(fiber.StatusTooManyRequests, APIErrorCategoryRateLimited, "too many logout attempts")
+}
+
 func authResetTokenCreateErrorSpec() APIErrorSpec {
 	return globalErrorSpec(fiber.StatusInternalServerError, APIErrorCategoryInternal, "failed to create reset token")
 }

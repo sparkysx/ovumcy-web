@@ -47,7 +47,7 @@ services:
       # Optional: mount a private OIDC CA bundle and set OIDC_CA_FILE=/run/certs/oidc-provider-ca.pem in ../.env
       # - ./certs/oidc-provider-ca.pem:/run/certs/oidc-provider-ca.pem:ro
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz >/dev/null || exit 1"]
+      test: ["CMD", "/app/ovumcy", "healthcheck"]
       interval: 30s
       timeout: 5s
       retries: 3

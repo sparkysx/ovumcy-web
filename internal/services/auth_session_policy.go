@@ -56,7 +56,7 @@ func BuildAuthSessionTokenWithVersionAndSessionID(secretKey []byte, userID uint,
 	claims := AuthSessionClaims{
 		UserID:         userID,
 		Role:           role,
-		SessionVersion: normalizeAuthSessionVersion(sessionVersion),
+		SessionVersion: NormalizeAuthSessionVersion(sessionVersion),
 		SessionID:      sessionID,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   strconv.FormatUint(uint64(userID), 10),
@@ -104,7 +104,7 @@ func ParseAuthSessionToken(secretKey []byte, rawToken string, now time.Time) (*A
 	if claims.UserID == 0 {
 		return nil, ErrAuthSessionTokenInvalidUserID
 	}
-	claims.SessionVersion = normalizeAuthSessionVersion(claims.SessionVersion)
+	claims.SessionVersion = NormalizeAuthSessionVersion(claims.SessionVersion)
 	claims.SessionID = strings.TrimSpace(claims.SessionID)
 	if claims.SessionID == "" {
 		return nil, ErrAuthSessionTokenInvalid
@@ -120,7 +120,7 @@ func GenerateAuthSessionID() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(buffer), nil
 }
 
-func normalizeAuthSessionVersion(version int) int {
+func NormalizeAuthSessionVersion(version int) int {
 	if version <= 0 {
 		return 1
 	}

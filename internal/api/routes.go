@@ -77,17 +77,17 @@ func registerAPIRoutes(app *fiber.App, handler *Handler) {
 	export.Post("/csv", handler.ExportCSV)
 	export.Post("/json", handler.ExportJSON)
 
-	settings := api.Group("/settings", handler.AuthRequired)
+	settings := api.Group("/settings", handler.AuthRequired, handler.OwnerOnly)
 	settings.Post("/interface", handler.UpdateInterfaceSettings)
 	settings.Post("/profile", handler.UpdateProfile)
-	settings.Post("/tracking", handler.OwnerOnly, handler.UpdateTrackingSettings)
+	settings.Post("/tracking", handler.UpdateTrackingSettings)
 	settings.Post("/change-password", handler.ChangePassword)
 	settings.Post("/start-local-password-setup", handler.StartLocalPasswordSetupReauth)
 	settings.Post("/regenerate-recovery-code", handler.RegenerateRecoveryCode)
 	settings.Post("/2fa/verify", handler.VerifyTOTP2FAEnrollment)
 	settings.Post("/2fa/disable", handler.DisableTOTP2FA)
-	settings.Post("/clear-data/validate", handler.OwnerOnly, handler.ValidateClearDataPassword)
-	settings.Post("/clear-data", handler.OwnerOnly, handler.ClearAllData)
+	settings.Post("/clear-data/validate", handler.ValidateClearDataPassword)
+	settings.Post("/clear-data", handler.ClearAllData)
 	settings.Delete("/delete-account", handler.DeleteAccount)
 }
 

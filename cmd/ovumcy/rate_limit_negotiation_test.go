@@ -7,11 +7,13 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/limiter"
 	"github.com/ovumcy/ovumcy-web/internal/api"
 	"github.com/ovumcy/ovumcy-web/internal/db"
 	"github.com/ovumcy/ovumcy-web/internal/i18n"
@@ -243,6 +245,77 @@ func TestAPIRateLimitHandlerReturnsStatusErrorMarkupForHTMX(t *testing.T) {
 	}
 	if !strings.Contains(rendered, "Too many requests.") {
 		t.Fatalf("expected localized generic rate-limit message, got %q", rendered)
+	}
+}
+
+func TestRateLimiterRetryAfterHeaderDoesNotLeakTimerState(t *testing.T) {
+	// Privacy invariant from .agents/context/security.md:
+	// "Retry-After header on rate-limit responses MUST NOT expose precise
+	// internal timer state that could be used as an oracle." The Fiber
+	// limiter encodes a coarse integer second count bounded by the configured
+	// window. This regression guards against accidental upgrades to high-
+	// resolution timestamps or HTTP-date values that would expose monotonic
+	// state.
+	handler := newRateLimitTestHandler(t)
+	app := fiber.New()
+	app.Use(handler.LanguageMiddleware)
+
+	const expirationSeconds = 30
+	app.Use("/api/auth/login", limiter.New(limiter.Config{
+		Max:        1,
+		Expiration: expirationSeconds * time.Second,
+		LimitReached: newAuthRateLimitHandler(handler, authRateLimitConfig{
+			ErrorCode: "too_many_login_attempts",
+		}),
+	}))
+	app.Post("/api/auth/login", func(c *fiber.Ctx) error {
+		return c.SendStatus(fiber.StatusNoContent)
+	})
+
+	// Burn the single allowed request.
+	first := httptest.NewRequest(http.MethodPost, "/api/auth/login", nil)
+	first.Header.Set("Content-Type", "application/json")
+	firstResponse, err := app.Test(first, -1)
+	if err != nil {
+		t.Fatalf("first request failed: %v", err)
+	}
+	defer firstResponse.Body.Close()
+	if firstResponse.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected first request to succeed (204), got %d", firstResponse.StatusCode)
+	}
+
+	// Second request must trip the limiter.
+	second := httptest.NewRequest(http.MethodPost, "/api/auth/login", nil)
+	second.Header.Set("Content-Type", "application/json")
+	secondResponse, err := app.Test(second, -1)
+	if err != nil {
+		t.Fatalf("second request failed: %v", err)
+	}
+	defer secondResponse.Body.Close()
+	if secondResponse.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected second request to trip limiter (429), got %d", secondResponse.StatusCode)
+	}
+
+	retryAfter := strings.TrimSpace(secondResponse.Header.Get("Retry-After"))
+	if retryAfter == "" {
+		t.Fatal("expected Retry-After header on rate-limited response")
+	}
+
+	// Must be plain integer seconds, not an HTTP-date (which would leak wall-clock state).
+	if strings.ContainsAny(retryAfter, ":,") {
+		t.Fatalf("Retry-After must be integer seconds, not HTTP-date: %q", retryAfter)
+	}
+	seconds, parseErr := strconv.Atoi(retryAfter)
+	if parseErr != nil {
+		t.Fatalf("Retry-After must parse as integer seconds, got %q: %v", retryAfter, parseErr)
+	}
+
+	// Granularity must be 1 second (not millisecond or sub-second). Already
+	// enforced by integer parsing above. Bounds: the value MUST NOT exceed
+	// the configured window — a larger value would imply leakage of state
+	// from outside the bucket. A zero/negative value would also be wrong.
+	if seconds < 1 || seconds > expirationSeconds {
+		t.Fatalf("Retry-After must fall inside (0, %ds] window, got %ds", expirationSeconds, seconds)
 	}
 }
 

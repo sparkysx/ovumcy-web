@@ -65,7 +65,7 @@ services:
     #   - ./secrets/ovumcy_secret_key:/run/secrets/ovumcy_secret_key:ro
     #   - ./certs/oidc-provider-ca.pem:/run/certs/oidc-provider-ca.pem:ro
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz >/dev/null || exit 1"]
+      test: ["CMD", "/app/ovumcy", "healthcheck"]
       interval: 30s
       timeout: 5s
       retries: 3

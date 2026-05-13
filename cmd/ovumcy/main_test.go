@@ -874,6 +874,57 @@ func TestTryRunCLICommandWithHandlersPropagatesUsersError(t *testing.T) {
 	}
 }
 
+func TestTryRunCLICommandWithHandlersDispatchesHealthcheck(t *testing.T) {
+	t.Setenv("PORT", "9876")
+
+	var receivedPort string
+	handled, err := tryRunCLICommandWithHandlers([]string{"healthcheck"}, cliCommandHandlers{
+		runHealthcheck: func(port string, _ time.Duration) error {
+			receivedPort = port
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if !handled {
+		t.Fatal("expected healthcheck command to be handled")
+	}
+	if receivedPort != "9876" {
+		t.Fatalf("expected port forwarded from PORT env, got %q", receivedPort)
+	}
+}
+
+func TestTryRunCLICommandWithHandlersRejectsHealthcheckExtraArgs(t *testing.T) {
+	handled, err := tryRunCLICommandWithHandlers([]string{"healthcheck", "extra"}, cliCommandHandlers{
+		runHealthcheck: func(string, time.Duration) error {
+			t.Fatal("did not expect healthcheck handler to be called")
+			return nil
+		},
+	})
+	if !handled {
+		t.Fatal("expected healthcheck command to be handled")
+	}
+	if err == nil || !strings.Contains(err.Error(), "usage: ovumcy healthcheck") {
+		t.Fatalf("expected healthcheck usage error, got %v", err)
+	}
+}
+
+func TestTryRunCLICommandWithHandlersPropagatesHealthcheckError(t *testing.T) {
+	expectedErr := errors.New("probe failed")
+	handled, err := tryRunCLICommandWithHandlers([]string{"healthcheck"}, cliCommandHandlers{
+		runHealthcheck: func(string, time.Duration) error {
+			return expectedErr
+		},
+	})
+	if !handled {
+		t.Fatal("expected healthcheck command to be handled")
+	}
+	if !errors.Is(err, expectedErr) {
+		t.Fatalf("expected propagated healthcheck error, got %v", err)
+	}
+}
+
 func testResponseCookie(cookies []*http.Cookie, name string) *http.Cookie {
 	for _, cookie := range cookies {
 		if cookie != nil && cookie.Name == name {

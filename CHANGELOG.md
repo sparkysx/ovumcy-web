@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- Strengthened `Strict-Transport-Security` header with `includeSubDomains` directive for enhanced HTTPS enforcement.
+- Expanded `Permissions-Policy` header to explicitly deny access to additional browser features (accelerometer, gyroscope, payment, usb, interest-cohort, ambient-light-sensor).
+- Added `Cross-Origin-Opener-Policy: same-origin` header to prevent cross-window opening attacks.
+- Implemented rate limiting for `/api/auth/register` endpoint (8 requests per 15 minutes by default) to mitigate enumeration and credential-stuffing attacks. Closes per-request Set-Cookie enumeration oracle on POST /api/auth/register via sealed recovery code cookie; residual two-step oracle documented in SECURITY.md.
+
+### Fixed
+- Per-account rate limit enforcement on `/api/auth/logout` endpoint to prevent denial-of-service attacks via session disruption.
+- Docker `HEALTHCHECK` no longer relies on external HTTP clients (`wget`/`curl`) that are not present in the scratch-based runtime image. The binary now ships an `ovumcy healthcheck` subcommand that performs the `/healthz` probe in-process; the `Dockerfile` and bundled compose examples invoke it directly. Without this fix the container was reported as `unhealthy` once Docker began running the bundled healthcheck.
+
 ## [0.9.3] - 2026-04-30
 
 ### Fixed

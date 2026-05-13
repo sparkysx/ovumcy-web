@@ -50,10 +50,15 @@ func TestSettingsPageKeepsPersistedCycleValuesAfterRecoveryCodeRegeneration(t *t
 	if recoveryCookie == "" {
 		t.Fatal("expected recovery-code page cookie after regeneration")
 	}
+	newAuthCookie := responseCookieValue(response.Cookies(), authCookieName)
+	if newAuthCookie == "" {
+		t.Fatal("expected fresh auth cookie after recovery code regeneration (session version was bumped)")
+	}
+	refreshedAuthCookie := authCookieName + "=" + newAuthCookie
 
 	recoveryPageRequest := httptest.NewRequest(http.MethodGet, "/recovery-code", nil)
 	recoveryPageRequest.Header.Set("Accept-Language", "en")
-	recoveryPageRequest.Header.Set("Cookie", ctx.authCookie+"; "+recoveryCodeCookieName+"="+recoveryCookie)
+	recoveryPageRequest.Header.Set("Cookie", refreshedAuthCookie+"; "+recoveryCodeCookieName+"="+recoveryCookie)
 
 	recoveryPageResponse := mustAppResponse(t, ctx.app, recoveryPageRequest)
 	assertStatusCode(t, recoveryPageResponse, http.StatusOK)
@@ -82,7 +87,7 @@ func TestSettingsPageKeepsPersistedCycleValuesAfterRecoveryCodeRegeneration(t *t
 		t.Fatalf("did not expect persisted unpredictable_cycle to change after recovery-code regeneration")
 	}
 
-	rendered := renderSettingsPageForTest(t, ctx.app, ctx.authCookie)
+	rendered := renderSettingsPageForTest(t, ctx.app, refreshedAuthCookie)
 	if !regexp.MustCompile(`name="period_length"[^>]*value="5"`).MatchString(rendered) {
 		t.Fatalf("expected persisted settings period length to stay at 5 days after recovery-code regeneration")
 	}

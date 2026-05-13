@@ -65,7 +65,7 @@ Use one of the example stacks under `docs/examples/reverse-proxy/` for public HT
 - `TRUST_PROXY_ENABLED=true`
 - `PROXY_HEADER=X-Forwarded-For`
 - `TRUSTED_PROXIES` must match the exact proxy IP or private Docker subnet used by that stack
-- when `COOKIE_SECURE=true`, Ovumcy emits `Strict-Transport-Security` itself, so the example proxy configs do not add a second HSTS policy
+- when `COOKIE_SECURE=true`, Ovumcy emits `Strict-Transport-Security: max-age=31536000; includeSubDomains` itself, so the example proxy configs do not add a second HSTS policy
 
 Do not start from the base compose file and then expose `8080` publicly as a shortcut. The supported public path is the dedicated proxy stack where only the reverse proxy publishes host ports.
 
@@ -215,6 +215,8 @@ Use them when you need both:
 
 ## Health Checks by Deployment Mode
 
+The runtime image ships with a built-in `ovumcy healthcheck` subcommand. It makes an in-process `GET /healthz` against `127.0.0.1:$PORT` and exits non-zero on failure, so the scratch-based container image needs no external HTTP client (no `curl`, no `wget`). Docker invokes it automatically per the `HEALTHCHECK` directive baked into the image.
+
 Use the health check that matches your deployment path:
 
 - Public reverse-proxy stack:
@@ -223,6 +225,8 @@ Use the health check that matches your deployment path:
 - Local/private base compose path:
   - `docker compose ps` should show the container healthy;
   - `curl -fsS http://127.0.0.1:8080/healthz` should succeed on the host.
+- Direct container probe (no host port published):
+  - `docker exec ovumcy /app/ovumcy healthcheck` should exit `0`.
 
 For the public reverse-proxy stacks, do not treat a missing host-level `127.0.0.1:8080` listener as a problem. In the preferred deployment model, that port is intentionally not published to the host at all.
 

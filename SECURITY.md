@@ -36,3 +36,14 @@ Closing the residual signal entirely is mathematically impossible without an out
 `POST /api/auth/login` returns `{"requires_totp": true}` when the supplied password is correct and the account has TOTP enabled, and `{"ok": true}` plus a session cookie otherwise. A credential-dump attacker can use this to triage accounts by whether they have a second factor.
 
 This is inherent to any password-then-TOTP flow that gates the second factor on account state — any uniform response that hides the difference either silently grants access without verifying TOTP (downgrade attack) or unconditionally rejects accounts without TOTP (lockout). The per-account rate limiter (`AuthAttemptPolicy`) and the recovery-code re-auth requirements bound the value of knowing the 2FA status.
+
+## Session Invalidation on Credential Rotation
+
+Operations that rotate a long-lived credential bump `users.auth_session_version` in the same database update, immediately invalidating every active `ovumcy_auth` cookie for that account. This applies to:
+
+- Password change (`POST /api/settings/change-password`).
+- Password reset via recovery code (`POST /api/auth/reset-password`).
+- Recovery-code regeneration (`POST /api/settings/regenerate-recovery-code`) — the current request receives a freshly issued cookie so the originating session stays alive, but every other device is signed out.
+- Forced password reset via the `ovumcy reset-password` operator command.
+
+If you suspect a session compromise, regenerating the recovery code is the fastest way to force every other device to re-authenticate without changing your password.

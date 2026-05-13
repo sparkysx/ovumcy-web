@@ -44,18 +44,42 @@ type AuthUserRepository interface {
 	FindByID(userID uint) (models.User, error)
 	Create(user *models.User) error
 	Save(user *models.User) error
-	UpdateRecoveryCodeHash(userID uint, recoveryHash string) error
+	UpdateRecoveryCodeHashAndRevokeSessions(userID uint, recoveryHash string) error
 	UpdatePasswordAndRevokeSessions(userID uint, passwordHash string, mustChangePassword bool) error
 	UpdatePasswordRecoveryCodeAndRevokeSessions(userID uint, passwordHash string, recoveryHash string, mustChangePassword bool) error
 	BumpAuthSessionVersion(userID uint) error
 }
 
+const (
+	DefaultLogoutAttemptsLimit  = 20
+	DefaultLogoutAttemptsWindow = 15 * time.Minute
+)
+
 type AuthService struct {
-	users AuthUserRepository
+	users               AuthUserRepository
+	logoutAttemptPolicy *AuthAttemptPolicy
 }
 
 func NewAuthService(users AuthUserRepository) *AuthService {
-	return &AuthService{users: users}
+	return &AuthService{
+		users:               users,
+		logoutAttemptPolicy: NewAuthAttemptPolicy("logout", nil, DefaultLogoutAttemptsLimit, DefaultLogoutAttemptsWindow),
+	}
+}
+
+func (service *AuthService) ConfigureLogoutAttemptLimits(attempts int, window time.Duration) {
+	service.logoutAttemptPolicy.Configure(attempts, window)
+}
+
+// CheckAndRecordLogoutAttempt returns true if the per-account logout rate limit is
+// exceeded for this (clientKey, identity) pair. If not exceeded, it also records
+// the attempt so subsequent calls count it toward the window.
+func (service *AuthService) CheckAndRecordLogoutAttempt(secretKey []byte, clientKey string, identity string, now time.Time) bool {
+	if service.logoutAttemptPolicy.TooManyRecent(secretKey, clientKey, identity, now) {
+		return true
+	}
+	service.logoutAttemptPolicy.AddFailure(secretKey, clientKey, identity, now)
+	return false
 }
 
 func (service *AuthService) RegistrationEmailExists(email string) (bool, error) {
@@ -287,7 +311,7 @@ func (service *AuthService) ResolveAuthSession(secretKey []byte, rawToken string
 	if user.MustChangePassword {
 		return nil, nil, ErrAuthSessionTokenRevoked
 	}
-	if normalizeAuthSessionVersion(claims.SessionVersion) != normalizeAuthSessionVersion(user.AuthSessionVersion) {
+	if NormalizeAuthSessionVersion(claims.SessionVersion) != NormalizeAuthSessionVersion(user.AuthSessionVersion) {
 		return nil, nil, ErrAuthSessionTokenRevoked
 	}
 	if err := ValidateSupportedWebUser(&user); err != nil {
@@ -327,7 +351,7 @@ func (service *AuthService) RegenerateRecoveryCode(userID uint) (string, error) 
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", ErrRecoveryCodeGenerate, err)
 	}
-	if err := service.users.UpdateRecoveryCodeHash(userID, recoveryHash); err != nil {
+	if err := service.users.UpdateRecoveryCodeHashAndRevokeSessions(userID, recoveryHash); err != nil {
 		return "", fmt.Errorf("%w: %v", ErrRecoveryCodeUpdate, err)
 	}
 	return recoveryCode, nil
@@ -349,7 +373,11 @@ func equalizeRecoveryCodeLookupTiming(code string) {
 // path. Without it, the early "user not found" / "local auth disabled" returns
 // short-circuit before any bcrypt work and leak account existence through
 // response timing (CWE-208 / CWE-204).
-func equalizeAuthCredentialsTiming(password string) {
+//
+// Declared as a var so tests can replace it with an invocation counter,
+// asserting "bcrypt was called" without measuring wall-clock time (which is
+// flake-prone on shared CI runners). Production code never reassigns this.
+var equalizeAuthCredentialsTiming = func(password string) {
 	_ = bcrypt.CompareHashAndPassword([]byte(credentialsTimingEqualizationHash), []byte(password))
 }
 
@@ -373,7 +401,7 @@ func (service *AuthService) ResetPasswordAndRotateRecoveryCode(user *models.User
 	user.PasswordHash = string(passwordHash)
 	user.RecoveryCodeHash = recoveryHash
 	user.LocalAuthEnabled = true
-	user.AuthSessionVersion = normalizeAuthSessionVersion(user.AuthSessionVersion) + 1
+	user.AuthSessionVersion = NormalizeAuthSessionVersion(user.AuthSessionVersion) + 1
 	user.MustChangePassword = false
 
 	return recoveryCode, nil

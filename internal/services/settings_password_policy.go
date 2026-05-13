@@ -65,7 +65,7 @@ func (service *SettingsService) ChangePassword(user *models.User, currentPasswor
 	}
 	user.PasswordHash = string(hashedPassword)
 	user.LocalAuthEnabled = true
-	user.AuthSessionVersion = normalizeAuthSessionVersion(user.AuthSessionVersion) + 1
+	user.AuthSessionVersion = NormalizeAuthSessionVersion(user.AuthSessionVersion) + 1
 	return nil
 }
 
@@ -124,7 +124,7 @@ func (service *SettingsService) FinalizeLocalPasswordSetup(user *models.User, pr
 	user.PasswordHash = preparedPasswordHash
 	user.RecoveryCodeHash = recoveryHash
 	user.LocalAuthEnabled = true
-	user.AuthSessionVersion = normalizeAuthSessionVersion(user.AuthSessionVersion) + 1
+	user.AuthSessionVersion = NormalizeAuthSessionVersion(user.AuthSessionVersion) + 1
 	user.MustChangePassword = false
 	return recoveryCode, nil
 }

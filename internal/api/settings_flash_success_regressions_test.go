@@ -1,0 +1,38 @@
+package api
+
+import (
+	"net/url"
+	"testing"
+)
+
+func TestSettingsClearDataUsesFlashSuccessOnRedirect(t *testing.T) {
+	assertSettingsFlashSuccessScenario(t, "/api/settings/clear-data", url.Values{
+		"password": {"StrongPass1"},
+	}, "All tracking data cleared successfully.")
+}
+
+func TestSettingsCycleUpdateUsesFlashSuccessOnRedirect(t *testing.T) {
+	form := url.Values{
+		"cycle_length":     {"29"},
+		"period_length":    {"6"},
+		"auto_period_fill": {"true"},
+	}
+	assertSettingsFlashSuccessScenario(t, "/settings/cycle", form, "Cycle settings updated successfully.")
+}
+
+func TestSettingsInterfaceUpdateUsesFlashSuccessOnRedirect(t *testing.T) {
+	form := url.Values{
+		"language": {"de"},
+		"theme":    {"dark"},
+	}
+	assertSettingsFlashSuccessScenario(t, "/api/settings/interface", form, "Interface settings updated.")
+}
+
+func TestSettingsPasswordChangeUsesFlashSuccessOnRedirect(t *testing.T) {
+	form := url.Values{
+		"current_password": {"StrongPass1"},
+		"new_password":     {"EvenStronger2"},
+		"confirm_password": {"EvenStronger2"},
+	}
+	assertSettingsFlashSuccessScenario(t, "/api/settings/change-password", form, "Password changed successfully.")
+}

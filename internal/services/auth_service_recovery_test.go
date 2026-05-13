@@ -88,12 +88,13 @@ func (stub *stubAuthUserRepo) Save(user *models.User) error {
 	return nil
 }
 
-func (stub *stubAuthUserRepo) UpdateRecoveryCodeHash(userID uint, recoveryHash string) error {
+func (stub *stubAuthUserRepo) UpdateRecoveryCodeHashAndRevokeSessions(userID uint, recoveryHash string) error {
 	if stub.updateRecoveryCodeErr != nil {
 		return stub.updateRecoveryCodeErr
 	}
 	stub.updatedUserID = userID
 	stub.updatedRecoveryHash = recoveryHash
+	stub.user.AuthSessionVersion = NormalizeAuthSessionVersion(stub.user.AuthSessionVersion) + 1
 	return nil
 }
 
@@ -109,7 +110,7 @@ func (stub *stubAuthUserRepo) UpdatePasswordAndRevokeSessions(userID uint, passw
 	stub.user.PasswordHash = passwordHash
 	stub.user.LocalAuthEnabled = true
 	stub.user.MustChangePassword = mustChangePassword
-	stub.user.AuthSessionVersion = normalizeAuthSessionVersion(stub.user.AuthSessionVersion) + 1
+	stub.user.AuthSessionVersion = NormalizeAuthSessionVersion(stub.user.AuthSessionVersion) + 1
 	return nil
 }
 
@@ -127,7 +128,7 @@ func (stub *stubAuthUserRepo) UpdatePasswordRecoveryCodeAndRevokeSessions(userID
 	stub.user.RecoveryCodeHash = recoveryHash
 	stub.user.LocalAuthEnabled = true
 	stub.user.MustChangePassword = mustChangePassword
-	stub.user.AuthSessionVersion = normalizeAuthSessionVersion(stub.user.AuthSessionVersion) + 1
+	stub.user.AuthSessionVersion = NormalizeAuthSessionVersion(stub.user.AuthSessionVersion) + 1
 	return nil
 }
 
@@ -138,7 +139,7 @@ func (stub *stubAuthUserRepo) BumpAuthSessionVersion(userID uint) error {
 	stub.bumpSessionCalled = true
 	stub.updatedUserID = userID
 	stub.user.ID = userID
-	stub.user.AuthSessionVersion = normalizeAuthSessionVersion(stub.user.AuthSessionVersion) + 1
+	stub.user.AuthSessionVersion = NormalizeAuthSessionVersion(stub.user.AuthSessionVersion) + 1
 	return nil
 }
 
@@ -577,10 +578,13 @@ func TestAuthServiceRegenerateRecoveryCode(t *testing.T) {
 		t.Fatalf("expected non-empty recovery code")
 	}
 	if repo.updatedUserID != 55 {
-		t.Fatalf("expected UpdateRecoveryCodeHash to be called for user 55, got %d", repo.updatedUserID)
+		t.Fatalf("expected UpdateRecoveryCodeHashAndRevokeSessions to be called for user 55, got %d", repo.updatedUserID)
 	}
 	if repo.updatedRecoveryHash == "" {
 		t.Fatalf("expected non-empty recovery hash update")
+	}
+	if repo.user.AuthSessionVersion != 2 {
+		t.Fatalf("expected AuthSessionVersion to be bumped to 2, got %d", repo.user.AuthSessionVersion)
 	}
 }
 

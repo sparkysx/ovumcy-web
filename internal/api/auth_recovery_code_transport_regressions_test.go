@@ -107,10 +107,14 @@ func TestRegenerateRecoveryCodeRedirectsToDedicatedRecoveryPage(t *testing.T) {
 	if recoveryCookie == "" {
 		t.Fatal("expected recovery-code page cookie after regeneration")
 	}
+	newAuthCookie := responseCookieValue(response.Cookies(), authCookieName)
+	if newAuthCookie == "" {
+		t.Fatal("expected fresh auth cookie after recovery code regeneration (session version was bumped)")
+	}
 
 	recoveryPageRequest := httptest.NewRequest(http.MethodGet, "/recovery-code", nil)
 	recoveryPageRequest.Header.Set("Accept-Language", "en")
-	recoveryPageRequest.Header.Set("Cookie", ctx.authCookie+"; "+recoveryCodeCookieName+"="+recoveryCookie)
+	recoveryPageRequest.Header.Set("Cookie", authCookieName+"="+newAuthCookie+"; "+recoveryCodeCookieName+"="+recoveryCookie)
 
 	recoveryPageResponse := mustAppResponse(t, ctx.app, recoveryPageRequest)
 	assertStatusCode(t, recoveryPageResponse, http.StatusOK)

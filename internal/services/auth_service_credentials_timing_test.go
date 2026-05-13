@@ -3,36 +3,57 @@ package services
 import (
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/ovumcy/ovumcy-web/internal/models"
 	"golang.org/x/crypto/bcrypt"
 )
 
-// TestAuthenticateCredentialsEqualizesTimingForMissingUser guards against the
-// account-existence timing oracle: every "invalid creds" path must still pay
-// the bcrypt cost. A bare early return without bcrypt would let an attacker
-// distinguish "no such email" (~1ms) from "wrong password for existing user"
-// (~50ms+). Threshold is generous (15ms) because bcrypt.DefaultCost is 10 on
-// every supported platform — well above 30ms wall time even on slow CI.
+// These tests guard against the account-existence timing oracle: every
+// "invalid creds" early-return path in AuthenticateCredentials must still
+// invoke the bcrypt equalizer so an attacker cannot distinguish
+// "no such email" (~1ms early return) from "wrong password for existing
+// user" (~50ms+).
+//
+// The earlier wall-clock budget (`elapsed >= 15*time.Millisecond`) was
+// replaced with a call-counter wrapper to remove wall-clock fragility on
+// shared CI runners. The counter asserts the equalizer was invoked exactly
+// once per call; that is the actual invariant we care about. A separate
+// test (TestCredentialsTimingEqualizationHashIsBcryptCompatible) still
+// verifies the placeholder hash is a real bcrypt hash, so the equalizer
+// cannot silently short-circuit even when overridden in tests.
+
+func withCountingCredentialsEqualizer(t *testing.T) *int {
+	t.Helper()
+
+	original := equalizeAuthCredentialsTiming
+	count := 0
+	equalizeAuthCredentialsTiming = func(string) {
+		count++
+	}
+	t.Cleanup(func() {
+		equalizeAuthCredentialsTiming = original
+	})
+	return &count
+}
+
 func TestAuthenticateCredentialsEqualizesTimingForMissingUser(t *testing.T) {
+	count := withCountingCredentialsEqualizer(t)
 	service := NewAuthService(&stubAuthUserRepo{
 		findByEmailErr: errors.New("not found"),
 	})
 
-	start := time.Now()
 	_, err := service.AuthenticateCredentials("nonexistent@example.com", "AnyPass1!")
-	elapsed := time.Since(start)
 
 	if !errors.Is(err, ErrAuthInvalidCreds) {
 		t.Fatalf("expected ErrAuthInvalidCreds, got %v", err)
 	}
-	if elapsed < 15*time.Millisecond {
-		t.Fatalf("nonexistent-user auth returned too quickly (%v) — bcrypt equalization is missing", elapsed)
+	if *count != 1 {
+		t.Fatalf("expected exactly 1 bcrypt equalization call on missing-user path, got %d", *count)
 	}
 }
 
 func TestAuthenticateCredentialsEqualizesTimingForDisabledLocalAuth(t *testing.T) {
+	count := withCountingCredentialsEqualizer(t)
 	service := NewAuthService(&stubAuthUserRepo{
 		findByEmailUser: models.User{
 			LocalAuthEnabled: false,
@@ -40,15 +61,13 @@ func TestAuthenticateCredentialsEqualizesTimingForDisabledLocalAuth(t *testing.T
 		},
 	})
 
-	start := time.Now()
 	_, err := service.AuthenticateCredentials("oidc-only@example.com", "AnyPass1!")
-	elapsed := time.Since(start)
 
 	if !errors.Is(err, ErrAuthInvalidCreds) {
 		t.Fatalf("expected ErrAuthInvalidCreds, got %v", err)
 	}
-	if elapsed < 15*time.Millisecond {
-		t.Fatalf("oidc-only auth returned too quickly (%v) — bcrypt equalization is missing", elapsed)
+	if *count != 1 {
+		t.Fatalf("expected exactly 1 bcrypt equalization call on oidc-only path, got %d", *count)
 	}
 }
 

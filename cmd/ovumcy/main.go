@@ -49,6 +49,10 @@ type rateLimitSettings struct {
 	LoginWindow          time.Duration
 	ForgotPasswordMax    int
 	ForgotPasswordWindow time.Duration
+	RegisterMax          int
+	RegisterWindow       time.Duration
+	LogoutMax            int
+	LogoutWindow         time.Duration
 	APIMax               int
 	APIWindow            time.Duration
 }
@@ -60,19 +64,21 @@ type proxySettings struct {
 }
 
 const (
-	headerXContentTypeOptions     = "X-Content-Type-Options"
-	headerReferrerPolicy          = "Referrer-Policy"
-	headerPermissionsPolicy       = "Permissions-Policy"
-	headerXFrameOptions           = "X-Frame-Options"
-	headerContentSecurityPolicy   = "Content-Security-Policy"
-	headerStrictTransportSecurity = "Strict-Transport-Security"
+	headerXContentTypeOptions        = "X-Content-Type-Options"
+	headerReferrerPolicy             = "Referrer-Policy"
+	headerPermissionsPolicy          = "Permissions-Policy"
+	headerCrossOriginOpenerPolicy    = "Cross-Origin-Opener-Policy"
+	headerXFrameOptions              = "X-Frame-Options"
+	headerContentSecurityPolicy      = "Content-Security-Policy"
+	headerStrictTransportSecurity    = "Strict-Transport-Security"
 
 	xContentTypeOptionsNoSniff           = "nosniff"
 	referrerPolicyStrictOrigin           = "strict-origin-when-cross-origin"
-	permissionsPolicyDefault             = "geolocation=(), camera=(), microphone=()"
+	permissionsPolicyDefault             = "geolocation=(), camera=(), microphone=(), accelerometer=(), gyroscope=(), payment=(), usb=(), interest-cohort=(), ambient-light-sensor=()"
+	crossOriginOpenerPolicyDefault       = "same-origin"
 	xFrameOptionsDeny                    = "DENY"
 	contentSecurityPolicyDefault         = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; worker-src 'none'"
-	strictTransportSecurityDefault       = "max-age=31536000"
+	strictTransportSecurityDefault       = "max-age=31536000; includeSubDomains"
 	maxSecretKeyFileBytes          int64 = 8 << 10
 )
 
@@ -155,8 +161,12 @@ func loadRuntimeConfig(location *time.Location) (runtimeConfig, error) {
 		RateLimits: rateLimitSettings{
 			LoginMax:             getEnvInt("RATE_LIMIT_LOGIN_MAX", 8),
 			LoginWindow:          getEnvDuration("RATE_LIMIT_LOGIN_WINDOW", 15*time.Minute),
+			RegisterMax:          getEnvInt("RATE_LIMIT_REGISTER_MAX", 8),
+			RegisterWindow:       getEnvDuration("RATE_LIMIT_REGISTER_WINDOW", 15*time.Minute),
 			ForgotPasswordMax:    getEnvInt("RATE_LIMIT_FORGOT_PASSWORD_MAX", 8),
 			ForgotPasswordWindow: getEnvDuration("RATE_LIMIT_FORGOT_PASSWORD_WINDOW", time.Hour),
+			LogoutMax:            getEnvInt("RATE_LIMIT_LOGOUT_MAX", 60),
+			LogoutWindow:         getEnvDuration("RATE_LIMIT_LOGOUT_WINDOW", 15*time.Minute),
 			APIMax:               getEnvInt("RATE_LIMIT_API_MAX", 300),
 			APIWindow:            getEnvDuration("RATE_LIMIT_API_WINDOW", time.Minute),
 		},
@@ -229,6 +239,7 @@ func mustNewI18nManager(defaultLanguage string) *i18n.Manager {
 
 func buildDependencies(repositories *db.Repositories, i18nManager *i18n.Manager, rateLimits rateLimitSettings, registrationMode services.RegistrationMode, oidcConfig security.OIDCConfig, secretKey string) api.Dependencies {
 	authService := services.NewAuthService(repositories.Users)
+	authService.ConfigureLogoutAttemptLimits(rateLimits.LogoutMax, rateLimits.LogoutWindow)
 	attemptLimiter := services.NewAttemptLimiter()
 	passwordResetService := services.NewPasswordResetService(authService, attemptLimiter)
 	passwordResetService.ConfigureRecoveryAttemptLimits(rateLimits.ForgotPasswordMax, rateLimits.ForgotPasswordWindow)
@@ -319,11 +330,25 @@ func configureFiberMiddleware(app *fiber.App, config runtimeConfig, handler *api
 	app.Use(recover.New())
 	app.Use(newRequestLogger(nil))
 	app.Use(compress.New())
+	app.Use("/api/auth/logout", limiter.New(limiter.Config{
+		Max:        config.RateLimits.LogoutMax,
+		Expiration: config.RateLimits.LogoutWindow,
+		LimitReached: newAuthRateLimitHandler(handler, authRateLimitConfig{
+			ErrorCode: "too_many_logout_attempts",
+		}),
+	}))
 	app.Use("/api/auth/login", limiter.New(limiter.Config{
 		Max:        config.RateLimits.LoginMax,
 		Expiration: config.RateLimits.LoginWindow,
 		LimitReached: newAuthRateLimitHandler(handler, authRateLimitConfig{
 			ErrorCode: "too_many_login_attempts",
+		}),
+	}))
+	app.Use("/api/auth/register", limiter.New(limiter.Config{
+		Max:        config.RateLimits.RegisterMax,
+		Expiration: config.RateLimits.RegisterWindow,
+		LimitReached: newAuthRateLimitHandler(handler, authRateLimitConfig{
+			ErrorCode: "too_many_register_attempts",
 		}),
 	}))
 	app.Use("/api/auth/forgot-password", limiter.New(limiter.Config{
@@ -371,6 +396,7 @@ func securityHeadersMiddleware(enableStrictTransportSecurity bool) fiber.Handler
 		c.Set(headerXContentTypeOptions, xContentTypeOptionsNoSniff)
 		c.Set(headerReferrerPolicy, referrerPolicyStrictOrigin)
 		c.Set(headerPermissionsPolicy, permissionsPolicyDefault)
+		c.Set(headerCrossOriginOpenerPolicy, crossOriginOpenerPolicyDefault)
 		c.Set(headerXFrameOptions, xFrameOptionsDeny)
 		c.Set(headerContentSecurityPolicy, contentSecurityPolicyDefault)
 		if enableStrictTransportSecurity {
@@ -441,12 +467,14 @@ func tryRunCLICommand() (bool, error) {
 	return tryRunCLICommandWithHandlers(os.Args[1:], cliCommandHandlers{
 		runResetPassword: cli.RunResetPasswordCommand,
 		runUsers:         cli.RunUsersCommand,
+		runHealthcheck:   cli.RunHealthcheckCommand,
 	})
 }
 
 type cliCommandHandlers struct {
 	runResetPassword func(databaseConfig db.Config, email string) error
 	runUsers         func(databaseConfig db.Config, args []string) error
+	runHealthcheck   func(port string, timeout time.Duration) error
 }
 
 func tryRunCLICommandWithHandlers(args []string, handlers cliCommandHandlers) (bool, error) {
@@ -481,6 +509,18 @@ func tryRunCLICommandWithHandlers(args []string, handlers cliCommandHandlers) (b
 			return true, fmt.Errorf("invalid database config: %w", err)
 		}
 		return true, handlers.runUsers(databaseConfig, args[1:])
+	case "healthcheck":
+		if len(args) != 1 {
+			return true, fmt.Errorf("usage: ovumcy healthcheck")
+		}
+		if handlers.runHealthcheck == nil {
+			return true, fmt.Errorf("healthcheck handler is required")
+		}
+		port, err := resolvePort()
+		if err != nil {
+			return true, fmt.Errorf("invalid PORT: %w", err)
+		}
+		return true, handlers.runHealthcheck(port, 0)
 	default:
 		return false, nil
 	}

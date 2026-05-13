@@ -38,4 +38,6 @@ USER 10001:10001
 
 EXPOSE 8080
 ENV DB_PATH=/app/data/ovumcy.db
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD ["/app/ovumcy", "healthcheck"]
 CMD ["/app/ovumcy"]

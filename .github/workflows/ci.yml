@@ -45,6 +45,7 @@ jobs:
         run: npm run lint:js
 
       - name: Install staticcheck
+        # git SHA for v0.6.1 (tag 2025.1.1): b8ec13ce4d00445d75da053c47498e6f9ec5d7d6 (verified via go list -m -json)
         run: go install honnef.co/go/tools/cmd/staticcheck@v0.6.1
 
       - name: Staticcheck

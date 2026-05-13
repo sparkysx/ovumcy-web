@@ -3,13 +3,19 @@ package api
 import (
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/ovumcy/ovumcy-web/internal/models"
 )
 
+// TestStatsPageRendersRichInsightsAndBBTChart guards the structural contracts
+// the stats page exposes for accessibility, charting, and HTMX hooks. It
+// intentionally avoids asserting human-readable copy: those fragments are
+// (a) covered at the service layer by stats_service_test.go for the
+// underlying computations, and (b) covered for rendered visible text by the
+// Playwright spec e2e/stats-factor-context.spec.ts. Keeping copy assertions
+// here as well only created copy-edit churn without catching new defects.
 func TestStatsPageRendersRichInsightsAndBBTChart(t *testing.T) {
 	app, database := newOnboardingTestApp(t)
 	user := createOnboardingTestUser(t, database, "stats-rich-insights@example.com", "StrongPass1", true)
@@ -88,43 +94,31 @@ func TestStatsPageRendersRichInsightsAndBBTChart(t *testing.T) {
 
 	rendered := mustReadBodyString(t, response.Body)
 	document := mustParseHTMLDocument(t, rendered)
-	documentText := htmlDocumentText(document)
 
-	for _, fragment := range []string{
-		"Last cycle length",
-		"Period length",
-		"Current phase",
-		"Prediction reliability",
-		"Based on 3 completed cycles.",
-		"Recent cycle factors",
-		"Factors seen across variable cycles",
-		"Recent cycle context",
-		"Within a variable pattern",
-		"Stress",
-		"Top symptoms in your last cycle",
-		"Symptom patterns",
-	} {
-		if !strings.Contains(documentText, fragment) {
-			t.Fatalf("expected stats page to contain %q, got %q", fragment, documentText)
-		}
+	// Charting accessibility contract — chart containers and their summary
+	// nodes must remain wired up so screen readers can describe each chart.
+	if htmlElementByID(document, "cycle-chart") == nil {
+		t.Fatal("expected stats page to render cycle chart container")
 	}
 	if htmlElementByID(document, "bbt-chart") == nil {
-		t.Fatalf("expected stats page to render BBT chart container")
+		t.Fatal("expected stats page to render BBT chart container")
 	}
+	if htmlElementByID(document, "stats-cycle-trend-summary") == nil {
+		t.Fatal("expected cycle chart summary node id=stats-cycle-trend-summary")
+	}
+	if htmlElementByID(document, "stats-bbt-summary") == nil {
+		t.Fatal("expected bbt chart summary node id=stats-bbt-summary")
+	}
+
+	// data-* and ARIA hooks Playwright + assistive tech depend on.
 	assertBodyContainsAll(t, rendered,
-		bodyStringMatch{fragment: `data-usage-goal-summary`, message: "expected stats usage-goal summary panel"},
-		bodyStringMatch{fragment: "Current mode: Trying to conceive", message: "expected current usage-goal label on stats page"},
-		bodyStringMatch{fragment: `id="cycle-chart"`, message: "expected cycle chart container"},
 		bodyStringMatch{fragment: `role="img"`, message: "expected chart containers to expose image role"},
 		bodyStringMatch{fragment: `aria-labelledby="stats-cycle-trend-title"`, message: "expected cycle chart accessible title"},
 		bodyStringMatch{fragment: `aria-describedby="stats-cycle-trend-summary"`, message: "expected cycle chart summary reference"},
-		bodyStringMatch{fragment: `id="stats-cycle-trend-summary"`, message: "expected cycle chart summary node"},
-		bodyStringMatch{fragment: "3 completed cycles shown.", message: "expected cycle chart summary copy"},
-		bodyStringMatch{fragment: `id="bbt-chart"`, message: "expected bbt chart container"},
 		bodyStringMatch{fragment: `aria-labelledby="stats-bbt-title"`, message: "expected bbt chart accessible title"},
 		bodyStringMatch{fragment: `aria-describedby="stats-bbt-summary stats-bbt-caption"`, message: "expected bbt chart summary reference"},
-		bodyStringMatch{fragment: `id="stats-bbt-summary"`, message: "expected bbt chart summary node"},
-		bodyStringMatch{fragment: "readings this cycle.", message: "expected bbt chart summary copy"},
-		bodyStringMatch{fragment: "Calculations stay the same.", message: "expected stats usage-goal disclaimer"},
+		bodyStringMatch{fragment: `data-usage-goal-summary`, message: "expected stats usage-goal summary panel hook"},
+		bodyStringMatch{fragment: `data-stats-prediction-explainer`, message: "expected stats prediction explainer hook"},
+		bodyStringMatch{fragment: `data-stats-factor-context`, message: "expected stats factor context hook"},
 	)
 }

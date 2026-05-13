@@ -39,15 +39,16 @@ test.describe('Auth: register, login, logout', () => {
     page,
     context,
   }) => {
-    // Pre-fix #5: registering an already-taken email surfaced a
-    // .status-error banner and pre-filled #register-email with the
-    // submitted address, giving an attacker a single-request oracle
-    // for "is this email registered". Post-fix the server returns the
-    // same status + body shape as a fresh enrollment but without auth
-    // or recovery cookies (Set-Cookie remains the residual signal —
-    // see SECURITY.md). UI must therefore look like a no-op landing on
-    // /register: no error banner, no email pre-fill, and no flash /
-    // auth / recovery cookies left behind.
+    // Cookie-less register flow: POST /api/auth/register returns the same
+    // status, body, and single sealed ovumcy_register_pickup cookie for
+    // both new and duplicate emails. GET /register/welcome then exchanges
+    // a valid pickup for auth + recovery cookies (lands on /register with
+    // the inline recovery surface) or, for a decoy pickup that resolves
+    // to no user, redirects to /login with a neutral flash. The duplicate
+    // branch therefore lands on /login, not /register; what matters for
+    // the no-leak property is that no auth / recovery cookies are issued
+    // and that any displayed flash text does not confirm or deny that the
+    // email already exists. See SECURITY.md "Register enumeration".
     const creds = createCredentials('auth-duplicate');
 
     await registerOwnerViaUI(page, creds);
@@ -56,14 +57,21 @@ test.describe('Auth: register, login, logout', () => {
     await logoutViaAPI(page);
     await registerOwnerViaUI(page, creds);
 
-    await expect(page).toHaveURL(/\/register(?:\?.*)?$/);
+    await expect(page).toHaveURL(/\/login(?:\?.*)?$/);
     expectNoSensitiveAuthParams(page.url());
-    await expect(page.locator('.status-error')).toHaveCount(0);
-    await expect(page.locator('#register-email')).toHaveValue('');
 
     const cookies = await context.cookies();
-    for (const name of ['ovumcy_auth', 'ovumcy_recovery_code', 'ovumcy_flash']) {
+    for (const name of ['ovumcy_auth', 'ovumcy_recovery_code']) {
       expect(cookies.find((cookie) => cookie.name === name)).toBeUndefined();
+    }
+
+    const errorBanner = page.locator('.status-error');
+    const bannerCount = await errorBanner.count();
+    if (bannerCount > 0) {
+      const message = (await errorBanner.first().textContent())?.toLowerCase() ?? '';
+      for (const forbidden of ['already', 'exists', 'taken', 'in use', 'registered']) {
+        expect(message).not.toContain(forbidden);
+      }
     }
   });
 

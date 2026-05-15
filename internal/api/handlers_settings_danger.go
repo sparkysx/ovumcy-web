@@ -3,6 +3,7 @@ package api
 import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/ovumcy/ovumcy-web/internal/models"
+	"github.com/ovumcy/ovumcy-web/internal/services"
 )
 
 func (handler *Handler) ValidateClearDataPassword(c *fiber.Ctx) error {
@@ -28,6 +29,16 @@ func (handler *Handler) ClearAllData(c *fiber.Ctx) error {
 		spec := settingsClearDataErrorSpec()
 		handler.logSecurityError(c, "settings.clear_data", spec)
 		return handler.respondMappedError(c, spec)
+	}
+
+	// ClearAllDataAndResetSettings bumps auth_session_version atomically;
+	// mirror the bump in memory and re-issue the auth cookie so this device
+	// stays signed in while every other session that existed before the
+	// wipe is invalidated on its next request. Matches the contract used by
+	// password change, recovery-code regen, and 2FA toggle.
+	user.AuthSessionVersion = services.NormalizeAuthSessionVersion(user.AuthSessionVersion) + 1
+	if err := handler.refreshCurrentSession(c, user, "settings.clear_data"); err != nil {
+		return err
 	}
 
 	handler.logSecurityEvent(c, "settings.clear_data", "success")

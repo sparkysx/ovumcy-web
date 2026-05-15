@@ -266,6 +266,13 @@ func (repo *UserRepository) ClearAllDataAndResetSettings(userID uint) error {
 			"unpredictable_cycle":             false,
 			"long_period_warning_cycle_start": nil,
 			"last_period_start":               nil,
+			// Bump auth_session_version inside the same transaction so a
+			// successful clear-data wipe also revokes every auth cookie that
+			// existed before the wipe. Without this bump a stolen session that
+			// was used to trigger the wipe would retain authenticated access
+			// to the freshly-empty account, and a legitimate "panic clear"
+			// gesture would not actually sign other devices out.
+			"auth_session_version": gorm.Expr("auth_session_version + 1"),
 		}).Error
 	})
 }

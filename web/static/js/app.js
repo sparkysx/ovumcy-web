@@ -1766,7 +1766,19 @@
       var xhr = event.detail.xhr;
       var responseText = xhr && typeof xhr.responseText === "string" ? xhr.responseText : "";
       if (responseText && responseText.indexOf("status-error") !== -1) {
-        target.innerHTML = responseText;
+        // Safe-by-construction swap: parse the server's status-error
+        // fragment, but only adopt its text content. Server templates
+        // already escape user-supplied values, so today this is purely
+        // defense-in-depth — any future regression that lets unescaped
+        // HTML into an error response would otherwise become an instant
+        // DOM-XSS through `target.innerHTML = responseText`.
+        var doc = new DOMParser().parseFromString(responseText, "text/html");
+        var fragment = doc.querySelector(".status-error");
+        var messageText = fragment ? fragment.textContent : responseText;
+        var safeContainer = document.createElement("div");
+        safeContainer.className = "status-error";
+        safeContainer.textContent = messageText;
+        target.replaceChildren(safeContainer);
         return;
       }
 

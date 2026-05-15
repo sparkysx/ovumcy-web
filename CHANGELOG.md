@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-05-15
+
 ### Added
 - Runtime proof-of-concept regression tests for the two OIDC contracts hardened in v0.9.5 (`internal/security/oidc_runtime_poc_test.go`). The suite stands up a controlled OIDC provider via `httptest.NewUnstartedServer` with a real TLS leaf signed by a per-test CA, configures `security.OIDCClient` against that issuer through the production `OIDC_CA_FILE` path, and exercises four contracts end-to-end without booting Ovumcy: (1) a malicious `end_session_endpoint` on a different host is stripped from the metadata so logout falls back to local-only, (2) a same-origin `end_session_endpoint` flows through, (3) an ID token signed with HS256 using the JWKS RSA public key as the HMAC secret is refused by the verifier (algorithm-confusion downgrade), and (4) an unsigned `alg=none` token is refused.
 - Frontend JavaScript unit-test suite under `web/src/js/__tests__/`, executed via `npm run test:unit` (Node's built-in test runner + jsdom). Twenty-seven tests cover the four security-sensitive client-side surfaces previously only exercised indirectly through Playwright e2e: CSRF token injection on the `htmx:configRequest` hook, the safe-by-construction DOM swap on `htmx:responseError` (the Sprint 3 #9 contract), the `isSafeClientTimezone` validator backing the `ovumcy_tz` cookie write, and the `navigator.clipboard` → `document.execCommand("copy")` fallback used by the recovery-code copy UI. The suite is wired into the CI workflow alongside `lint:js`.

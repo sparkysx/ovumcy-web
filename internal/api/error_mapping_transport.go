@@ -8,24 +8,36 @@ import (
 	"github.com/ovumcy/ovumcy-web/internal/services"
 )
 
-func apiError(c *fiber.Ctx, status int, message string) error {
+// apiError renders an error response in the format matching the request.
+// HTML/HTMX requests get a localized status fragment; JSON requests get the
+// standard envelope with both the legacy top-level `error` string key and the
+// richer `error_detail` object describing category and target. The top-level
+// key stays for backward compatibility with clients that already parse it.
+func apiError(c *fiber.Ctx, spec APIErrorSpec) error {
 	if responseFormat(c) == httpx.ResponseFormatHTMX {
-		rendered := message
-		if key := services.AuthErrorTranslationKey(message); key != "" {
+		rendered := spec.Key
+		if key := services.AuthErrorTranslationKey(spec.Key); key != "" {
 			if localized := translateMessage(currentMessages(c), key); localized != key {
 				rendered = localized
 			}
-		} else if localized := translateMessage(currentMessages(c), message); localized != message {
+		} else if localized := translateMessage(currentMessages(c), spec.Key); localized != spec.Key {
 			rendered = localized
 		}
-		return c.Status(status).SendString(httpx.StatusErrorMarkup(rendered))
+		return c.Status(spec.Status).SendString(httpx.StatusErrorMarkup(rendered))
 	}
-	return c.Status(status).JSON(fiber.Map{"error": message})
+	return c.Status(spec.Status).JSON(fiber.Map{
+		"error": spec.Key,
+		"error_detail": fiber.Map{
+			"key":      spec.Key,
+			"category": string(spec.Category),
+			"target":   string(spec.Target),
+		},
+	})
 }
 
-func (handler *Handler) respondAuthError(c *fiber.Ctx, status int, message string) error {
+func (handler *Handler) respondAuthError(c *fiber.Ctx, spec APIErrorSpec) error {
 	if (strings.HasPrefix(c.Path(), "/api/auth/") || strings.HasPrefix(c.Path(), "/auth/oidc")) && !acceptsJSON(c) && !isHTMX(c) {
-		flash := FlashPayload{AuthError: message}
+		flash := FlashPayload{AuthError: spec.Key}
 		switch c.Path() {
 		case "/api/auth/register":
 			email := services.NormalizeAuthEmail(c.FormValue("email"))
@@ -54,13 +66,13 @@ func (handler *Handler) respondAuthError(c *fiber.Ctx, status int, message strin
 			return c.Redirect("/login", fiber.StatusSeeOther)
 		}
 	}
-	return apiError(c, status, message)
+	return apiError(c, spec)
 }
 
-func (handler *Handler) respondSettingsError(c *fiber.Ctx, status int, message string) error {
+func (handler *Handler) respondSettingsError(c *fiber.Ctx, spec APIErrorSpec) error {
 	if isHTMX(c) {
-		rendered := message
-		if key := services.AuthErrorTranslationKey(message); key != "" {
+		rendered := spec.Key
+		if key := services.AuthErrorTranslationKey(spec.Key); key != "" {
 			if localized := translateMessage(currentMessages(c), key); localized != key {
 				rendered = localized
 			}
@@ -68,8 +80,8 @@ func (handler *Handler) respondSettingsError(c *fiber.Ctx, status int, message s
 		return c.Status(fiber.StatusOK).SendString(httpx.StatusErrorMarkup(rendered))
 	}
 	if (strings.HasPrefix(c.Path(), "/api/settings/") || strings.HasPrefix(c.Path(), "/settings/")) && !acceptsJSON(c) {
-		handler.setFlashCookie(c, FlashPayload{SettingsError: message})
+		handler.setFlashCookie(c, FlashPayload{SettingsError: spec.Key})
 		return c.Redirect("/settings", fiber.StatusSeeOther)
 	}
-	return apiError(c, status, message)
+	return apiError(c, spec)
 }

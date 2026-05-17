@@ -61,16 +61,16 @@ func settingsFormErrorSpec(status int, category APIErrorCategory, key string) AP
 }
 
 func respondGlobalMappedError(c *fiber.Ctx, spec APIErrorSpec) error {
-	return apiError(c, spec.Status, spec.Key)
+	return apiError(c, spec)
 }
 
 func (handler *Handler) respondMappedError(c *fiber.Ctx, spec APIErrorSpec) error {
 	switch spec.Target {
 	case APIErrorTargetAuthForm:
-		return handler.respondAuthError(c, spec.Status, spec.Key)
+		return handler.respondAuthError(c, spec)
 	case APIErrorTargetSettingsForm:
-		return handler.respondSettingsError(c, spec.Status, spec.Key)
+		return handler.respondSettingsError(c, spec)
 	default:
-		return apiError(c, spec.Status, spec.Key)
+		return apiError(c, spec)
 	}
 }

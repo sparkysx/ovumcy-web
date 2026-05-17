@@ -103,7 +103,9 @@ func responseCookie(cookies []*http.Cookie, name string) *http.Cookie {
 func readAPIError(t *testing.T, body io.Reader) string {
 	t.Helper()
 
-	payload := map[string]string{}
+	payload := struct {
+		Error string `json:"error"`
+	}{}
 	bytes, err := io.ReadAll(body)
 	if err != nil {
 		t.Fatalf("read response body: %v", err)
@@ -111,5 +113,5 @@ func readAPIError(t *testing.T, body io.Reader) string {
 	if err := json.Unmarshal(bytes, &payload); err != nil {
 		t.Fatalf("decode response body: %v", err)
 	}
-	return payload["error"]
+	return payload.Error
 }

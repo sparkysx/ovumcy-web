@@ -38,11 +38,13 @@ info:
     additional per-account budgets enforced by `AuthAttemptPolicy`. Specific
     defaults are listed in [SECURITY.md#rate-limits](../SECURITY.md#rate-limits).
 
-    Errors — all errors share the shape `{ "error": "<key>" }`. Error keys are
-    namespaced strings (`"auth.invalid_credentials"`, `"unauthorized"`,
-    `"invalid input"`, etc.). Clients should branch on the HTTP status code,
-    not the key string, and treat unknown keys as their generic status-class
-    failure.
+    Errors — every error response carries `{ "error": "<key>", "error_detail":
+    { "key", "category", "target" } }`. The top-level `error` string is the
+    legacy field kept for backward compatibility; `error_detail` is the
+    structured form for programmatic clients (see `ApiError` /
+    `ApiErrorDetail` in `components.schemas`). Clients should branch on the
+    HTTP status code plus `error_detail.category` rather than the key string,
+    and treat unknown keys/categories as their generic status-class failure.
 
     Page routes (`/login`, `/dashboard`, `/calendar`, etc.) are **not** part of
     this specification. They serve HTML to browsers only.
@@ -181,14 +183,39 @@ components:
     ApiError:
       type: object
       description: |
-        Standard error envelope. `error` is a namespaced key — clients should
-        branch on the HTTP status code, not the string value, and treat unknown
-        keys as their generic status-class failure.
-      required: [error]
+        Standard error envelope. The top-level `error` string is the legacy
+        key kept for backward compatibility. The `error_detail` object carries
+        the structured form for programmatic clients — `category` identifies
+        the error class (validation, unauthorized, rate_limited, …) and
+        `target` distinguishes global errors from form-level ones. Clients
+        should branch on the HTTP status code plus `error_detail.category`
+        rather than the key string, and treat unknown keys/categories as their
+        generic status-class failure.
+      required: [error, error_detail]
       properties:
         error:
           type: string
           example: "auth.invalid_credentials"
+        error_detail:
+          $ref: '#/components/schemas/ApiErrorDetail'
+      additionalProperties: false
+
+    ApiErrorDetail:
+      type: object
+      required: [key, category, target]
+      properties:
+        key:
+          type: string
+          description: Same value as the top-level `error` string. Duplicated here so a client that consumes only `error_detail` can branch without parsing the parent envelope.
+          example: "auth.invalid_credentials"
+        category:
+          type: string
+          enum: [validation, not_found, conflict, unauthorized, forbidden, rate_limited, internal]
+          description: Error class. Stable enum — new values may be added in any release but existing values do not change meaning.
+        target:
+          type: string
+          enum: [global, auth_form, settings_form]
+          description: Where the error originated. `global` errors are unscoped; form targets indicate the error belongs inside an auth or settings form so HTMX-style clients can render it inline.
       additionalProperties: false
 
     OkResponse:

@@ -11,6 +11,9 @@ import (
 )
 
 func TestCreateSymptomLogsMutationWithoutLeakingUserInput(t *testing.T) {
+	SetAuditLogEnabled(true)
+	t.Cleanup(func() { SetAuditLogEnabled(false) })
+
 	originalWriter := log.Writer()
 	defer log.SetOutput(originalWriter)
 
@@ -48,6 +51,9 @@ func TestCreateSymptomLogsMutationWithoutLeakingUserInput(t *testing.T) {
 }
 
 func TestUpsertDayLogsSanitizedPathWithoutConcreteDate(t *testing.T) {
+	SetAuditLogEnabled(true)
+	t.Cleanup(func() { SetAuditLogEnabled(false) })
+
 	originalWriter := log.Writer()
 	defer log.SetOutput(originalWriter)
 

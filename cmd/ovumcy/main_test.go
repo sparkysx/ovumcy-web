@@ -15,6 +15,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/csrf"
 	"github.com/gofiber/fiber/v2/middleware/logger"
+	"github.com/ovumcy/ovumcy-web/internal/api"
 	"github.com/ovumcy/ovumcy-web/internal/db"
 	"github.com/ovumcy/ovumcy-web/internal/security"
 	"github.com/ovumcy/ovumcy-web/internal/services"
@@ -1107,6 +1108,9 @@ func TestRateLimitLogDoesNotLogQueryPII(t *testing.T) {
 }
 
 func TestCSRFMiddlewareErrorHandlerLogsSecurityEventWithoutPII(t *testing.T) {
+	api.SetAuditLogEnabled(true)
+	t.Cleanup(func() { api.SetAuditLogEnabled(false) })
+
 	originalWriter := log.Writer()
 	defer log.SetOutput(originalWriter)
 
@@ -1149,6 +1153,9 @@ func TestCSRFMiddlewareErrorHandlerLogsSecurityEventWithoutPII(t *testing.T) {
 }
 
 func TestAuthRateLimitHandlerLogsSecurityEventWithoutPII(t *testing.T) {
+	api.SetAuditLogEnabled(true)
+	t.Cleanup(func() { api.SetAuditLogEnabled(false) })
+
 	originalWriter := log.Writer()
 	defer log.SetOutput(originalWriter)
 

@@ -42,6 +42,7 @@ type runtimeConfig struct {
 	OIDC             security.OIDCConfig
 	RateLimits       rateLimitSettings
 	Proxy            proxySettings
+	AuditLogEnabled  bool
 }
 
 type rateLimitSettings struct {
@@ -95,6 +96,7 @@ func main() {
 	time.Local = location
 
 	config := mustLoadRuntimeConfig(location)
+	api.SetAuditLogEnabled(config.AuditLogEnabled)
 	database := mustOpenDatabase(config.DatabaseConfig)
 	i18nManager := mustNewI18nManager(config.DefaultLanguage)
 	dependencies := buildDependencies(db.NewRepositories(database), i18nManager, config.RateLimits, config.RegistrationMode, config.OIDC, config.SecretKey)
@@ -170,7 +172,8 @@ func loadRuntimeConfig(location *time.Location) (runtimeConfig, error) {
 			APIMax:               getEnvInt("RATE_LIMIT_API_MAX", 300),
 			APIWindow:            getEnvDuration("RATE_LIMIT_API_WINDOW", time.Minute),
 		},
-		Proxy: proxy,
+		Proxy:           proxy,
+		AuditLogEnabled: getEnvBool("AUDIT_LOG_ENABLED", false),
 	}, nil
 }
 
@@ -422,12 +425,13 @@ func installGracefulShutdown(app *fiber.App) context.CancelFunc {
 
 func logStartup(config runtimeConfig) {
 	log.Printf(
-		"Ovumcy listening on http://0.0.0.0:%s (rev: %s, tz: %s, registration=%s, oidc=%t, rate_limits: login=%d/%s api=%d/%s, trusted_proxy=%t)",
+		"Ovumcy listening on http://0.0.0.0:%s (rev: %s, tz: %s, registration=%s, oidc=%t, audit_log=%t, rate_limits: login=%d/%s api=%d/%s, trusted_proxy=%t)",
 		config.Port,
 		buildRevision(),
 		config.Location.String(),
 		config.RegistrationMode,
 		config.OIDC.Enabled,
+		config.AuditLogEnabled,
 		config.RateLimits.LoginMax,
 		config.RateLimits.LoginWindow,
 		config.RateLimits.APIMax,

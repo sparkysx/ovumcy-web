@@ -239,6 +239,7 @@ Treat the application secret as part of the deployment identity, whether you pas
 - Store the underlying secret privately and back it up separately from the SQLite archive.
 - Rotating the application secret invalidates existing sealed cookies and active sign-ins.
 - Restoring SQLite data with a different application secret is valid, but users should expect a fresh sign-in and new sealed-cookie state.
+- Rotating the secret on a database with TOTP-enabled accounts will leave their `users.totp_secret` ciphertexts undecryptable; affected users must sign in with their recovery code (or have the operator run `ovumcy reset-password <email>`) and re-enrol TOTP under the new secret. See the *SECRET_KEY Usage Map* section in [SECURITY.md](../SECURITY.md) for the full impact map.
 - Do not paste the application secret, backup archives, or certificate material into issue trackers, chat logs, or shared shell history.
 
 ## Backup and Restore Contract

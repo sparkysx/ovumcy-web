@@ -75,7 +75,7 @@ No. Ovumcy is designed without telemetry or advertising trackers.
 
 ### Can I export my data?
 
-Yes. Ovumcy supports CSV and JSON export so your records stay portable.
+Yes. Ovumcy supports CSV and JSON export so your records stay portable. See [docs/export.md](docs/export.md) for the exact JSON shape, CSV columns, and stability contract.
 
 ### Do I need technical knowledge to install Ovumcy?
 
@@ -84,6 +84,8 @@ Basic familiarity with Docker is enough for the supported quick start. A `docker
 ### Is Ovumcy a medical product?
 
 No. Ovumcy provides estimates and logs based on recorded data. It is not a medical device and should not be treated as diagnostic or treatment advice.
+
+Period and fertile-window predictions in particular are statistical estimates derived from the cycle data you log. They are not a contraceptive method, a fertility treatment, or a substitute for medical care. Use a medically appropriate method when you need one.
 
 ## Demo
 
@@ -146,13 +148,13 @@ These are the currently supported first-party UI languages. Operators can set `D
 
 ## Privacy and Security
 
-- No analytics or ad trackers.
-- No third-party API dependencies for core functionality.
-- Essential first-party cookies only (auth, CSRF, language, timezone, short-lived flash/recovery state).
+- No analytics, ad trackers, or remote telemetry.
+- No outbound network calls in the default configuration. When OIDC is enabled, the server only talks to the configured identity provider.
+- First-party cookies only; see [SECURITY.md](SECURITY.md#cookies) for the full inventory and attributes.
 - Data stays on infrastructure you control.
 - Automated security checks cover CodeQL, gosec, Trivy filesystem/container scans, and CycloneDX SBOM generation in GitHub Actions.
 - SQLite is the baseline default; Postgres is available for advanced self-hosted deployments through official example stacks.
-- Optional TOTP 2FA: secrets are AES-256-GCM encrypted at rest, the login challenge and disable-confirmation endpoints are rate-limited, and replayed codes are rejected within the verifier window.
+- Optional TOTP 2FA: secrets are AES-256-GCM encrypted at rest with per-row aad binding, the login challenge and disable-confirmation endpoints are rate-limited, and replayed codes are rejected within the 30-second verifier window.
 
 If you found a security issue, see [SECURITY.md](SECURITY.md).
 
@@ -275,6 +277,9 @@ TRUST_PROXY_ENABLED=false
 PROXY_HEADER=X-Forwarded-For
 TRUSTED_PROXIES=127.0.0.1,::1
 
+# Per-action audit logs to stderr. Default off. Enable only when investigating an incident.
+AUDIT_LOG_ENABLED=false
+
 # Optional OIDC sign-in / SSO
 # OIDC_ENABLED=true
 # OIDC_ISSUER_URL=https://id.example.com
@@ -298,6 +303,7 @@ Important notes:
 - `REGISTRATION_MODE` supports `open` and `closed`; use `closed` for pre-provisioned or otherwise operator-restricted internet-facing instances where self-service sign-up must stay disabled.
 - `HOST_BIND_ADDRESS=127.0.0.1` keeps the base compose path local/private by default. Only change it deliberately for a specific private-network bind.
 - Set `COOKIE_SECURE=true` when serving over HTTPS.
+- `AUDIT_LOG_ENABLED` is off by default. Per-action security-event lines are suppressed; Go panics, startup errors, and the Fiber request log stay enabled. Flip to `true` only when investigating a specific incident, and remember the resulting stream contains `user_id` and is as sensitive as the database. See [SECURITY.md](SECURITY.md#logging-policy).
 - OIDC sign-in is optional, supports `hybrid` and `oidc_only` login modes, and requires HTTPS plus `COOKIE_SECURE=true`.
 - `OIDC_CA_FILE` is optional and lets Ovumcy trust a readable PEM CA bundle for private or internal identity-provider certificates.
 - The first OIDC sign-in uses an existing `(issuer, subject)` link when present, otherwise it falls back to a verified email match.
@@ -314,18 +320,20 @@ For deployment paths, reverse-proxy examples, backups, restores, and advanced Po
 
 ## Operator CLI
 
-For self-hosted operators, the binary includes a small local-only CLI for account audit and removal:
+For self-hosted operators, the binary includes a small local-only CLI for account audit, removal, and emergency password reset:
 
 ```bash
 go run ./cmd/ovumcy users list
 go run ./cmd/ovumcy users delete owner@example.com
 go run ./cmd/ovumcy users delete owner@example.com --yes
+go run ./cmd/ovumcy reset-password owner@example.com
 ```
 
 Notes:
 
 - `users list` prints a minimal account audit table: `id`, `email`, `role`, `display name`, onboarding state, and creation time.
 - `users delete <email>` removes the selected account together with related health data and prompts for an explicit `DELETE` confirmation unless `--yes` is provided.
+- `reset-password <email>` prompts for a new password interactively, validates it against the password policy, writes its bcrypt hash to the account, and atomically bumps `auth_session_version` so every existing session is invalidated. Use this when an owner has lost both their password and their recovery code.
 - Treat CLI usage as operator-only access. It is intended for local shell access on the instance, not for browser or remote public administration.
 
 ## Development

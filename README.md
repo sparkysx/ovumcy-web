@@ -77,6 +77,10 @@ No. Ovumcy is designed without telemetry or advertising trackers.
 
 Yes. Ovumcy supports CSV and JSON export so your records stay portable. See [docs/export.md](docs/export.md) for the exact JSON shape, CSV columns, and stability contract.
 
+### Is there an HTTP API specification?
+
+Yes. The JSON surface served at `/api/*` (and the state-changing routes that historically live outside `/api/*`) is described in [docs/openapi.yaml](docs/openapi.yaml) (OpenAPI 3.1). It documents what the server emits today; it is not a stable third-party API — see [CONTRIBUTING.md](CONTRIBUTING.md) for the stability contract.
+
 ### Do I need technical knowledge to install Ovumcy?
 
 Basic familiarity with Docker is enough for the supported quick start. A `docker-compose.yml` with working defaults is included in the repository.

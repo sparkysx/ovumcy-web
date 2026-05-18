@@ -78,7 +78,7 @@ func TestDashboardTodayActionsUseRequestTimezoneHeaderAndCookie(t *testing.T) {
 
 	tzCookieHeader := joinCookieHeader(authCookie, timezoneCookieName+"="+timezoneName)
 
-	clearResponse := dashboardTimezoneActionResponse(t, app, http.MethodDelete, "/api/log/delete?date="+todayRaw+"&source=dashboard", nil, tzCookieHeader, timezoneName)
+	clearResponse := dashboardTimezoneActionResponse(t, app, http.MethodDelete, "/api/v1/days?date="+todayRaw+"&source=dashboard", nil, tzCookieHeader, timezoneName)
 	assertStatusCode(t, clearResponse, http.StatusOK)
 	if clearResponse.Header.Get("HX-Redirect") != "/dashboard" {
 		t.Fatalf("expected HX-Redirect /dashboard on clear, got %q", clearResponse.Header.Get("HX-Redirect"))
@@ -97,7 +97,7 @@ func TestDashboardTodayActionsUseRequestTimezoneHeaderAndCookie(t *testing.T) {
 		"flow":      {models.FlowNone},
 		"notes":     {"timezone save note"},
 	}
-	saveResponse := dashboardTimezoneActionResponse(t, app, http.MethodPost, "/api/days/"+todayRaw, strings.NewReader(form.Encode()), tzCookieHeader, timezoneName)
+	saveResponse := dashboardTimezoneActionResponse(t, app, http.MethodPut, "/api/v1/days/"+todayRaw, strings.NewReader(form.Encode()), tzCookieHeader, timezoneName)
 	assertStatusCode(t, saveResponse, http.StatusOK)
 
 	savedEntry, err := fetchLogByDateForTest(database, user.ID, today, location)
@@ -129,7 +129,7 @@ func dashboardTimezoneActionResponse(t *testing.T, app *fiber.App, method string
 	t.Helper()
 
 	request := httptest.NewRequest(method, target, body)
-	if method == http.MethodPost {
+	if body != nil {
 		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	}
 	request.Header.Set("HX-Request", "true")

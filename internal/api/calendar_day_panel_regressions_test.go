@@ -137,7 +137,7 @@ func TestCalendarDayPanelEditModePreservesAndSavesPeriodToggle(t *testing.T) {
 		"flow":  {models.FlowNone},
 		"notes": {"updated"},
 	}
-	saveRequest := httptest.NewRequest(http.MethodPost, "/api/days/2026-02-17", strings.NewReader(form.Encode()))
+	saveRequest := httptest.NewRequest(http.MethodPut, "/api/v1/days/2026-02-17", strings.NewReader(form.Encode()))
 	saveRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	saveRequest.Header.Set("HX-Request", "true")
 	saveRequest.Header.Set("Accept-Language", "en")

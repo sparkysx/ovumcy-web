@@ -45,9 +45,9 @@ export async function registerOwnerAndEnableIrregularMode(
 export async function todayISOFromDashboard(page: Page): Promise<string> {
   await page.goto('/dashboard');
   await expect(page).toHaveURL(/\/dashboard$/);
-  const action = await page.locator('[data-dashboard-save-form]').first().getAttribute('hx-post');
+  const action = await page.locator('[data-dashboard-save-form]').first().getAttribute('hx-put');
   expect(action).toMatch(/^\/api\/days\/\d{4}-\d{2}-\d{2}$/);
-  return String(action).replace('/api/days/', '');
+  return String(action).replace('/api/v1/days/', '');
 }
 
 export async function markCycleStart(page: Page, isoDate: string): Promise<void> {
@@ -67,7 +67,7 @@ export async function markCycleStart(page: Page, isoDate: string): Promise<void>
     page.waitForResponse((response) => {
       return (
         response.request().method() === 'POST' &&
-        response.url().includes(`/api/days/${isoDate}/cycle-start?source=calendar`)
+        response.url().includes(`/api/v1/days/${isoDate}/cycle-start?source=calendar`)
       );
     }),
     manualStartButton.click(),
@@ -104,7 +104,7 @@ export async function saveCycleFactorOnDay(
   await factorChip.click();
   await Promise.all([
     page.waitForResponse((response) => {
-      return response.request().method() === 'POST' && response.url().includes(`/api/days/${isoDate}`);
+      return response.request().method() === 'PUT' && response.url().includes(`/api/v1/days/${isoDate}`);
     }),
     form.evaluate((node) => {
       if (node instanceof HTMLFormElement) {
@@ -147,7 +147,7 @@ export async function saveBBTOnDay(page: Page, isoDate: string, value: string): 
   await bbtInput.fill(value);
   await Promise.all([
     page.waitForResponse((response) => {
-      return response.request().method() === 'POST' && response.url().includes(`/api/days/${isoDate}`);
+      return response.request().method() === 'PUT' && response.url().includes(`/api/v1/days/${isoDate}`);
     }),
     form.evaluate((node) => {
       if (node instanceof HTMLFormElement) {

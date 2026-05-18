@@ -34,7 +34,7 @@ func TestDayReadEndpointsUseRequestTimezoneForLocalCalendarDay(t *testing.T) {
 
 	cookieHeader := joinCookieHeader(authCookie, timezoneCookieName+"="+timezoneName)
 
-	listRequest := httptest.NewRequest(http.MethodGet, "/api/days?from="+localDayRaw+"&to="+localDayRaw, nil)
+	listRequest := httptest.NewRequest(http.MethodGet, "/api/v1/days?from="+localDayRaw+"&to="+localDayRaw, nil)
 	listRequest.Header.Set("Accept", "application/json")
 	listRequest.Header.Set("Cookie", cookieHeader)
 	listRequest.Header.Set(timezoneHeaderName, timezoneName)
@@ -53,7 +53,7 @@ func TestDayReadEndpointsUseRequestTimezoneForLocalCalendarDay(t *testing.T) {
 		t.Fatalf("expected listed notes %q, got %q", seed.Notes, listPayload[0].Notes)
 	}
 
-	dayRequest := httptest.NewRequest(http.MethodGet, "/api/days/"+localDayRaw, nil)
+	dayRequest := httptest.NewRequest(http.MethodGet, "/api/v1/days/"+localDayRaw, nil)
 	dayRequest.Header.Set("Accept", "application/json")
 	dayRequest.Header.Set("Cookie", cookieHeader)
 	dayRequest.Header.Set(timezoneHeaderName, timezoneName)
@@ -69,21 +69,10 @@ func TestDayReadEndpointsUseRequestTimezoneForLocalCalendarDay(t *testing.T) {
 		t.Fatalf("expected fetched day notes %q, got %q", seed.Notes, dayPayload.Notes)
 	}
 
-	existsRequest := httptest.NewRequest(http.MethodGet, "/api/days/"+localDayRaw+"/exists", nil)
-	existsRequest.Header.Set("Accept", "application/json")
+	existsRequest := httptest.NewRequest(http.MethodHead, "/api/v1/days/"+localDayRaw, nil)
 	existsRequest.Header.Set("Cookie", cookieHeader)
 	existsRequest.Header.Set(timezoneHeaderName, timezoneName)
 
 	existsResponse := mustAppResponse(t, app, existsRequest)
 	assertStatusCode(t, existsResponse, http.StatusOK)
-
-	existsPayload := struct {
-		Exists bool `json:"exists"`
-	}{}
-	if err := json.NewDecoder(existsResponse.Body).Decode(&existsPayload); err != nil {
-		t.Fatalf("decode exists payload: %v", err)
-	}
-	if !existsPayload.Exists {
-		t.Fatalf("expected exists=true for request-local day %s", localDayRaw)
-	}
 }

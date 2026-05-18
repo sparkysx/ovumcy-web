@@ -216,12 +216,12 @@ test.describe('Bug regressions', () => {
       await page.goto('/dashboard');
       await expect(page).toHaveURL(/\/dashboard$/);
 
-      const todayAction = await page.locator('form[hx-post^="/api/days/"]').first().getAttribute('hx-post');
+      const todayAction = await page.locator('form[hx-put^="/api/v1/days/"]').first().getAttribute('hx-put');
       expect(todayAction).toMatch(/^\/api\/days\/\d{4}-\d{2}-\d{2}$/);
-      const actualTodayISO = String(todayAction || '').replace('/api/days/', '');
+      const actualTodayISO = String(todayAction || '').replace('/api/v1/days/', '');
 
       const todayCard = page
-        .locator('form[hx-post^="/api/days/"]')
+        .locator('form[hx-put^="/api/v1/days/"]')
         .first()
         .locator('xpath=ancestor::section[contains(@class,"journal-card")][1]');
       const subtitleText = String((await todayCard.locator('p.journal-muted').first().textContent()) || '');

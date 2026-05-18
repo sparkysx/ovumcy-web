@@ -49,7 +49,7 @@ func TestDashboardAndCalendarExposeAccessibleBBTInputs(t *testing.T) {
 		}
 	}
 
-	dayActionPrefix := `hx-post="/api/days/`
+	dayActionPrefix := `hx-post="/api/v1/days/`
 	startIndex := strings.Index(dashboardBody, dayActionPrefix)
 	if startIndex < 0 {
 		t.Fatal("expected dashboard day form action")
@@ -231,7 +231,7 @@ func TestDashboardTodaySavePersistsPeriodToggleAndNotes(t *testing.T) {
 }
 
 func dashboardSaveRequest(todayRaw string, form url.Values, authCookie string) *http.Request {
-	request := httptest.NewRequest(http.MethodPost, "/api/days/"+todayRaw, strings.NewReader(form.Encode()))
+	request := httptest.NewRequest(http.MethodPut, "/api/v1/days/"+todayRaw, strings.NewReader(form.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.Header.Set("HX-Request", "true")
 	request.Header.Set("Accept-Language", "en")
@@ -253,7 +253,7 @@ func TestDashboardTodaySavePersistsAndRendersWithNonUTCTimezone(t *testing.T) {
 		"notes":     {note},
 	}
 
-	saveRequest := httptest.NewRequest(http.MethodPost, "/api/days/"+today, strings.NewReader(form.Encode()))
+	saveRequest := httptest.NewRequest(http.MethodPut, "/api/v1/days/"+today, strings.NewReader(form.Encode()))
 	saveRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	saveRequest.Header.Set("HX-Request", "true")
 	saveRequest.Header.Set("Accept-Language", "en")

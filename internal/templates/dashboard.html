@@ -181,7 +181,7 @@
 
       {{if .IsOwner}}
       <form
-        hx-post="/api/days/{{.Today}}"
+        hx-put="/api/v1/days/{{.Today}}"
         hx-target="#save-status"
         hx-swap="innerHTML"
         class="space-y-5"
@@ -307,7 +307,7 @@
       <div class="dashboard-secondary-actions">
         <form
           class="dashboard-secondary-form"
-          hx-post="/api/days/{{.Today}}/cycle-start?source=dashboard"
+          hx-post="/api/v1/days/{{.Today}}/cycle-start?source=dashboard"
           hx-target="#save-status"
           hx-swap="innerHTML"
           data-dashboard-cycle-start-form
@@ -345,7 +345,7 @@
       <div class="dashboard-danger-actions">
         <button
           type="button"
-          hx-delete="/api/log/delete?date={{.Today}}&source=dashboard"
+          hx-delete="/api/v1/days?date={{.Today}}&source=dashboard"
           hx-swap="none"
           hx-confirm="{{t .Messages "confirm.delete_entry"}}"
           data-confirm-accept="{{t .Messages "confirm.yes"}}"

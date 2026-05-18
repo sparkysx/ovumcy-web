@@ -20,7 +20,7 @@ func TestDaysUpsertPostRejectsRequestsMissingCSRFToken(t *testing.T) {
 	authCookie := loginAndExtractAuthCookieWithCSRF(t, app, user.Email, "StrongPass1")
 
 	today := time.Now().UTC().Format("2006-01-02")
-	request := httptest.NewRequest(http.MethodPost, "/api/days/"+today, strings.NewReader(url.Values{
+	request := httptest.NewRequest(http.MethodPut, "/api/v1/days/"+today, strings.NewReader(url.Values{
 		"notes": {"missing csrf token"},
 	}.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")

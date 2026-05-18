@@ -41,7 +41,7 @@ func TestDashboardFormSavePreservesHiddenOwnerOnlyFields(t *testing.T) {
 
 	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
 	todayRaw := today.Format("2006-01-02")
-	request := httptest.NewRequest(http.MethodPost, "/api/days/"+todayRaw, strings.NewReader("mood=4"))
+	request := httptest.NewRequest(http.MethodPut, "/api/v1/days/"+todayRaw, strings.NewReader("mood=4"))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.Header.Set("HX-Request", "true")
 	request.Header.Set("Accept-Language", "en")

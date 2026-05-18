@@ -323,9 +323,9 @@ func TestAPIRateLimitHandlerReturnsJSONForGenericBrowserRequests(t *testing.T) {
 	handler := newRateLimitTestHandler(t)
 	app := fiber.New()
 	app.Use(handler.LanguageMiddleware)
-	app.Post("/api/days/2026-02-17", newAPIRateLimitHandler(handler))
+	app.Put("/api/v1/days/2026-02-17", newAPIRateLimitHandler(handler))
 
-	request := httptest.NewRequest(http.MethodPost, "/api/days/2026-02-17", strings.NewReader("notes=test"))
+	request := httptest.NewRequest(http.MethodPut, "/api/v1/days/2026-02-17", strings.NewReader("notes=test"))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	response, err := app.Test(request, -1)

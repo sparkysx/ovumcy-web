@@ -63,7 +63,7 @@ function clearTodayButton(page: Page) {
 }
 
 async function todaySavePath(page: Page): Promise<string> {
-  const action = await todaySaveForm(page).first().getAttribute('hx-post');
+  const action = await todaySaveForm(page).first().getAttribute('hx-put');
   expect(action).toMatch(/^\/api\/days\/\d{4}-\d{2}-\d{2}$/);
   return String(action);
 }
@@ -124,10 +124,10 @@ test.describe('Dashboard: today editor', () => {
     const todayForm = todaySaveForm(page);
     await expect(todayForm).toBeVisible();
 
-    const action = await todayForm.getAttribute('hx-post');
+    const action = await todayForm.getAttribute('hx-put');
     expect(action).toMatch(/^\/api\/days\/\d{4}-\d{2}-\d{2}$/);
 
-    const serverToday = action!.replace('/api/days/', '');
+    const serverToday = action!.replace('/api/v1/days/', '');
     const clientToday = await clientLocalISODate(page);
 
     expect(serverToday).toBe(clientToday);
@@ -351,10 +351,10 @@ test.describe('Dashboard: today editor', () => {
     await registerOwnerOnDashboard(page, 'dashboard-calendar-sync');
 
     const todayForm = todaySaveForm(page).first();
-    const todayAction = await todayForm.getAttribute('hx-post');
+    const todayAction = await todayForm.getAttribute('hx-put');
     expect(todayAction).toMatch(/^\/api\/days\/\d{4}-\d{2}-\d{2}$/);
 
-    const todayISO = String(todayAction).replace('/api/days/', '');
+    const todayISO = String(todayAction).replace('/api/v1/days/', '');
     const month = todayISO.slice(0, 7);
     const periodToggle = page.locator('input[name="is_period"]');
     const flowMedium = page.locator('input[name="flow"][value="medium"]');
@@ -394,10 +394,10 @@ test.describe('Dashboard: today editor', () => {
     await symptomChipForOption(firstSymptom).click();
     await saveToday(page);
 
-    const todayAction = await todaySaveForm(page).first().getAttribute('hx-post');
+    const todayAction = await todaySaveForm(page).first().getAttribute('hx-put');
     expect(todayAction).toMatch(/^\/api\/days\/\d{4}-\d{2}-\d{2}$/);
 
-    const todayISO = String(todayAction).replace('/api/days/', '');
+    const todayISO = String(todayAction).replace('/api/v1/days/', '');
     const month = todayISO.slice(0, 7);
     await page.goto(`/calendar?month=${month}&day=${todayISO}`);
 

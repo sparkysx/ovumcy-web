@@ -54,7 +54,7 @@ func TestCycleStartSavedWithoutTimezoneRendersOnLocalDayInNegativeOffset(t *test
 	priorDayRaw := serverToday.AddDate(0, 0, -1).Format("2006-01-02")
 	monthValue := serverToday.Format("2006-01")
 
-	cycleStartRequest := httptest.NewRequest(http.MethodPost, "/api/days/"+postedDayRaw+"/cycle-start", strings.NewReader(""))
+	cycleStartRequest := httptest.NewRequest(http.MethodPost, "/api/v1/days/"+postedDayRaw+"/cycle-start", strings.NewReader(""))
 	cycleStartRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	cycleStartRequest.Header.Set("HX-Request", "true")
 	cycleStartRequest.Header.Set("Accept-Language", "en")

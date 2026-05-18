@@ -152,9 +152,9 @@ async function saveTodayWithSymptom(page: Page, symptomName: string): Promise<st
   const todayAction = await page
     .locator('[data-dashboard-save-form]')
     .first()
-    .getAttribute('hx-post');
+    .getAttribute('hx-put');
   expect(todayAction).toMatch(/^\/api\/days\/\d{4}-\d{2}-\d{2}$/);
-  return String(todayAction).replace('/api/days/', '');
+  return String(todayAction).replace('/api/v1/days/', '');
 }
 
 async function openCalendarDayEditor(page: Page, isoDate: string): Promise<Locator> {
@@ -439,9 +439,9 @@ test.describe('Settings: profile and cycle', () => {
     await page.locator('button[data-save-button]').first().click();
     await expect(page.locator('#save-status .status-ok')).toBeVisible();
 
-    const todayAction = await dashboardForm.getAttribute('hx-post');
+    const todayAction = await dashboardForm.getAttribute('hx-put');
     expect(todayAction).toMatch(/^\/api\/days\/\d{4}-\d{2}-\d{2}$/);
-    const todayISO = String(todayAction).replace('/api/days/', '');
+    const todayISO = String(todayAction).replace('/api/v1/days/', '');
     const dayEditorForm = await openCalendarDayEditor(page, todayISO);
     await expect(dayEditorForm.getByLabel('BBT')).toHaveValue('98.60');
     await expect(dayEditorForm.locator('.measurement-field-unit')).toContainText('°F');
@@ -562,9 +562,9 @@ test.describe('Settings: profile and cycle', () => {
     );
     await expect(dashboardSymptom).toBeVisible();
 
-    const todayAction = await dashboardSaveForm(page).getAttribute('hx-post');
+    const todayAction = await dashboardSaveForm(page).getAttribute('hx-put');
     expect(todayAction).toMatch(/^\/api\/days\/\d{4}-\d{2}-\d{2}$/);
-    const todayISO = String(todayAction).replace('/api/days/', '');
+    const todayISO = String(todayAction).replace('/api/v1/days/', '');
 
     const dayEditorForm = await openCalendarDayEditor(page, todayISO);
     await expect(

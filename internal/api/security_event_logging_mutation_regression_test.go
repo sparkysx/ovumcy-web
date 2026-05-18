@@ -64,7 +64,7 @@ func TestUpsertDayLogsSanitizedPathWithoutConcreteDate(t *testing.T) {
 	user := createOnboardingTestUser(t, database, "settings-day-audit@example.com", "StrongPass1", true)
 	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
 
-	request := httptest.NewRequest(http.MethodPost, "/api/days/2026-02-17", strings.NewReader(url.Values{
+	request := httptest.NewRequest(http.MethodPut, "/api/v1/days/2026-02-17", strings.NewReader(url.Values{
 		"is_period": {"true"},
 	}.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -85,7 +85,7 @@ func TestUpsertDayLogsSanitizedPathWithoutConcreteDate(t *testing.T) {
 	if !strings.Contains(logLine, `security event: action="health.day_upsert" outcome="success"`) {
 		t.Fatalf("expected health.day_upsert security event, got %q", logLine)
 	}
-	if !strings.Contains(logLine, `path="/api/days/:date"`) {
+	if !strings.Contains(logLine, `path="/api/v1/days/:date"`) {
 		t.Fatalf("expected sanitized day route in log line, got %q", logLine)
 	}
 	if strings.Contains(logLine, "2026-02-17") {

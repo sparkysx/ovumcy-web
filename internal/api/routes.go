@@ -22,6 +22,15 @@ func registerV1APIRoutes(app *fiber.App, handler *Handler) {
 	passwordResets := v1.Group("/password-resets")
 	passwordResets.Post("", handler.ForgotPassword)
 	passwordResets.Post("/redeem", handler.ResetPassword)
+
+	days := v1.Group("/days", handler.AuthRequired)
+	days.Get("", handler.GetDays)
+	days.Delete("", handler.OwnerOnly, handler.DeleteDailyLog)
+	days.Head("/:date", handler.OwnerOnly, handler.CheckDayExists)
+	days.Get("/:date", handler.GetDay)
+	days.Put("/:date", handler.OwnerOnly, handler.UpsertDay)
+	days.Delete("/:date", handler.OwnerOnly, handler.DeleteDay)
+	days.Post("/:date/cycle-start", handler.OwnerOnly, handler.MarkCycleStart)
 }
 
 func registerPageRoutes(app *fiber.App, handler *Handler) {
@@ -58,17 +67,6 @@ func registerPageRoutes(app *fiber.App, handler *Handler) {
 
 func registerAPIRoutes(app *fiber.App, handler *Handler) {
 	api := app.Group("/api")
-
-	days := api.Group("/days", handler.AuthRequired)
-	days.Get("", handler.GetDays)
-	days.Get("/:date/exists", handler.OwnerOnly, handler.CheckDayExists)
-	days.Get("/:date", handler.GetDay)
-	days.Post("/:date", handler.OwnerOnly, handler.UpsertDay)
-	days.Post("/:date/cycle-start", handler.OwnerOnly, handler.MarkCycleStart)
-	days.Delete("/:date", handler.OwnerOnly, handler.DeleteDay)
-
-	dailyLog := api.Group("/log", handler.AuthRequired, handler.OwnerOnly)
-	dailyLog.Delete("/delete", handler.DeleteDailyLog)
 
 	symptoms := api.Group("/symptoms", handler.AuthRequired)
 	symptoms.Get("", handler.OwnerOnly, handler.GetSymptoms)

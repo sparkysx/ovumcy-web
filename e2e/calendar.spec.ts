@@ -281,7 +281,7 @@ test.describe('Calendar page', () => {
       page.waitForResponse((response) => {
         return (
           response.request().method() === 'POST' &&
-          response.url().includes(`/api/days/${pastISO}/cycle-start?source=calendar`)
+          response.url().includes(`/api/v1/days/${pastISO}/cycle-start?source=calendar`)
         );
       }),
       manualStartButton.click(),
@@ -314,7 +314,7 @@ test.describe('Calendar page', () => {
       page.waitForResponse((response) => {
         return (
           response.request().method() === 'POST' &&
-          response.url().includes(`/api/days/${tomorrowISO}/cycle-start?source=calendar`)
+          response.url().includes(`/api/v1/days/${tomorrowISO}/cycle-start?source=calendar`)
         );
       }),
       manualStartButton.click(),

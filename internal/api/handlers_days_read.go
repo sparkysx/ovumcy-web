@@ -59,5 +59,8 @@ func (handler *Handler) CheckDayExists(c *fiber.Ctx) error {
 		return handler.respondMappedError(c, dayFetchErrorSpec())
 	}
 
-	return c.JSON(fiber.Map{"exists": exists})
+	if !exists {
+		return c.SendStatus(fiber.StatusNotFound)
+	}
+	return c.SendStatus(fiber.StatusOK)
 }

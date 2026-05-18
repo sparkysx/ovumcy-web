@@ -40,7 +40,7 @@ func TestUpsertDayAutoFillCanBeDisabled(t *testing.T) {
 		t.Fatalf("marshal payload: %v", err)
 	}
 
-	request := httptest.NewRequest(http.MethodPost, "/api/days/2026-02-10", bytes.NewReader(body))
+	request := httptest.NewRequest(http.MethodPut, "/api/v1/days/2026-02-10", bytes.NewReader(body))
 	request.Header.Set("Content-Type", fiber.MIMEApplicationJSON)
 	request.Header.Set("Cookie", authCookie)
 
@@ -97,7 +97,7 @@ func TestUpsertDayAutoFillDoesNotCreateFutureDays(t *testing.T) {
 		"is_period": {"true"},
 		"flow":      {models.FlowLight},
 	}
-	request := httptest.NewRequest(http.MethodPost, "/api/days/"+todayRaw, strings.NewReader(form.Encode()))
+	request := httptest.NewRequest(http.MethodPut, "/api/v1/days/"+todayRaw, strings.NewReader(form.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.Header.Set("HX-Request", "true")
 	request.Header.Set("Accept-Language", "en")
@@ -141,7 +141,7 @@ func TestUpsertDayAutoFillsFollowingPeriodDays(t *testing.T) {
 		t.Fatalf("marshal payload: %v", err)
 	}
 
-	request := httptest.NewRequest(http.MethodPost, "/api/days/2026-02-10", bytes.NewReader(body))
+	request := httptest.NewRequest(http.MethodPut, "/api/v1/days/2026-02-10", bytes.NewReader(body))
 	request.Header.Set("Content-Type", fiber.MIMEApplicationJSON)
 	request.Header.Set("Cookie", authCookie)
 
@@ -220,7 +220,7 @@ func TestUpsertDayAutoFillSkipsWhenRecentPeriodDayExists(t *testing.T) {
 		t.Fatalf("marshal payload: %v", err)
 	}
 
-	request := httptest.NewRequest(http.MethodPost, "/api/days/2026-02-10", bytes.NewReader(body))
+	request := httptest.NewRequest(http.MethodPut, "/api/v1/days/2026-02-10", bytes.NewReader(body))
 	request.Header.Set("Content-Type", fiber.MIMEApplicationJSON)
 	request.Header.Set("Cookie", authCookie)
 

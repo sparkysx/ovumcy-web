@@ -43,7 +43,7 @@ func TestOwnerCriticalFlowSmoke(t *testing.T) {
 		t.Fatalf("marshal day payload: %v", err)
 	}
 
-	upsertRequest := httptest.NewRequest(http.MethodPost, "/api/days/2026-02-21", bytes.NewReader(body))
+	upsertRequest := httptest.NewRequest(http.MethodPut, "/api/v1/days/2026-02-21", bytes.NewReader(body))
 	upsertRequest.Header.Set("Content-Type", fiber.MIMEApplicationJSON)
 	upsertRequest.Header.Set("Cookie", authCookie)
 

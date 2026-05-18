@@ -14,7 +14,7 @@ import (
 )
 
 // TestUpsertDayCanonicalizesStoredDateToUTCMidnightForRequestTimezone is the
-// HTTP-level lock for issue #49. A POST /api/days/{ISODate} arriving with
+// HTTP-level lock for issue #49. A POST /api/v1/days/{ISODate} arriving with
 // a non-UTC request timezone (X-Ovumcy-Timezone header + ovumcy_tz cookie
 // pair) must persist DailyLog.Date as UTC-midnight on disk. The same
 // calendar day, fetched via GET in the same locale, must round-trip back
@@ -55,7 +55,7 @@ func TestUpsertDayCanonicalizesStoredDateToUTCMidnightForRequestTimezone(t *test
 			}
 
 			postedDayRaw := "2026-02-10"
-			request := httptest.NewRequest(http.MethodPost, "/api/days/"+postedDayRaw, bytes.NewReader(body))
+			request := httptest.NewRequest(http.MethodPut, "/api/v1/days/"+postedDayRaw, bytes.NewReader(body))
 			request.Header.Set("Content-Type", fiber.MIMEApplicationJSON)
 			request.Header.Set("Cookie", joinCookieHeader(authCookie, timezoneCookieName+"="+location.String()))
 			request.Header.Set(timezoneHeaderName, location.String())
@@ -75,7 +75,7 @@ func TestUpsertDayCanonicalizesStoredDateToUTCMidnightForRequestTimezone(t *test
 			}
 			assertUpsertUTCDate(t, rawDate, postedDayRaw)
 
-			roundTripRequest := httptest.NewRequest(http.MethodGet, "/api/days/"+postedDayRaw, nil)
+			roundTripRequest := httptest.NewRequest(http.MethodGet, "/api/v1/days/"+postedDayRaw, nil)
 			roundTripRequest.Header.Set("Cookie", joinCookieHeader(authCookie, timezoneCookieName+"="+location.String()))
 			roundTripRequest.Header.Set(timezoneHeaderName, location.String())
 

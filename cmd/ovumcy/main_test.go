@@ -1023,11 +1023,11 @@ func TestRequestLoggerUsesSafeRouteTemplateWithoutIP(t *testing.T) {
 	var output bytes.Buffer
 	app := fiber.New()
 	app.Use(newRequestLogger(&output))
-	app.Post("/api/days/:date", func(c *fiber.Ctx) error {
+	app.Put("/api/v1/days/:date", func(c *fiber.Ctx) error {
 		return c.SendStatus(http.StatusNoContent)
 	})
 
-	request := httptest.NewRequest(http.MethodPost, "/api/days/2026-02-17", nil)
+	request := httptest.NewRequest(http.MethodPut, "/api/v1/days/2026-02-17", nil)
 	request.RemoteAddr = "203.0.113.9:43123"
 
 	response, err := app.Test(request, -1)
@@ -1041,7 +1041,7 @@ func TestRequestLoggerUsesSafeRouteTemplateWithoutIP(t *testing.T) {
 	}
 
 	logLine := output.String()
-	if !strings.Contains(logLine, "/api/days/:date") {
+	if !strings.Contains(logLine, "/api/v1/days/:date") {
 		t.Fatalf("expected safe route template in request logs, got %q", logLine)
 	}
 	if strings.Contains(logLine, "2026-02-17") {
@@ -1062,15 +1062,15 @@ func TestRateLimitLogDoesNotLogQueryPII(t *testing.T) {
 	const plaintextPassword = "PlaintextPassword123!"
 
 	app := fiber.New()
-	app.Post("/api/days/:date", func(c *fiber.Ctx) error {
+	app.Put("/api/v1/days/:date", func(c *fiber.Ctx) error {
 		c.Response().Header.Set(fiber.HeaderRetryAfter, "60")
 		logRateLimitHit(c)
 		return c.SendStatus(http.StatusTooManyRequests)
 	})
 
 	request := httptest.NewRequest(
-		http.MethodPost,
-		"/api/days/2026-02-17?token=plain-reset-token&email=user@example.com",
+		http.MethodPut,
+		"/api/v1/days/2026-02-17?token=plain-reset-token&email=user@example.com",
 		strings.NewReader("email=user@example.com&password=PlaintextPassword123%21&token=plain-reset-token"),
 	)
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -1087,7 +1087,7 @@ func TestRateLimitLogDoesNotLogQueryPII(t *testing.T) {
 	}
 
 	logLine := output.String()
-	if !strings.Contains(logLine, "path=/api/days/:date") {
+	if !strings.Contains(logLine, "path=/api/v1/days/:date") {
 		t.Fatalf("expected sanitized path without query string in rate-limit logs, got %q", logLine)
 	}
 	if strings.Contains(logLine, "plain-reset-token") {

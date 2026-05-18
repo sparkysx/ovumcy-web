@@ -38,7 +38,7 @@ func TestShouldEnforceOnboardingAccess(t *testing.T) {
 		want bool
 	}{
 		{name: "dashboard requires onboarding gate", path: "/dashboard", want: true},
-		{name: "api day endpoint requires onboarding gate", path: "/api/days/2026-03-01", want: true},
+		{name: "api day endpoint requires onboarding gate", path: "/api/v1/days/2026-03-01", want: true},
 		{name: "onboarding page bypasses onboarding gate", path: "/onboarding", want: false},
 		{name: "onboarding step bypasses onboarding gate", path: "/onboarding/step1", want: false},
 		{name: "logout api bypasses onboarding gate", path: "/api/v1/sessions/current", want: false},

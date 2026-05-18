@@ -31,7 +31,7 @@ func TestUpsertDayNormalizesFlowWhenNotPeriod(t *testing.T) {
 		t.Fatalf("marshal payload: %v", err)
 	}
 
-	request := httptest.NewRequest(http.MethodPost, "/api/days/2026-02-19", bytes.NewReader(body))
+	request := httptest.NewRequest(http.MethodPut, "/api/v1/days/2026-02-19", bytes.NewReader(body))
 	request.Header.Set("Content-Type", fiber.MIMEApplicationJSON)
 	request.Header.Set("Cookie", authCookie)
 
@@ -76,7 +76,7 @@ func TestUpsertDayAllowsPeriodWithoutExplicitFlow(t *testing.T) {
 		t.Fatalf("marshal payload: %v", err)
 	}
 
-	request := httptest.NewRequest(http.MethodPost, "/api/days/2026-02-19", bytes.NewReader(body))
+	request := httptest.NewRequest(http.MethodPut, "/api/v1/days/2026-02-19", bytes.NewReader(body))
 	request.Header.Set("Content-Type", fiber.MIMEApplicationJSON)
 	request.Header.Set("Cookie", authCookie)
 
@@ -135,7 +135,7 @@ func TestUpsertDayPreservesSymptomsWhenNotPeriod(t *testing.T) {
 		t.Fatalf("marshal payload: %v", err)
 	}
 
-	request := httptest.NewRequest(http.MethodPost, "/api/days/2026-02-20", bytes.NewReader(body))
+	request := httptest.NewRequest(http.MethodPut, "/api/v1/days/2026-02-20", bytes.NewReader(body))
 	request.Header.Set("Content-Type", fiber.MIMEApplicationJSON)
 	request.Header.Set("Cookie", authCookie)
 

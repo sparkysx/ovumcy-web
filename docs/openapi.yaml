@@ -74,8 +74,6 @@ tags:
     description: First-run setup wizard. Currently lives at `/onboarding/*` outside the `/api` prefix.
   - name: days
     description: Daily health log entries (one per calendar day, in the user's timezone).
-  - name: dailyLog
-    description: Bulk delete of the entire daily log.
   - name: symptoms
     description: Owner-managed symptom catalog.
   - name: stats
@@ -414,13 +412,6 @@ components:
         updated_at:
           type: string
           format: date-time
-
-    DayExistsResponse:
-      type: object
-      required: [exists]
-      properties:
-        exists: { type: boolean }
-      additionalProperties: false
 
     SymptomPayload:
       type: object
@@ -979,7 +970,7 @@ paths:
   # =========================================================================
   # days
   # =========================================================================
-  /api/days:
+  /api/v1/days:
     get:
       tags: [days]
       summary: List daily log entries in a date range.
@@ -996,8 +987,38 @@ paths:
                 items: { $ref: '#/components/schemas/DailyLog' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [days]
+      summary: Delete the user's daily log entry for a single day (owner only).
+      description: |
+        Deletes the daily log row identified by the `date` query parameter.
+        The `source` query parameter (`dashboard` or `calendar`) selects the
+        HTMX response shape used by the browser UI; programmatic clients can
+        omit it and receive `204 No Content`.
+      parameters:
+        - in: query
+          name: date
+          required: true
+          schema: { $ref: '#/components/schemas/DateParam' }
+          description: Calendar date to delete in the request timezone.
+        - in: query
+          name: source
+          required: false
+          schema: { type: string, enum: [dashboard, calendar] }
+          description: HTMX response selector (browser UI only).
+      responses:
+        '204':
+          description: Deleted (programmatic client).
+        '200':
+          description: HTMX/browser response.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OkResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationError' }
 
-  /api/days/{date}:
+  /api/v1/days/{date}:
     parameters:
       - $ref: '#/components/parameters/DateParam'
     get:
@@ -1011,7 +1032,21 @@ paths:
               schema: { $ref: '#/components/schemas/DailyLog' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '422': { $ref: '#/components/responses/ValidationError' }
-    post:
+    head:
+      tags: [days]
+      summary: Check whether the day has any persisted data (owner only).
+      description: |
+        Returns `200` if the day has at least one persisted field and `404`
+        otherwise. The response body is empty (HEAD); clients must branch on
+        the status code.
+      responses:
+        '200':
+          description: Day has persisted data.
+        '404':
+          description: Day has no persisted data.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    put:
       tags: [days]
       summary: Upsert a day's entry (owner only).
       description: |
@@ -1041,22 +1076,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
-  /api/days/{date}/exists:
-    get:
-      tags: [days]
-      summary: Check whether the day has any persisted data (owner only).
-      parameters:
-        - $ref: '#/components/parameters/DateParam'
-      responses:
-        '200':
-          description: Existence check result.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/DayExistsResponse' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-
-  /api/days/{date}/cycle-start:
+  /api/v1/days/{date}/cycle-start:
     post:
       tags: [days]
       summary: Mark the day as the start of a new cycle (owner only).
@@ -1078,22 +1098,6 @@ paths:
       responses:
         '200':
           description: Cycle start marked.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/OkResponse' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-
-  # =========================================================================
-  # dailyLog
-  # =========================================================================
-  /api/log/delete:
-    delete:
-      tags: [dailyLog]
-      summary: Delete the user's entire daily log (owner only).
-      responses:
-        '200':
-          description: Deleted.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/OkResponse' }

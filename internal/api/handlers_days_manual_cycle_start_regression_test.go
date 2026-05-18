@@ -16,7 +16,7 @@ import (
 func TestMarkCycleStartRequiresAuthJSON(t *testing.T) {
 	app, _ := newOnboardingTestApp(t)
 
-	request := httptest.NewRequest(http.MethodPost, "/api/days/2026-02-19/cycle-start", nil)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/days/2026-02-19/cycle-start", nil)
 	request.Header.Set("Accept", "application/json")
 
 	response, err := app.Test(request, -1)
@@ -42,7 +42,7 @@ func TestMarkCycleStartRejectsUnsupportedLegacyRoleJSON(t *testing.T) {
 	user.Role = "partner"
 	authCookie := issueAuthCookieForUser(t, user)
 
-	request := httptest.NewRequest(http.MethodPost, "/api/days/2026-02-19/cycle-start", nil)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/days/2026-02-19/cycle-start", nil)
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("Cookie", authCookie)
 
@@ -78,7 +78,7 @@ func TestMarkCycleStartHTMXWithCSRFRefreshesAndPersists(t *testing.T) {
 	}
 
 	form := url.Values{"csrf_token": {csrfToken}}
-	request := httptest.NewRequest(http.MethodPost, "/api/days/"+targetDay+"/cycle-start?source=calendar", strings.NewReader(form.Encode()))
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/days/"+targetDay+"/cycle-start?source=calendar", strings.NewReader(form.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.Header.Set("HX-Request", "true")
 	request.Header.Set("Cookie", joinCookieHeader(authCookie, cookiePair(csrfCookie)))
@@ -123,7 +123,7 @@ func TestMarkCycleStartMissingCSRFRejectedByMiddleware(t *testing.T) {
 	user := createOnboardingTestUser(t, database, "manual-cycle-start-csrf@example.com", "StrongPass1", true)
 	authCookie := loginAndExtractAuthCookieWithCSRF(t, app, user.Email, "StrongPass1")
 
-	request := httptest.NewRequest(http.MethodPost, "/api/days/2026-02-19/cycle-start", strings.NewReader(url.Values{}.Encode()))
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/days/2026-02-19/cycle-start", strings.NewReader(url.Values{}.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.Header.Set("Cookie", authCookie)
 

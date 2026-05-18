@@ -28,7 +28,7 @@ func TestAuditLogDefaultOffSuppressesSecurityEvents(t *testing.T) {
 	user := createOnboardingTestUser(t, database, "audit-default-off@example.com", "StrongPass1", true)
 	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
 
-	request := httptest.NewRequest(http.MethodPost, "/api/days/2026-02-17", strings.NewReader(url.Values{
+	request := httptest.NewRequest(http.MethodPut, "/api/v1/days/2026-02-17", strings.NewReader(url.Values{
 		"is_period": {"true"},
 	}.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -66,7 +66,7 @@ func TestAuditLogEnabledRestoresSecurityEvents(t *testing.T) {
 	user := createOnboardingTestUser(t, database, "audit-enabled@example.com", "StrongPass1", true)
 	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
 
-	request := httptest.NewRequest(http.MethodPost, "/api/days/2026-02-17", strings.NewReader(url.Values{
+	request := httptest.NewRequest(http.MethodPut, "/api/v1/days/2026-02-17", strings.NewReader(url.Values{
 		"is_period": {"true"},
 	}.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")

@@ -336,4 +336,18 @@ test.describe('Onboarding flow', () => {
     expect(nextPeriodText).toContain('3 cycles are needed');
     expect(nextPeriodText).not.toContain(' - ');
   });
+
+  test('step 1 surfaces the day-1 spotting clarification tip above the date field', async ({
+    page,
+  }) => {
+    // onboarding.step1.day1_tip is rendered unconditionally between the
+    // subtitle and the privacy line inside [data-onboarding-panel="1"]. Scope
+    // the assertion to that panel so a future cross-step rewrite cannot let
+    // the tip silently migrate to step 2.
+    await registerAndOpenOnboarding(page, 'onboarding-day1-tip');
+
+    const stepOnePanel = page.locator('[data-onboarding-panel="1"]');
+    await expect(stepOnePanel).toBeVisible();
+    await expect(stepOnePanel).toContainText('Day 1 is the first day of full flow, not spotting.');
+  });
 });

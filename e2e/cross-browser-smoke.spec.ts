@@ -36,7 +36,7 @@ async function registerOwnerAndReachDashboard(page: Page, prefix: string): Promi
 
 async function todayISO(page: Page): Promise<string> {
   const action = await page.locator('[data-dashboard-save-form]').first().getAttribute('hx-put');
-  expect(action).toMatch(/^\/api\/days\/\d{4}-\d{2}-\d{2}$/);
+  expect(action).toMatch(/^\/api\/v1\/days\/\d{4}-\d{2}-\d{2}$/);
   return String(action).replace('/api/v1/days/', '');
 }
 

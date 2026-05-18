@@ -79,7 +79,7 @@ test.describe('Security and role-based access', () => {
     });
 
     const todayAction = await page.locator('form[hx-put^="/api/v1/days/"]').first().getAttribute('hx-put');
-    expect(todayAction).toMatch(/^\/api\/days\/\d{4}-\d{2}-\d{2}$/);
+    expect(todayAction).toMatch(/^\/api\/v1\/days\/\d{4}-\d{2}-\d{2}$/);
     const savedDay = String(todayAction || '').replace('/api/v1/days/', '');
 
     const payload = `<script>alert('xss-notes')</script><img src=x onerror=alert('xss-notes-img')>`;

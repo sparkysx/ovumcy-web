@@ -217,7 +217,7 @@ test.describe('Bug regressions', () => {
       await expect(page).toHaveURL(/\/dashboard$/);
 
       const todayAction = await page.locator('form[hx-put^="/api/v1/days/"]').first().getAttribute('hx-put');
-      expect(todayAction).toMatch(/^\/api\/days\/\d{4}-\d{2}-\d{2}$/);
+      expect(todayAction).toMatch(/^\/api\/v1\/days\/\d{4}-\d{2}-\d{2}$/);
       const actualTodayISO = String(todayAction || '').replace('/api/v1/days/', '');
 
       const todayCard = page

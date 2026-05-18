@@ -64,7 +64,7 @@ function clearTodayButton(page: Page) {
 
 async function todaySavePath(page: Page): Promise<string> {
   const action = await todaySaveForm(page).first().getAttribute('hx-put');
-  expect(action).toMatch(/^\/api\/days\/\d{4}-\d{2}-\d{2}$/);
+  expect(action).toMatch(/^\/api\/v1\/days\/\d{4}-\d{2}-\d{2}$/);
   return String(action);
 }
 
@@ -125,7 +125,7 @@ test.describe('Dashboard: today editor', () => {
     await expect(todayForm).toBeVisible();
 
     const action = await todayForm.getAttribute('hx-put');
-    expect(action).toMatch(/^\/api\/days\/\d{4}-\d{2}-\d{2}$/);
+    expect(action).toMatch(/^\/api\/v1\/days\/\d{4}-\d{2}-\d{2}$/);
 
     const serverToday = action!.replace('/api/v1/days/', '');
     const clientToday = await clientLocalISODate(page);
@@ -352,7 +352,7 @@ test.describe('Dashboard: today editor', () => {
 
     const todayForm = todaySaveForm(page).first();
     const todayAction = await todayForm.getAttribute('hx-put');
-    expect(todayAction).toMatch(/^\/api\/days\/\d{4}-\d{2}-\d{2}$/);
+    expect(todayAction).toMatch(/^\/api\/v1\/days\/\d{4}-\d{2}-\d{2}$/);
 
     const todayISO = String(todayAction).replace('/api/v1/days/', '');
     const month = todayISO.slice(0, 7);
@@ -395,7 +395,7 @@ test.describe('Dashboard: today editor', () => {
     await saveToday(page);
 
     const todayAction = await todaySaveForm(page).first().getAttribute('hx-put');
-    expect(todayAction).toMatch(/^\/api\/days\/\d{4}-\d{2}-\d{2}$/);
+    expect(todayAction).toMatch(/^\/api\/v1\/days\/\d{4}-\d{2}-\d{2}$/);
 
     const todayISO = String(todayAction).replace('/api/v1/days/', '');
     const month = todayISO.slice(0, 7);

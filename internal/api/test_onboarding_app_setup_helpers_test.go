@@ -164,6 +164,7 @@ func testCSRFMiddlewareConfig(cookieSecure bool) csrf.Config {
 		CookieHTTPOnly: true,
 		CookieSecure:   cookieSecure,
 		ContextKey:     "csrf",
+		Extractor:      CSRFTokenExtractor,
 		ErrorHandler: func(c *fiber.Ctx, err error) error {
 			LogSecurityEvent(c, "csrf", "denied", SecurityEventField{
 				Key:   "reason",

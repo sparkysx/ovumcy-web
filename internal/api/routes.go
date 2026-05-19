@@ -29,9 +29,9 @@ func registerV1APIRoutes(app *fiber.App, handler *Handler) {
 	usersCurrent.Post("/data-wipe", handler.OwnerOnly, handler.ClearAllData)
 
 	onboarding := v1.Group("/onboarding", handler.AuthRequired)
-	onboarding.Post("/steps/1", handler.OnboardingStep1)
-	onboarding.Post("/steps/2", handler.OnboardingStep2)
-	onboarding.Post("/complete", handler.OnboardingComplete)
+	onboarding.Post("/steps/1", handler.OwnerOnly, handler.OnboardingStep1)
+	onboarding.Post("/steps/2", handler.OwnerOnly, handler.OnboardingStep2)
+	onboarding.Post("/complete", handler.OwnerOnly, handler.OnboardingComplete)
 
 	sessions := v1.Group("/sessions")
 	sessions.Post("", handler.Login)

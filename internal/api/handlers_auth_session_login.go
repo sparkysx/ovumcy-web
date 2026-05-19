@@ -25,6 +25,11 @@ func (handler *Handler) Register(c *fiber.Ctx) error {
 		handler.logSecurityError(c, "auth.register", spec)
 		return handler.respondMappedError(c, spec)
 	}
+	if !services.ParseBoolLike(credentials.Consent) {
+		spec := authConsentRequiredErrorSpec()
+		handler.logSecurityError(c, "auth.register", spec)
+		return handler.respondAuthError(c, spec)
+	}
 
 	// Cookie-less register: do not issue ovumcy_auth or ovumcy_recovery_code
 	// directly. Instead, build a sealed pickup cookie whose ciphertext shape

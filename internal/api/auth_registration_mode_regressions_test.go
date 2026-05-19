@@ -19,6 +19,7 @@ func TestRegisterClosedModeReturnsForbiddenJSONError(t *testing.T) {
 		"email":            {"closed-mode@example.com"},
 		"password":         {"StrongPass1"},
 		"confirm_password": {"StrongPass1"},
+		"consent":          {"true"},
 	}
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/users", strings.NewReader(form.Encode()))
 	request.Header.Set("Accept", "application/json")
@@ -45,6 +46,7 @@ func TestRegisterClosedModeRedirectDoesNotLeakEmailOrErrorInQuery(t *testing.T) 
 		"email":            {"closed-mode@example.com"},
 		"password":         {"StrongPass1"},
 		"confirm_password": {"StrongPass1"},
+		"consent":          {"true"},
 	}
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/users", strings.NewReader(form.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")

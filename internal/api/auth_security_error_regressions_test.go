@@ -35,6 +35,7 @@ func TestRegisterReturnsSeedFailureAndRollsBackUser(t *testing.T) {
 		"email":            "seed-failure@example.com",
 		"password":         "StrongPass1",
 		"confirm_password": "StrongPass1",
+		"consent":          "true",
 	}
 	serialized, err := json.Marshal(requestBody)
 	if err != nil {

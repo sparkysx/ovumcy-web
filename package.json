@@ -18,13 +18,13 @@
     "e2e:cross-browser": "node ./scripts/run-e2e.mjs --mode=ci --project=chromium --project=firefox --project=webkit e2e/cross-browser-smoke.spec.ts"
   },
   "devDependencies": {
-    "@eslint/js": "^10.0.1",
-    "@playwright/test": "^1.58.2",
-    "eslint": "^10.0.1",
-    "globals": "^15.15.0",
-    "htmx.org": "^1.9.12",
-    "jsdom": "^29.1.1",
-    "otplib": "^13.4.0",
-    "tailwindcss": "^3.4.17"
+    "@eslint/js": "10.0.1",
+    "@playwright/test": "1.58.2",
+    "eslint": "10.0.1",
+    "globals": "15.15.0",
+    "htmx.org": "1.9.12",
+    "jsdom": "29.1.1",
+    "otplib": "13.4.0",
+    "tailwindcss": "3.4.19"
   }
 }

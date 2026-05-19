@@ -15,6 +15,7 @@ func TestRegisterJSONContentTypeWithoutAcceptReturnsJSONError(t *testing.T) {
 		"email":            "transport-register@example.com",
 		"password":         "12345678",
 		"confirm_password": "12345678",
+		"consent":          "true",
 	})
 	if err != nil {
 		t.Fatalf("marshal register payload: %v", err)

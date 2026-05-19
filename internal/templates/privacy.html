@@ -19,9 +19,24 @@
     <p class="journal-muted">{{t .Messages "privacy.your_data.body"}}</p>
   </section>
 
+  <section class="journal-card p-5 sm:p-6 space-y-3" data-privacy-section="your-rights">
+    <h2 class="journal-subtitle">✋ {{t .Messages "privacy.your_rights.title"}}</h2>
+    <p class="journal-muted">{{t .Messages "privacy.your_rights.body"}}</p>
+  </section>
+
+  <section class="journal-card p-5 sm:p-6 space-y-3" data-privacy-section="retention">
+    <h2 class="journal-subtitle">⏳ {{t .Messages "privacy.retention.title"}}</h2>
+    <p class="journal-muted">{{t .Messages "privacy.retention.body"}}</p>
+  </section>
+
   <section class="journal-card p-5 sm:p-6 space-y-3" data-privacy-section="hidden-sections">
     <h2 class="journal-subtitle">🙈 {{t .Messages "privacy.hidden_sections.title"}}</h2>
     <p class="journal-muted">{{t .Messages "privacy.hidden_sections.body"}}</p>
+  </section>
+
+  <section class="journal-card p-5 sm:p-6 space-y-3" data-privacy-section="predictions">
+    <h2 class="journal-subtitle">🔮 {{t .Messages "privacy.predictions.title"}}</h2>
+    <p class="journal-muted">{{t .Messages "privacy.predictions.body"}}</p>
   </section>
 
   <section class="journal-card p-5 sm:p-6 space-y-3" data-privacy-section="third-parties">

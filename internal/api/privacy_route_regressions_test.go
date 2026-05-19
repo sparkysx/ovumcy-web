@@ -30,7 +30,10 @@ func TestPrivacyRouteRendersPublicPage(t *testing.T) {
 	expectedSections := []string{
 		"zero-collection",
 		"your-data",
+		"your-rights",
+		"retention",
 		"hidden-sections",
+		"predictions",
 		"third-parties",
 		"open-source",
 	}

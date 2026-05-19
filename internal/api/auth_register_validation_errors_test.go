@@ -21,6 +21,7 @@ func TestRegisterRejectsWeakNumericPassword(t *testing.T) {
 		"email":            {email},
 		"password":         {"12345678"},
 		"confirm_password": {"12345678"},
+		"consent":          {"true"},
 	}
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/users", strings.NewReader(form.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -58,6 +59,7 @@ func TestRegisterRejectsPasswordMismatch(t *testing.T) {
 		"email":            {email},
 		"password":         {"StrongPass1"},
 		"confirm_password": {"StrongPass2"},
+		"consent":          {"true"},
 	}
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/users", strings.NewReader(form.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -152,6 +154,7 @@ func TestRegisterRejectsCaseInsensitiveDuplicateEmail(t *testing.T) {
 		"email":            {"qa-test2@ovumcy.local"},
 		"password":         {"StrongPass1"},
 		"confirm_password": {"StrongPass1"},
+		"consent":          {"true"},
 	}
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/users", strings.NewReader(form.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -201,6 +204,7 @@ func TestRegisterRejectsExactDuplicateEmail(t *testing.T) {
 		"email":            {existingEmail},
 		"password":         {"StrongPass1"},
 		"confirm_password": {"StrongPass1"},
+		"consent":          {"true"},
 	}
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/users", strings.NewReader(form.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -250,6 +254,7 @@ func TestRegisterRejectsExactDuplicateEmailHTMLFlow(t *testing.T) {
 		"email":            {existingEmail},
 		"password":         {"StrongPass1"},
 		"confirm_password": {"StrongPass1"},
+		"consent":          {"true"},
 	}
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/users", strings.NewReader(form.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")

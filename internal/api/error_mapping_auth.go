@@ -13,6 +13,10 @@ func authInvalidInputErrorSpec() APIErrorSpec {
 	return authValidationErrorSpec("invalid input")
 }
 
+func authConsentRequiredErrorSpec() APIErrorSpec {
+	return authValidationErrorSpec("consent required")
+}
+
 func totpInvalidCodeErrorSpec() APIErrorSpec {
 	return authFormErrorSpec(fiber.StatusUnauthorized, APIErrorCategoryUnauthorized, "totp invalid code")
 }

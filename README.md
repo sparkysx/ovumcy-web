@@ -160,6 +160,8 @@ These are the currently supported first-party UI languages. Operators can set `D
 - SQLite is the baseline default; Postgres is available for advanced self-hosted deployments through official example stacks.
 - Optional TOTP 2FA: secrets are AES-256-GCM encrypted at rest with per-row aad binding, the login challenge and disable-confirmation endpoints are rate-limited, and replayed codes are rejected within the 30-second verifier window.
 
+Operator-facing GDPR compliance walkthrough lives in [docs/gdpr.md](docs/gdpr.md) (lawful basis, encryption-at-rest guidance, DSAR via export, breach notification runbook). The repo-visible security invariants live in [docs/SECURITY_INVARIANTS.md](docs/SECURITY_INVARIANTS.md); the GDPR cross-reference table is in [SECURITY.md → GDPR Cross-Reference](SECURITY.md#gdpr-cross-reference).
+
 If you found a security issue, see [SECURITY.md](SECURITY.md).
 
 ## Architecture

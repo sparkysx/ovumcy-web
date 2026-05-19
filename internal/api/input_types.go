@@ -5,6 +5,7 @@ type credentialsInput struct {
 	Password        string `json:"password" form:"password"`
 	ConfirmPassword string `json:"confirm_password" form:"confirm_password"`
 	RememberMe      bool   `json:"remember_me" form:"remember_me"`
+	Consent         string `json:"consent" form:"consent"`
 }
 
 type dayPayload struct {

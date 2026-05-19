@@ -82,3 +82,45 @@ func TestUnsupportedLegacyRoleAPIAccessIsRejected(t *testing.T) {
 		t.Fatalf("expected api denial to clear auth cookie, got %#v", cleared)
 	}
 }
+
+func TestUnsupportedLegacyRoleOnboardingMutationsAreRejected(t *testing.T) {
+	t.Parallel()
+
+	onboardingMutations := []struct {
+		name string
+		path string
+	}{
+		{name: "step1", path: "/api/v1/onboarding/steps/1"},
+		{name: "step2", path: "/api/v1/onboarding/steps/2"},
+		{name: "complete", path: "/api/v1/onboarding/complete"},
+	}
+
+	for _, mutation := range onboardingMutations {
+		t.Run(mutation.name, func(t *testing.T) {
+			t.Parallel()
+
+			app, database := newOnboardingTestApp(t)
+			user := createOnboardingTestUser(t, database, "smoke-legacy-onboarding-"+mutation.name+"@example.com", "StrongPass1", false)
+			if err := database.Model(&user).Update("role", "partner").Error; err != nil {
+				t.Fatalf("set unsupported legacy role: %v", err)
+			}
+			user.Role = "partner"
+			authCookie := issueAuthCookieForUser(t, user)
+
+			request := httptest.NewRequest(http.MethodPost, mutation.path, strings.NewReader(""))
+			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			request.Header.Set("Accept", "application/json")
+			request.Header.Set("Cookie", authCookie)
+
+			response := mustAppResponse(t, app, request)
+			assertStatusCode(t, response, http.StatusForbidden)
+			if got := readAPIError(t, response.Body); got != "web sign-in unavailable" {
+				t.Fatalf("expected unsupported-role error on %s, got %q", mutation.path, got)
+			}
+			cleared := responseCookie(response.Cookies(), authCookieName)
+			if cleared == nil || strings.TrimSpace(cleared.Value) != "" {
+				t.Fatalf("expected onboarding %s denial to clear auth cookie, got %#v", mutation.name, cleared)
+			}
+		})
+	}
+}

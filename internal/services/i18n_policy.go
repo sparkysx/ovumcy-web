@@ -7,6 +7,7 @@ import (
 
 var authErrorTranslationKeys = map[string]string{
 	"invalid input":                                   "auth.error.invalid_input",
+	"consent required":                                "auth.error.consent_required",
 	"registration disabled":                           "auth.error.registration_disabled",
 	"invalid credentials":                             "auth.error.invalid_credentials",
 	"too many requests":                               "common.error.too_many_requests",

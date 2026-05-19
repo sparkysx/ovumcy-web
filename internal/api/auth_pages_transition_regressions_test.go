@@ -16,6 +16,7 @@ func TestRegisterInlineRecoveryStepRendersCopyDownloadAndContinueControls(t *tes
 		"email":            {"recovery-controls@example.com"},
 		"password":         {"StrongPass1"},
 		"confirm_password": {"StrongPass1"},
+		"consent":          {"true"},
 	}
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/users", strings.NewReader(form.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")

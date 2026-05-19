@@ -54,6 +54,15 @@
         "Autocomplete" "new-password"
         "Required" true)}}
       {{template "password_requirements_checklist" (dict "Messages" .Messages)}}
+
+      <label class="remember-option" for="register-consent" data-register-consent>
+        <input id="register-consent" type="checkbox" name="consent" value="true" required class="remember-checkbox" />
+        <span class="remember-copy">
+          <span class="remember-title">{{t .Messages "auth.consent.label"}}</span>
+          <span class="remember-hint">{{t .Messages "auth.consent.hint"}} <a href="/privacy" class="inline-link" target="_blank" rel="noopener noreferrer">{{t .Messages "auth.consent.link_text"}}</a>.</span>
+        </span>
+      </label>
+
       <div id="register-client-status" class="save-status text-sm" aria-live="polite"></div>
 
       <button type="submit" class="btn-primary w-full">{{t .Messages "auth.register"}}</button>

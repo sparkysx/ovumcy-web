@@ -19,6 +19,7 @@ func TestRegisterJSONSuccessDoesNotExposeRecoveryCode(t *testing.T) {
 		"email":            {"json-register@example.com"},
 		"password":         {"StrongPass1"},
 		"confirm_password": {"StrongPass1"},
+		"consent":          {"true"},
 	}.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.Header.Set("Accept", "application/json")
@@ -152,6 +153,7 @@ func TestRegisterInlineRecoveryStepConsumesCookieAfterFirstView(t *testing.T) {
 		"email":            {"one-time-recovery@example.com"},
 		"password":         {"StrongPass1"},
 		"confirm_password": {"StrongPass1"},
+		"consent":          {"true"},
 	}.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.Header.Set("Accept-Language", "en")
@@ -219,6 +221,7 @@ func TestRecoveryCodePageRedirectsInlineRegistrationSurfaceBackToRegister(t *tes
 		"email":            {"inline-surface@example.com"},
 		"password":         {"StrongPass1"},
 		"confirm_password": {"StrongPass1"},
+		"consent":          {"true"},
 	}.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.Header.Set("Accept-Language", "en")

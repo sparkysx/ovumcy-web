@@ -86,6 +86,7 @@ func TestSecureRecoveryCookieEnabledWhenConfigured(t *testing.T) {
 		"email":            {"recovery-cookie-secure@example.com"},
 		"password":         {"StrongPass1"},
 		"confirm_password": {"StrongPass1"},
+		"consent":          {"true"},
 	}))
 	assertStatusCode(t, registerResponse, http.StatusSeeOther)
 

@@ -20,8 +20,17 @@ test.describe('Privacy page: copy and navigation', () => {
     await expect(page.locator('[data-privacy-section="your-data"]')).toContainText(
       'SQLite or PostgreSQL database on this server',
     );
+    await expect(page.locator('[data-privacy-section="your-rights"]')).toContainText(
+      'access, rectification, portability, restriction, and erasure',
+    );
+    await expect(page.locator('[data-privacy-section="retention"]')).toContainText(
+      'Ovumcy does not delete your records on a schedule',
+    );
     await expect(page.locator('[data-privacy-section="hidden-sections"]')).toContainText(
       'Hidden sections and exports',
+    );
+    await expect(page.locator('[data-privacy-section="predictions"]')).toContainText(
+      'statistical summaries of your own logged days',
     );
     await expect(page.locator('[data-privacy-section="third-parties"]')).toBeVisible();
     await expect(page.locator('[data-privacy-section="open-source"]')).toBeVisible();

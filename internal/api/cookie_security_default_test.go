@@ -34,6 +34,7 @@ func TestSecureCookiesDisabledByDefault(t *testing.T) {
 		"email":            {"recovery-cookie-default@example.com"},
 		"password":         {"StrongPass1"},
 		"confirm_password": {"StrongPass1"},
+		"consent":          {"true"},
 	}
 	registerRequest := httptest.NewRequest(http.MethodPost, "/api/v1/users", strings.NewReader(registerForm.Encode()))
 	registerRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")

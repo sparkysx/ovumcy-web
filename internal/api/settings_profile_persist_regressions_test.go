@@ -62,8 +62,9 @@ func TestProfileUpdatePersistsDisplayNameAndShowsItInNavigation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read settings body: %v", err)
 	}
-	if !strings.Contains(string(settingsBody), "Profile updated successfully.") {
-		t.Fatalf("expected profile update success flash message")
+	settingsDocument := mustParseHTMLDocument(t, string(settingsBody))
+	if htmlFlashByKey(settingsDocument, "settings.success.profile_updated") == nil {
+		t.Fatalf("expected profile update success flash key")
 	}
 	if !strings.Contains(string(settingsBody), `value="Maya"`) {
 		t.Fatalf("expected profile display name input to show persisted value")
@@ -134,11 +135,8 @@ func TestProfileUpdateRejectsMarkupLikeDisplayName(t *testing.T) {
 	}
 	defer settingsResponse.Body.Close()
 
-	settingsBody, err := io.ReadAll(settingsResponse.Body)
-	if err != nil {
-		t.Fatalf("read settings body: %v", err)
-	}
-	if !strings.Contains(string(settingsBody), "Use plain text only. Tags and angle brackets are not allowed.") {
-		t.Fatalf("expected invalid display-name characters error")
+	settingsDocument := mustParseHTMLDocument(t, mustReadBodyString(t, settingsResponse.Body))
+	if htmlFlashByKey(settingsDocument, "settings.error.display_name_invalid_characters") == nil {
+		t.Fatalf("expected display-name invalid-characters flash key")
 	}
 }

@@ -16,14 +16,16 @@ import (
 func apiError(c *fiber.Ctx, spec APIErrorSpec) error {
 	if responseFormat(c) == httpx.ResponseFormatHTMX {
 		rendered := spec.Key
+		flashKey := spec.Key
 		if key := services.AuthErrorTranslationKey(spec.Key); key != "" {
+			flashKey = key
 			if localized := translateMessage(currentMessages(c), key); localized != key {
 				rendered = localized
 			}
 		} else if localized := translateMessage(currentMessages(c), spec.Key); localized != spec.Key {
 			rendered = localized
 		}
-		return c.Status(spec.Status).SendString(httpx.StatusErrorMarkup(rendered))
+		return c.Status(spec.Status).SendString(httpx.StatusErrorMarkup(rendered, flashKey))
 	}
 	return c.Status(spec.Status).JSON(fiber.Map{
 		"error": spec.Key,
@@ -87,12 +89,14 @@ func isV1AuthFormPath(path string) bool {
 func (handler *Handler) respondSettingsError(c *fiber.Ctx, spec APIErrorSpec) error {
 	if isHTMX(c) {
 		rendered := spec.Key
+		flashKey := spec.Key
 		if key := services.AuthErrorTranslationKey(spec.Key); key != "" {
+			flashKey = key
 			if localized := translateMessage(currentMessages(c), key); localized != key {
 				rendered = localized
 			}
 		}
-		return c.Status(fiber.StatusOK).SendString(httpx.StatusErrorMarkup(rendered))
+		return c.Status(fiber.StatusOK).SendString(httpx.StatusErrorMarkup(rendered, flashKey))
 	}
 	if strings.HasPrefix(c.Path(), "/api/v1/users/current") && !acceptsJSON(c) {
 		handler.setFlashCookie(c, FlashPayload{SettingsError: spec.Key})

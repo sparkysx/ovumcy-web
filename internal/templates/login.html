@@ -9,7 +9,7 @@
     </div>
 
     {{if .ErrorKey}}
-    <div class="status-error mt-5" data-auth-server-error>{{t .Messages .ErrorKey}}</div>
+    <div class="status-error mt-5" data-auth-server-error data-error-key="{{.ErrorKey}}">{{t .Messages .ErrorKey}}</div>
     {{end}}
 
     {{if .LocalPublicAuthEnabled}}

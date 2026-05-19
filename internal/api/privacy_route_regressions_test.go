@@ -1,12 +1,12 @@
 package api
 
 import (
-	"io"
 	"net/http"
 	"net/http/httptest"
-	"regexp"
-	"strings"
+	"slices"
 	"testing"
+
+	"golang.org/x/net/html"
 )
 
 func TestPrivacyRouteRendersPublicPage(t *testing.T) {
@@ -22,32 +22,27 @@ func TestPrivacyRouteRendersPublicPage(t *testing.T) {
 	defer response.Body.Close()
 
 	if response.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(response.Body)
-		t.Fatalf("expected 200, got %d: %s", response.StatusCode, string(body))
+		t.Fatalf("expected 200, got %d", response.StatusCode)
 	}
 
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatalf("read body: %v", err)
+	document := mustParseHTMLDocument(t, mustReadBodyString(t, response.Body))
+
+	expectedSections := []string{
+		"zero-collection",
+		"your-data",
+		"hidden-sections",
+		"third-parties",
+		"open-source",
 	}
-	rendered := string(body)
-	if !strings.Contains(rendered, "Privacy Policy") {
-		t.Fatalf("expected rendered page to contain privacy title, got body: %s", rendered)
+	gotSections := privacySectionIDs(document)
+	for _, expected := range expectedSections {
+		if !slices.Contains(gotSections, expected) {
+			t.Fatalf("expected privacy section %q, got %v", expected, gotSections)
+		}
 	}
-	if !strings.Contains(rendered, "Zero Data Collection") {
-		t.Fatalf("expected rendered page to contain privacy section, got body: %s", rendered)
-	}
-	if !strings.Contains(rendered, "Hidden sections and exports") {
-		t.Fatalf("expected rendered page to explain hidden sections and exports, got body: %s", rendered)
-	}
-	if !strings.Contains(rendered, "SQLite or PostgreSQL database on this server") {
-		t.Fatalf("expected rendered page to describe server-side storage, got body: %s", rendered)
-	}
-	if strings.Contains(rendered, "Ovumcy is built for private, self-hosted tracking.") {
-		t.Fatalf("did not expect deprecated privacy subtitle to be rendered")
-	}
-	if !strings.Contains(rendered, `href="/login"`) {
-		t.Fatalf("expected back link to point to /login for guest users")
+
+	if !privacyHasBackLink(document, "/login") {
+		t.Fatal("expected privacy back link to point to /login for guest users")
 	}
 }
 
@@ -67,20 +62,46 @@ func TestPrivacyRouteBackLinkForAuthenticatedUser(t *testing.T) {
 	defer response.Body.Close()
 
 	if response.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(response.Body)
-		t.Fatalf("expected 200, got %d: %s", response.StatusCode, string(body))
+		t.Fatalf("expected 200, got %d", response.StatusCode)
 	}
 
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatalf("read body: %v", err)
+	document := mustParseHTMLDocument(t, mustReadBodyString(t, response.Body))
+	if !privacyHasBackLink(document, "/dashboard") {
+		t.Fatal("expected privacy back link to point to /dashboard for authenticated users")
 	}
-	rendered := string(body)
-	if !strings.Contains(rendered, `href="/dashboard"`) {
-		t.Fatalf("expected privacy page to include dashboard backlink for authenticated users")
+	if !privacyHasBreadcrumbLink(document, "/dashboard") {
+		t.Fatal("expected privacy breadcrumb to link back to /dashboard for authenticated users")
 	}
-	breadcrumbPattern := regexp.MustCompile(`(?s)<p class="journal-muted text-sm">\s*<a href="/dashboard" class="inline-link">Dashboard</a>`)
-	if !breadcrumbPattern.MatchString(rendered) {
-		t.Fatalf("expected breadcrumb to use dashboard naming for authenticated users")
+}
+
+func privacySectionIDs(root *html.Node) []string {
+	sections := htmlFindElements(root, func(node *html.Node) bool {
+		return node.Type == html.ElementNode && node.Data == "section" && htmlHasAttr(node, "data-privacy-section")
+	})
+	ids := make([]string, 0, len(sections))
+	for _, section := range sections {
+		ids = append(ids, htmlAttr(section, "data-privacy-section"))
 	}
+	return ids
+}
+
+func privacyHasBackLink(root *html.Node, target string) bool {
+	return htmlFindElement(root, func(node *html.Node) bool {
+		return node.Type == html.ElementNode && node.Data == "a" && htmlAttr(node, "href") == target
+	}) != nil
+}
+
+func privacyHasBreadcrumbLink(root *html.Node, target string) bool {
+	breadcrumb := htmlFindElement(root, func(node *html.Node) bool {
+		if node.Type != html.ElementNode || node.Data != "p" {
+			return false
+		}
+		if !htmlHasClass(node, "journal-muted") || !htmlHasClass(node, "text-sm") {
+			return false
+		}
+		return htmlFindElement(node, func(child *html.Node) bool {
+			return child.Type == html.ElementNode && child.Data == "a" && htmlAttr(child, "href") == target
+		}) != nil
+	})
+	return breadcrumb != nil
 }

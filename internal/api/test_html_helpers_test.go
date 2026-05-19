@@ -138,3 +138,15 @@ func htmlHasClass(node *html.Node, className string) bool {
 	}
 	return false
 }
+
+func htmlFlashByKey(root *html.Node, key string) *html.Node {
+	return htmlFindElement(root, func(node *html.Node) bool {
+		return node.Type == html.ElementNode && htmlAttr(node, "data-flash-key") == key
+	})
+}
+
+func htmlAuthErrorByKey(root *html.Node, key string) *html.Node {
+	return htmlFindElement(root, func(node *html.Node) bool {
+		return node.Type == html.ElementNode && htmlAttr(node, "data-error-key") == key
+	})
+}

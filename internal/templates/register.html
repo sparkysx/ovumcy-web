@@ -19,7 +19,7 @@
     </div>
 
     {{if .ErrorKey}}
-    <div class="status-error mt-5" data-auth-server-error{{if not .RegistrationOpen}} data-registration-disabled{{end}}>{{t .Messages .ErrorKey}}</div>
+    <div class="status-error mt-5" data-auth-server-error data-error-key="{{.ErrorKey}}"{{if not .RegistrationOpen}} data-registration-disabled{{end}}>{{t .Messages .ErrorKey}}</div>
     {{end}}
 
     {{if .RegistrationOpen}}

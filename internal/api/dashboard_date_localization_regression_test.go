@@ -4,7 +4,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
-	"strings"
 	"testing"
 	"time"
 
@@ -116,9 +115,12 @@ func TestDashboardEnglishRendersOvulationRangeForIrregularMode(t *testing.T) {
 	if htmlAttr(hero, "data-cycle-hero-approximate") != "true" {
 		t.Fatalf("expected irregular range dashboard hero to be marked approximate")
 	}
-	explainerText := dashboardElementTextByDataAttr(t, document, "data-dashboard-prediction-explainer")
-	if !strings.Contains(explainerText, "Irregular cycle mode uses ranges instead of exact prediction dates.") {
-		t.Fatalf("expected shared irregular-range explanation note in dashboard, got %q", explainerText)
+	explainer := dashboardElementByDataAttr(document, "data-dashboard-prediction-explainer")
+	if explainer == nil {
+		t.Fatal("expected dashboard prediction explainer block in irregular range state")
+	}
+	if got := htmlAttr(explainer, "data-explainer-key"); got != "prediction.explainer.irregular_ranges" {
+		t.Fatalf("expected dashboard explainer key %q, got %q", "prediction.explainer.irregular_ranges", got)
 	}
 }
 
@@ -166,13 +168,12 @@ func TestDashboardEnglishRendersSharedSparsePredictionExplanationForIrregularMod
 	if dashboardElementByDataAttr(document, "data-dashboard-cycle-hero") != nil {
 		t.Fatal("did not expect dashboard cycle hero before sparse irregular history becomes reliable")
 	}
-	pageText := htmlDocumentText(document)
-	if !strings.Contains(pageText, "3 cycles are needed for a reliable range") {
-		t.Fatalf("expected sparse irregular dashboard status copy, got %q", pageText)
+	explainer := dashboardElementByDataAttr(document, "data-dashboard-prediction-explainer")
+	if explainer == nil {
+		t.Fatal("expected dashboard prediction explainer block in sparse irregular state")
 	}
-	explainerText := dashboardElementTextByDataAttr(t, document, "data-dashboard-prediction-explainer")
-	if !strings.Contains(explainerText, "Irregular cycle mode needs at least 3 completed cycles before Ovumcy can show steadier ranges.") {
-		t.Fatalf("expected shared sparse irregular explanation note in dashboard, got %q", explainerText)
+	if got := htmlAttr(explainer, "data-explainer-key"); got != "prediction.explainer.irregular_sparse" {
+		t.Fatalf("expected dashboard explainer key %q, got %q", "prediction.explainer.irregular_sparse", got)
 	}
 }
 

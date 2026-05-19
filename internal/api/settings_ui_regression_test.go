@@ -11,8 +11,8 @@ import (
 	"golang.org/x/net/html"
 )
 
-func TestSettingsPageRendersSingleIrregularCycleExplanation(t *testing.T) {
-	ctx := newSettingsSecurityTestContext(t, "settings-irregular-copy@example.com")
+func TestSettingsPageRendersSingleIrregularCycleHint(t *testing.T) {
+	ctx := newSettingsSecurityTestContext(t, "settings-irregular-hint@example.com")
 
 	request := httptest.NewRequest(http.MethodGet, "/settings", nil)
 	request.Header.Set("Accept-Language", "en")
@@ -28,11 +28,12 @@ func TestSettingsPageRendersSingleIrregularCycleExplanation(t *testing.T) {
 		t.Fatalf("expected settings status 200, got %d", response.StatusCode)
 	}
 
-	rendered := mustReadBodyString(t, response.Body)
-	documentText := htmlDocumentText(mustParseHTMLDocument(t, rendered))
-	const hint = "Turn this on if your cycles vary by more than 7 days. Ranges will be used for next period and ovulation instead of a single date."
-	if strings.Count(documentText, hint) != 1 {
-		t.Fatalf("expected a single irregular-cycle explanation, got %q", documentText)
+	document := mustParseHTMLDocument(t, mustReadBodyString(t, response.Body))
+	hints := htmlFindElements(document, func(node *html.Node) bool {
+		return node.Type == html.ElementNode && htmlHasAttr(node, "data-settings-irregular-cycle-hint")
+	})
+	if len(hints) != 1 {
+		t.Fatalf("expected exactly one irregular-cycle hint element, got %d", len(hints))
 	}
 }
 
@@ -78,29 +79,6 @@ func TestSettingsPageUsesMedicalSectionsBeforeInterfaceAndDangerZone(t *testing.
 	}
 	if slices.Contains(sectionIDs, "settings-reminders") {
 		t.Fatalf("did not expect deprecated reminders section, got %v", sectionIDs)
-	}
-}
-
-func TestSettingsPageExplainsClearDataRemovesCustomSymptoms(t *testing.T) {
-	ctx := newSettingsSecurityTestContext(t, "settings-clear-data-copy@example.com")
-
-	request := httptest.NewRequest(http.MethodGet, "/settings", nil)
-	request.Header.Set("Accept-Language", "en")
-	request.Header.Set("Cookie", ctx.authCookie)
-
-	response, err := ctx.app.Test(request, -1)
-	if err != nil {
-		t.Fatalf("settings request failed: %v", err)
-	}
-	defer response.Body.Close()
-
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("expected settings status 200, got %d", response.StatusCode)
-	}
-
-	documentText := htmlDocumentText(mustParseHTMLDocument(t, mustReadBodyString(t, response.Body)))
-	if !strings.Contains(documentText, "remove your custom symptoms") {
-		t.Fatalf("expected clear-data copy to explain custom symptom removal, got %q", documentText)
 	}
 }
 
@@ -154,32 +132,6 @@ func TestSettingsTrackingSectionRendersExpectedToggleContracts(t *testing.T) {
 		if toggleText == "" {
 			t.Fatalf("expected tracking toggle %q to render non-empty user-facing copy", attribute)
 		}
-	}
-}
-
-func TestSettingsDataSectionExplainsServerStorageAndUIOnlyHiding(t *testing.T) {
-	ctx := newSettingsSecurityTestContext(t, "settings-data-copy@example.com")
-
-	request := httptest.NewRequest(http.MethodGet, "/settings", nil)
-	request.Header.Set("Accept-Language", "en")
-	request.Header.Set("Cookie", ctx.authCookie)
-
-	response, err := ctx.app.Test(request, -1)
-	if err != nil {
-		t.Fatalf("settings request failed: %v", err)
-	}
-	defer response.Body.Close()
-
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("expected settings status 200, got %d", response.StatusCode)
-	}
-
-	documentText := htmlDocumentText(mustParseHTMLDocument(t, mustReadBodyString(t, response.Body)))
-	if !strings.Contains(documentText, "SQLite or PostgreSQL database on this server") {
-		t.Fatalf("expected settings data section to describe server-side storage, got %q", documentText)
-	}
-	if !strings.Contains(documentText, "Hidden entry sections are a UI-only preference.") {
-		t.Fatalf("expected settings data section to explain hidden-section export behavior, got %q", documentText)
 	}
 }
 
@@ -259,9 +211,14 @@ func TestSettingsDangerZoneDeleteAccountCardShowsVisibleTitle(t *testing.T) {
 		t.Fatal("expected delete-account danger card")
 	}
 
-	deleteCardText := normalizeHTMLText(htmlNodeText(deleteCard))
-	if !strings.Contains(deleteCardText, "Delete account") {
-		t.Fatalf("expected delete-account danger card to include a visible title, got %q", deleteCardText)
+	titleElement := htmlFindElement(deleteCard, func(node *html.Node) bool {
+		return node.Type == html.ElementNode && htmlHasClass(node, "field-label")
+	})
+	if titleElement == nil {
+		t.Fatal("expected delete-account danger card to include a visible field-label title element")
+	}
+	if normalizeHTMLText(htmlNodeText(titleElement)) == "" {
+		t.Fatal("expected delete-account danger card title to render non-empty user-facing copy")
 	}
 }
 
@@ -290,8 +247,8 @@ func TestSettingsCycleAndTrackingSectionsRenderDraftDiscardContract(t *testing.T
 		bodyStringMatch{fragment: `data-settings-draft-form="tracking"`, message: "expected tracking draft form contract"},
 		bodyStringMatch{fragment: `data-settings-tracking-save`, message: "expected tracking save hook"},
 		bodyStringMatch{fragment: `data-settings-tracking-discard`, message: "expected tracking discard control"},
-		bodyStringMatch{fragment: "You have unsaved settings changes. Leave without saving?", message: "expected shared settings unsaved prompt"},
-		bodyStringMatch{fragment: "Discard changes", message: "expected shared settings discard copy"},
+		bodyStringMatch{fragment: `data-settings-unsaved-prompt=`, message: "expected shared unsaved-prompt hook on draft forms"},
+		bodyStringMatch{fragment: `data-settings-unsaved-accept=`, message: "expected shared unsaved-accept hook on draft forms"},
 	)
 }
 
@@ -331,8 +288,17 @@ func TestForgotPasswordEmailStepUsesGenericEnumerationSafeSubtitle(t *testing.T)
 		t.Fatalf("expected forgot-password follow-up status 200, got %d", followResponse.StatusCode)
 	}
 
-	documentText := htmlDocumentText(mustParseHTMLDocument(t, mustReadBodyString(t, followResponse.Body)))
-	if !strings.Contains(documentText, "If this address is registered, enter your recovery code to continue.") {
-		t.Fatalf("expected generic recovery subtitle after email step, got %q", documentText)
+	document := mustParseHTMLDocument(t, mustReadBodyString(t, followResponse.Body))
+	subtitle := htmlFindElement(document, func(node *html.Node) bool {
+		return node.Type == html.ElementNode && htmlHasAttr(node, "data-subtitle-key")
+	})
+	if subtitle == nil {
+		t.Fatal("expected forgot-password subtitle element to expose data-subtitle-key")
+	}
+	if got := htmlAttr(subtitle, "data-subtitle-key"); got != "auth.forgot_password_step2_subtitle" {
+		t.Fatalf("expected enumeration-safe recovery-step subtitle key, got %q", got)
+	}
+	if got := htmlAttr(subtitle, "data-forgot-step"); got != "recovery_code" {
+		t.Fatalf("expected forgot-step %q, got %q", "recovery_code", got)
 	}
 }

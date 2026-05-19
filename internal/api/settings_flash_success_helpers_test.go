@@ -1,7 +1,6 @@
 package api
 
 import (
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -9,7 +8,7 @@ import (
 	"testing"
 )
 
-func assertSettingsFlashSuccessScenario(t *testing.T, method string, path string, form url.Values, successLabel string) {
+func assertSettingsFlashSuccessScenario(t *testing.T, method string, path string, form url.Values, successKey string) {
 	t.Helper()
 
 	ctx := newSettingsSecurityTestContext(t, "settings-user@example.com")
@@ -47,15 +46,12 @@ func assertSettingsFlashSuccessScenario(t *testing.T, method string, path string
 		t.Fatalf("expected follow-up status 200, got %d", followResponse.StatusCode)
 	}
 
-	body, err := io.ReadAll(followResponse.Body)
-	if err != nil {
-		t.Fatalf("read follow-up body: %v", err)
+	followBody := mustReadBodyString(t, followResponse.Body)
+	followDocument := mustParseHTMLDocument(t, followBody)
+	if htmlFlashByKey(followDocument, successKey) == nil {
+		t.Fatalf("expected flash success key %q in settings page", successKey)
 	}
-	rendered := string(body)
-	if !strings.Contains(rendered, successLabel) {
-		t.Fatalf("expected success label %q in settings page", successLabel)
-	}
-	if strings.Contains(rendered, weakPasswordErrorText) {
+	if strings.Contains(followBody, weakPasswordErrorText) {
 		t.Fatalf("did not expect weak password error on success page")
 	}
 
@@ -69,11 +65,8 @@ func assertSettingsFlashSuccessScenario(t *testing.T, method string, path string
 	}
 	defer afterFlashResponse.Body.Close()
 
-	afterFlashBody, err := io.ReadAll(afterFlashResponse.Body)
-	if err != nil {
-		t.Fatalf("read settings body after flash consumption: %v", err)
-	}
-	if strings.Contains(string(afterFlashBody), successLabel) {
-		t.Fatalf("did not expect success label after flash is consumed")
+	afterFlashDocument := mustParseHTMLDocument(t, mustReadBodyString(t, afterFlashResponse.Body))
+	if htmlFlashByKey(afterFlashDocument, successKey) != nil {
+		t.Fatalf("did not expect flash success key %q after flash is consumed", successKey)
 	}
 }

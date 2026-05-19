@@ -58,12 +58,9 @@ func TestProfileUpdateShowsMessageWhenDisplayNameCleared(t *testing.T) {
 	}
 	defer settingsResponse.Body.Close()
 
-	settingsBody, err := io.ReadAll(settingsResponse.Body)
-	if err != nil {
-		t.Fatalf("read settings body: %v", err)
-	}
-	if !strings.Contains(string(settingsBody), "Profile name removed.") {
-		t.Fatalf("expected profile cleared success message")
+	settingsDocument := mustParseHTMLDocument(t, mustReadBodyString(t, settingsResponse.Body))
+	if htmlFlashByKey(settingsDocument, "settings.success.profile_name_cleared") == nil {
+		t.Fatalf("expected profile_name_cleared success flash key")
 	}
 
 	dashboardRequest := httptest.NewRequest(http.MethodGet, "/dashboard", nil)

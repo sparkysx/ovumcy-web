@@ -1,7 +1,6 @@
 package api
 
 import (
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -38,16 +37,12 @@ func TestSettingsFlashErrorTakesPrecedenceOverQueryError(t *testing.T) {
 	}
 	defer followResponse.Body.Close()
 
-	body, err := io.ReadAll(followResponse.Body)
-	if err != nil {
-		t.Fatalf("read settings body: %v", err)
+	document := mustParseHTMLDocument(t, mustReadBodyString(t, followResponse.Body))
+	if htmlFlashByKey(document, "settings.error.invalid_current_password") == nil {
+		t.Fatal("expected flash error keyed to invalid_current_password in settings page")
 	}
-	rendered := string(body)
-	if !strings.Contains(rendered, "Current password is incorrect.") {
-		t.Fatalf("expected flash error text in settings page")
-	}
-	if strings.Contains(rendered, "Unable to process profile data.") {
-		t.Fatalf("expected flash error to take precedence over query error")
+	if htmlFlashByKey(document, "settings.error.invalid_profile_input") != nil {
+		t.Fatal("expected flash error to take precedence over query error")
 	}
 }
 
@@ -64,12 +59,9 @@ func TestSettingsStatusIgnoresQueryWhenFlashMissing(t *testing.T) {
 	}
 	defer response.Body.Close()
 
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatalf("read settings body: %v", err)
-	}
-	if strings.Contains(string(body), "Password changed successfully.") {
-		t.Fatalf("expected query status to be ignored without flash state")
+	document := mustParseHTMLDocument(t, mustReadBodyString(t, response.Body))
+	if htmlFlashByKey(document, "settings.success.password_changed") != nil {
+		t.Fatal("expected query status to be ignored without flash state")
 	}
 }
 
@@ -106,15 +98,11 @@ func TestSettingsFlashSuccessTakesPrecedenceOverQueryStatus(t *testing.T) {
 	}
 	defer followResponse.Body.Close()
 
-	body, err := io.ReadAll(followResponse.Body)
-	if err != nil {
-		t.Fatalf("read settings body: %v", err)
+	document := mustParseHTMLDocument(t, mustReadBodyString(t, followResponse.Body))
+	if htmlFlashByKey(document, "settings.success.profile_updated") == nil {
+		t.Fatal("expected flash success keyed to settings.success.profile_updated")
 	}
-	rendered := string(body)
-	if !strings.Contains(rendered, "Profile updated successfully.") {
-		t.Fatalf("expected flash success message")
-	}
-	if strings.Contains(rendered, "Password changed successfully.") {
-		t.Fatalf("expected flash success to take precedence over query status")
+	if htmlFlashByKey(document, "settings.success.password_changed") != nil {
+		t.Fatal("expected flash success to take precedence over query status")
 	}
 }

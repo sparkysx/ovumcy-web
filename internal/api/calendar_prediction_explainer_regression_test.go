@@ -3,15 +3,15 @@ package api
 import (
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/ovumcy/ovumcy-web/internal/models"
 	"github.com/ovumcy/ovumcy-web/internal/services"
+	"golang.org/x/net/html"
 )
 
-func TestCalendarEnglishRendersSharedPredictionExplanation(t *testing.T) {
+func TestCalendarRendersSharedPredictionExplainerKeys(t *testing.T) {
 	app, database, _ := newOnboardingTestAppWithLocation(t, time.UTC)
 	user := createOnboardingTestUser(t, database, "calendar-prediction-copy@example.com", "StrongPass1", true)
 	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
@@ -72,19 +72,22 @@ func TestCalendarEnglishRendersSharedPredictionExplanation(t *testing.T) {
 		t.Fatalf("expected status 200, got %d", response.StatusCode)
 	}
 
-	rendered := mustReadBodyString(t, response.Body)
-	if !strings.Contains(rendered, `data-calendar-prediction-explainer`) {
-		t.Fatalf("expected calendar prediction explainer block, got %q", rendered)
+	document := mustParseHTMLDocument(t, mustReadBodyString(t, response.Body))
+	explainer := htmlFindElement(document, func(node *html.Node) bool {
+		return node.Type == html.ElementNode && htmlHasAttr(node, "data-calendar-prediction-explainer")
+	})
+	if explainer == nil {
+		t.Fatalf("expected calendar prediction explainer block")
 	}
-	if !strings.Contains(rendered, "Irregular cycle mode uses ranges instead of exact prediction dates.") {
-		t.Fatalf("expected shared irregular range note, got %q", rendered)
+	if got := htmlAttr(explainer, "data-explainer-primary-key"); got != "prediction.explainer.irregular_ranges" {
+		t.Fatalf("expected primary explainer key %q, got %q", "prediction.explainer.irregular_ranges", got)
 	}
-	if !strings.Contains(rendered, "Recent tags can add context when timing feels less steady.") {
-		t.Fatalf("expected shared factor context note, got %q", rendered)
+	if got := htmlAttr(explainer, "data-explainer-secondary-key"); got != "prediction.explainer.factor_context" {
+		t.Fatalf("expected secondary explainer key %q, got %q", "prediction.explainer.factor_context", got)
 	}
 }
 
-func TestCalendarEnglishRendersUnpredictableFactsOnlyExplanation(t *testing.T) {
+func TestCalendarRendersUnpredictableFactsOnlyExplainerKey(t *testing.T) {
 	app, database, _ := newOnboardingTestAppWithLocation(t, time.UTC)
 	user := createOnboardingTestUser(t, database, "calendar-unpredictable-copy@example.com", "StrongPass1", true)
 	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
@@ -115,11 +118,14 @@ func TestCalendarEnglishRendersUnpredictableFactsOnlyExplanation(t *testing.T) {
 		t.Fatalf("expected status 200, got %d", response.StatusCode)
 	}
 
-	rendered := mustReadBodyString(t, response.Body)
-	if !strings.Contains(rendered, `data-calendar-prediction-explainer`) {
-		t.Fatalf("expected calendar prediction explainer block, got %q", rendered)
+	document := mustParseHTMLDocument(t, mustReadBodyString(t, response.Body))
+	explainer := htmlFindElement(document, func(node *html.Node) bool {
+		return node.Type == html.ElementNode && htmlHasAttr(node, "data-calendar-prediction-explainer")
+	})
+	if explainer == nil {
+		t.Fatalf("expected calendar prediction explainer block")
 	}
-	if !strings.Contains(rendered, "Predictions are off in unpredictable cycle mode. Ovumcy shows recorded facts only.") {
-		t.Fatalf("expected shared unpredictable facts-only note, got %q", rendered)
+	if got := htmlAttr(explainer, "data-explainer-primary-key"); got != "prediction.explainer.unpredictable" {
+		t.Fatalf("expected primary explainer key %q, got %q", "prediction.explainer.unpredictable", got)
 	}
 }

@@ -4,12 +4,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/ovumcy/ovumcy-web/internal/models"
 	"github.com/ovumcy/ovumcy-web/internal/services"
+	"golang.org/x/net/html"
 )
 
 func TestStatsChartExcludesCycleEndingToday(t *testing.T) {
@@ -68,9 +68,14 @@ func TestStatsChartExcludesCycleEndingToday(t *testing.T) {
 	}
 
 	document := mustParseHTMLDocument(t, rendered)
-	documentText := htmlDocumentText(document)
-	if !strings.Contains(documentText, "Complete 2 cycles to unlock insights. Start by entering the first day of your next period.") {
-		t.Fatalf("expected empty-state message when chart payload is skipped, got %q", documentText)
+	emptyState := htmlFindElement(document, func(node *html.Node) bool {
+		return node.Type == html.ElementNode && htmlHasAttr(node, "data-stats-empty-state")
+	})
+	if emptyState == nil {
+		t.Fatal("expected stats empty-state container when chart payload is skipped")
+	}
+	if got := htmlAttr(emptyState, "data-stats-completed-cycles"); got != "0" {
+		t.Fatalf("expected stats empty-state completed-cycles attribute %q, got %q", "0", got)
 	}
 }
 
@@ -102,14 +107,19 @@ func TestStatsPageKeepsMetricGridHiddenAfterOneCompletedCycle(t *testing.T) {
 	}
 
 	document := mustParseHTMLDocument(t, mustReadBodyString(t, response.Body))
-	documentText := htmlDocumentText(document)
-	if !strings.Contains(documentText, "You have 1 completed cycle. Complete one more cycle to unlock insights.") {
-		t.Fatalf("expected one-cycle empty-state guidance, got %q", documentText)
+	emptyState := htmlFindElement(document, func(node *html.Node) bool {
+		return node.Type == html.ElementNode && htmlHasAttr(node, "data-stats-empty-state")
+	})
+	if emptyState == nil {
+		t.Fatal("expected stats empty-state container after a single completed cycle")
+	}
+	if got := htmlAttr(emptyState, "data-stats-completed-cycles"); got != "1" {
+		t.Fatalf("expected stats empty-state completed-cycles attribute %q, got %q", "1", got)
 	}
 	if htmlElementByID(document, "cycle-chart") != nil {
 		t.Fatalf("did not expect cycle chart before two completed cycles")
 	}
-	if strings.Contains(documentText, "Last cycle length") {
+	if htmlElementByTagAndClass(document, "article", "stat-card") != nil {
 		t.Fatalf("did not expect metric cards before two completed cycles")
 	}
 }

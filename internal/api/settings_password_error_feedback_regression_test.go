@@ -1,11 +1,9 @@
 package api
 
 import (
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"regexp"
 	"strings"
 	"testing"
 )
@@ -44,17 +42,21 @@ func TestSettingsChangePasswordInvalidCurrentPasswordShowsTopErrorBanner(t *test
 	}
 	defer followResponse.Body.Close()
 
-	body, err := io.ReadAll(followResponse.Body)
-	if err != nil {
-		t.Fatalf("read settings body: %v", err)
+	rendered := mustReadBodyString(t, followResponse.Body)
+	document := mustParseHTMLDocument(t, rendered)
+	flash := htmlFlashByKey(document, "settings.error.invalid_current_password")
+	if flash == nil {
+		t.Fatal("expected flash error keyed to settings.error.invalid_current_password")
 	}
-	rendered := string(body)
-	if !strings.Contains(rendered, "Current password is incorrect.") {
-		t.Fatalf("expected localized invalid-current-password banner")
+	if got := htmlAttr(flash, "data-flash-target"); got != "change_password" {
+		t.Fatalf("expected change-password flash target attribute, got %q", got)
 	}
 
-	topBannerPattern := regexp.MustCompile(`(?s)<section class="space-y-6">.*?Current password is incorrect\..*?<section class="journal-card p-5 sm:p-6 space-y-6" id="settings-account">`)
-	if !topBannerPattern.MatchString(rendered) {
-		t.Fatalf("expected invalid-current-password message in top settings banner area")
+	flashTag := `data-flash-key="settings.error.invalid_current_password"`
+	accountAnchor := `id="settings-account"`
+	flashIdx := strings.Index(rendered, flashTag)
+	accountIdx := strings.Index(rendered, accountAnchor)
+	if flashIdx < 0 || accountIdx < 0 || flashIdx >= accountIdx {
+		t.Fatalf("expected change-password flash to render in top banner area before #settings-account (flash=%d, account=%d)", flashIdx, accountIdx)
 	}
 }

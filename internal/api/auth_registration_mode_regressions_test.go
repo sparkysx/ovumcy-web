@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/ovumcy/ovumcy-web/internal/services"
+	"golang.org/x/net/html"
 )
 
 func TestRegisterClosedModeReturnsForbiddenJSONError(t *testing.T) {
@@ -83,19 +84,17 @@ func TestRegisterPageClosedModeRendersDisabledStateWithoutForm(t *testing.T) {
 		t.Fatalf("expected status 200, got %d", response.StatusCode)
 	}
 
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatalf("read body: %v", err)
+	document := mustParseHTMLDocument(t, mustReadBodyString(t, response.Body))
+	if htmlAuthErrorByKey(document, "auth.error.registration_disabled") == nil {
+		t.Fatal("expected register page to render auth.error.registration_disabled banner")
 	}
-	rendered := string(body)
-	if !strings.Contains(rendered, "Registration is disabled after initial setup.") {
-		t.Fatalf("expected registration disabled copy in register page")
+	if htmlFindElement(document, func(node *html.Node) bool {
+		return node.Type == html.ElementNode && htmlHasAttr(node, "data-registration-disabled")
+	}) == nil {
+		t.Fatal("expected disabled register state marker")
 	}
-	if !strings.Contains(rendered, "data-registration-disabled") {
-		t.Fatalf("expected disabled register state marker")
-	}
-	if strings.Contains(rendered, `id="register-form"`) {
-		t.Fatalf("did not expect register form in closed mode")
+	if htmlElementByID(document, "register-form") != nil {
+		t.Fatal("did not expect register form in closed mode")
 	}
 }
 

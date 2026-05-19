@@ -121,13 +121,19 @@ func TestDashboardShowsCurrentUsageGoalSummaryForOwner(t *testing.T) {
 		t.Fatalf("expected status 200, got %d", response.StatusCode)
 	}
 
-	rendered := mustReadBodyString(t, response.Body)
-	assertBodyContainsAll(t, rendered,
-		bodyStringMatch{fragment: `data-usage-goal-summary`, message: "expected dashboard usage-goal summary panel"},
-		bodyStringMatch{fragment: "Current mode: Trying to conceive", message: "expected current usage-goal label on dashboard"},
-		bodyStringMatch{fragment: "Fertile indicators are framed around timing opportunities", message: "expected usage-goal summary copy on dashboard"},
-		bodyStringMatch{fragment: "Calculations stay the same.", message: "expected dashboard usage-goal disclaimer"},
-	)
+	document := mustParseHTMLDocument(t, mustReadBodyString(t, response.Body))
+	summary := htmlFindElement(document, func(node *html.Node) bool {
+		return node.Type == html.ElementNode && htmlHasAttr(node, "data-usage-goal-summary")
+	})
+	if summary == nil {
+		t.Fatal("expected dashboard usage-goal summary panel")
+	}
+	if got := htmlAttr(summary, "data-usage-goal-label-key"); got != "settings.goal.trying" {
+		t.Fatalf("expected usage-goal label key %q, got %q", "settings.goal.trying", got)
+	}
+	if got := htmlAttr(summary, "data-usage-goal-summary-key"); got != "usage_goal.summary.trying" {
+		t.Fatalf("expected usage-goal summary key %q, got %q", "usage_goal.summary.trying", got)
+	}
 }
 
 func assertDashboardSavedNoteDisclosure(t *testing.T, document *html.Node) {

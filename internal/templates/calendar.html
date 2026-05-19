@@ -89,7 +89,7 @@
       </div>
 
       {{if or .HasPredictionExplanationPrimary .HasPredictionExplanationSecondary}}
-      <div class="mt-4 space-y-2" data-calendar-prediction-explainer>
+      <div class="mt-4 space-y-2" data-calendar-prediction-explainer data-explainer-primary-key="{{.PredictionExplanationPrimaryKey}}" data-explainer-secondary-key="{{.PredictionExplanationSecondaryKey}}">
         {{if .HasPredictionExplanationPrimary}}
         <p class="journal-muted text-sm">{{t .Messages .PredictionExplanationPrimaryKey}}</p>
         {{end}}

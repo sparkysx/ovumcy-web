@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"golang.org/x/net/html"
 )
 
 func TestNotFoundPageForGuestUsesLoginPrimaryAction(t *testing.T) {
@@ -24,13 +26,16 @@ func TestNotFoundPageForGuestUsesLoginPrimaryAction(t *testing.T) {
 		t.Fatalf("expected status 404, got %d", response.StatusCode)
 	}
 
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatalf("read not-found page body: %v", err)
+	rendered := mustReadBodyString(t, response.Body)
+	document := mustParseHTMLDocument(t, rendered)
+	title := htmlFindElement(document, func(node *html.Node) bool {
+		return node.Type == html.ElementNode && htmlHasAttr(node, "data-not-found-title")
+	})
+	if title == nil {
+		t.Fatalf("expected not-found title element with stable hook")
 	}
-	rendered := string(body)
-	if !strings.Contains(rendered, "Page not found") {
-		t.Fatalf("expected localized not-found title")
+	if got := htmlAttr(title, "data-title-key"); got != "not_found.title" {
+		t.Fatalf("expected not-found title key %q, got %q", "not_found.title", got)
 	}
 	if !strings.Contains(rendered, `href="/login"`) {
 		t.Fatalf("expected login primary action for guest not-found page")
@@ -114,16 +119,17 @@ func TestNotFoundHTMXPathReturnsLocalizedStatusErrorMarkup(t *testing.T) {
 		t.Fatalf("expected status 404, got %d", response.StatusCode)
 	}
 
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatalf("read htmx not-found body: %v", err)
+	rendered := mustReadBodyString(t, response.Body)
+	document := mustParseHTMLDocument(t, rendered)
+	flash := htmlFlashByKey(document, "not_found.title")
+	if flash == nil {
+		t.Fatalf("expected htmx not-found response to carry not_found.title flash key, got %q", rendered)
 	}
-	rendered := string(body)
-	if !strings.Contains(rendered, `class="status-error"`) {
-		t.Fatalf("expected shared status-error markup, got %q", rendered)
+	if !htmlHasClass(flash, "status-error") {
+		t.Fatalf("expected htmx not-found wrapper to use status-error class")
 	}
-	if !strings.Contains(rendered, "Страница не найдена") {
-		t.Fatalf("expected localized not-found htmx message, got %q", rendered)
+	if normalizeHTMLText(htmlNodeText(flash)) == "" {
+		t.Fatalf("expected localized not-found htmx message body, got empty")
 	}
 	if strings.Contains(rendered, "<html") {
 		t.Fatalf("expected htmx branch to avoid full page markup, got %q", rendered)

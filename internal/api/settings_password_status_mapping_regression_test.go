@@ -1,7 +1,6 @@
 package api
 
 import (
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -72,15 +71,15 @@ func TestSettingsChangePasswordInvalidCurrentPasswordHTMXInlineError(t *testing.
 		t.Fatalf("expected status 200 for htmx inline error, got %d", response.StatusCode)
 	}
 
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatalf("read htmx response body: %v", err)
+	document := mustParseHTMLDocument(t, mustReadBodyString(t, response.Body))
+	flash := htmlFlashByKey(document, "settings.error.invalid_current_password")
+	if flash == nil {
+		t.Fatal("expected htmx response to carry invalid_current_password flash key")
 	}
-	rendered := string(body)
-	if !strings.Contains(rendered, `class="status-error"`) {
-		t.Fatalf("expected status-error markup in htmx response, got %q", rendered)
+	if !htmlHasClass(flash, "status-error") {
+		t.Fatal("expected htmx flash wrapper to use the shared status-error class")
 	}
-	if !strings.Contains(rendered, "Current password is incorrect.") {
-		t.Fatalf("expected localized invalid current password message, got %q", rendered)
+	if got := htmlAttr(flash, "data-flash-status"); got != "error" {
+		t.Fatalf("expected htmx flash status %q, got %q", "error", got)
 	}
 }

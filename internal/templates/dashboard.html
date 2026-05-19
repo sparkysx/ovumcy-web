@@ -83,7 +83,7 @@
     {{end}}
 
     {{if not .CycleHero.Visible}}
-    <div class="dashboard-status-line reveal" data-dashboard-status-line>
+    <div class="dashboard-status-line reveal" data-dashboard-status-line data-dashboard-phase="{{if .CycleDataStale}}unknown{{else}}{{.Stats.CurrentPhase}}{{end}}">
       <span class="dashboard-status-item">
         <span aria-hidden="true">{{if .CycleDataStale}}{{phaseIcon "unknown"}}{{else}}{{phaseIcon .Stats.CurrentPhase}}{{end}}</span>
         <span>{{if .CycleDataStale}}{{phaseLabel .Messages "unknown"}}{{else}}{{phaseLabel .Messages .Stats.CurrentPhase}}{{end}}</span>
@@ -124,11 +124,11 @@
     {{end}}
 
     {{if .HasPredictionExplanationPrimary}}
-    <p class="journal-muted text-sm" data-dashboard-prediction-explainer>{{t .Messages .PredictionExplanationPrimaryKey}}</p>
+    <p class="journal-muted text-sm" data-dashboard-prediction-explainer data-explainer-key="{{.PredictionExplanationPrimaryKey}}">{{t .Messages .PredictionExplanationPrimaryKey}}</p>
     {{end}}
 
     {{if .IsOwner}}
-    <div class="journal-panel text-sm space-y-1" data-usage-goal-summary>
+    <div class="journal-panel text-sm space-y-1" data-usage-goal-summary data-usage-goal-label-key="{{.UsageGoalLabelKey}}" data-usage-goal-summary-key="{{.UsageGoalSummaryKey}}">
       <p class="field-label">{{t .Messages "usage_goal.current_mode"}}: {{t .Messages .UsageGoalLabelKey}}</p>
       <p class="journal-muted">{{t .Messages .UsageGoalSummaryKey}}</p>
       <p class="journal-muted text-xs">{{t .Messages "usage_goal.ui_only_hint"}}</p>
@@ -136,14 +136,14 @@
     {{end}}
 
     {{if or .CycleDataStale .CycleDayWarning .NextPeriodInPast .OvulationInPast}}
-    <div class="flex flex-wrap items-center gap-3 text-sm">
+    <div class="flex flex-wrap items-center gap-3 text-sm" data-dashboard-cycle-warnings>
       {{if .CycleDataStale}}
-      <p class="warning-amber">{{t .Messages "dashboard.cycle_day_stale_hint"}}</p>
+      <p class="warning-amber" data-dashboard-stale-warning>{{t .Messages "dashboard.cycle_day_stale_hint"}}</p>
       {{else if .CycleDayWarning}}
-      <p class="warning-amber">{{printf (t .Messages "dashboard.cycle_day_long_hint") .CycleDayReference}}</p>
+      <p class="warning-amber" data-dashboard-cycle-day-warning>{{printf (t .Messages "dashboard.cycle_day_long_hint") .CycleDayReference}}</p>
       {{end}}
       {{if or .NextPeriodInPast .OvulationInPast}}
-      <p class="warning-amber">{{t .Messages "dashboard.prediction_in_past"}}</p>
+      <p class="warning-amber" data-dashboard-prediction-past>{{t .Messages "dashboard.prediction_in_past"}}</p>
       {{end}}
       <a href="/settings#settings-cycle" class="btn-secondary text-sm">{{t .Messages "dashboard.update_cycle_data"}}</a>
     </div>

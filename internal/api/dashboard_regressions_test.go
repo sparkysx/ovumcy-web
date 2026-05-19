@@ -17,6 +17,7 @@ import (
 	"github.com/ovumcy/ovumcy-web/internal/i18n"
 	"github.com/ovumcy/ovumcy-web/internal/models"
 	"github.com/ovumcy/ovumcy-web/internal/services"
+	"golang.org/x/net/html"
 	"gorm.io/gorm"
 )
 
@@ -107,20 +108,28 @@ func TestDashboardStaleCycleWarningIncludesSettingsCTAAndEstimatedPhase(t *testi
 		t.Fatalf("expected status 200, got %d", response.StatusCode)
 	}
 
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatalf("read dashboard body: %v", err)
-	}
-	rendered := string(body)
+	document := mustParseHTMLDocument(t, mustReadBodyString(t, response.Body))
 
-	if !strings.Contains(rendered, "Cycle data may be outdated.") {
-		t.Fatalf("expected stale cycle warning in dashboard")
+	warnings := dashboardElementByDataAttr(document, "data-dashboard-cycle-warnings")
+	if warnings == nil {
+		t.Fatal("expected dashboard cycle warning container when baseline is stale")
 	}
-	if !strings.Contains(rendered, `href="/settings#settings-cycle"`) {
-		t.Fatalf("expected stale cycle warning to include direct settings CTA")
+	if dashboardElementByDataAttr(warnings, "data-dashboard-stale-warning") == nil {
+		t.Fatal("expected stale cycle warning element inside the warning container")
 	}
-	if !strings.Contains(rendered, "Unknown") {
-		t.Fatalf("expected phase to be rendered as unknown while cycle data is stale")
+	settingsCTA := htmlFindElement(warnings, func(node *html.Node) bool {
+		return node.Type == html.ElementNode && node.Data == "a" && htmlAttr(node, "href") == "/settings#settings-cycle"
+	})
+	if settingsCTA == nil {
+		t.Fatal("expected stale cycle warning to include direct settings CTA")
+	}
+
+	statusLine := dashboardElementByDataAttr(document, "data-dashboard-status-line")
+	if statusLine == nil {
+		t.Fatal("expected dashboard status line when stale baseline suppresses the hero")
+	}
+	if got := htmlAttr(statusLine, "data-dashboard-phase"); got != "unknown" {
+		t.Fatalf("expected dashboard status line phase %q while cycle data is stale, got %q", "unknown", got)
 	}
 }
 
@@ -147,12 +156,13 @@ func TestDashboardAndStatsUseSameStalePhasePresentation(t *testing.T) {
 	}
 	defer dashboardResponse.Body.Close()
 
-	dashboardBody, err := io.ReadAll(dashboardResponse.Body)
-	if err != nil {
-		t.Fatalf("read dashboard body: %v", err)
+	dashboardDocument := mustParseHTMLDocument(t, mustReadBodyString(t, dashboardResponse.Body))
+	dashboardStatusLine := dashboardElementByDataAttr(dashboardDocument, "data-dashboard-status-line")
+	if dashboardStatusLine == nil {
+		t.Fatal("expected dashboard status line while cycle data is stale")
 	}
-	if !strings.Contains(string(dashboardBody), "Unknown") {
-		t.Fatalf("expected dashboard stale phase to render as unknown")
+	if got := htmlAttr(dashboardStatusLine, "data-dashboard-phase"); got != "unknown" {
+		t.Fatalf("expected dashboard status line phase %q while cycle data is stale, got %q", "unknown", got)
 	}
 
 	statsRequest := httptest.NewRequest(http.MethodGet, "/stats", nil)
@@ -164,13 +174,9 @@ func TestDashboardAndStatsUseSameStalePhasePresentation(t *testing.T) {
 	}
 	defer statsResponse.Body.Close()
 
-	statsBody, err := io.ReadAll(statsResponse.Body)
-	if err != nil {
-		t.Fatalf("read stats body: %v", err)
-	}
-	renderedStats := string(statsBody)
-	if !strings.Contains(renderedStats, "Keep logging") {
-		t.Fatalf("expected stats page to show gated empty state before enough completed cycles")
+	statsDocument := mustParseHTMLDocument(t, mustReadBodyString(t, statsResponse.Body))
+	if dashboardElementByDataAttr(statsDocument, "data-stats-empty-state") == nil {
+		t.Fatal("expected stats page to show gated empty state before enough completed cycles")
 	}
 }
 

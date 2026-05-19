@@ -59,7 +59,7 @@ func respondNotFoundMappedError(c *fiber.Ctx) error {
 		if message == "not_found.title" {
 			message = "Page not found"
 		}
-		return c.Status(spec.Status).SendString(httpx.StatusErrorMarkup(message))
+		return c.Status(spec.Status).SendString(httpx.StatusErrorMarkup(message, "not_found.title"))
 	}
 	return respondGlobalMappedError(c, spec)
 }

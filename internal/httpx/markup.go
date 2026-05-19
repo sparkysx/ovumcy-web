@@ -18,9 +18,19 @@ func StatusOKTemplateHTML(message string) template.HTML {
 	return trustedEscapedHTML(StatusOKMarkup(message))
 }
 
-// StatusErrorMarkup renders the shared HTMX status-error wrapper.
-func StatusErrorMarkup(message string) string {
-	return fmt.Sprintf("<div class=\"status-error\">%s</div>", template.HTMLEscapeString(message))
+// StatusErrorMarkup renders the shared HTMX status-error wrapper. When
+// errorKey is non-empty, the wrapper exposes it as data-flash-key + a
+// data-flash-status="error" attribute so backend regressions and Playwright
+// can assert the policy-selected key without matching the localized message.
+func StatusErrorMarkup(message string, errorKey string) string {
+	if errorKey == "" {
+		return fmt.Sprintf("<div class=\"status-error\">%s</div>", template.HTMLEscapeString(message))
+	}
+	return fmt.Sprintf(
+		"<div class=\"status-error\" data-flash-key=\"%s\" data-flash-status=\"error\">%s</div>",
+		template.HTMLEscapeString(errorKey),
+		template.HTMLEscapeString(message),
+	)
 }
 
 // DismissibleStatusOKMarkup renders the shared HTMX dismissible status-ok wrapper.

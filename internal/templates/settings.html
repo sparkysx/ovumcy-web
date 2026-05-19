@@ -5,10 +5,17 @@
     <p class="journal-muted mt-2">{{t .Messages "settings.subtitle"}}</p>
   </div>
 
-  {{if .SuccessKey}}{{statusOK (t .Messages .SuccessKey)}}{{end}}
+  {{if .SuccessKey}}
+  <div class="status-ok" data-flash-key="{{.SuccessKey}}" data-flash-status="success">
+    <span class="toast-message-wrap">
+      <span class="toast-icon" aria-hidden="true">✓</span>
+      <span class="toast-message">{{t .Messages .SuccessKey}}</span>
+    </span>
+  </div>
+  {{end}}
 
   {{if or .ErrorKey .ChangePasswordErrorKey}}
-  <div class="status-error flex items-center gap-2">
+  <div class="status-error flex items-center gap-2" data-flash-key="{{if .ErrorKey}}{{.ErrorKey}}{{else}}{{.ChangePasswordErrorKey}}{{end}}" data-flash-status="error"{{if .ChangePasswordErrorKey}} data-flash-target="change_password"{{end}}>
     <span aria-hidden="true">⚠️</span>
     <span>{{if .ErrorKey}}{{t .Messages .ErrorKey}}{{else}}{{t .Messages .ChangePasswordErrorKey}}{{end}}</span>
   </div>
@@ -103,7 +110,7 @@
             <span class="period-toggle-main">〰️ {{t .Messages "settings.cycle.irregular_cycle"}}</span>
           </span>
         </label>
-        <p class="journal-muted text-sm">{{t .Messages "settings.cycle.irregular_cycle_hint"}}</p>
+        <p class="journal-muted text-sm" data-settings-irregular-cycle-hint>{{t .Messages "settings.cycle.irregular_cycle_hint"}}</p>
       </div>
 
       <div class="space-y-2">

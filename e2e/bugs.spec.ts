@@ -398,6 +398,7 @@ test.describe('Bug regressions', () => {
       await page.locator('#register-email').fill(creds.email);
       await page.locator('#register-password').fill('ValidPass1');
       await page.locator('#register-confirm-password').fill('ValidPass1');
+      await page.locator('#register-consent').check();
       await page.locator('form[action="/api/v1/users"] button[type="submit"]').click();
 
       // Duplicate registration dispatches through the pickup-cookie flow:

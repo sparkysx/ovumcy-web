@@ -67,6 +67,7 @@ export async function registerOwnerViaUI(
   await page.locator('#register-email').fill(credentials.email);
   await page.locator('#register-password').fill(credentials.password);
   await page.locator('#register-confirm-password').fill(confirmPassword);
+  await page.locator('#register-consent').check();
   await requestSubmitForm(page.locator('form[action="/api/v1/users"]'));
 }
 

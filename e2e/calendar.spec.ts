@@ -11,6 +11,7 @@ import { saveSettingsLanguage } from './support/language-helpers';
 import { expectElementAboveMobileTabbar } from './support/mobile-layout-helpers';
 import { ensureNotesFieldVisible } from './support/note-helpers';
 import { setRequestTimezoneFromBrowser } from './support/timezone-helpers';
+import { dateFieldRoot, fillDateField } from './support/date-field-helpers';
 
 function shiftISODate(iso: string, days: number): string {
   const [y, m, d] = iso.split('-').map((part) => Number(part));
@@ -324,6 +325,79 @@ test.describe('Calendar page', () => {
     const dayEditorForm = page.locator(`[data-day-editor-form][data-day-editor-date="${tomorrowISO}"]`);
     await expect(dayEditorForm).toBeVisible();
     await expect(dayEditorForm.locator('input[name="is_period"]')).toBeChecked();
+  });
+
+  test('BBT tracking without a confirmed signal demotes the predicted ovulation day to a tentative dash', async ({
+    page,
+  }) => {
+    // appendCurrentCycleBBTSignal demotes the predicted OvulationDate from
+    // .calendar-ovulation-dot to .calendar-ovulation-dash when:
+    //   - user.TrackBBT is true
+    //   - stats has a non-zero OvulationDate / NextPeriodStart
+    //   - inferBBTOvulationDate finds no confirmed BBT signal in the cycle
+    // Onboard 20 days back so the predicted ovulation (cycleStart + 13d)
+    // sits in the past while the cycle is still current, enable TrackBBT
+    // through the tracking endpoint without logging any BBT, then assert
+    // the calendar grid surfaces at least one tentative dash and no
+    // confirmed ovulation dot in calendar day cells (the legend dots stay
+    // in their own .legend-item containers and are excluded).
+    const creds = createCredentials('calendar-anovulatory-dash');
+    await registerOwnerViaUI(page, creds);
+    await expectInlineRegisterRecoveryStep(page);
+    await readRecoveryCode(page);
+    await continueFromRecoveryCode(page);
+
+    // Custom onboarding flow: anchor last_period_start at today-20 so the
+    // predicted cycle day 14 lies in the past.
+    const startISO = shiftISODate(
+      await page.evaluate(() => {
+        const now = new Date();
+        const yyyy = now.getFullYear();
+        const mm = String(now.getMonth() + 1).padStart(2, '0');
+        const dd = String(now.getDate()).padStart(2, '0');
+        return `${yyyy}-${mm}-${dd}`;
+      }),
+      -20,
+    );
+    const startInput = page.locator('#last-period-start');
+    await expect(dateFieldRoot(startInput)).toBeVisible();
+    await fillDateField(startInput, startISO);
+    await page.locator('form[hx-post="/api/v1/onboarding/steps/1"] button[type="submit"]').click();
+    const stepTwoForm = page.locator('form[hx-post="/api/v1/onboarding/steps/2"]');
+    await expect(stepTwoForm).toBeVisible();
+    await Promise.all([
+      page.waitForURL(/\/dashboard(?:\?.*)?$/, { timeout: 15000 }),
+      stepTwoForm.locator('button[type="submit"]').click(),
+    ]);
+    await setRequestTimezoneFromBrowser(page);
+
+    // Enable TrackBBT via the tracking settings endpoint. Send the full
+    // default snapshot — the JSON body parser does not treat missing fields
+    // as no-op, so a single-field patch would wipe the other tracking flags.
+    const csrf = (await page.locator('meta[name="csrf-token"]').getAttribute('content')) ?? '';
+    const trackingResponse = await page.request.patch('/api/v1/users/current/tracking', {
+      headers: { 'X-CSRF-Token': csrf, 'Content-Type': 'application/json' },
+      data: {
+        track_bbt: true,
+        temperature_unit: 'celsius',
+        track_cervical_mucus: false,
+        hide_sex_chip: false,
+        hide_cycle_factors: false,
+        hide_notes_field: false,
+        show_historical_phases: false,
+      },
+    });
+    expect(trackingResponse.status()).toBeLessThan(400);
+
+    await page.goto('/calendar');
+    await expect(page).toHaveURL(/\/calendar(?:\?.*)?$/);
+
+    // Scope to calendar grid buttons only — the legend keeps a dot AND a
+    // dash for the icon row regardless of state.
+    const gridDashes = page.locator('button[data-day] .calendar-ovulation-dash');
+    const gridDots = page.locator('button[data-day] .calendar-ovulation-dot');
+    await expect(gridDashes.first()).toBeVisible();
+    await expect(gridDots).toHaveCount(0);
   });
 
   test('usage_goal setting flips the calendar root data-usage-goal attribute', async ({ page }) => {

@@ -134,7 +134,20 @@ func (service *DayService) DayHasDataForDate(userID uint, day time.Time, locatio
 }
 
 func (service *DayService) UpsertDayEntry(userID uint, dayStart time.Time, payload DayEntryInput, location *time.Location) (models.DailyLog, bool, error) {
-	dayRangeStart, dayRangeEnd := DayRange(dayStart, location)
+	// Defensive normalization: collapse any time-of-day or non-UTC offset on
+	// the incoming dayStart back to canonical UTC-midnight. The intended
+	// contract is "caller already invoked DayRange and is passing canonical
+	// UTC-midnight", but if a future caller passes time.Now() or a
+	// location-local midnight, the window below would silently drift and
+	// re-introduce issue #64 — second upsert misses the existing row and the
+	// follow-up Create collides with uidx_user_date. Cheaper to normalize
+	// than to debug a regression.
+	if !dayStart.IsZero() {
+		year, month, day := dayStart.UTC().Date()
+		dayStart = time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
+	}
+	dayRangeStart := dayStart
+	dayRangeEnd := dayStart.AddDate(0, 0, 1)
 	entry, found, err := service.logs.FindByUserAndDayRange(userID, dayRangeStart, dayRangeEnd)
 	if err != nil {
 		return models.DailyLog{}, false, ErrDayEntryLoadFailed

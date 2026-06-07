@@ -136,3 +136,39 @@ func TestClearAutoFilledPeriodNeighbors_NoOpForSingleDayPeriod(t *testing.T) {
 		t.Fatalf("expected no writes for a single-day period, got %d entries", len(logs.entries))
 	}
 }
+
+func TestDeleteDayEntry_RemovesPersistedEntry(t *testing.T) {
+	service, logs, start := seedAutoFilledPeriod(t, 1) // single day 02-10
+	if _, ok := logs.entries["2026-02-10"]; !ok {
+		t.Fatal("precondition: the entry should exist before deletion")
+	}
+
+	if err := service.DeleteDayEntry(10, start, time.UTC); err != nil {
+		t.Fatalf("DeleteDayEntry: %v", err)
+	}
+
+	if _, ok := logs.entries["2026-02-10"]; ok {
+		t.Fatal("expected the day entry to be deleted")
+	}
+}
+
+func TestDayServiceResolveManualCycleStartPolicy_UsesUsersLogs(t *testing.T) {
+	logs := newDayLogRepositoryStub()
+	logs.entries["2026-01-01"] = models.DailyLog{
+		UserID: 10, Date: time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC),
+		IsPeriod: true, CycleStart: true,
+	}
+	service := NewDayService(logs, &dayUserRepositoryStub{})
+
+	user := &models.User{}
+	user.ID = 10
+	day := time.Date(2026, time.January, 10, 0, 0, 0, 0, time.UTC) // 9-day gap from the start
+
+	policy, err := service.ResolveManualCycleStartPolicy(user, day, day, time.UTC)
+	if err != nil {
+		t.Fatalf("ResolveManualCycleStartPolicy: %v", err)
+	}
+	if policy.ShortGapDays != 9 {
+		t.Fatalf("expected short gap of 9 days from the user's logs, got %d", policy.ShortGapDays)
+	}
+}

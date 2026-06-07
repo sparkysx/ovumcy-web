@@ -23,6 +23,15 @@ playwright-report/
 coverage.*
 profile.cov
 
+# Test code must stay in the public repo but never ship in the runtime image.
+# The build runs only `go build`, which ignores these; CI tests from a repo
+# checkout, not the Docker context. internal/i18n and internal/templates are
+# copied wholesale into the scratch image, so without this their *_test.go files
+# would leak into production.
+**/*_test.go
+**/testdata/
+.mutation/
+
 AGENTS.md
 AI_CONTEXT.md
 PROJECT_CONTEXT.md

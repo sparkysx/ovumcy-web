@@ -348,9 +348,9 @@ func TestBuildStatsCycleFactorItemsTieBreaksByCanonicalOrder(t *testing.T) {
 // Survives mutant: changing > to >= drops the third item when count==3.
 func TestBuildStatsCycleFactorItemsExactlyAtContextLimit(t *testing.T) {
 	counts := map[string]int{
-		models.CycleFactorStress:          3,
-		models.CycleFactorIllness:         2,
-		models.CycleFactorTravel:          1,
+		models.CycleFactorStress:  3,
+		models.CycleFactorIllness: 2,
+		models.CycleFactorTravel:  1,
 	}
 
 	items := buildStatsCycleFactorItems(counts)
@@ -364,10 +364,10 @@ func TestBuildStatsCycleFactorItemsExactlyAtContextLimit(t *testing.T) {
 // than statsCycleFactorContextLimit items are trimmed to the limit.
 func TestBuildStatsCycleFactorItemsTruncatesAboveContextLimit(t *testing.T) {
 	counts := map[string]int{
-		models.CycleFactorStress:           4,
-		models.CycleFactorIllness:          3,
-		models.CycleFactorTravel:           2,
-		models.CycleFactorSleepDisruption:  1,
+		models.CycleFactorStress:          4,
+		models.CycleFactorIllness:         3,
+		models.CycleFactorTravel:          2,
+		models.CycleFactorSleepDisruption: 1,
 	}
 
 	items := buildStatsCycleFactorItems(counts)

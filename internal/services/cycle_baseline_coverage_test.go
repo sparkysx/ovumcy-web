@@ -175,10 +175,10 @@ func TestCyclebaselineCov_DetectCurrentPhaseRoundsAveragePeriodLengthUp(t *testi
 	lastPeriodStart := mustParseBaselineDay(t, "2026-04-01")
 	// Craft stats with AveragePeriodLength=4.6 (rounds to 5) and known OvulationDate.
 	stats := CycleStats{
-		LastPeriodStart:     lastPeriodStart,
-		AveragePeriodLength: 4.6,
-		OvulationDate:       mustParseBaselineDay(t, "2026-04-15"),
-		OvulationExact:      true,
+		LastPeriodStart:      lastPeriodStart,
+		AveragePeriodLength:  4.6,
+		OvulationDate:        mustParseBaselineDay(t, "2026-04-15"),
+		OvulationExact:       true,
 		FertilityWindowStart: mustParseBaselineDay(t, "2026-04-10"),
 		FertilityWindowEnd:   mustParseBaselineDay(t, "2026-04-15"),
 	}
@@ -197,10 +197,10 @@ func TestCyclebaselineCov_DetectCurrentPhaseRoundsAveragePeriodLengthUp(t *testi
 func TestCyclebaselineCov_DetectCurrentPhaseZeroPeriodLengthUsesDefault(t *testing.T) {
 	lastPeriodStart := mustParseBaselineDay(t, "2026-04-01")
 	stats := CycleStats{
-		LastPeriodStart:     lastPeriodStart,
-		AveragePeriodLength: 0, // would produce periodLength=0 before default fix
-		OvulationDate:       mustParseBaselineDay(t, "2026-04-15"),
-		OvulationExact:      true,
+		LastPeriodStart:      lastPeriodStart,
+		AveragePeriodLength:  0, // would produce periodLength=0 before default fix
+		OvulationDate:        mustParseBaselineDay(t, "2026-04-15"),
+		OvulationExact:       true,
 		FertilityWindowStart: mustParseBaselineDay(t, "2026-04-10"),
 		FertilityWindowEnd:   mustParseBaselineDay(t, "2026-04-15"),
 	}
@@ -220,10 +220,10 @@ func TestCyclebaselineCov_DetectCurrentPhaseZeroPeriodLengthUsesDefault(t *testi
 func TestCyclebaselineCov_DetectCurrentPhaseLastDayOfPeriodIsInclusive(t *testing.T) {
 	lastPeriodStart := mustParseBaselineDay(t, "2026-04-01")
 	stats := CycleStats{
-		LastPeriodStart:     lastPeriodStart,
-		AveragePeriodLength: 5,
-		OvulationDate:       mustParseBaselineDay(t, "2026-04-15"),
-		OvulationExact:      true,
+		LastPeriodStart:      lastPeriodStart,
+		AveragePeriodLength:  5,
+		OvulationDate:        mustParseBaselineDay(t, "2026-04-15"),
+		OvulationExact:       true,
 		FertilityWindowStart: mustParseBaselineDay(t, "2026-04-10"),
 		FertilityWindowEnd:   mustParseBaselineDay(t, "2026-04-15"),
 	}

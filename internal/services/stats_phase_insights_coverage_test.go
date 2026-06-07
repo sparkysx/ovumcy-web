@@ -172,7 +172,7 @@ func TestStatsphaseinsightsCovMenstrualPhaseUsesDefaultPeriodLength(t *testing.T
 		{Date: statsphaseinsightsCovDay(t, "2026-01-29"), IsPeriod: true, Mood: 3},
 		{Date: statsphaseinsightsCovDay(t, "2026-01-31"), Mood: 2}, // day 3 of cycle 2 → menstrual
 		{Date: statsphaseinsightsCovDay(t, "2026-02-26"), IsPeriod: true, Mood: 3},
-		{Date: statsphaseinsightsCovDay(t, "2026-02-28"), Mood: 2}, // day 3 of cycle 3 → menstrual
+		{Date: statsphaseinsightsCovDay(t, "2026-02-28"), Mood: 2},        // day 3 of cycle 3 → menstrual
 		{Date: statsphaseinsightsCovDay(t, "2026-03-26"), IsPeriod: true}, // opens 4th cycle start
 	}
 
@@ -337,13 +337,13 @@ func TestStatsphaseinsightsCovMoodInsightEntryCountMatchesLogCount(t *testing.T)
 	//   - 1 mood log on day 2 — NOT IsPeriod → day 2 > periodLength(1), day 2 < ovulationDay(14) → follicular
 	// So across 3 cycles: menstrual.EntryCount=3, follicular.EntryCount=3.
 	logs := []models.DailyLog{
-		{Date: statsphaseinsightsCovDay(t, "2026-01-01"), IsPeriod: true, Mood: 3},  // day 1 → menstrual
-		{Date: statsphaseinsightsCovDay(t, "2026-01-02"), Mood: 4},                   // day 2 → follicular
-		{Date: statsphaseinsightsCovDay(t, "2026-01-29"), IsPeriod: true, Mood: 3},  // day 1 → menstrual
-		{Date: statsphaseinsightsCovDay(t, "2026-01-30"), Mood: 4},                   // day 2 → follicular
-		{Date: statsphaseinsightsCovDay(t, "2026-02-26"), IsPeriod: true, Mood: 3},  // day 1 → menstrual
-		{Date: statsphaseinsightsCovDay(t, "2026-02-27"), Mood: 4},                   // day 2 → follicular
-		{Date: statsphaseinsightsCovDay(t, "2026-03-26"), IsPeriod: true},             // opens 4th cycle start
+		{Date: statsphaseinsightsCovDay(t, "2026-01-01"), IsPeriod: true, Mood: 3}, // day 1 → menstrual
+		{Date: statsphaseinsightsCovDay(t, "2026-01-02"), Mood: 4},                 // day 2 → follicular
+		{Date: statsphaseinsightsCovDay(t, "2026-01-29"), IsPeriod: true, Mood: 3}, // day 1 → menstrual
+		{Date: statsphaseinsightsCovDay(t, "2026-01-30"), Mood: 4},                 // day 2 → follicular
+		{Date: statsphaseinsightsCovDay(t, "2026-02-26"), IsPeriod: true, Mood: 3}, // day 1 → menstrual
+		{Date: statsphaseinsightsCovDay(t, "2026-02-27"), Mood: 4},                 // day 2 → follicular
+		{Date: statsphaseinsightsCovDay(t, "2026-03-26"), IsPeriod: true},          // opens 4th cycle start
 	}
 
 	insights, ok := service.BuildPhaseMoodInsights(owner, logs, statsphaseinsightsCovLocation)

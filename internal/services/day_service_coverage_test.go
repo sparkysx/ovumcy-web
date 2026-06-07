@@ -21,8 +21,8 @@ import (
 // inject a controlled PeriodLength and AutoPeriodFill setting without the
 // full dayUserRepositoryStub, so there is no risk of name collision.
 type dayserviceCovUserStub struct {
-	settings models.User
-	loadErr  error
+	settings  models.User
+	loadErr   error
 	updateErr error
 }
 

@@ -379,10 +379,10 @@ func TestDashboardcycleheroCovSegmentDashOffsetAccumulates(t *testing.T) {
 	// Offsets: menstrual starts at 0, follicular at -menstrual_dash, etc.
 	// Note: dashboardCycleHeroFloat(-0.0) produces "-0.0" for the first segment.
 	expectedOffsets := []float64{
-		0,                                          // segment[0]: -0.0 (formatted as "-0.0" by FormatFloat)
-		-dayFrac(5),                                // segment[1]
-		-(dayFrac(5) + dayFrac(8)),                 // segment[2]
-		-(dayFrac(5) + dayFrac(8) + dayFrac(1)),    // segment[3]
+		0,                                       // segment[0]: -0.0 (formatted as "-0.0" by FormatFloat)
+		-dayFrac(5),                             // segment[1]
+		-(dayFrac(5) + dayFrac(8)),              // segment[2]
+		-(dayFrac(5) + dayFrac(8) + dayFrac(1)), // segment[3]
 	}
 	// Segments 1-3 must strictly match. For segment 0, just verify absolute value is 0.
 	if hero.Segments[0].DashOffset != "0.0" && hero.Segments[0].DashOffset != "-0.0" {

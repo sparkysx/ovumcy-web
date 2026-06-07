@@ -10,13 +10,13 @@ import (
 
 // oidclogoutstateserviceCovStore is a test-local stub for OIDCLogoutStateStore.
 type oidclogoutstateserviceCovStore struct {
-	saved             *models.OIDCLogoutState
-	saveErr           error
-	findRecord        models.OIDCLogoutState
-	findFound         bool
-	findErr           error
-	deleteBySessionID string
-	deleteBySessionErr error
+	saved               *models.OIDCLogoutState
+	saveErr             error
+	findRecord          models.OIDCLogoutState
+	findFound           bool
+	findErr             error
+	deleteBySessionID   string
+	deleteBySessionErr  error
 	deleteExpiredCutoff time.Time
 	deleteExpiredErr    error
 	deleteExpiredCalls  int

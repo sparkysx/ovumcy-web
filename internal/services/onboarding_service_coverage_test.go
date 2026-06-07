@@ -9,10 +9,10 @@ import (
 // onboardingserviceCovStep2Repo is a stub that supports injecting a SaveOnboardingStep2 error.
 type onboardingserviceCovStep2Repo struct {
 	stubOnboardingRepo
-	saveStep2Err   error
+	saveStep2Err    error
 	saveStep2Called bool
-	savedCycle     int
-	savedPeriod    int
+	savedCycle      int
+	savedPeriod     int
 }
 
 func (s *onboardingserviceCovStep2Repo) SaveOnboardingStep2(userID uint, cycleLength int, periodLength int, autoPeriodFill bool, irregularCycle bool, ageGroup string, usageGoal string) error {

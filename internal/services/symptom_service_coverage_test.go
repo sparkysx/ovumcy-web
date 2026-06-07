@@ -255,8 +255,8 @@ func TestSymptomServiceCovSortBuiltinOrderPreservesCanonicalSequence(t *testing.
 	// "Cramps" is index 0, "Headache" is index 1 in DefaultBuiltinSymptoms.
 	// Deliberately place them reversed to prove the sort moves them correctly.
 	symptoms := []models.SymptomType{
-		{ID: 2, Name: "Headache", IsBuiltin: true},  // canonical index 1
-		{ID: 1, Name: "Cramps", IsBuiltin: true},    // canonical index 0
+		{ID: 2, Name: "Headache", IsBuiltin: true}, // canonical index 1
+		{ID: 1, Name: "Cramps", IsBuiltin: true},   // canonical index 0
 	}
 	SortSymptomsByBuiltinAndName(symptoms)
 

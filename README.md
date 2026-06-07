@@ -139,6 +139,28 @@ The privacy-safe hero demo asset pack, including the mobile install prompt captu
 - English, Russian, Spanish, French, and German localization.
 - Self-hosted deployment with Docker or a single Go binary.
 
+## How Predictions Work
+
+Ovumcy estimates ovulation, the fertile window, and your next period from the
+dates you log — no sensors and no guessing at your hormones. The model is simple
+and fully open:
+
+- Your **next period** is the start of your last period plus your typical cycle
+  length (the median of your recent cycles).
+- **Ovulation** is counted backwards from there: the luteal phase (ovulation →
+  next period) is assumed to be about 14 days, so ovulation ≈ cycle length − 14.
+- The **fertile window** is the 6 days ending on ovulation day, reflecting that
+  sperm can survive a few days and the egg about one.
+
+That is the whole idea. These are **calendar-based estimates — not medical advice
+and not contraception** — and they get less reliable for irregular cycles.
+
+The full algorithm (every constant, edge case, and assumption) is documented in
+**[docs/cycle-prediction.md](docs/cycle-prediction.md)**. Its worked examples are
+pinned by automated reference tests, so the documentation and the code can never
+silently drift apart — you can read exactly how a prediction is made and verify it
+against the numbers.
+
 ## Supported Languages
 
 | Language | Code | UI support | `DEFAULT_LANGUAGE` |
@@ -362,7 +384,12 @@ Project structure:
 - `web/` - templates, JavaScript, and CSS assets
 
 CI runs staticcheck, `go vet`, tests, and frontend build on pushes and pull requests.
-Dedicated security workflows run CodeQL plus `gosec`, Trivy filesystem/container scanning, and publish a CycloneDX image SBOM artifact for each scan run.
+Dedicated security workflows run CodeQL plus `gosec`, `govulncheck`, Trivy filesystem/container scanning, and publish a CycloneDX image SBOM artifact for each scan run.
+
+Beyond plain unit and integration tests, the suite uses property-based tests,
+native fuzzing, reference-vector tests for the cycle math, and mutation testing to
+verify the tests themselves catch real bugs. See **[TESTING.md](TESTING.md)** for
+the full quality and security approach.
 
 ## Contributing
 

@@ -21,7 +21,44 @@ func TestSQLiteBackupRestorePreservesHealthData(t *testing.T) {
 	dir := t.TempDir()
 	originalPath := filepath.Join(dir, "ovumcy.db")
 
-	originalDB, err := OpenDatabase(Config{Driver: DriverSQLite, SQLitePath: originalPath})
+	user, seedLogs := seedBackupSourceDatabase(t, originalPath)
+
+	backupPath := filepath.Join(dir, "ovumcy-backup.db")
+	copyFileForBackupTest(t, originalPath, backupPath)
+
+	restoredDB, err := OpenDatabase(Config{Driver: DriverSQLite, SQLitePath: backupPath})
+	if err != nil {
+		t.Fatalf("open restored database: %v", err)
+	}
+	t.Cleanup(func() {
+		if sqlDB, err := restoredDB.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	})
+	restoredRepos := NewRepositories(restoredDB)
+
+	restoredUser, err := restoredRepos.Users.FindByID(user.ID)
+	if err != nil {
+		t.Fatalf("find restored user: %v", err)
+	}
+	if restoredUser.Email != user.Email || restoredUser.Role != user.Role {
+		t.Fatalf("restored user mismatch: email=%q role=%q", restoredUser.Email, restoredUser.Role)
+	}
+
+	restoredLogs, err := restoredRepos.DailyLogs.ListByUser(user.ID)
+	if err != nil {
+		t.Fatalf("list restored logs: %v", err)
+	}
+	assertRestoredLogsMatch(t, seedLogs, restoredLogs)
+}
+
+// seedBackupSourceDatabase opens a fresh SQLite database at path, seeds it with a
+// user and a few representative day logs, then closes the connection so SQLite
+// flushes (and checkpoints any WAL) into the main file before it is copied.
+func seedBackupSourceDatabase(t *testing.T, path string) (*models.User, []models.DailyLog) {
+	t.Helper()
+
+	originalDB, err := OpenDatabase(Config{Driver: DriverSQLite, SQLitePath: path})
 	if err != nil {
 		t.Fatalf("open original database: %v", err)
 	}
@@ -64,40 +101,20 @@ func TestSQLiteBackupRestorePreservesHealthData(t *testing.T) {
 		}
 	}
 
-	// Close the original connection so SQLite flushes (and checkpoints any WAL)
-	// into the main file before it is copied.
 	if sqlDB, err := originalDB.DB(); err == nil {
 		if err := sqlDB.Close(); err != nil {
 			t.Fatalf("close original database: %v", err)
 		}
 	}
 
-	backupPath := filepath.Join(dir, "ovumcy-backup.db")
-	copyFileForBackupTest(t, originalPath, backupPath)
+	return user, seedLogs
+}
 
-	restoredDB, err := OpenDatabase(Config{Driver: DriverSQLite, SQLitePath: backupPath})
-	if err != nil {
-		t.Fatalf("open restored database: %v", err)
-	}
-	t.Cleanup(func() {
-		if sqlDB, err := restoredDB.DB(); err == nil {
-			_ = sqlDB.Close()
-		}
-	})
-	restoredRepos := NewRepositories(restoredDB)
+// assertRestoredLogsMatch verifies the restored copy holds exactly the seeded
+// logs, comparing both scalar fields and the JSON-serialized slice fields.
+func assertRestoredLogsMatch(t *testing.T, seedLogs, restoredLogs []models.DailyLog) {
+	t.Helper()
 
-	restoredUser, err := restoredRepos.Users.FindByID(user.ID)
-	if err != nil {
-		t.Fatalf("find restored user: %v", err)
-	}
-	if restoredUser.Email != user.Email || restoredUser.Role != user.Role {
-		t.Fatalf("restored user mismatch: email=%q role=%q", restoredUser.Email, restoredUser.Role)
-	}
-
-	restoredLogs, err := restoredRepos.DailyLogs.ListByUser(user.ID)
-	if err != nil {
-		t.Fatalf("list restored logs: %v", err)
-	}
 	if len(restoredLogs) != len(seedLogs) {
 		t.Fatalf("expected %d restored logs, got %d", len(seedLogs), len(restoredLogs))
 	}
@@ -113,10 +130,7 @@ func TestSQLiteBackupRestorePreservesHealthData(t *testing.T) {
 		if !ok {
 			t.Fatalf("missing restored log for %s", key)
 		}
-		if got.IsPeriod != want.IsPeriod || got.CycleStart != want.CycleStart ||
-			got.Flow != want.Flow || got.Mood != want.Mood || got.Notes != want.Notes ||
-			got.BBT != want.BBT || got.SexActivity != want.SexActivity ||
-			got.CervicalMucus != want.CervicalMucus {
+		if !dailyLogScalarsEqual(got, want) {
 			t.Fatalf("scalar field mismatch for %s:\n got %+v\nwant %+v", key, got, want)
 		}
 		if !slices.Equal(got.SymptomIDs, want.SymptomIDs) {
@@ -126,6 +140,14 @@ func TestSQLiteBackupRestorePreservesHealthData(t *testing.T) {
 			t.Fatalf("CycleFactorKeys mismatch for %s: got %v want %v", key, got.CycleFactorKeys, want.CycleFactorKeys)
 		}
 	}
+}
+
+// dailyLogScalarsEqual compares every non-slice tracked field of two day logs.
+func dailyLogScalarsEqual(a, b models.DailyLog) bool {
+	return a.IsPeriod == b.IsPeriod && a.CycleStart == b.CycleStart &&
+		a.Flow == b.Flow && a.Mood == b.Mood && a.Notes == b.Notes &&
+		a.BBT == b.BBT && a.SexActivity == b.SexActivity &&
+		a.CervicalMucus == b.CervicalMucus
 }
 
 func backupRestoreDay(t *testing.T, value string) time.Time {

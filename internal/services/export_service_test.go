@@ -94,6 +94,7 @@ func TestExportBuildJSONEntriesNormalizesFlowAndMapsSymptoms(t *testing.T) {
 					SexActivity:     models.SexActivityProtected,
 					BBT:             36.55,
 					CervicalMucus:   models.CervicalMucusEggWhite,
+					PregnancyTest:   models.PregnancyTestPositive,
 					CycleFactorKeys: []string{models.CycleFactorStress, models.CycleFactorTravel},
 					SymptomIDs:      []uint{1, 2, 3, 3},
 					Notes:           "json-note",
@@ -135,6 +136,7 @@ func TestExportBuildCSVRowsBuildsExpectedColumns(t *testing.T) {
 					SexActivity:     models.SexActivityUnprotected,
 					BBT:             36.7,
 					CervicalMucus:   models.CervicalMucusCreamy,
+					PregnancyTest:   models.PregnancyTestNegative,
 					CycleFactorKeys: []string{models.CycleFactorStress, models.CycleFactorMedicationChange},
 					SymptomIDs:      []uint{1, 2},
 					Notes:           "note",
@@ -225,6 +227,24 @@ func TestExportServicePropagatesDependencyErrors(t *testing.T) {
 	}
 }
 
+func TestCsvPregnancyTestLabel(t *testing.T) {
+	cases := []struct {
+		value string
+		want  string
+	}{
+		{models.PregnancyTestPositive, "Positive"},
+		{models.PregnancyTestNegative, "Negative"},
+		{models.PregnancyTestNone, "None"},
+		{"bogus-value", "None"},
+		{"", "None"},
+	}
+	for _, testCase := range cases {
+		if got := csvPregnancyTestLabel(testCase.value); got != testCase.want {
+			t.Fatalf("csvPregnancyTestLabel(%q) = %q, want %q", testCase.value, got, testCase.want)
+		}
+	}
+}
+
 func mustParseExportDay(t *testing.T, raw string) time.Time {
 	t.Helper()
 	parsed, err := time.ParseInLocation("2006-01-02", raw, time.UTC)
@@ -262,6 +282,9 @@ func assertExportJSONEntryTrackingFields(t *testing.T, entry ExportJSONEntry) {
 	}
 	if entry.CervicalMucus != models.CervicalMucusEggWhite {
 		t.Fatalf("expected eggwhite cervical mucus, got %q", entry.CervicalMucus)
+	}
+	if entry.PregnancyTest != models.PregnancyTestPositive {
+		t.Fatalf("expected positive pregnancy test, got %q", entry.PregnancyTest)
 	}
 	if len(entry.CycleFactors) != 2 || entry.CycleFactors[0] != models.CycleFactorStress || entry.CycleFactors[1] != models.CycleFactorTravel {
 		t.Fatalf("expected normalized cycle factors, got %#v", entry.CycleFactors)
@@ -301,6 +324,9 @@ func assertExportCSVTrackingColumns(t *testing.T, columns []string, indexByHeade
 	}
 	if columns[indexByHeader["Cervical mucus"]] != "Creamy" {
 		t.Fatalf("expected cervical mucus column Creamy, got %q", columns[indexByHeader["Cervical mucus"]])
+	}
+	if columns[indexByHeader["Pregnancy test"]] != "Negative" {
+		t.Fatalf("expected pregnancy test column Negative, got %q", columns[indexByHeader["Pregnancy test"]])
 	}
 	if columns[indexByHeader["Cycle factors"]] != "Stress; Medication change" {
 		t.Fatalf("expected cycle factors column, got %q", columns[indexByHeader["Cycle factors"]])

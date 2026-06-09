@@ -162,6 +162,30 @@ func TestBuildCalendarDayStatesDisablesPredictionsForUnpredictableCycle(t *testi
 	}
 }
 
+func TestBuildCalendarDayStatesSuppressesPredictionsWhenPregnancyPaused(t *testing.T) {
+	monthStart := time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2026, time.March, 12, 0, 0, 0, 0, time.UTC)
+
+	stats := CycleStats{
+		AveragePeriodLength:  5,
+		LastPeriodStart:      time.Date(2026, time.March, 8, 0, 0, 0, 0, time.UTC),
+		NextPeriodStart:      time.Date(2026, time.April, 5, 0, 0, 0, 0, time.UTC),
+		FertilityWindowStart: time.Date(2026, time.March, 18, 0, 0, 0, 0, time.UTC),
+		FertilityWindowEnd:   time.Date(2026, time.March, 23, 0, 0, 0, 0, time.UTC),
+		OvulationDate:        time.Date(2026, time.March, 23, 0, 0, 0, 0, time.UTC),
+		PregnancyPaused:      true,
+	}
+
+	days := BuildCalendarDayStates(&models.User{}, monthStart, nil, stats, now, time.UTC)
+
+	for _, dateString := range []string{"2026-03-08", "2026-03-18", "2026-03-23", "2026-04-04"} {
+		day := findCalendarDayStateByDateString(t, days, dateString)
+		if day.IsPredicted || day.IsPreFertile || day.IsFertility || day.IsOvulation || day.IsTentativeOvulation {
+			t.Fatalf("expected pregnancy pause to suppress calendar predictions on %s, got %#v", dateString, day)
+		}
+	}
+}
+
 func TestBuildCalendarDayStatesOpensEditDirectlyForFutureEmptyDays(t *testing.T) {
 	monthStart := time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC)
 	now := time.Date(2026, time.March, 12, 0, 0, 0, 0, time.UTC)
@@ -205,6 +229,62 @@ func TestBuildCalendarDayStatesMarksTentativeOvulationWhenBBTHasNoShift(t *testi
 	}
 	if ovulationDay.IsOvulation {
 		t.Fatalf("expected confirmed ovulation marker to be removed when no BBT shift is present")
+	}
+}
+
+// TestBuildCalendarDayStatesKeepsBBTDemotedDashInGridOnEveryRunDate is the
+// service-layer regression guard behind the BBT tentative-dash calendar e2e.
+// The demotion paints a single tentative-ovulation dash on the predicted
+// OvulationDate, but the calendar renders only the current month, whose
+// Sunday-aligned 6-week grid extends at most 6 days before the 1st and after
+// the last day. A past or future ovulation anchor can therefore slip past the
+// grid's leading/trailing edge in the first/last days of a month (which is how
+// the e2e flaked). Anchoring ovulation on today — last_period_start = today-13,
+// ovulation = cycleStart + 13 — keeps the dash in-grid on every run date.
+// Sweep a full year of run dates to lock that invariant in without a browser.
+func TestBuildCalendarDayStatesKeepsBBTDemotedDashInGridOnEveryRunDate(t *testing.T) {
+	location := time.UTC
+	firstRunDate := time.Date(2026, time.January, 1, 0, 0, 0, 0, location)
+	user := &models.User{TrackBBT: true}
+
+	for offset := 0; offset < 366; offset++ {
+		today := firstRunDate.AddDate(0, 0, offset)
+		todayKey := today.Format("2006-01-02")
+		cycleStart := today.AddDate(0, 0, -13)
+		stats := CycleStats{
+			LastPeriodStart: cycleStart,
+			OvulationDate:   today,
+			NextPeriodStart: cycleStart.AddDate(0, 0, 28),
+		}
+		monthStart := time.Date(today.Year(), today.Month(), 1, 0, 0, 0, 0, location)
+
+		days := BuildCalendarDayStates(user, monthStart, nil, stats, today, location)
+
+		dashDays := make([]string, 0, 1)
+		var todayState *CalendarDayState
+		for index := range days {
+			if days[index].IsTentativeOvulation {
+				dashDays = append(dashDays, days[index].DateString)
+			}
+			if days[index].DateString == todayKey {
+				todayState = &days[index]
+			}
+		}
+
+		if todayState == nil {
+			t.Fatalf("run date %s: today is not present in the rendered grid", todayKey)
+		}
+		if !todayState.IsTentativeOvulation {
+			t.Fatalf("run date %s: expected tentative dash on today, got %#v", todayKey, *todayState)
+		}
+		if todayState.IsOvulation {
+			t.Fatalf("run date %s: expected the demoted day to carry no confirmed dot", todayKey)
+		}
+		// Exactly one dash, on today. A confirmed dot may still appear elsewhere
+		// (the next predicted cycle), but it is asserted off the demoted day above.
+		if len(dashDays) != 1 || dashDays[0] != todayKey {
+			t.Fatalf("run date %s: expected exactly one tentative dash on today, got %v", todayKey, dashDays)
+		}
 	}
 }
 

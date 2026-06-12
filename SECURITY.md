@@ -185,6 +185,7 @@ Both operations require the current password through `validateSettingsActionPass
 **Local passwords:**
 
 - Minimum length: 8 Unicode code points.
+- Maximum length: 72 bytes — bcrypt's hard input limit. Longer submissions fail validation with the same stable weak-password error on every password-accepting flow instead of surfacing bcrypt's opaque hashing error.
 - Required character classes: at least one uppercase letter, one lowercase letter, and one digit (`ValidatePasswordStrength` in `internal/services/password_policy.go`).
 - Storage: bcrypt with `bcrypt.DefaultCost` (currently cost 10) via `golang.org/x/crypto/bcrypt`. Hashes live in `users.password_hash`.
 
@@ -222,7 +223,7 @@ Behind a trusted proxy (`TRUST_PROXY_ENABLED=true`), the per-IP key is the **rig
 
 Plus per-account, identity-keyed budgets enforced by `AuthAttemptPolicy` (`internal/services/auth_attempt_policy.go`):
 
-- Login attempts: 8 failures / 15 minutes.
+- Login attempts: 8 failures / 15 minutes. The OIDC link-confirmation password challenge (`POST /auth/oidc/link-confirm`) draws from this same budget, so link-confirm cannot be used as a faster password oracle than the login form.
 - Logout attempts: 20 failures / 15 minutes (account-scoped).
 - TOTP login challenge: 5 failures / 15 minutes.
 - TOTP disable: 5 failures / 15 minutes.
@@ -262,6 +263,7 @@ Plan secret rotation as planned maintenance, communicate it in advance, and cons
 - Algorithm-confusion attacks against ID tokens (asymmetric-algorithm allowlist; `HS*` and `none` are rejected even if the provider advertises them).
 - Malicious OIDC discovery metadata redirecting the logout flow to attacker-controlled hosts (`end_session_endpoint` host-pinned to the configured issuer).
 - Malicious OIDC discovery metadata redirecting the JWKS key fetch to attacker-controlled hosts (`jwks_uri` origin-pinned to the configured issuer, so token-signature keys are only fetched same-origin).
+- Malicious OIDC discovery metadata redirecting the code exchange: `token_endpoint` is origin-pinned to the configured issuer the same way, so the server-side POST carrying the client secret and authorization code can only go same-origin.
 - Cross-account ciphertext substitution at the database layer (field encryption is AAD-bound to the row id).
 - Trivial password reuse (8-character minimum with three required character classes).
 - Account takeover via a malicious or sloppy upstream OIDC IdP asserting a verified email already held by a local-auth Ovumcy account — first-time linking is refused without an explicit password confirmation step (`ovumcy_oidc_link_pending` + `/auth/oidc/link-confirm`), and when the target has TOTP enabled the same submission additionally requires a valid 6-digit code. See *OIDC Account Linking*.
@@ -407,6 +409,7 @@ Policy-level claims (threat model in/out-of-scope, design rationale, marketing-s
 | Claim | Enforced by |
 | --- | --- |
 | Passwords require ≥ 8 Unicode code points | `TestValidatePasswordStrength_RejectsWeakPasswords` (`"Short1"` case) in [internal/services/password_policy_test.go](internal/services/password_policy_test.go) |
+| Passwords longer than 72 bytes are rejected at validation (bcrypt input limit) | `TestValidatePasswordStrength_EnforcesBcryptByteLimit` in [internal/services/password_policy_test.go](internal/services/password_policy_test.go) |
 | Passwords require at least one uppercase, one lowercase, and one digit | `TestValidatePasswordStrength_RejectsWeakPasswords` (alllowercase / ALLUPPERCASE / NoDigitsHere cases) in [internal/services/password_policy_test.go](internal/services/password_policy_test.go) |
 | Strong password passes | `TestValidatePasswordStrength_AcceptsStrongPassword` in [internal/services/password_policy_test.go](internal/services/password_policy_test.go) |
 | Change-password rejects weak password and mismatch | `TestChangePasswordRejectsWeakNumericPassword`, `TestChangePasswordRejectsPasswordMismatch` in [internal/api/auth_change_password_validation_test.go](internal/api/auth_change_password_validation_test.go) |
@@ -425,6 +428,8 @@ Policy-level claims (threat model in/out-of-scope, design rationale, marketing-s
 | Per-account rate-limit keys are HMAC-derived from `SECRET_KEY` (no raw identity persisted) | `TestAuthAttemptPolicyKeysUseScopedHMACFingerprint`, `TestAuthAttemptPolicyKeysOmitIdentityFingerprintForBlankIdentity` in [internal/services/auth_attempt_policy_test.go](internal/services/auth_attempt_policy_test.go) |
 | Attempt limiter respects window and reset semantics | `TestAttemptLimiterWindowAndReset`, `TestAttemptLimiterMultiKeyOperations` in [internal/services/attempt_limiter_test.go](internal/services/attempt_limiter_test.go) |
 | Logout endpoint is rate-limited per account | `auth_logout_rate_limit_regression_test.go` in `internal/api/` |
+| OIDC link-confirm password challenge shares the login failure budget (correct password refused once exhausted) | `TestCompleteOIDCLinkConfirmationRateLimitsPasswordAttempts` in [internal/api/auth_oidc_regressions_test.go](internal/api/auth_oidc_regressions_test.go) |
+| Attempt limiter memory is hard-capped under a fresh-key flood | `TestAttemptLimiterSizeCapUnderFreshKeyFlood`, `TestAttemptLimiterSizeCapEvictsColdestKeysFirst` in [internal/services/attempt_limiter_test.go](internal/services/attempt_limiter_test.go) |
 | TOTP login rate-limited at 5 failures / 15 min | `TestVerifyTOTPLoginRateLimitsRepeatedAttempts` (or sibling) in `handlers_auth_2fa_test.go` |
 | TOTP disable rate-limited at 5 failures / 15 min | `handlers_settings_2fa_test.go` |
 | Rate-limit error response is sanitized and contains no PII | `TestAuthRateLimitHandlerLogsSecurityEventWithoutPII` in [cmd/ovumcy/main_test.go](cmd/ovumcy/main_test.go) |
@@ -446,6 +451,7 @@ Policy-level claims (threat model in/out-of-scope, design rationale, marketing-s
 | --- | --- |
 | OIDC `end_session_endpoint` is host-pinned; cross-origin endpoint is dropped, logout falls back to local | `TestOIDC_RuntimePoC_HostPinRejectsCrossOriginEndSessionEndpoint`, `TestOIDC_RuntimePoC_HostPinAcceptsSameOriginEndSessionEndpoint` in [internal/security/oidc_runtime_poc_test.go](internal/security/oidc_runtime_poc_test.go) |
 | OIDC `jwks_uri` is origin-pinned to the issuer; a cross-origin `jwks_uri` from discovery is rejected before any verifier is built | `TestOIDC_RuntimePoC_JWKSOriginPinRejectsCrossOrigin`, `TestOIDC_RuntimePoC_JWKSOriginPinAcceptsSameOrigin` in [internal/security/oidc_runtime_poc_test.go](internal/security/oidc_runtime_poc_test.go); `TestValidateDiscoveredJWKSURI` in [internal/security/oidc_test.go](internal/security/oidc_test.go) |
+| OIDC `token_endpoint` is origin-pinned to the issuer; a cross-origin or non-https endpoint from discovery is rejected before any code exchange | `TestValidateDiscoveredTokenEndpoint` in [internal/security/oidc_test.go](internal/security/oidc_test.go) |
 | OIDC ID-token signing-algorithm allowlist rejects symmetric algorithms and `none` | `TestOIDC_RuntimePoC_AlgorithmConfusionRejected`, `TestOIDC_RuntimePoC_AlgorithmNoneRejected` in [internal/security/oidc_runtime_poc_test.go](internal/security/oidc_runtime_poc_test.go) |
 | OIDC step-up reauth requires a matching `(issuer, subject)` identity for the current user | `auth_oidc_v2_regressions_test.go`, `settings_oidc_local_password_setup_test.go` in `internal/api/` |
 | OIDC first-time link to a pre-existing local-auth account is refused without password confirmation (returns `ErrOIDCLinkRequiresConfirmation`; no identity row is created in the bypass path) | `TestOIDCLoginServiceAuthenticateRequiresConfirmationOnFirstLinkToExistingEmail` in [internal/services/oidc_login_service_test.go](internal/services/oidc_login_service_test.go) |

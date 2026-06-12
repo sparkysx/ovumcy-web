@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"github.com/ovumcy/ovumcy-web/internal/db"
 	"github.com/ovumcy/ovumcy-web/internal/security"
 	"github.com/ovumcy/ovumcy-web/internal/services"
+	"gorm.io/gorm"
 )
 
 func TestResolveSecretKey(t *testing.T) {
@@ -1522,4 +1524,117 @@ func mustRateLimitedResponse(t *testing.T, app *fiber.App, request *http.Request
 		_ = response.Body.Close()
 	})
 	return response
+}
+
+// TestCloseDatabaseClosesUnderlyingConnection verifies the close-on-exit
+// path actually releases the database: after closeDatabase the underlying
+// *sql.DB must reject further use, so SQLite has checkpointed its WAL and
+// freed the file before process exit.
+func TestCloseDatabaseClosesUnderlyingConnection(t *testing.T) {
+	database, err := db.OpenSQLite(filepath.Join(t.TempDir(), "close-test.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite() unexpected error: %v", err)
+	}
+
+	closeDatabase(database)
+
+	sqlDB, err := database.DB()
+	if err != nil {
+		t.Fatalf("database.DB() unexpected error: %v", err)
+	}
+	if err := sqlDB.Ping(); err == nil {
+		t.Fatal("expected Ping to fail after closeDatabase, got nil")
+	}
+
+	// A second close must stay quiet (idempotent exit path).
+	closeDatabase(database)
+}
+
+// TestRunServerClosesDatabaseOnListenError pins the failure exit path: when
+// the listener cannot bind, runServer must still close the database before
+// returning the error, so SQLite checkpoints its WAL even on a failed start.
+func TestRunServerClosesDatabaseOnListenError(t *testing.T) {
+	database, err := db.OpenSQLite(filepath.Join(t.TempDir(), "runserver-err.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite() unexpected error: %v", err)
+	}
+	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+
+	if err := runServer(app, database, "256.256.256.256:0"); err == nil {
+		t.Fatal("expected runServer to fail on an unbindable address")
+	}
+
+	sqlDB, err := database.DB()
+	if err != nil {
+		t.Fatalf("database.DB() unexpected error: %v", err)
+	}
+	if err := sqlDB.Ping(); err == nil {
+		t.Fatal("expected database to be closed after a failed listen")
+	}
+}
+
+// TestRunServerClosesDatabaseAfterGracefulStop pins the graceful exit path:
+// Listen returns nil after a graceful stop, and runServer closes the
+// database before handing control back to main. The stop is issued only
+// after a TCP dial against the bound listener succeeds — calling Shutdown
+// straight from the OnListen hook races the accept loop and can fire before
+// the server is stoppable, hanging Listen forever.
+func TestRunServerClosesDatabaseAfterGracefulStop(t *testing.T) {
+	database, err := db.OpenSQLite(filepath.Join(t.TempDir(), "runserver-stop.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite() unexpected error: %v", err)
+	}
+	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+
+	addrCh := make(chan string, 1)
+	app.Hooks().OnListen(func(listenData fiber.ListenData) error {
+		addrCh <- net.JoinHostPort(listenData.Host, listenData.Port)
+		return nil
+	})
+	go func() {
+		address := <-addrCh
+		for {
+			conn, dialErr := net.Dial("tcp", address)
+			if dialErr == nil {
+				_ = conn.Close()
+				_ = app.Shutdown()
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+
+	done := make(chan error, 1)
+	go func() { done <- runServer(app, database, "127.0.0.1:0") }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runServer after graceful stop: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("runServer did not return within 30s of the graceful stop")
+	}
+
+	sqlDB, err := database.DB()
+	if err != nil {
+		t.Fatalf("database.DB() unexpected error: %v", err)
+	}
+	if err := sqlDB.Ping(); err == nil {
+		t.Fatal("expected database to be closed after a graceful stop")
+	}
+}
+
+// TestCloseDatabaseLogsWhenPoolUnavailable covers the defensive branch: a
+// gorm handle without a connection pool cannot be closed, and closeDatabase
+// must log instead of panicking.
+func TestCloseDatabaseLogsWhenPoolUnavailable(t *testing.T) {
+	var buffer bytes.Buffer
+	log.SetOutput(&buffer)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	closeDatabase(&gorm.DB{Config: &gorm.Config{}})
+
+	if !strings.Contains(buffer.String(), "database close:") {
+		t.Fatalf("expected close failure to be logged, got %q", buffer.String())
+	}
 }

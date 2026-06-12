@@ -116,8 +116,29 @@ func main() {
 	defer stopSignals()
 
 	logStartup(config)
-	if err := app.Listen(":" + config.Port); err != nil {
+	// codecov:ignore:start -- main() run loop; runServer itself is unit-tested.
+	if err := runServer(app, database, ":"+config.Port); err != nil {
 		log.Fatalf("server exited: %v", err)
+	}
+	// codecov:ignore:end
+}
+
+// runServer blocks in app.Listen until the listener fails or a graceful
+// stop completes, then closes the database so SQLite checkpoints its WAL
+// and releases the file before the process exits — on both exit paths.
+func runServer(app *fiber.App, database *gorm.DB, address string) error {
+	err := app.Listen(address)
+	closeDatabase(database)
+	return err
+}
+
+func closeDatabase(database *gorm.DB) {
+	sqlDB, err := database.DB()
+	if err == nil {
+		err = sqlDB.Close()
+	}
+	if err != nil {
+		log.Printf("database close: %v", err)
 	}
 }
 

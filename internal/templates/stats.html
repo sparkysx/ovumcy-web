@@ -9,6 +9,14 @@
   <div class="journal-panel text-sm journal-muted" data-stats-perimenopause-hint>{{t .Messages "stats.perimenopause_hint"}}</div>
   {{end}}
 
+  {{if .ShowShortCycleNotice}}
+  <div class="journal-panel text-sm journal-muted" data-stats-short-cycle-notice>{{t .Messages "stats.short_cycle_notice"}}</div>
+  {{end}}
+
+  {{if .ShowLongCycleNotice}}
+  <div class="journal-panel text-sm journal-muted" data-stats-long-cycle-notice>{{t .Messages "stats.long_cycle_notice"}}</div>
+  {{end}}
+
   {{if not .HasInsights}}
   <section class="journal-card p-5 sm:p-6 space-y-4" data-stats-empty-state data-stats-completed-cycles="{{.CompletedCycleCount}}">
     <div class="stats-empty-hero" aria-hidden="true">
@@ -130,7 +138,7 @@
         </article>
         <article class="journal-panel">
           <p class="stat-label">{{t .Messages "stats.cycle_range"}}</p>
-          <p class="stat-value mt-2">{{if gt .Stats.MinCycleLength 0}}{{printf (tn .Messages .Lang "stats.cycle_range_summary" .Stats.MaxCycleLength) .Stats.MinCycleLength .Stats.MaxCycleLength}}{{else}}{{.NoDataLabel}}{{end}}</p>
+          <p class="stat-value mt-2">{{if gt .Stats.MinCycleLength 0}}{{if eq .Stats.MinCycleLength .Stats.MaxCycleLength}}{{.Stats.MaxCycleLength}} {{t .Messages "common.days_short"}}{{else}}{{printf (tn .Messages .Lang "stats.cycle_range_summary" .Stats.MaxCycleLength) .Stats.MinCycleLength .Stats.MaxCycleLength}}{{end}}{{else}}{{.NoDataLabel}}{{end}}</p>
         </article>
       </div>
     </section>

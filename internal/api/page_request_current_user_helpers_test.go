@@ -5,7 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 	"github.com/ovumcy/ovumcy-web/internal/models"
 )
 
@@ -14,7 +14,7 @@ func TestCurrentUserOrRedirectToLoginRedirectsWhenMissing(t *testing.T) {
 
 	handler := &Handler{}
 	app := fiber.New()
-	app.Get("/", func(c *fiber.Ctx) error {
+	app.Get("/", func(c fiber.Ctx) error {
 		user, handled, err := handler.currentUserOrRedirectToLogin(c)
 		if err != nil {
 			return err
@@ -26,7 +26,7 @@ func TestCurrentUserOrRedirectToLoginRedirectsWhenMissing(t *testing.T) {
 	})
 
 	request := httptest.NewRequest(http.MethodGet, "/", nil)
-	response, err := app.Test(request)
+	response, err := app.Test(request, testConfigNoTimeout)
 	if err != nil {
 		t.Fatalf("app test failed: %v", err)
 	}
@@ -43,7 +43,7 @@ func TestCurrentUserOrRedirectToLoginReturnsUserWhenPresent(t *testing.T) {
 
 	handler := &Handler{}
 	app := fiber.New()
-	app.Get("/", func(c *fiber.Ctx) error {
+	app.Get("/", func(c fiber.Ctx) error {
 		c.Locals(contextUserKey, &models.User{Email: "user@example.com"})
 		user, handled, err := handler.currentUserOrRedirectToLogin(c)
 		if err != nil {
@@ -56,7 +56,7 @@ func TestCurrentUserOrRedirectToLoginReturnsUserWhenPresent(t *testing.T) {
 	})
 
 	request := httptest.NewRequest(http.MethodGet, "/", nil)
-	response, err := app.Test(request)
+	response, err := app.Test(request, testConfigNoTimeout)
 	if err != nil {
 		t.Fatalf("app test failed: %v", err)
 	}
@@ -69,13 +69,13 @@ func TestCurrentUserOrUnauthorizedWhenMissing(t *testing.T) {
 	t.Parallel()
 
 	app := fiber.New()
-	app.Get("/", func(c *fiber.Ctx) error {
+	app.Get("/", func(c fiber.Ctx) error {
 		_, _, err := currentUserOrUnauthorized(c)
 		return err
 	})
 
 	request := httptest.NewRequest(http.MethodGet, "/", nil)
-	response, err := app.Test(request)
+	response, err := app.Test(request, testConfigNoTimeout)
 	if err != nil {
 		t.Fatalf("app test failed: %v", err)
 	}

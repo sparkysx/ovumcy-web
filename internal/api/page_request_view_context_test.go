@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
 func TestCurrentPageViewContextUsesLocalsAndHandlerLocation(t *testing.T) {
@@ -17,7 +17,7 @@ func TestCurrentPageViewContextUsesLocalsAndHandlerLocation(t *testing.T) {
 	handler := &Handler{location: location}
 	app := fiber.New()
 
-	app.Get("/", func(c *fiber.Ctx) error {
+	app.Get("/", func(c fiber.Ctx) error {
 		c.Locals(contextLanguageKey, "en")
 		c.Locals(contextMessagesKey, map[string]string{"sample.key": "value"})
 
@@ -30,7 +30,7 @@ func TestCurrentPageViewContextUsesLocalsAndHandlerLocation(t *testing.T) {
 	})
 
 	request := httptest.NewRequest(http.MethodGet, "/", nil)
-	response, err := app.Test(request)
+	response, err := app.Test(request, testConfigNoTimeout)
 	if err != nil {
 		t.Fatalf("app test failed: %v", err)
 	}
@@ -60,7 +60,7 @@ func TestCurrentPageViewContextUsesRequestLocationWhenPresent(t *testing.T) {
 	app := fiber.New()
 	requestLocation := time.FixedZone("UTC+9", 9*60*60)
 
-	app.Get("/", func(c *fiber.Ctx) error {
+	app.Get("/", func(c fiber.Ctx) error {
 		c.Locals(contextLanguageKey, "en")
 		c.Locals(contextMessagesKey, map[string]string{"sample.key": "value"})
 		c.Locals(contextLocationKey, requestLocation)
@@ -72,7 +72,7 @@ func TestCurrentPageViewContextUsesRequestLocationWhenPresent(t *testing.T) {
 	})
 
 	request := httptest.NewRequest(http.MethodGet, "/", nil)
-	response, err := app.Test(request)
+	response, err := app.Test(request, testConfigNoTimeout)
 	if err != nil {
 		t.Fatalf("app test failed: %v", err)
 	}

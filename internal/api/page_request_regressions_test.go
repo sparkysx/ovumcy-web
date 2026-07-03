@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
 func TestOptionalAuthenticatedUserWithoutCookieReturnsNil(t *testing.T) {
@@ -16,13 +16,13 @@ func TestOptionalAuthenticatedUserWithoutCookieReturnsNil(t *testing.T) {
 	handler := &Handler{secretKey: []byte("secret")}
 	app := fiber.New()
 
-	app.Get("/", func(c *fiber.Ctx) error {
+	app.Get("/", func(c fiber.Ctx) error {
 		user := handler.optionalAuthenticatedUser(c)
 		return c.JSON(fiber.Map{"has_user": user != nil})
 	})
 
 	request := httptest.NewRequest(http.MethodGet, "/", nil)
-	response, err := app.Test(request)
+	response, err := app.Test(request, testConfigNoTimeout)
 	if err != nil {
 		t.Fatalf("app test failed: %v", err)
 	}
@@ -56,7 +56,7 @@ func TestRedirectAuthenticatedUserIfPresentRedirectsAuthenticatedRequest(t *test
 	}
 
 	app := fiber.New()
-	app.Get("/", func(c *fiber.Ctx) error {
+	app.Get("/", func(c fiber.Ctx) error {
 		redirected, redirectErr := handler.redirectAuthenticatedUserIfPresent(c)
 		if redirectErr != nil {
 			return redirectErr
@@ -70,7 +70,7 @@ func TestRedirectAuthenticatedUserIfPresentRedirectsAuthenticatedRequest(t *test
 	request := httptest.NewRequest(http.MethodGet, "/", nil)
 	request.AddCookie(&http.Cookie{Name: authCookieName, Value: sealedToken})
 
-	response, err := app.Test(request)
+	response, err := app.Test(request, testConfigNoTimeout)
 	if err != nil {
 		t.Fatalf("app test failed: %v", err)
 	}

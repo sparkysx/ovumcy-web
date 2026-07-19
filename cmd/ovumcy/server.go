@@ -71,7 +71,7 @@ const (
 // If new code here starts making a decision (not just wiring an
 // already-tested collaborator), pull it into its own tested function instead.
 func newFiberApp(config runtimeConfig, handler *api.Handler) *fiber.App {
-	app := fiber.New(fiberConfig(config.Proxy))
+	app := fiber.New(fiberConfig(config))
 	configureFiberMiddleware(app, config, handler)
 	registerStaticContentTypes()
 	app.Use("/static", newStaticAssetHandler())
@@ -109,16 +109,17 @@ func newStaticAssetHandler() fiber.Handler {
 	})
 }
 
-func fiberConfig(proxy proxySettings) fiber.Config {
+func fiberConfig(config runtimeConfig) fiber.Config {
 	appConfig := fiber.Config{
-		AppName:      "Ovumcy",
-		ErrorHandler: ovumcyErrorHandler,
-		BodyLimit:    maxRequestBodyBytes,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		AppName:        "Ovumcy",
+		ErrorHandler:   ovumcyErrorHandler,
+		BodyLimit:      maxRequestBodyBytes,
+		ReadBufferSize: config.ReadBufferSize,
+		ReadTimeout:    30 * time.Second,
+		WriteTimeout:   60 * time.Second,
+		IdleTimeout:    120 * time.Second,
 	}
-	if !proxy.Enabled {
+	if !config.Proxy.Enabled {
 		return appConfig
 	}
 	// Fiber v3 collapses v2's EnableTrustedProxyCheck+TrustedProxies into
@@ -127,10 +128,10 @@ func fiberConfig(proxy proxySettings) fiber.Config {
 	// Proxies must list only literal IPs/CIDRs (no Loopback/Private/LinkLocal
 	// convenience flags) so fiber's trusted set stays byte-for-byte identical to
 	// the boundary trustedProxyMatcher parses for the rate-limit key generator.
-	appConfig.ProxyHeader = proxy.Header
+	appConfig.ProxyHeader = config.Proxy.Header
 	appConfig.TrustProxy = true
 	appConfig.EnableIPValidation = true
-	appConfig.TrustProxyConfig = fiber.TrustProxyConfig{Proxies: proxy.TrustedProxies}
+	appConfig.TrustProxyConfig = fiber.TrustProxyConfig{Proxies: config.Proxy.TrustedProxies}
 	return appConfig
 }
 
@@ -232,63 +233,4 @@ const requestLoggerFormat = "${time} | ${status} | ${latency} | ${method} | ${re
 func newRequestLogger(output io.Writer) fiber.Handler {
 	config := logger.Config{
 		Format: requestLoggerFormat,
-		CustomTags: map[string]logger.LogFunc{
-			"request_path": func(buffer logger.Buffer, c fiber.Ctx, data *logger.Data, extraParam string) (int, error) {
-				return buffer.WriteString(api.SafeRequestLogPath(c))
-			},
-			"safe_error": func(buffer logger.Buffer, c fiber.Ctx, data *logger.Data, extraParam string) (int, error) {
-				return buffer.WriteString(api.SafeLogError(data.ChainErr))
-			},
-		},
-	}
-	if output != nil {
-		// Fiber v3 renamed logger.Config.Output to Stream (still an io.Writer).
-		config.Stream = output
-	}
-	return logger.New(config)
-}
-
-func securityHeadersMiddleware(enableStrictTransportSecurity bool) fiber.Handler {
-	return func(c fiber.Ctx) error {
-		c.Set(headerXContentTypeOptions, xContentTypeOptionsNoSniff)
-		c.Set(headerReferrerPolicy, referrerPolicyStrictOrigin)
-		c.Set(headerPermissionsPolicy, permissionsPolicyDefault)
-		c.Set(headerCrossOriginOpenerPolicy, crossOriginOpenerPolicyDefault)
-		c.Set(headerXFrameOptions, xFrameOptionsDeny)
-		c.Set(headerContentSecurityPolicy, contentSecurityPolicyDefault)
-		if enableStrictTransportSecurity {
-			c.Set(headerStrictTransportSecurity, strictTransportSecurityDefault)
-		}
-		if !strings.HasPrefix(c.Path(), "/static") {
-			c.Set("Cache-Control", "no-store")
-		}
-		return c.Next()
-	}
-}
-
-func csrfMiddlewareConfig(cookieSecure bool, handler *api.Handler) csrf.Config {
-	return csrf.Config{
-		Next: func(c fiber.Ctx) bool {
-			return c.Method() == fiber.MethodPost && c.Path() == security.OIDCCallbackPath
-		},
-		// Fiber v3 removed KeyLookup and ContextKey: the token source is now a
-		// typed extractors.Extractor (see api.CSRFTokenExtractor, form-then-
-		// header) and the token is read back via csrf.TokenFromContext.
-		CookieName:     "ovumcy_csrf",
-		CookieSameSite: "Lax",
-		CookieHTTPOnly: true,
-		CookieSecure:   cookieSecure,
-		// Behavior-preserving pin: Fiber v2 used Expiration=1h; v3 renamed this
-		// to IdleTimeout and defaults it to 30m. Pin 1h so the token lifetime
-		// (and thus form/session validity window) is unchanged by the upgrade.
-		IdleTimeout: time.Hour,
-		Extractor:   api.CSRFTokenExtractor(),
-		ErrorHandler: func(c fiber.Ctx, err error) error {
-			handler.LogSecurityEvent(c, "csrf", "denied", api.SecurityEventField{
-				Key:   "reason",
-				Value: api.CSRFFailureReason(err),
-			})
-			return fiber.ErrForbidden
-		},
-	}
-}
+		CustomTags: map[string]logger.LogFunc{\n\t\t\t\"request_path\": func(buffer logger.Buffer, c fiber.Ctx, data *logger.Data, extraParam string) (int, error) {\n\t\t\t\treturn buffer.WriteString(api.SafeRequestLogPath(c))\n\t\t\t},\n\t\t\t\"safe_error\": func(buffer logger.Buffer, c fiber.Ctx, data *logger.Data, extraParam string) (int, error) {\n\t\t\t\treturn buffer.WriteString(api.SafeLogError(data.ChainErr))\n\t\t\t},\n\t\t},\n\t}\n\tif output != nil {\n\t\t// Fiber v3 renamed logger.Config.Output to Stream (still an io.Writer).\n\t\tconfig.Stream = output\n\t}\n\treturn logger.New(config)\n}\n\nfunc securityHeadersMiddleware(enableStrictTransportSecurity bool) fiber.Handler {\n\treturn func(c fiber.Ctx) error {\n\t\tc.Set(headerXContentTypeOptions, xContentTypeOptionsNoSniff)\n\t\tc.Set(headerReferrerPolicy, referrerPolicyStrictOrigin)\n\t\tc.Set(headerPermissionsPolicy, permissionsPolicyDefault)\n\t\tc.Set(headerCrossOriginOpenerPolicy, crossOriginOpenerPolicyDefault)\n\t\tc.Set(headerXFrameOptions, xFrameOptionsDeny)\n\t\tc.Set(headerContentSecurityPolicy, contentSecurityPolicyDefault)\n\t\tif enableStrictTransportSecurity {\n\t\t\tc.Set(headerStrictTransportSecurity, strictTransportSecurityDefault)\n\t\t}\n\t\tif !strings.HasPrefix(c.Path(), \"/static\") {\n\t\t\tc.Set(\"Cache-Control\", \"no-store\")\n\t\t}\n\t\treturn c.Next()\n\t}\n}\n\nfunc csrfMiddlewareConfig(cookieSecure bool, handler *api.Handler) csrf.Config {\n\treturn csrf.Config{\n\t\tNext: func(c fiber.Ctx) bool {\n\t\t\treturn c.Method() == fiber.MethodPost && c.Path() == security.OIDCCallbackPath\n\t\t},\n\t\t// Fiber v3 removed KeyLookup and ContextKey: the token source is now a\n\t\t// typed extractors.Extractor (see api.CSRFTokenExtractor, form-then-\n\t\t// header) and the token is read back via csrf.TokenFromContext.\n\t\tCookieName:     \"ovumcy_csrf\",\n\t\tCookieSameSite: \"Lax\",\n\t\tCookieHTTPOnly: true,\n\t\tCookieSecure:   cookieSecure,\n\t\t// Behavior-preserving pin: Fiber v2 used Expiration=1h; v3 renamed this\n\t\t// to IdleTimeout and defaults it to 30m. Pin 1h so the token lifetime\n\t\t// (and thus form/session validity window) is unchanged by the upgrade.\n\t\tIdleTimeout: time.Hour,\n\t\tExtractor:   api.CSRFTokenExtractor(),\n\t\tErrorHandler: func(c fiber.Ctx, err error) error {\n\t\t\thandler.LogSecurityEvent(c, \"csrf\", \"denied\", api.SecurityEventField{\n\t\t\t\tKey:   \"reason\",\n\t\t\t\tValue: api.CSRFFailureReason(err),\n\t\t\t})\n\t\t\treturn fiber.ErrForbidden\n\t\t},\n\t}\n}

@@ -33,6 +33,7 @@ type runtimeConfig struct {
 	// deliverer hardening.
 	WebhookBlockPrivate bool
 	ReminderScheduler   reminderSchedulerSettings
+	ReadBufferSize      int
 }
 
 // reminderSchedulerSettings configures the optional built-in reminder scheduler
@@ -128,6 +129,7 @@ func loadRuntimeConfig(location *time.Location) (runtimeConfig, error) {
 		CookieSecure:     cookieSecure,
 		HSTSEnabled:      hstsEnabled,
 		OIDC:             oidcConfig,
+		ReadBufferSize:   getEnvIntInRange("OVUMCY_READ_BUFFER_SIZE", 16384, 4096, 1024*1024),
 		RateLimits: rateLimitSettings{
 			LoginMax:             getEnvInt("RATE_LIMIT_LOGIN_MAX", 8),
 			LoginWindow:          getEnvDuration("RATE_LIMIT_LOGIN_WINDOW", 15*time.Minute),

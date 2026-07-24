@@ -200,7 +200,7 @@ jobs:
 
       - name: Upload coverage to Codecov
         id: codecov
-        continue-on-error: ${{ github.event_name == 'push' }}
+        continue-on-error: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           files: coverage.out
@@ -214,8 +214,8 @@ jobs:
           use_pypi: true
 
       - name: Warn on non-blocking Codecov failure
-        if: ${{ github.event_name == 'push' && steps.codecov.outcome == 'failure' }}
-        run: echo "::warning::Codecov upload failed on push. Coverage artifact was generated successfully, but Codecov ingest returned an external error."
+        if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.codecov.outcome == 'failure' }}
+        run: echo "::warning::Codecov upload failed. Coverage artifact was generated successfully, but Codecov ingest returned an external error."
 
   patch-coverage:
     runs-on: ubuntu-latest

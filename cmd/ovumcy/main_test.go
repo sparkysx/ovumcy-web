@@ -880,11 +880,11 @@ func TestLoadRuntimeConfigResolvesHSTSSwitch(t *testing.T) {
 }
 
 func TestFiberConfigAppliesTrustedProxySettings(t *testing.T) {
-	config := fiberConfig(proxySettings{
+	config := fiberConfig(runtimeConfig{Proxy: proxySettings{
 		Enabled:        true,
 		Header:         "X-Forwarded-For",
 		TrustedProxies: []string{"127.0.0.1", "::1"},
-	})
+	}})
 
 	if config.ProxyHeader != "X-Forwarded-For" {
 		t.Fatalf("expected proxy header to be applied, got %q", config.ProxyHeader)
@@ -906,7 +906,7 @@ func TestFiberConfigAppliesTrustedProxySettings(t *testing.T) {
 // restore (~8-12 MiB) — the documented import capacity would be unreachable
 // over HTTP.
 func TestFiberConfigSetsImportSizedBodyLimit(t *testing.T) {
-	config := fiberConfig(proxySettings{})
+	config := fiberConfig(runtimeConfig{})
 
 	if config.BodyLimit != maxRequestBodyBytes {
 		t.Fatalf("expected BodyLimit=%d, got %d", maxRequestBodyBytes, config.BodyLimit)

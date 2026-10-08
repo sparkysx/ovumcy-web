@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -155,9 +156,138 @@ func TestSettingsPageRendersPersistedCycleValues(t *testing.T) {
 	if !exportInputPattern.MatchString(rendered) {
 		t.Fatalf("expected export date fields to render segmented controls with explicit calendar buttons")
 	}
-	lastPeriodInputAccessibilityPattern := regexp.MustCompile(`(?s)data-date-field-id="settings-last-period-start".*?id="settings-last-period-start".*?lang="en".*?min="\d{4}-01-01".*?aria-label="Day".*?aria-label="Month".*?aria-label="Year"`)
+	// The min attribute is the rolling floor SettingsCycleStartDateBounds
+	// returns — any calendar day, not January 1st: the floor used to be the
+	// start of the current year, which put a December cycle start out of reach
+	// through the whole of January.
+	lastPeriodInputAccessibilityPattern := regexp.MustCompile(`(?s)data-date-field-id="settings-last-period-start".*?id="settings-last-period-start".*?lang="en".*?min="\d{4}-\d{2}-\d{2}".*?aria-label="Day".*?aria-label="Month".*?aria-label="Year"`)
 	if !lastPeriodInputAccessibilityPattern.MatchString(rendered) {
 		t.Fatalf("expected settings last-period-start field to include localized segmented accessibility labels and range attributes")
+	}
+}
+
+// TestSettingsUsageGoalChooserLeadsWithTheNeutralDefault pins the display order
+// of the settings mode chooser against the same contract onboarding renders:
+// the neutral default first, the two alternative modes after it.
+func TestSettingsUsageGoalChooserLeadsWithTheNeutralDefault(t *testing.T) {
+	app, database := newOnboardingTestApp(t)
+	user := createOnboardingTestUser(t, database, "settings-goal-order@example.com", "StrongPass1", true)
+	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
+
+	document := mustParseHTMLDocument(t, renderSettingsPageForTest(t, app, authCookie))
+
+	assertUsageGoalOrder(t, htmlRadioValues(document, "usage_goal"))
+}
+
+// TestSettingsCycleGoalOnlyPatchWritesNothingButTheGoal covers the shape the
+// dashboard quick switch sends: a body carrying usage_goal and nothing else.
+// It rides the endpoint the settings form already uses, writes only that one
+// column, and asks the browser to re-render — the goal reframes the whole page.
+func TestSettingsCycleGoalOnlyPatchWritesNothingButTheGoal(t *testing.T) {
+	app, database := newOnboardingTestAppWithCSRF(t)
+	user := createOnboardingTestUser(t, database, "settings-goal-only@example.com", "StrongPass1", true)
+	if err := database.Model(&models.User{}).Where("id = ?", user.ID).Updates(map[string]any{
+		"cycle_length":  31,
+		"period_length": 6,
+		"age_group":     models.AgeGroup40To45,
+		"usage_goal":    models.UsageGoalHealth,
+	}).Error; err != nil {
+		t.Fatalf("seed cycle values: %v", err)
+	}
+
+	authCookie := loginAndExtractAuthCookieWithCSRF(t, app, user.Email, "StrongPass1")
+	csrfCookie, csrfToken := loadSettingsCSRFContext(t, app, authCookie)
+
+	goalOnly := func(token string) *http.Request {
+		form := url.Values{"usage_goal": {models.UsageGoalAvoid}}
+		if strings.TrimSpace(token) != "" {
+			form.Set("csrf_token", token)
+		}
+		request := httptest.NewRequest(http.MethodPatch, "/api/v1/users/current/cycle", strings.NewReader(form.Encode()))
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		request.Header.Set("HX-Request", "true")
+		request.Header.Set("Accept-Language", "en")
+		request.Header.Set("Cookie", joinCookieHeader(authCookie, cookiePair(csrfCookie)))
+		return request
+	}
+
+	assertStatusCode(t, mustAppResponse(t, app, goalOnly("")), http.StatusForbidden)
+
+	response := mustAppResponse(t, app, goalOnly(csrfToken))
+	assertStatusCode(t, response, http.StatusNoContent)
+	if got := response.Header.Get("HX-Refresh"); got != "true" {
+		t.Fatalf("expected the quick switch to re-render the page, got HX-Refresh=%q", got)
+	}
+
+	persisted := models.User{}
+	if err := database.Select("cycle_length", "period_length", "age_group", "usage_goal").First(&persisted, user.ID).Error; err != nil {
+		t.Fatalf("load persisted user: %v", err)
+	}
+	if persisted.UsageGoal != models.UsageGoalAvoid {
+		t.Fatalf("expected persisted usage_goal=%q, got %q", models.UsageGoalAvoid, persisted.UsageGoal)
+	}
+	if persisted.CycleLength != 31 || persisted.PeriodLength != 6 {
+		t.Fatalf("expected cycle length/period untouched (31/6), got %d/%d", persisted.CycleLength, persisted.PeriodLength)
+	}
+	if persisted.AgeGroup != models.AgeGroup40To45 {
+		t.Fatalf("expected age_group untouched (%q), got %q", models.AgeGroup40To45, persisted.AgeGroup)
+	}
+}
+
+// TestSettingsCycleGoalOnlyPatchAnswersEveryCaller covers the two non-HTMX
+// shapes of the same goal-only save: a JSON body from an API client, and a
+// plain browser form post with no negotiation headers at all. The CSRF posture
+// is covered by the HTMX case above; this one isolates body parsing and
+// content negotiation.
+func TestSettingsCycleGoalOnlyPatchAnswersEveryCaller(t *testing.T) {
+	app, database := newOnboardingTestApp(t)
+	user := createOnboardingTestUser(t, database, "settings-goal-only-negotiation@example.com", "StrongPass1", true)
+	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
+
+	jsonRequest := httptest.NewRequest(http.MethodPatch, "/api/v1/users/current/cycle", strings.NewReader(`{"usage_goal":"trying_to_conceive"}`))
+	jsonRequest.Header.Set("Content-Type", "application/json")
+	jsonRequest.Header.Set("Accept", "application/json")
+	jsonRequest.Header.Set("Cookie", authCookie)
+
+	jsonResponse := mustAppResponse(t, app, jsonRequest)
+	assertStatusCode(t, jsonResponse, http.StatusOK)
+	payload := map[string]any{}
+	if err := json.Unmarshal([]byte(mustReadBodyString(t, jsonResponse.Body)), &payload); err != nil {
+		t.Fatalf("decode goal-only JSON response: %v", err)
+	}
+	// The stored goal is deliberately NOT echoed: `OkResponse` declares
+	// `additionalProperties: false`. That the save happened is asserted against
+	// the database below, and the response shape against the schema in
+	// TestUsageGoalOnlySaveAnswersTheDeclaredOkShape.
+	if _, echoed := payload["usage_goal"]; echoed {
+		t.Fatalf("the goal-only save echoed a member the OkResponse schema forbids: %v", payload)
+	}
+	afterJSON := models.User{}
+	if err := database.Select("usage_goal").First(&afterJSON, user.ID).Error; err != nil {
+		t.Fatalf("load persisted user: %v", err)
+	}
+	if afterJSON.UsageGoal != models.UsageGoalTrying {
+		t.Fatalf("expected the JSON caller's goal %q to be stored, got %q", models.UsageGoalTrying, afterJSON.UsageGoal)
+	}
+
+	formRequest := httptest.NewRequest(http.MethodPatch, "/api/v1/users/current/cycle", strings.NewReader(url.Values{
+		"usage_goal": {models.UsageGoalAvoid},
+	}.Encode()))
+	formRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	formRequest.Header.Set("Cookie", authCookie)
+
+	formResponse := mustAppResponse(t, app, formRequest)
+	assertStatusCode(t, formResponse, http.StatusSeeOther)
+	if location := formResponse.Header.Get("Location"); location != "/dashboard" {
+		t.Fatalf("expected a browser caller to land back on the dashboard, got %q", location)
+	}
+
+	persisted := models.User{}
+	if err := database.Select("usage_goal").First(&persisted, user.ID).Error; err != nil {
+		t.Fatalf("load persisted user: %v", err)
+	}
+	if persisted.UsageGoal != models.UsageGoalAvoid {
+		t.Fatalf("expected the last save to win with %q, got %q", models.UsageGoalAvoid, persisted.UsageGoal)
 	}
 }
 

@@ -1,4 +1,4 @@
-import { expect, test, type Locator, type Page } from '@playwright/test';
+import { expect, test, type Locator, type Page } from './support/fixtures';
 import {
   completeOnboardingIfPresent,
   continueFromRecoveryCode,
@@ -6,14 +6,23 @@ import {
   expectInlineRegisterRecoveryStep,
   readRecoveryCode,
   registerOwnerViaUI,
+  apiOriginHeader,
 } from './support/auth-helpers';
+import { applyTheme } from './support/contrast-helpers';
 import { saveSettingsLanguage } from './support/language-helpers';
 import { expectElementAboveMobileTabbar } from './support/mobile-layout-helpers';
 import { ensureNotesFieldVisible } from './support/note-helpers';
-import { openCalendarDayEditor } from './support/stats-helpers';
+import { markCycleStart, openCalendarDayEditor, saveDayEditorForm } from './support/stats-helpers';
 import { setRequestTimezoneFromBrowser } from './support/timezone-helpers';
 import { checkStyledControl } from './support/form-helpers';
-import { dateFieldRoot, fillDateField } from './support/date-field-helpers';
+import { selectOnboardingStartDate } from './support/onboarding-helpers';
+import { localeText } from './support/locale-helpers';
+import {
+  acceptConfirmDialog,
+  cancelConfirmDialog,
+  expectConfirmDialogCaptions,
+  mutatingRequestsDuring,
+} from './support/confirm-dialog-helpers';
 
 function shiftISODate(iso: string, days: number): string {
   const [y, m, d] = iso.split('-').map((part) => Number(part));
@@ -54,6 +63,11 @@ async function openSexActivityDisclosure(form: Locator): Promise<void> {
   await expect(form.locator('[data-sex-activity-option="protected"]')).toBeVisible();
 }
 
+/** The computed background-color the browser actually paints for a cell. */
+async function paintedBackgroundColor(cell: Locator): Promise<string> {
+  return cell.evaluate((node: Element) => window.getComputedStyle(node).backgroundColor);
+}
+
 async function todayISOFromCalendar(page: Page): Promise<string> {
   const todayButton = page.locator('button[data-day]:has(.calendar-today-pill)').first();
   await expect(todayButton).toBeVisible();
@@ -62,28 +76,84 @@ async function todayISOFromCalendar(page: Page): Promise<string> {
   return todayISO!;
 }
 
+/** The browser's own current date as an ISO string (not the test runner's clock:
+ * a test that pins the page clock needs the date the page itself sees). */
+async function todayISOFromBrowser(page: Page): Promise<string> {
+  return page.evaluate(() => {
+    const now = new Date();
+    const yyyy = now.getFullYear();
+    const mm = String(now.getMonth() + 1).padStart(2, '0');
+    const dd = String(now.getDate()).padStart(2, '0');
+    return `${yyyy}-${mm}-${dd}`;
+  });
+}
+
+/**
+ * Registers a fresh owner and drives onboarding to a caller-chosen
+ * `last_period_start`, without arming auto-period-fill (step 2 is submitted
+ * as-is) — the shape two calendar specs need to anchor a prediction on a
+ * specific day rather than on `completeOnboardingIfPresent`'s fixed today-3.
+ *
+ * The step-2 submit and the redirect to `/dashboard` are awaited together
+ * (bound to the click's own navigation, not a generic network-idle wait):
+ * `/dashboard` is server-rendered with no `hx-get` lazy-loads of its own, and
+ * a `networkidle` wait here was measured to never resolve (probed against
+ * this exact call site: 9 minutes, no settle) — some long-lived connection on
+ * that page keeps the network "busy" by Playwright's definition, so
+ * `networkidle` is the wrong signal for this transition, matching this
+ * suite's own rule against binding waits to anything but a concrete signal.
+ */
+async function registerAndOnboardOnDate(page: Page, prefix: string, startISO: string): Promise<void> {
+  const creds = createCredentials(prefix);
+  await registerOwnerViaUI(page, creds);
+  await expectInlineRegisterRecoveryStep(page);
+  await readRecoveryCode(page);
+  await continueFromRecoveryCode(page);
+
+  await selectOnboardingStartDate(page, startISO);
+  await page.locator('form[hx-post="/api/v1/onboarding/steps/1"] button[type="submit"]').click();
+  const stepTwoForm = page.locator('form[hx-post="/api/v1/onboarding/steps/2"]');
+  await expect(stepTwoForm).toBeVisible();
+  await Promise.all([
+    page.waitForURL(/\/dashboard(?:\?.*)?$/, { timeout: 15000 }),
+    stepTwoForm.locator('[data-onboarding-step2-submit]').click(),
+  ]);
+  await setRequestTimezoneFromBrowser(page);
+}
+
 test.describe('Calendar page', () => {
   test('default month renders and navigation prev/next/today works', async ({ page }) => {
     await registerOwnerOnCalendar(page, 'calendar-nav');
 
-    const navigationCard = page.locator('div.journal-card').filter({
-      has: page.locator('a.btn-primary[href="/calendar"]'),
+    // Addressed by the navigation hook, not by the button utility: the Today
+    // control is compact secondary navigation, so the calendar screen's only
+    // primary fill is the day panel's edit action.
+    const navigationCard = page.locator('div.card').filter({
+      has: page.locator('[data-calendar-month-nav]'),
     }).first();
     const monthLabel = navigationCard.locator('p.journal-muted').first();
     const prevLink = navigationCard.locator('a.btn-secondary[href^="/calendar?month="]').first();
     const nextLink = navigationCard.locator('a.btn-secondary[href^="/calendar?month="]').nth(1);
-    const todayLink = navigationCard.locator('a.btn-primary[href="/calendar"]');
+    const todayLink = navigationCard.locator('a[data-calendar-today]');
 
     const initialLabel = ((await monthLabel.textContent()) ?? '').trim();
     expect(initialLabel.length).toBeGreaterThan(0);
 
+    // Each wait names the month the control points at. The generic
+    // /calendar?month=\d{4}-\d{2} shape is satisfied by the URL the click starts
+    // from once a month is selected, so it would pass without the transition.
+    const prevMonth = new URL((await prevLink.getAttribute('href')) ?? '', page.url()).searchParams.get('month');
+    expect(prevMonth).toMatch(/^\d{4}-\d{2}$/);
     await prevLink.click();
-    await expect(page).toHaveURL(/\/calendar\?month=\d{4}-\d{2}/);
+    await expect(page).toHaveURL(new RegExp(`/calendar\\?month=${prevMonth}$`));
     const prevLabel = ((await monthLabel.textContent()) ?? '').trim();
     expect(prevLabel).not.toBe(initialLabel);
 
+    const nextMonth = new URL((await nextLink.getAttribute('href')) ?? '', page.url()).searchParams.get('month');
+    expect(nextMonth).toMatch(/^\d{4}-\d{2}$/);
+    expect(nextMonth).not.toBe(prevMonth);
     await nextLink.click();
-    await expect(page).toHaveURL(/\/calendar\?month=\d{4}-\d{2}/);
+    await expect(page).toHaveURL(new RegExp(`/calendar\\?month=${nextMonth}$`));
 
     await todayLink.click();
     await expect(page).toHaveURL(/\/calendar$/);
@@ -95,21 +165,77 @@ test.describe('Calendar page', () => {
 
     await page.goto('/calendar?month=9999-99');
     await expect(page).toHaveURL(/\/calendar$/);
-    await expect(page.locator('h1')).toContainText(/Calendar|Календарь|Calendario/);
+    // Address the page title by the key it declares. The regex this replaces
+    // listed three of six languages and, being an alternation, matched any of
+    // them regardless of which language the page was actually rendering.
+    const title = page.locator('h1[data-title-key="calendar.title"]');
+    await expect(title).toBeVisible();
+    await expect(title).toHaveText(localeText('en', 'calendar.title'));
   });
 
-  test('legend includes period/predicted/fertility/ovulation markers', async ({ page }) => {
+  test('far-future month query renders the clamped month with the next link disabled', async ({ page }) => {
+    // WEB-14 SEC-H5 sibling of the invalid-month case above: "9999-12" is a
+    // syntactically valid month (unlike "9999-99"), so the page renders 200
+    // at the requested URL instead of redirecting — but the rendered month
+    // is clamped to services.CalendarMaximumNavigableMonth (three years
+    // out), never the requested far-future value, and the "next" link is
+    // disabled there exactly as "prev" is at the lower bound.
+    await registerOwnerOnCalendar(page, 'calendar-far-future-month');
+
+    const navigationCard = page.locator('div.card').filter({
+      has: page.locator('[data-calendar-month-nav]'),
+    }).first();
+    const monthLabel = navigationCard.locator('p.journal-muted').first();
+    const initialLabel = ((await monthLabel.textContent()) ?? '').trim();
+
+    await page.goto('/calendar?month=9999-12');
+    await expect(page).toHaveURL(/\/calendar\?month=9999-12$/);
+
+    const title = page.locator('h1[data-title-key="calendar.title"]');
+    await expect(title).toBeVisible();
+
+    const clampedLabel = ((await monthLabel.textContent()) ?? '').trim();
+    expect(clampedLabel.length).toBeGreaterThan(0);
+    expect(clampedLabel).not.toBe(initialLabel);
+
+    const nextDisabled = navigationCard.locator('span.btn-disabled[aria-disabled="true"]');
+    await expect(nextDisabled).toHaveCount(1);
+    await expect(nextDisabled).toHaveText(localeText('en', 'calendar.next'));
+
+    const prevLink = navigationCard.locator('a.btn-secondary[href^="/calendar?month="]');
+    await expect(prevLink).toHaveCount(1);
+  });
+
+  test('legend groups the grid encoding by concept and leads the grid', async ({ page }) => {
     await registerOwnerOnCalendar(page, 'calendar-legend');
 
-    await expect(page.locator('.legend-dot.legend-dot-period')).toHaveCount(1);
-    await expect(page.locator('.legend-dot.legend-dot-predicted')).toHaveCount(1);
-    await expect(page.locator('.legend-outline')).toHaveCount(1);
-    await expect(page.locator('.legend-dot.legend-dot-fertile-edge')).toHaveCount(1);
-    await expect(page.locator('.legend-dot.legend-dot-fertile-peak')).toHaveCount(1);
-    const ovulationDot = page.locator('.legend-item .calendar-ovulation-dot');
-    const tentativeOvulation = page.locator('.legend-item .calendar-ovulation-dash');
+    const legend = page.locator('[data-calendar-legend]');
+    await expect(legend).toBeVisible();
+    await expect(legend.locator('.legend-swatch-period')).toHaveCount(1);
+    await expect(legend.locator('.legend-swatch-predicted')).toHaveCount(1);
+    await expect(legend.locator('.legend-swatch-start-window')).toHaveCount(1);
+    await expect(legend.locator('.legend-swatch-fertile')).toHaveCount(1);
+    await expect(legend.locator('.legend-swatch-overlap-period-fertile')).toHaveCount(1);
+    await expect(legend.locator('.legend-swatch-today')).toHaveCount(1);
+    // Eight concepts, not the ten CSS states the grid happens to have. The
+    // overlap earns an entry of its own because it is a fill the reader cannot
+    // decode from the two it is made of.
+    await expect(legend.locator('.legend-item')).toHaveCount(8);
+
+    // The legend is above the first day cell, so it is on screen while the
+    // month is being read.
+    const legendBox = await legend.boundingBox();
+    const firstCellBox = await page.locator('button[data-day]').first().boundingBox();
+    expect(legendBox).not.toBeNull();
+    expect(firstCellBox).not.toBeNull();
+    expect(legendBox!.y).toBeLessThan(firstCellBox!.y);
+
+    const ovulationDot = legend.locator('.calendar-ovulation-dot');
+    const tentativeOvulation = legend.locator('.calendar-ovulation-dash');
     await expect(ovulationDot).toHaveCount(1);
-    await expect(tentativeOvulation).toHaveCount(1);
+    // A fresh owner does not track temperature, and the dash only ever marks a
+    // projection awaiting a temperature shift, so the legend must not draw it.
+    await expect(tentativeOvulation).toHaveCount(0);
 
     const styles = await ovulationDot.evaluate((node) => {
       const computed = window.getComputedStyle(node);
@@ -120,6 +246,58 @@ test.describe('Calendar page', () => {
     });
     expect(styles.width).toBeGreaterThanOrEqual(12);
     expect(styles.boxShadow).not.toBe('none');
+  });
+
+  test('the band/window overlap paints a fill neither of its two parents paints', async ({
+    page,
+  }) => {
+    // A projected bleeding day that also falls inside the fertile window is a
+    // state of its own, and the grid resolves one fill per cell — so if the
+    // overlap fill ever collapses onto the predicted-period fill or the fertile
+    // fill, one of the two facts silently disappears from the month, which is
+    // the defect this state exists to close. The legend swatches are the
+    // measurable form of that: each paints exactly the fill its cell paints,
+    // from the same token, and all three are on screen on every calendar render
+    // without any cycle data having to line up.
+    //
+    // Both layers are read, not just background-color: the projected fill is a
+    // gradient over no colour at all, so on background-color alone two states
+    // that share nothing would compare equal.
+    await registerOwnerOnCalendar(page, 'calendar-overlap-fill');
+
+    const legend = page.locator('[data-calendar-legend]');
+    const swatches = {
+      predicted: legend.locator('.legend-swatch-predicted'),
+      fertile: legend.locator('.legend-swatch-fertile'),
+      overlap: legend.locator('.legend-swatch-overlap-period-fertile'),
+    } as const;
+    for (const [name, swatch] of Object.entries(swatches)) {
+      await expect(swatch, `${name} swatch`).toHaveCount(1);
+    }
+
+    for (const theme of ['light', 'dark'] as const) {
+      await applyTheme(page, theme);
+
+      const painted = async (swatch: Locator): Promise<string> =>
+        swatch.evaluate((node: Element) => {
+          const computed = window.getComputedStyle(node);
+          return `${computed.backgroundColor} | ${computed.backgroundImage}`;
+        });
+
+      const predicted = await painted(swatches.predicted);
+      const fertile = await painted(swatches.fertile);
+      const overlap = await painted(swatches.overlap);
+
+      expect(overlap, `${theme}: the overlap paints the projected-period fill`).not.toBe(predicted);
+      expect(overlap, `${theme}: the overlap paints the fertile fill`).not.toBe(fertile);
+      // The control: the two parents were already distinct, so a reading in
+      // which everything differs from everything proves nothing.
+      expect(predicted, `${theme}: projected-period and fertile fills collapsed`).not.toBe(fertile);
+      // A fill that resolves to nothing would satisfy every inequality above.
+      expect(overlap, `${theme}: the overlap cell has no fill at all`).toContain(
+        'repeating-linear-gradient'
+      );
+    }
   });
 
   test('mobile calendar keeps the legend scrollable above the bottom tabbar', async ({ page }) => {
@@ -148,7 +326,7 @@ test.describe('Calendar page', () => {
     const noteText = `calendar-note-${Date.now()}`;
     await openCalendarNotes(dayEditorForm);
     await dayEditorForm.locator('#calendar-notes').fill(noteText);
-    await dayEditorForm.locator('button[data-save-button]').click();
+    await saveDayEditorForm(page, pastISO, dayEditorForm);
 
     await page.goto(`/calendar?month=${pastMonth}&day=${pastISO}`);
     await expect(page).toHaveURL(new RegExp(`/calendar\\?month=${pastMonth}&day=${pastISO}`));
@@ -173,7 +351,7 @@ test.describe('Calendar page', () => {
     await dayEditorForm.locator('[data-sex-activity-option="protected"]').click();
     await openCalendarNotes(dayEditorForm);
     await dayEditorForm.locator('#calendar-notes').fill(`calendar-marker-${Date.now()}`);
-    await dayEditorForm.locator('button[data-save-button]').click();
+    await saveDayEditorForm(page, pastISO, dayEditorForm);
 
     await page.goto(`/calendar?month=${pastMonth}&day=${pastISO}`);
     const dayButton = page.locator(`button[data-day="${pastISO}"]`);
@@ -194,7 +372,7 @@ test.describe('Calendar page', () => {
     await dayEditorForm.locator('input[name="is_period"]').check();
     await openCalendarNotes(dayEditorForm);
     await dayEditorForm.locator('#calendar-notes').fill(noteText);
-    await dayEditorForm.locator('button[data-save-button]').click();
+    await saveDayEditorForm(page, pastISO, dayEditorForm);
 
     await page.goto(`/calendar?month=${pastMonth}&day=${pastISO}`);
     await expect(page.locator('#day-editor')).toContainText(noteText);
@@ -212,6 +390,86 @@ test.describe('Calendar page', () => {
     await expect(page.locator('#day-editor')).not.toContainText(noteText);
   });
 
+  // Cancelling the confirmation must be inert. This is a real regression, not a
+  // hypothetical: while the delete control carried `data-confirm`, htmx issued
+  // the DELETE from its own listener on the form before the document-level
+  // interceptor ever ran, so the dialog was decorative and Cancel erased the
+  // day anyway — irrecoverable, since health data has no undo. The control now
+  // uses `hx-confirm`, which htmx gates on. The template-level guard against the
+  // whole class is TestNoTemplateElementMixesHTMXRequestWithDataConfirm; the
+  // sibling cancel-is-inert tests cover the other gated surfaces in
+  // settings-profile-cycle.spec.ts, settings-calendar-feed.spec.ts, and
+  // settings-webhook.spec.ts.
+  test('cancelling the delete confirmation leaves the day entry intact', async ({ page }) => {
+    await registerOwnerOnCalendar(page, 'calendar-delete-cancel');
+
+    const todayISO = await todayISOFromCalendar(page);
+    const pastISO = shiftISODate(todayISO, -2);
+    const pastMonth = pastISO.slice(0, 7);
+    const noteText = `calendar-delete-cancel-${Date.now()}`;
+
+    const dayEditorForm = await openCalendarDayEditor(page, pastISO);
+    await dayEditorForm.locator('input[name="is_period"]').check();
+    await openCalendarNotes(dayEditorForm);
+    await dayEditorForm.locator('#calendar-notes').fill(noteText);
+    // Bind the wait to this click's own PUT and let the htmx cascade it triggers
+    // settle, so the entry is committed — not merely submitted — before the
+    // delete flow starts (same reasoning as saveDayEditorForm in
+    // calendar-autofill-clear.spec.ts).
+    const [saveRequest] = await Promise.all([
+      page.waitForRequest(
+        (candidate) =>
+          candidate.method() === 'PUT' && candidate.url().includes(`/api/v1/days/${pastISO}`)
+      ),
+      dayEditorForm.locator('button[data-save-button]').click(),
+    ]);
+    const saveResponse = await saveRequest.response();
+    expect(saveResponse, `expected a response for PUT /api/v1/days/${pastISO}`).not.toBeNull();
+    expect(
+      saveResponse!.ok(),
+      `PUT /api/v1/days/${pastISO} failed with ${saveResponse!.status()}`
+    ).toBeTruthy();
+    await page.waitForLoadState('networkidle');
+
+    const deleteForm = page.locator(`[data-day-delete-form][data-day-delete-date="${pastISO}"]`);
+    const isDayMutation = (pathname: string) => pathname.endsWith(`/api/v1/days/${pastISO}`);
+
+    const cancelledRequests = await mutatingRequestsDuring(page, isDayMutation, async () => {
+      await openCalendarDayEditor(page, pastISO);
+      const deleteButton = deleteForm.locator('[data-day-delete-button]');
+      await expect(deleteButton).toBeVisible();
+      await deleteButton.click();
+
+      // The dialog must show the captions this surface declared, not a
+      // hardcoded fallback: backend coverage only pins that they are declared.
+      await expectConfirmDialogCaptions(page, deleteForm);
+      await cancelConfirmDialog(page);
+
+      // A reload is the concrete signal that any request the click was going to
+      // issue has had its chance — no arbitrary timeout involved.
+      await page.reload();
+      await expect(page).toHaveURL(new RegExp(`/calendar\\?month=${pastMonth}&day=${pastISO}`));
+    });
+    expect(cancelledRequests, 'cancelling the delete must issue no request').toEqual([]);
+
+    // The entry survived the dialog and the reload — asserted on the server-rendered
+    // grid marker as well as the panel, so this cannot pass on stale client state.
+    await expect(page.locator('#day-editor')).toContainText(noteText);
+    await expect(page.locator(`button[data-day="${pastISO}"]`)).toHaveAttribute(
+      'data-calendar-has-data',
+      'true'
+    );
+
+    // Positive anchor: the same control, accepted, really does delete — so the
+    // assertions above prove Cancel is inert, not that the control is dead.
+    await openCalendarDayEditor(page, pastISO);
+    await deleteForm.locator('[data-day-delete-button]').click();
+    await acceptConfirmDialog(page);
+
+    await expect(deleteForm).toHaveCount(0);
+    await expect(page.locator('#day-editor')).not.toContainText(noteText);
+  });
+
   test('future empty day opens editor directly and keeps future warning context', async ({ page }) => {
     await registerOwnerOnCalendar(page, 'calendar-future-day');
 
@@ -224,7 +482,7 @@ test.describe('Calendar page', () => {
 
     await page.locator(`button[data-day="${futureISO}"]`).click();
 
-    const warningPanel = page.locator('#day-editor .journal-panel.text-sm').first();
+    const warningPanel = page.locator('#day-editor .card-quiet.text-sm').first();
     await expect(warningPanel).toBeVisible();
     await expect(warningPanel).not.toHaveText(/^$/);
     await expect(page.locator(`[data-day-editor-form][data-day-editor-date="${futureISO}"]`)).toBeVisible();
@@ -275,7 +533,12 @@ test.describe('Calendar page', () => {
       }),
       manualStartButton.click(),
     ]);
-    await req.response();
+    const cycleStartResponse = await req.response();
+    expect(cycleStartResponse, `expected a response for POST /api/v1/days/${pastISO}/cycle-start`).not.toBeNull();
+    expect(
+      cycleStartResponse!.ok(),
+      `POST /api/v1/days/${pastISO}/cycle-start failed with ${cycleStartResponse!.status()}`
+    ).toBeTruthy();
 
     const editButton = page.locator(`[data-day-editor-open="${pastISO}"]`).first();
     await expect(editButton).toBeVisible();
@@ -299,7 +562,15 @@ test.describe('Calendar page', () => {
     const manualStartForm = page.locator(`[data-day-cycle-start-form][data-day-cycle-start-date="${tomorrowISO}"]`);
     const manualStartButton = manualStartForm.locator('[data-day-cycle-start-button]');
     await expect(manualStartButton).toBeVisible();
-    await expect(page.locator('#day-editor')).toContainText(/recalculated|пересчитается|recalcular/i);
+    // The notice has its own hook and declares the key it renders — the same
+    // element dashboard-warnings.spec.ts pins, so the two specs can no longer
+    // describe it two different ways.
+    const futureNotice = page.locator('#day-editor [data-future-cycle-start-notice]');
+    await expect(futureNotice.first()).toBeVisible();
+    await expect(futureNotice.first()).toHaveAttribute(
+      'data-notice-key',
+      'warning.future_cycle_start'
+    );
 
     // The onboarding seed anchors last_period_start at today-3, so tomorrow is a
     // 4-day short gap: the backend rejects the start with a 400 unless the owner
@@ -318,7 +589,11 @@ test.describe('Calendar page', () => {
       page.locator('#confirm-modal-accept').click(),
     ]);
     const cycleStartResponse = await cycleStartRequest.response();
-    expect(cycleStartResponse.status()).toBeLessThan(400);
+    expect(
+      cycleStartResponse,
+      `expected a response for POST /api/v1/days/${tomorrowISO}/cycle-start?source=calendar`
+    ).not.toBeNull();
+    expect(cycleStartResponse!.status()).toBeLessThan(400);
     await page.waitForLoadState('networkidle');
 
     await page.locator(`[data-day-editor-open="${tomorrowISO}"]`).first().click();
@@ -371,7 +646,11 @@ test.describe('Calendar page', () => {
       page.locator('#confirm-modal-accept').click(),
     ]);
     const cycleStartResponse = await cycleStartRequest.response();
-    expect(cycleStartResponse.status()).toBeLessThan(400);
+    expect(
+      cycleStartResponse,
+      `expected a response for POST /api/v1/days/${tomorrowISO}/cycle-start?source=calendar`
+    ).not.toBeNull();
+    expect(cycleStartResponse!.status()).toBeLessThan(400);
   });
 
   test('BBT tracking without a confirmed signal demotes the predicted ovulation day to a tentative dash', async ({
@@ -391,43 +670,32 @@ test.describe('Calendar page', () => {
     // anchor that is in-grid regardless of when the test runs.) Enable
     // TrackBBT through the tracking endpoint without logging any BBT, then
     // assert the demoted day carries a tentative dash and no confirmed dot.
-    const creds = createCredentials('calendar-anovulatory-dash');
-    await registerOwnerViaUI(page, creds);
-    await expectInlineRegisterRecoveryStep(page);
-    await readRecoveryCode(page);
-    await continueFromRecoveryCode(page);
-
     // Custom onboarding flow: anchor last_period_start at today-13 so the
     // predicted ovulation (cycle day 14) lands on today, keeping the demoted
     // dash inside the current month's grid on any run date.
-    const startISO = shiftISODate(
-      await page.evaluate(() => {
-        const now = new Date();
-        const yyyy = now.getFullYear();
-        const mm = String(now.getMonth() + 1).padStart(2, '0');
-        const dd = String(now.getDate()).padStart(2, '0');
-        return `${yyyy}-${mm}-${dd}`;
-      }),
-      -13,
-    );
-    const startInput = page.locator('#last-period-start');
-    await expect(dateFieldRoot(startInput)).toBeVisible();
-    await fillDateField(startInput, startISO);
-    await page.locator('form[hx-post="/api/v1/onboarding/steps/1"] button[type="submit"]').click();
-    const stepTwoForm = page.locator('form[hx-post="/api/v1/onboarding/steps/2"]');
-    await expect(stepTwoForm).toBeVisible();
-    await Promise.all([
-      page.waitForURL(/\/dashboard(?:\?.*)?$/, { timeout: 15000 }),
-      stepTwoForm.locator('button[type="submit"]').click(),
-    ]);
-    await setRequestTimezoneFromBrowser(page);
+    const startISO = shiftISODate(await todayISOFromBrowser(page), -13);
+    await registerAndOnboardOnDate(page, 'calendar-anovulatory-dash', startISO);
+
+    // The demotion acts on the PREDICTED ovulation day, and that projection is
+    // withheld until three cycles have been observed. Log this cycle's start and
+    // the three before it, each exactly 28 days from the next — the length the
+    // account settings already carry — so the observed cycles change nothing
+    // about where the predicted ovulation lands, and the latest logged start is
+    // still today-13.
+    for (const cyclesBack of [3, 2, 1]) {
+      await markCycleStart(page, shiftISODate(startISO, -28 * cyclesBack));
+    }
+    await markCycleStart(page, startISO);
 
     // Enable TrackBBT via the tracking settings endpoint. Send the full
     // default snapshot — the JSON body parser does not treat missing fields
     // as no-op, so a single-field patch would wipe the other tracking flags.
+    // The JSON body keeps the published v1 keys, which spell the three section
+    // flags in their stored, inverted form; only the settings form posts the
+    // positive show_* fields the toggles are labelled with.
     const csrf = (await page.locator('meta[name="csrf-token"]').getAttribute('content')) ?? '';
     const trackingResponse = await page.request.patch('/api/v1/users/current/tracking', {
-      headers: { 'X-CSRF-Token': csrf, 'Content-Type': 'application/json' },
+      headers: { ...apiOriginHeader(page), 'X-CSRF-Token': csrf, 'Content-Type': 'application/json' },
       data: {
         track_bbt: true,
         temperature_unit: 'celsius',
@@ -471,11 +739,12 @@ test.describe('Calendar page', () => {
     const csrf = (await page.locator('meta[name="csrf-token"]').getAttribute('content')) ?? '';
 
     async function patchUsageGoal(goal: string): Promise<void> {
-      // parseCycleSettingsInput validates cycle_length / period_length even
-      // on a partial JSON patch — resend the full default snapshot with the
-      // UsageGoal override.
+      // A body carrying the goal and nothing else takes the dashboard quick
+      // switch's one-column path. This spec wants the ordinary partial save, so
+      // it sends the geometry alongside the goal; every member it omits would
+      // keep its stored value either way.
       const response = await page.request.patch('/api/v1/users/current/cycle', {
-        headers: { 'X-CSRF-Token': csrf, 'Content-Type': 'application/json' },
+        headers: { ...apiOriginHeader(page), 'X-CSRF-Token': csrf, 'Content-Type': 'application/json' },
         data: {
           cycle_length: 28,
           period_length: 5,
@@ -496,6 +765,77 @@ test.describe('Calendar page', () => {
     await patchUsageGoal('trying_to_conceive');
     await page.goto('/calendar');
     await expect(page.locator('[data-calendar-view]')).toHaveAttribute('data-usage-goal', 'trying_to_conceive');
+  });
+
+  test('the two fertile tiers paint distinct fills for the default usage goal', async ({ page }) => {
+    test.slow();
+
+    // The tier classes (.calendar-cell-fertile-edge / -peak) always ship
+    // alongside .calendar-cell-fertile, whose `background` SHORTHAND resets the
+    // `background-color` they set. While the tier rules were written on the bare
+    // class the two tied at equal specificity and the shorthand won wherever it
+    // was emitted later — so the tiers rendered only under the two goal
+    // selectors, and the default goal painted the whole window flat. The tier
+    // rules are compounded with the base class now; this pins the RESULT, which
+    // is the only form the tie cannot pass green.
+    // Anchor the cycle at day 1 of the current month: on the 28/14 defaults the
+    // predicted ovulation is cycle day 14 and the fertile window is the five
+    // days before it, so the whole window (edge days 9-11, peak days 12-13,
+    // ovulation on the 14th) sits mid-month and is inside that month's grid on
+    // every run date — unlike a window anchored relative to today, which can
+    // fall past the grid's trailing edge at a month's end.
+    const monthISO = (await todayISOFromBrowser(page)).slice(0, 7);
+    await registerAndOnboardOnDate(page, 'calendar-fertile-tiers', `${monthISO}-01`);
+
+    // The fertile window is withheld until three cycles have been observed, so
+    // the three cycles before this one are logged as well, 28 days apart — the
+    // length the account settings already carry, so the window stays mid-month
+    // exactly as described above. Three of them, none counted from the anchor:
+    // on a run date that IS the 1st, the anchor itself has not closed a cycle yet,
+    // and the three before it have.
+    const anchorISO = `${monthISO}-01`;
+    await markCycleStart(page, shiftISODate(anchorISO, -84));
+    await markCycleStart(page, shiftISODate(anchorISO, -56));
+    await markCycleStart(page, shiftISODate(anchorISO, -28));
+    await markCycleStart(page, anchorISO);
+
+    await page.goto(`/calendar?month=${monthISO}`);
+    await expect(page.locator('[data-calendar-view]')).toHaveAttribute('data-usage-goal', 'health');
+
+    // The ovulation day carries .calendar-cell-fertile on its own — that is the
+    // flat fill the two tiers have to differ from.
+    const flatCell = page.locator(
+      '.calendar-cell-fertile:not(.calendar-cell-fertile-edge):not(.calendar-cell-fertile-peak)'
+    );
+    const edgeCell = page.locator('.calendar-cell-fertile-edge');
+    const peakCell = page.locator('.calendar-cell-fertile-peak');
+    await expect(flatCell.first()).toBeVisible();
+    await expect(edgeCell.first()).toBeVisible();
+    await expect(peakCell.first()).toBeVisible();
+
+    for (const theme of ['light', 'dark'] as const) {
+      await applyTheme(page, theme);
+
+      const flat = await paintedBackgroundColor(flatCell.first());
+      const edge = await paintedBackgroundColor(edgeCell.first());
+      const peak = await paintedBackgroundColor(peakCell.first());
+
+      expect(edge, `${theme}: fertile edge paints the flat fertile fill`).not.toBe(flat);
+      expect(peak, `${theme}: fertile peak paints the flat fertile fill`).not.toBe(flat);
+      expect(peak, `${theme}: fertile peak paints the fertile edge fill`).not.toBe(edge);
+
+      // The contrast gate resolves rgb()/rgba() only; a fill that computes to
+      // any other form (color-mix() serialises as color(srgb ...)) is one it
+      // cannot flatten, so it would be unmeasurable rather than compliant.
+      for (const [label, value] of [
+        ['fertile edge', edge],
+        ['fertile peak', peak],
+      ] as const) {
+        expect(value, `${theme}: ${label} fill is not resolvable as rgb()/rgba()`).toMatch(
+          /^rgba?\(/
+        );
+      }
+    }
   });
 
   test('summary-view manual cycle start on a day WITH logged data exposes its policy node so the confirm modal opens', async ({
@@ -532,7 +872,12 @@ test.describe('Calendar page', () => {
       ),
       dayEditorForm.locator('button[data-save-button]').click(),
     ]);
-    await saveRequest.response();
+    const saveResponse = await saveRequest.response();
+    expect(saveResponse, `expected a response for PUT /api/v1/days/${tomorrowISO}`).not.toBeNull();
+    expect(
+      saveResponse!.ok(),
+      `PUT /api/v1/days/${tomorrowISO} failed with ${saveResponse!.status()}`
+    ).toBeTruthy();
 
     // Reload the summary (non-edit) view for tomorrow. It now renders the
     // with-data branch: the logged note is shown by owner_log_summary, which the
@@ -570,6 +915,10 @@ test.describe('Calendar page', () => {
       page.locator('#confirm-modal-accept').click(),
     ]);
     const cycleStartResponse = await cycleStartRequest.response();
-    expect(cycleStartResponse.status()).toBeLessThan(400);
+    expect(
+      cycleStartResponse,
+      `expected a response for POST /api/v1/days/${tomorrowISO}/cycle-start?source=calendar`
+    ).not.toBeNull();
+    expect(cycleStartResponse!.status()).toBeLessThan(400);
   });
 });

@@ -1,0 +1,562 @@
+package services
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/ovumcy/ovumcy-web/internal/models"
+)
+
+// The pass under test repairs a CACHE, so every fixture here states two things
+// at once: what the logs support under the corrected inference, and what the old
+// convention had stored for those same logs. The stored numbers are chosen so
+// that "recompute from the logs" and "subtract one from the stored value" — the
+// only correction a SQL migration could express — give different answers wherever
+// the two can differ at all. A fixture where they agree would be green about
+// nothing.
+//
+// The logs come from lutealRoundTripLogs, the same builder the round-trip
+// regression for the inference fix uses, so these expectations rest on that
+// test's arithmetic rather than on a second copy of it.
+//
+// What each fixture's logs stored under the OLD convention was measured, not
+// derived on paper: the pre-fix formula (the calendar span from the ovulation
+// date to the next start, filtered and averaged exactly as it was) was replayed
+// over these three fixtures and reported 15, 14 and 14 against the corrected
+// 14, 18 and 14. That measurement is why the stored values below are what they
+// are; it is not re-run here, because a permanent copy of the old formula would
+// be a second implementation to keep in step with nothing.
+
+var errLutealRecomputeStub = errors.New("stub storage failure")
+
+// lutealRecomputeOrigin is the first cycle start every fixture is built from.
+// Any UTC date works; the inference reads calendar-day differences only.
+var lutealRecomputeOrigin = time.Date(2026, 1, 5, 0, 0, 0, 0, time.UTC)
+
+type stubLutealRecomputeAppState struct {
+	values map[string]string
+	getErr error
+	setErr error
+}
+
+func (s *stubLutealRecomputeAppState) Get(_ context.Context, key string) (string, bool, error) {
+	if s.getErr != nil {
+		return "", false, s.getErr
+	}
+	value, ok := s.values[key]
+	return value, ok, nil
+}
+
+func (s *stubLutealRecomputeAppState) Set(_ context.Context, key string, value string) error {
+	if s.setErr != nil {
+		return s.setErr
+	}
+	if s.values == nil {
+		s.values = map[string]string{}
+	}
+	s.values[key] = value
+	return nil
+}
+
+func (s *stubLutealRecomputeAppState) markerWritten() bool {
+	_, ok := s.values[models.AppStateKeyLutealPhaseRecomputeV1]
+	return ok
+}
+
+type lutealPhaseUpdate struct {
+	userID uint
+	value  int
+}
+
+type stubLutealRecomputeUserStore struct {
+	rows      []models.LutealPhaseRecomputeRow
+	updates   []lutealPhaseUpdate
+	listed    bool
+	listErr   error
+	updateErr map[uint]error
+}
+
+func (s *stubLutealRecomputeUserStore) ListOwnerLutealPhaseRows(_ context.Context) ([]models.LutealPhaseRecomputeRow, error) {
+	s.listed = true
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+	return s.rows, nil
+}
+
+func (s *stubLutealRecomputeUserStore) UpdateByID(_ context.Context, userID uint, updates map[string]any) error {
+	if err := s.updateErr[userID]; err != nil {
+		return err
+	}
+	value, ok := updates["luteal_phase"].(int)
+	if !ok || len(updates) != 1 {
+		return errors.New("the pass may write luteal_phase and nothing else")
+	}
+	s.updates = append(s.updates, lutealPhaseUpdate{userID: userID, value: value})
+	return nil
+}
+
+type stubLutealRecomputeLogStore struct {
+	logs   map[uint][]models.DailyLog
+	read   []uint
+	errs   map[uint]error
+	shared []models.DailyLog
+}
+
+func (s *stubLutealRecomputeLogStore) ListByUser(_ context.Context, userID uint) ([]models.DailyLog, error) {
+	s.read = append(s.read, userID)
+	if err := s.errs[userID]; err != nil {
+		return nil, err
+	}
+	if s.shared != nil {
+		return s.shared, nil
+	}
+	return s.logs[userID], nil
+}
+
+// assertInferenceSupports pins what the fixture's logs mean before the pass is
+// asked about them. Without it a fixture built outside the inference's range
+// reads as a defect in the pass instead of as a fixture that supplies no signal.
+func assertInferenceSupports(t *testing.T, logs []models.DailyLog, wantLuteal int, wantRefined bool) {
+	t.Helper()
+
+	luteal, refined := InferUserLutealPhase(logs, time.UTC, BoundaryContext{})
+	if refined != wantRefined {
+		t.Fatalf("fixture: InferUserLutealPhase refined = %v, want %v", refined, wantRefined)
+	}
+	if luteal != wantLuteal {
+		t.Fatalf("fixture: InferUserLutealPhase = %d, want %d", luteal, wantLuteal)
+	}
+}
+
+func TestLutealPhaseRecomputeCorrectsARowWrittenUnderTheOldConvention(t *testing.T) {
+	// Three observed starts 28 days apart, ovulation on cycle day 14 in each of
+	// the first two: the corrected inference reads 28-14 = 14. The old
+	// convention measured the calendar span from the ovulation date to the next
+	// start, which counts the ovulation day itself, so it stored 15 — and 15 fed
+	// back into CalcOvulationDay predicts cycle day 13 on the same cycle.
+	logs := lutealRoundTripLogs(t, lutealRecomputeOrigin, 28, []int{14, 14}, lutealSignalEggWhite)
+	assertInferenceSupports(t, logs, 14, true)
+
+	appState := &stubLutealRecomputeAppState{}
+	users := &stubLutealRecomputeUserStore{rows: []models.LutealPhaseRecomputeRow{{ID: 7, LutealPhase: 15}}}
+	logStore := &stubLutealRecomputeLogStore{logs: map[uint][]models.DailyLog{7: logs}}
+
+	outcome, err := NewLutealPhaseRecomputer(appState, users, logStore, time.UTC).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if len(users.updates) != 1 || users.updates[0] != (lutealPhaseUpdate{userID: 7, value: 14}) {
+		t.Fatalf("the stale row must be rewritten to 14, got %+v", users.updates)
+	}
+	if outcome.Corrected != 1 || outcome.Failed != 0 || outcome.AlreadyDone {
+		t.Fatalf("outcome = %+v, want one correction and no failure", outcome)
+	}
+	if !appState.markerWritten() {
+		t.Fatal("a completed pass must record the done-marker")
+	}
+}
+
+func TestLutealPhaseRecomputeLandsOnTheDefaultWhenNoSignalSurvives(t *testing.T) {
+	// Two observed starts, so the inference declines before it reads a single
+	// ovulation signal — the population that can never self-heal, since neither
+	// writer of the cache runs without the owner writing something.
+	//
+	// The stored 18 is a personalized estimate the account earned when it still
+	// had three starts to infer from and kept after it stopped (days re-marked,
+	// a partial restore). It is also what separates the two candidate repairs:
+	// recomputing lands on defaultLutealPhaseDays (14), while subtracting one
+	// from the stored value would leave 17 — a number no derivation produces.
+	logs := lutealRoundTripLogs(t, lutealRecomputeOrigin, 28, []int{14}, lutealSignalEggWhite)
+	assertInferenceSupports(t, logs, defaultLutealPhaseDays, false)
+
+	appState := &stubLutealRecomputeAppState{}
+	users := &stubLutealRecomputeUserStore{rows: []models.LutealPhaseRecomputeRow{{ID: 3, LutealPhase: 18}}}
+	logStore := &stubLutealRecomputeLogStore{logs: map[uint][]models.DailyLog{3: logs}}
+
+	if _, err := NewLutealPhaseRecomputer(appState, users, logStore, time.UTC).Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if len(users.updates) != 1 || users.updates[0].value != defaultLutealPhaseDays {
+		t.Fatalf("an account with no usable signal must land on %d, got %+v", defaultLutealPhaseDays, users.updates)
+	}
+}
+
+func TestLutealPhaseRecomputeIsNotAShiftOfTheStoredValue(t *testing.T) {
+	// The case that rules out an arithmetic migration outright. Three cycles of
+	// 30 days with ovulation on days 10, 10 and 16 carry corrected samples
+	// 20, 20 and 14 — average 18.
+	//
+	// Under the old convention those same cycles measured 21, 21 and 15, and the
+	// plausibility filter drops anything above maxPlausibleLutealPhaseDays, so
+	// two of the three samples were thrown away. One sample is below the refine
+	// gate, so the old code declined and the writer stored defaultLutealPhaseDays.
+	//
+	// So the stored 14 must become 18: it moves UP by four, from a value that
+	// looks exactly like the seeded default. Subtracting one would give 13, and
+	// reading 14 as "already the default, leave it" would give 14. Both are
+	// wrong, and only re-running the inference over the logs finds 18.
+	logs := lutealRoundTripLogs(t, lutealRecomputeOrigin, 30, []int{10, 10, 16}, lutealSignalEggWhite)
+	assertInferenceSupports(t, logs, 18, true)
+
+	appState := &stubLutealRecomputeAppState{}
+	users := &stubLutealRecomputeUserStore{rows: []models.LutealPhaseRecomputeRow{{ID: 11, LutealPhase: defaultLutealPhaseDays}}}
+	logStore := &stubLutealRecomputeLogStore{logs: map[uint][]models.DailyLog{11: logs}}
+
+	if _, err := NewLutealPhaseRecomputer(appState, users, logStore, time.UTC).Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if len(users.updates) != 1 || users.updates[0].value != 18 {
+		t.Fatalf("the row must be recomputed to 18, got %+v", users.updates)
+	}
+}
+
+func TestLutealPhaseRecomputeLeavesAnAgreeingRowUnwritten(t *testing.T) {
+	logs := lutealRoundTripLogs(t, lutealRecomputeOrigin, 28, []int{14, 14}, lutealSignalEggWhite)
+
+	appState := &stubLutealRecomputeAppState{}
+	users := &stubLutealRecomputeUserStore{rows: []models.LutealPhaseRecomputeRow{{ID: 5, LutealPhase: 14}}}
+	logStore := &stubLutealRecomputeLogStore{logs: map[uint][]models.DailyLog{5: logs}}
+
+	outcome, err := NewLutealPhaseRecomputer(appState, users, logStore, time.UTC).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if len(users.updates) != 0 {
+		t.Fatalf("a row the recompute agrees with must not be written, got %+v", users.updates)
+	}
+	// Not writing and not looking print the same nothing, so the row's logs
+	// having been read is what makes the assertion above mean anything.
+	if len(logStore.read) != 1 || logStore.read[0] != 5 {
+		t.Fatalf("the pass must still read the row's logs, read = %v", logStore.read)
+	}
+	if outcome.Corrected != 0 || !appState.markerWritten() {
+		t.Fatalf("outcome = %+v, marker written = %v; want a completed pass with no correction", outcome, appState.markerWritten())
+	}
+}
+
+func TestLutealPhaseRecomputeSkipsTheScanOnceTheMarkerIsPresent(t *testing.T) {
+	appState := &stubLutealRecomputeAppState{values: map[string]string{models.AppStateKeyLutealPhaseRecomputeV1: "done"}}
+	users := &stubLutealRecomputeUserStore{rows: []models.LutealPhaseRecomputeRow{{ID: 1, LutealPhase: 15}}}
+	logStore := &stubLutealRecomputeLogStore{}
+
+	outcome, err := NewLutealPhaseRecomputer(appState, users, logStore, time.UTC).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if !outcome.AlreadyDone {
+		t.Fatalf("outcome = %+v, want AlreadyDone", outcome)
+	}
+	if users.listed || len(logStore.read) != 0 || len(users.updates) != 0 {
+		t.Fatalf("a marked instance must scan nothing (listed=%v, read=%v, updates=%+v)", users.listed, logStore.read, users.updates)
+	}
+}
+
+func TestLutealPhaseRecomputeKeepsTheMarkerUnwrittenWhenARowFails(t *testing.T) {
+	logs := lutealRoundTripLogs(t, lutealRecomputeOrigin, 28, []int{14, 14}, lutealSignalEggWhite)
+
+	appState := &stubLutealRecomputeAppState{}
+	users := &stubLutealRecomputeUserStore{
+		rows:      []models.LutealPhaseRecomputeRow{{ID: 1, LutealPhase: 15}, {ID: 2, LutealPhase: 15}, {ID: 3, LutealPhase: 15}},
+		updateErr: map[uint]error{3: errLutealRecomputeStub},
+	}
+	logStore := &stubLutealRecomputeLogStore{
+		logs: map[uint][]models.DailyLog{1: logs, 2: logs, 3: logs},
+		errs: map[uint]error{2: errLutealRecomputeStub},
+	}
+
+	outcome, err := NewLutealPhaseRecomputer(appState, users, logStore, time.UTC).Run(context.Background())
+	if err != nil {
+		t.Fatalf("a per-row failure must not abort the pass: %v", err)
+	}
+
+	// One row repaired, one unreadable, one unwritable — and the pass walked all
+	// three rather than stopping at the first failure.
+	if outcome.Corrected != 1 || outcome.Failed != 2 {
+		t.Fatalf("outcome = %+v, want 1 corrected and 2 failed", outcome)
+	}
+	if appState.markerWritten() {
+		t.Fatal("a pass that skipped a row must leave the marker unwritten so the next boot retries")
+	}
+}
+
+func TestLutealPhaseRecomputeAbortsWithoutMarkerOnStorageFailure(t *testing.T) {
+	for name, appStateAndUsers := range map[string]struct {
+		appState *stubLutealRecomputeAppState
+		users    *stubLutealRecomputeUserStore
+	}{
+		"marker unreadable": {
+			appState: &stubLutealRecomputeAppState{getErr: errLutealRecomputeStub},
+			users:    &stubLutealRecomputeUserStore{},
+		},
+		"owner listing unreadable": {
+			appState: &stubLutealRecomputeAppState{},
+			users:    &stubLutealRecomputeUserStore{listErr: errLutealRecomputeStub},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			appState, users := appStateAndUsers.appState, appStateAndUsers.users
+			logStore := &stubLutealRecomputeLogStore{}
+
+			if _, err := NewLutealPhaseRecomputer(appState, users, logStore, time.UTC).Run(context.Background()); !errors.Is(err, errLutealRecomputeStub) {
+				t.Fatalf("Run error = %v, want the storage failure", err)
+			}
+			if appState.markerWritten() {
+				t.Fatal("an aborted pass must leave the marker unwritten")
+			}
+		})
+	}
+}
+
+func TestLutealPhaseRecomputeReadsEveryOwnerAtTheirOwnStoredTimezone(t *testing.T) {
+	// Date-only values persist as UTC-midnight and every comparison the inference
+	// makes re-anchors both operands, so the owner's zone cannot move the answer —
+	// which is what lets a boot pass with no request agree with the day-save
+	// writer that has one. Pinned rather than assumed: an empty column, a real
+	// IANA name, and the "Local" token resolveOwnerLocation refuses by input must
+	// all reach the same corrected value.
+	logs := lutealRoundTripLogs(t, lutealRecomputeOrigin, 28, []int{14, 14}, lutealSignalEggWhite)
+
+	appState := &stubLutealRecomputeAppState{}
+	users := &stubLutealRecomputeUserStore{rows: []models.LutealPhaseRecomputeRow{
+		{ID: 1, Timezone: "", LutealPhase: 15},
+		{ID: 2, Timezone: "America/New_York", LutealPhase: 15},
+		{ID: 3, Timezone: "Pacific/Kiritimati", LutealPhase: 15},
+		{ID: 4, Timezone: "Local", LutealPhase: 15},
+	}}
+	logStore := &stubLutealRecomputeLogStore{shared: logs}
+
+	if _, err := NewLutealPhaseRecomputer(appState, users, logStore, time.UTC).Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if len(users.updates) != 4 {
+		t.Fatalf("every owner must be corrected, got %+v", users.updates)
+	}
+	for _, update := range users.updates {
+		if update.value != 14 {
+			t.Fatalf("owner %d landed on %d, want 14 — the zone must not move the derivation", update.userID, update.value)
+		}
+	}
+}
+
+func TestDeriveUserLutealPhaseIsTheOneRuleTheCacheIsWrittenBy(t *testing.T) {
+	// The helper the two request-driven writers and the boot pass share. Its
+	// contract is exactly two branches, and both are pinned here so a future
+	// edit cannot quietly change what an un-inferable account stores.
+	refinable := lutealRoundTripLogs(t, lutealRecomputeOrigin, 28, []int{14, 14}, lutealSignalEggWhite)
+	if got := deriveUserLutealPhase(refinable, time.Now(), time.UTC, BoundaryContext{}); got != 14 {
+		t.Fatalf("deriveUserLutealPhase on refinable logs = %d, want 14", got)
+	}
+	if got := deriveUserLutealPhase(nil, time.Now(), time.UTC, BoundaryContext{}); got != defaultLutealPhaseDays {
+		t.Fatalf("deriveUserLutealPhase with no logs = %d, want %d", got, defaultLutealPhaseDays)
+	}
+}
+
+func TestLutealPhaseRecomputeTreatsANilFallbackLocationAsUTC(t *testing.T) {
+	// The constructor's nil guard, asserted where it actually lives.
+	//
+	// Checking it through the pass's OUTPUT would prove nothing: every layer
+	// below already defaults nil to UTC — resolveOwnerLocation hands the
+	// fallback straight back for an empty stored timezone, and
+	// InferUserLutealPhase opens with its own nil check — so the row corrects to
+	// the same value whether the guard is there or not. A behavioural assertion
+	// here would cover the two lines and be unable to fail when they are
+	// deleted, which is a fixture agreeing with itself.
+	//
+	// So the field is read back. That is white-box on purpose: the guard's whole
+	// job is to normalise at the boundary so a nil never travels further, and
+	// the only way to see that is at the boundary.
+	logs := lutealRoundTripLogs(t, lutealRecomputeOrigin, 28, []int{14, 14}, lutealSignalEggWhite)
+
+	appState := &stubLutealRecomputeAppState{}
+	users := &stubLutealRecomputeUserStore{rows: []models.LutealPhaseRecomputeRow{{ID: 9, LutealPhase: 15}}}
+	logStore := &stubLutealRecomputeLogStore{logs: map[uint][]models.DailyLog{9: logs}}
+
+	recomputer := NewLutealPhaseRecomputer(appState, users, logStore, nil)
+	// Reported as nil-or-not, never by printing the zone: %v on a nil
+	// *time.Location prints "UTC", so the obvious message renders the failure as
+	// "want UTC, got UTC" and reads like a bug in the test. Same family as the
+	// rule against judging the Local token by the loaded zone's String().
+	if recomputer.fallbackLocation == nil {
+		t.Fatal("a nil fallback location must be normalised at construction; it was stored as nil")
+	}
+	if recomputer.fallbackLocation != time.UTC {
+		t.Fatalf("a nil fallback location must be normalised to UTC, got the zone named %q", recomputer.fallbackLocation.String())
+	}
+
+	// And the pass still runs on it, so the normalised zone is one the
+	// derivation accepts rather than merely non-nil.
+	if _, err := recomputer.Run(context.Background()); err != nil {
+		t.Fatalf("Run with a nil fallback location: %v", err)
+	}
+	if len(users.updates) != 1 || users.updates[0].value != 14 {
+		t.Fatalf("the pass must still correct the row, got %+v", users.updates)
+	}
+}
+
+func TestLutealPhaseRecomputeReportsAMarkerItCouldNotWrite(t *testing.T) {
+	// The corrections have already landed when Set fails, so the pass returns
+	// both the error AND the count: the operator line must still say what was
+	// repaired, and the caller must still learn the marker is missing. The next
+	// boot then re-walks, agrees with every row and writes the marker on its own,
+	// which is why an unwritten marker costs a scan and never a wrong value.
+	logs := lutealRoundTripLogs(t, lutealRecomputeOrigin, 28, []int{14, 14}, lutealSignalEggWhite)
+
+	appState := &stubLutealRecomputeAppState{setErr: errLutealRecomputeStub}
+	users := &stubLutealRecomputeUserStore{rows: []models.LutealPhaseRecomputeRow{{ID: 4, LutealPhase: 15}}}
+	logStore := &stubLutealRecomputeLogStore{logs: map[uint][]models.DailyLog{4: logs}}
+
+	outcome, err := NewLutealPhaseRecomputer(appState, users, logStore, time.UTC).Run(context.Background())
+	if !errors.Is(err, errLutealRecomputeStub) {
+		t.Fatalf("Run error = %v, want the marker write failure", err)
+	}
+	if outcome.Corrected != 1 {
+		t.Fatalf("outcome = %+v, want the correction that already landed to be reported", outcome)
+	}
+	if appState.markerWritten() {
+		t.Fatal("a failed Set must leave no marker behind")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The pass reads OBSERVED history, and manualCycleStartFutureDays lets an owner
+// record a cycle start up to two days ahead. CycleBoundaries takes such a
+// start as the boundary of the last observed cycle, so an unbounded read
+// derives the cached column from a day that has not happened yet — while the
+// display path re-infers over a today-bounded window. The two then disagree by
+// construction, which is the drift this pass exists to remove.
+// ---------------------------------------------------------------------------
+
+// lutealRecomputeFutureStartLogs builds three 28-day cycles whose ovulation
+// falls on cycle day 14 (luteal 14 in each), then a FOURTH cycle start 32 days
+// after the third. Read unbounded, that fourth start closes a third cycle and
+// contributes a luteal sample of 32-14 = 18, pulling the average to 15. Read
+// bounded at a today before it, the fourth start is not history yet and the
+// answer stays 14. It returns the logs and that fourth start's date.
+func lutealRecomputeFutureStartLogs(t *testing.T) ([]models.DailyLog, time.Time) {
+	t.Helper()
+
+	starts := []time.Time{
+		lutealRecomputeOrigin,
+		lutealRecomputeOrigin.AddDate(0, 0, 28),
+		lutealRecomputeOrigin.AddDate(0, 0, 56),
+	}
+	fourthStart := starts[2].AddDate(0, 0, 32)
+
+	logs := make([]models.DailyLog, 0, len(starts)*3+2)
+	for _, start := range starts {
+		logs = append(logs,
+			models.DailyLog{Date: start, IsPeriod: true, CycleStart: true, Flow: models.FlowMedium},
+			models.DailyLog{Date: start.AddDate(0, 0, 1), IsPeriod: true, Flow: models.FlowMedium},
+			// Egg-white peak on cycle day 13 puts ovulation on cycle day 14.
+			models.DailyLog{Date: start.AddDate(0, 0, 12), CervicalMucus: models.CervicalMucusEggWhite},
+		)
+	}
+	logs = append(logs,
+		models.DailyLog{Date: fourthStart, IsPeriod: true, CycleStart: true, Flow: models.FlowMedium},
+		models.DailyLog{Date: fourthStart.AddDate(0, 0, 1), IsPeriod: true, Flow: models.FlowMedium},
+	)
+	return logs, fourthStart
+}
+
+// runLutealRecomputeAt drives one pass with the clock pinned to `now`.
+func runLutealRecomputeAt(t *testing.T, logs []models.DailyLog, storedLutealPhase int, now time.Time) (*stubLutealRecomputeUserStore, LutealPhaseRecomputeOutcome) {
+	t.Helper()
+
+	appState := &stubLutealRecomputeAppState{}
+	users := &stubLutealRecomputeUserStore{rows: []models.LutealPhaseRecomputeRow{{ID: 7, LutealPhase: storedLutealPhase}}}
+	logStore := &stubLutealRecomputeLogStore{logs: map[uint][]models.DailyLog{7: logs}}
+
+	recomputer := NewLutealPhaseRecomputer(appState, users, logStore, time.UTC)
+	recomputer.now = func() time.Time { return now }
+
+	outcome, err := recomputer.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	return users, outcome
+}
+
+func TestLutealPhaseRecomputeIgnoresACycleStartRecordedAhead(t *testing.T) {
+	logs, fourthStart := lutealRecomputeFutureStartLogs(t)
+
+	// Anti-vacuity: the unbounded reading of these same logs really does answer
+	// 15, so a green result below is the bound working rather than a fixture
+	// that could only ever say 14.
+	assertInferenceSupports(t, logs, 15, true)
+
+	// Today is the day before the fourth start: the owner recorded it ahead,
+	// exactly as manualCycleStartFutureDays permits.
+	users, outcome := runLutealRecomputeAt(t, logs, 14, fourthStart.AddDate(0, 0, -1))
+
+	if len(users.updates) != 0 {
+		t.Fatalf("a cycle start recorded ahead must not move the stored column, got %+v", users.updates)
+	}
+	if outcome.Corrected != 0 || outcome.Failed != 0 {
+		t.Fatalf("outcome = %+v, want no correction and no failure", outcome)
+	}
+}
+
+func TestLutealPhaseRecomputeUsesACycleStartOnceItHasHappened(t *testing.T) {
+	logs, fourthStart := lutealRecomputeFutureStartLogs(t)
+	assertInferenceSupports(t, logs, 15, true)
+
+	// The control for the case above: the same start, one day in the PAST, is
+	// observed history and must move the column. Without this pair the bound
+	// could be a blanket refusal to read the last cycle at all.
+	users, outcome := runLutealRecomputeAt(t, logs, 14, fourthStart.AddDate(0, 0, 1))
+
+	if len(users.updates) != 1 || users.updates[0] != (lutealPhaseUpdate{userID: 7, value: 15}) {
+		t.Fatalf("a cycle start already in the past must move the column to 15, got %+v", users.updates)
+	}
+	if outcome.Corrected != 1 || outcome.Failed != 0 {
+		t.Fatalf("outcome = %+v, want one correction", outcome)
+	}
+}
+
+// TestEveryWriterOfTheColumnBoundsTheHistoryAtToday is the class guard for the
+// pair above. The column has three writers — a day save, a bulk restore and this
+// boot pass — and deriveUserLutealPhase is the single rule all three route
+// through, which is why the today bound lives there rather than in one caller's
+// fetch. Bounding one writer alone would be worse than bounding none: the boot
+// pass would correct the column and the next day save would put the
+// future-dated value straight back.
+//
+// The day-save path is exercised here because it is the one that runs most
+// often; the restore path shares the same derivation call and the compiler now
+// requires an instant from both, so neither can silently drop the bound.
+func TestEveryWriterOfTheColumnBoundsTheHistoryAtToday(t *testing.T) {
+	logs, fourthStart := lutealRecomputeFutureStartLogs(t)
+	assertInferenceSupports(t, logs, 15, true)
+
+	logStore := newDayLogRepositoryStub()
+	for _, entry := range logs {
+		entry.UserID = 10
+		logStore.entries[CalendarDayKey(entry.Date)] = entry
+	}
+	users := &dayUserRepositoryStub{settings: models.User{LutealPhase: 14}}
+	service := NewDayService(logStore, users)
+
+	// Today is the day before the fourth start: the owner recorded it ahead,
+	// exactly as manualCycleStartFutureDays permits.
+	service.refreshDerivedCycleSettings(context.Background(), 10, fourthStart.AddDate(0, 0, -1), time.UTC)
+	if users.settings.LutealPhase != 14 {
+		t.Fatalf("a day save derived luteal_phase = %d from a cycle start recorded ahead, want 14", users.settings.LutealPhase)
+	}
+
+	// Control: once that start is in the past it is observed history and must
+	// move the column, or the bound would be a blanket refusal to read the last
+	// cycle rather than a today bound.
+	service.refreshDerivedCycleSettings(context.Background(), 10, fourthStart.AddDate(0, 0, 1), time.UTC)
+	if users.settings.LutealPhase != 15 {
+		t.Fatalf("a day save after that start has happened derived luteal_phase = %d, want 15", users.settings.LutealPhase)
+	}
+}

@@ -18,7 +18,6 @@ import (
 	"github.com/ovumcy/ovumcy-web/internal/i18n"
 	"github.com/ovumcy/ovumcy-web/internal/models"
 	"github.com/ovumcy/ovumcy-web/internal/services"
-	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
 
@@ -32,7 +31,10 @@ func decodeJSONBody(t *testing.T, body io.Reader, target any) {
 // These regressions pin the no-JS full-page fallback contract: a plain
 // browser form submission (no HX-Request header, no Accept: application/json)
 // must land on a 303 redirect with the outcome carried in the sealed flash
-// cookie, never a bare error body. The HTMX/JSON negotiation paths are pinned
+// cookie, never a bare error body. The exception is a refusal before the
+// handler on the day forms, the usage-goal switch and the cycle settings form,
+// and a validation refusal of a day: it answers a page with a fixed link back
+// and sets no cookie, flash included (pinned in day_form_refusal_page_test.go). The HTMX/JSON negotiation paths are pinned
 // by the per-domain aggregators; only the full-page tails live here.
 
 // newFullPageFallbackApp mirrors newOnboardingTestAppWithOptions but returns
@@ -42,7 +44,7 @@ func newFullPageFallbackApp(t *testing.T, options onboardingTestAppOptions) (*fi
 	t.Helper()
 
 	databasePath := filepath.Join(t.TempDir(), "ovumcy-fullpage-fallback-test.db")
-	database, err := db.OpenSQLite(databasePath)
+	database, err := db.OpenDatabase(db.Config{Driver: db.DriverSQLite, SQLitePath: databasePath})
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
@@ -77,7 +79,7 @@ func newFullPageFallbackApp(t *testing.T, options onboardingTestAppOptions) (*fi
 		return c.JSON(fiber.Map{"state": state.State})
 	})
 	app.Get("/__seed/oidc-stepup", func(c fiber.Ctx) error {
-		userID := uint(fiber.Query[int](c, "user_id", 0))
+		userID := uint(fiber.Query(c, "user_id", 0))
 		state, stateErr := newOIDCStepupState(time.Now(), oidcStepupPurposeLocalPasswordSetup, userID, "prepared-hash")
 		if stateErr != nil {
 			return c.Status(fiber.StatusInternalServerError).SendString(stateErr.Error())
@@ -87,23 +89,14 @@ func newFullPageFallbackApp(t *testing.T, options onboardingTestAppOptions) (*fi
 		}
 		return c.SendStatus(fiber.StatusOK)
 	})
-	app.Get("/__seed/link-pending", func(c fiber.Ctx) error {
-		userID := uint(fiber.Query[int](c, "user_id", 0))
-		payload, payloadErr := newOIDCLinkPendingPayload(time.Now(), userID, "https://issuer.example.com", "subject-1", c.Query("email", ""))
-		if payloadErr != nil {
-			return c.Status(fiber.StatusInternalServerError).SendString(payloadErr.Error())
-		}
-		if err := handler.setOIDCLinkPendingCookie(c, payload); err != nil {
-			return c.Status(fiber.StatusInternalServerError).SendString(err.Error())
-		}
-		return c.SendStatus(fiber.StatusOK)
-	})
 	app.Get("/__seed/logout-bridge", func(c fiber.Ctx) error {
 		sessionID := c.Query("sid", "")
-		if err := handler.oidcLogoutStateSvc.Save(c.Context(), sessionID, services.OIDCLogoutState{}, time.Now()); err != nil {
+		ownerID := uint(fiber.Query(c, "user_id", 1))
+		state := services.OIDCLogoutState{UserID: ownerID}
+		if err := handler.oidcLogoutStateSvc.Save(c.Context(), sessionID, state, time.Now()); err != nil {
 			return c.Status(fiber.StatusInternalServerError).SendString(err.Error())
 		}
-		if err := handler.setOIDCLogoutBridgeCookie(c, sessionID, time.Now()); err != nil {
+		if err := handler.setOIDCLogoutBridgeCookie(c, sessionID, ownerID, time.Now()); err != nil {
 			return c.Status(fiber.StatusInternalServerError).SendString(err.Error())
 		}
 		return c.SendStatus(fiber.StatusOK)
@@ -414,40 +407,6 @@ func TestFullPageFallbackStepupRedirects(t *testing.T) {
 	})
 }
 
-func TestFullPageFallbackLinkConfirmRejectsUnsupportedRoleTarget(t *testing.T) {
-	// A legacy non-owner target never reaches identity linking: the shared
-	// LoginService password gate refuses unsupported roles, so the submission
-	// bounces back to the link-confirm form (enumeration-safe retry) and no
-	// session or link is created.
-	stub := &stubOIDCWorkflowService{enabled: true, localPublicAuthEnabled: true}
-	app, database, _ := newFullPageFallbackApp(t, onboardingTestAppOptions{oidcService: stub, cookieSecure: true})
-
-	passwordHash, err := bcrypt.GenerateFromPassword([]byte("StrongPass1"), bcrypt.MinCost)
-	if err != nil {
-		t.Fatalf("hash password: %v", err)
-	}
-	legacy := models.User{
-		Email:               "fullpage-link-partner@example.com",
-		PasswordHash:        string(passwordHash),
-		LocalAuthEnabled:    true,
-		Role:                "partner",
-		OnboardingCompleted: true,
-		CycleLength:         28,
-		PeriodLength:        5,
-		CreatedAt:           time.Now().UTC(),
-	}
-	if err := database.Create(&legacy).Error; err != nil {
-		t.Fatalf("create partner user: %v", err)
-	}
-
-	pendingCookie, seedResponse := seedCookieHeader(t, app, "/__seed/link-pending?user_id="+utoa(legacy.ID)+"&email="+url.QueryEscape(legacy.Email))
-	_ = seedResponse.Body.Close()
-
-	form := url.Values{"password": {"StrongPass1"}}
-	response := fullPageRequest(t, app, http.MethodPost, oidcLinkConfirmPath, form, pendingCookie)
-	assertSeeOther(t, response, oidcLinkConfirmPath)
-}
-
 func TestFullPageFallbackOIDCStartWithoutSecureCookiesRedirects(t *testing.T) {
 	// OIDC boot-requires COOKIE_SECURE=true; a handler wired insecure makes
 	// setOIDCStateCookie refuse, exercising the start handler's fallback tail.
@@ -529,6 +488,97 @@ func TestDaySaveSpottingWarningSetsEncodedNotice(t *testing.T) {
 	}
 	if want := url.QueryEscape(i18nManager.Messages("en")["dashboard.spotting_cycle_warning"]); notice != want {
 		t.Fatalf("expected spotting-cycle warning notice %q, got %q", want, notice)
+	}
+}
+
+// TestDaySaveLongPeriodWarningSetsEncodedNoticeWithKey and its implantation
+// sibling below cover the two notice branches the spotting test above did not
+// reach. Both assert the key header rather than the sentence: which warning
+// fired is the claim, and the copy that expresses it belongs to the catalogue.
+func TestDaySaveLongPeriodWarningSetsEncodedNoticeWithKey(t *testing.T) {
+	app, database := newOnboardingTestApp(t)
+	user := createOnboardingTestUser(t, database, "fullpage-long-period@example.com", "StrongPass1", true)
+	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
+
+	// A streak longer than 8 days ending on the saved day is the documented
+	// ShowLongPeriodWarning recipe: seed the first eight, then save the ninth.
+	todayUTC := services.CalendarDay(time.Now().UTC(), time.UTC)
+	streak := make([]models.DailyLog, 0, 8)
+	for offset := 8; offset >= 1; offset-- {
+		streak = append(streak, models.DailyLog{
+			UserID:   user.ID,
+			Date:     todayUTC.AddDate(0, 0, -offset),
+			IsPeriod: true,
+			Flow:     models.FlowMedium,
+		})
+	}
+	if err := database.Create(&streak).Error; err != nil {
+		t.Fatalf("seed period streak: %v", err)
+	}
+
+	form := url.Values{"is_period": {"true"}, "flow": {string(models.FlowMedium)}}
+	request := httptest.NewRequest(http.MethodPut, "/api/v1/days/"+todayUTC.Format("2006-01-02"), strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("HX-Request", "true")
+	request.Header.Set("Accept-Language", "en")
+	request.Header.Set("Cookie", authCookie)
+
+	response := mustAppResponse(t, app, request)
+	defer func() { _ = response.Body.Close() }()
+	assertStatusCode(t, response, http.StatusOK)
+
+	if got := response.Header.Get("X-Ovumcy-Notice-Key"); got != "dashboard.long_period_warning" {
+		t.Fatalf("expected the long-period warning key, got %q", got)
+	}
+	if response.Header.Get("X-Ovumcy-Notice") == "" {
+		t.Fatal("expected the rendered sentence alongside the key")
+	}
+}
+
+func TestMarkCycleStartImplantationWarningSetsEncodedNoticeWithKey(t *testing.T) {
+	app, database := newOnboardingTestApp(t)
+	user := createOnboardingTestUser(t, database, "fullpage-implantation@example.com", "StrongPass1", true)
+	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
+
+	// Four recorded cycle starts 28 days apart: the warning is counted from a
+	// projected ovulation, so the completed-cycle floor withholds it until three
+	// cycles have completed and observed lengths stand behind the projection.
+	// With that 28-day length the predicted ovulation lands 14 days after the
+	// latest start, and the warning covers a new start 6-12 days past
+	// ovulation, so a latest start 22 days back puts today inside the window.
+	todayUTC := services.CalendarDay(time.Now().UTC(), time.UTC)
+	for _, daysAgo := range []int{106, 78, 50, 22} {
+		previousStart := models.DailyLog{
+			UserID:     user.ID,
+			Date:       todayUTC.AddDate(0, 0, -daysAgo),
+			IsPeriod:   true,
+			CycleStart: true,
+			Flow:       models.FlowMedium,
+		}
+		if err := database.Create(&previousStart).Error; err != nil {
+			t.Fatalf("seed previous cycle start %d days back: %v", daysAgo, err)
+		}
+	}
+
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/days/"+todayUTC.Format("2006-01-02")+"/cycle-start",
+		strings.NewReader(url.Values{"replace_existing": {"true"}}.Encode()),
+	)
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("HX-Request", "true")
+	request.Header.Set("Accept-Language", "en")
+	request.Header.Set("Cookie", authCookie)
+
+	response := mustAppResponse(t, app, request)
+	defer func() { _ = response.Body.Close() }()
+	assertStatusCode(t, response, http.StatusNoContent)
+
+	if got := response.Header.Get("X-Ovumcy-Notice-Key"); got != "dashboard.implantation_warning" {
+		t.Fatalf("expected the implantation warning key, got %q", got)
+	}
+	if response.Header.Get("X-Ovumcy-Notice") == "" {
+		t.Fatal("expected the rendered sentence alongside the key")
 	}
 }
 

@@ -2,6 +2,7 @@ package api
 
 import (
 	"strings"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/ovumcy/ovumcy-web/internal/services"
@@ -27,12 +28,32 @@ import (
 // the full URL into a one-time cookie (calendar_feed_reveal_cookie.go) and
 // redirect to a dedicated reveal page that shows it exactly once, mirroring the
 // recovery-code reveal. Revoke carries no secret. Nothing here logs the token.
+//
+// "Exactly once" is enforced by users.calendar_feed_revealed_at (migration 036),
+// not by the cookie retraction: the mint NULLs the mark in the same write that
+// persists the token, and the reveal page claims it with a compare-and-set. The
+// cookie decides WHICH URL may be shown and the mark decides WHETHER it still
+// may be, so a client that kept the sealed value gains nothing by presenting it
+// again.
 
 var (
 	calendarFeedGenerateMutation = healthMutationKind{action: "settings.calendar_feed_generate", target: "calendar_feed"}
 	calendarFeedRotateMutation   = healthMutationKind{action: "settings.calendar_feed_rotate", target: "calendar_feed"}
 	calendarFeedRevokeMutation   = healthMutationKind{action: "settings.calendar_feed_revoke", target: "calendar_feed"}
 )
+
+// calendarFeedRevealEgress tags the one-time reveal of the subscribe URL. The
+// URL is a standing read-only capability over the owner's predicted cycle, so
+// the audited moment is the one where it reaches a person — the later polls by
+// a calendar client are not per-request audited (a bearer-token route that
+// answers 404 with no oracle would have to log its own refusals to be useful,
+// which is an oracle moved into the log; see docs/security/known-disclosures.md).
+// The one exception, at day granularity, is users.calendar_feed_last_polled_on
+// (migration 040, WEB-46): the owner's calendar day of the most recent
+// successful poll, with no IP, no user agent and no per-request row — an
+// owner-facing signal on the settings card, not an audit log entry. The event
+// below records the fact of the reveal; the URL never enters the line.
+var calendarFeedRevealEgress = healthEgressKind{action: "settings.calendar_feed_reveal", target: "calendar_feed"}
 
 // calendarFeedRevealPath is the dedicated one-time reveal page the generate and
 // rotate handlers redirect to after sealing the subscribe URL.
@@ -94,8 +115,10 @@ func (handler *Handler) issueCalendarFeedToken(c fiber.Ctx, mutation healthMutat
 }
 
 // RevokeCalendarFeed disables the owner's feed by clearing both token columns.
-// Any previously-issued subscribe URL 404s immediately. It carries no secret and
-// returns to /settings with a flash (or JSON status for API clients).
+// Any previously-issued subscribe URL 404s immediately. It carries no secret.
+// The answer is respondEgressMutation's: a JSON status, the whole egress card
+// rebuilt from a read taken after the write for an HTMX caller, or a flash and a
+// redirect to /settings.
 func (handler *Handler) RevokeCalendarFeed(c fiber.Ctx) error {
 	user, ok := currentUser(c)
 	if !ok {
@@ -103,26 +126,23 @@ func (handler *Handler) RevokeCalendarFeed(c fiber.Ctx) error {
 	}
 
 	if err := handler.calendarFeedSettings.RevokeFeedToken(c.Context(), user.ID); err != nil {
-		return handler.failMutation(c, calendarFeedRevokeMutation, settingsCalendarFeedUpdateErrorSpec())
+		return handler.failEgressMutation(c, calendarFeedRevokeMutation, user, settingsCalendarFeedUpdateErrorSpec())
 	}
 
-	status := services.SettingsCalendarFeedRevokedStatus
 	handler.logMutationSuccess(c, calendarFeedRevokeMutation)
-
-	if acceptsJSON(c) {
-		return c.JSON(fiber.Map{"ok": true, "status": status})
-	}
-	if isHTMX(c) {
-		return c.SendString(htmxSettingsSuccessMarkup(c, status, "Calendar feed turned off."))
-	}
-	handler.setFlashCookie(c, FlashPayload{SettingsSuccess: status})
-	return redirectOrJSON(c, "/settings")
+	// The answer is the whole egress block rebuilt from a read taken after this
+	// write, not a toast swapped in beside the sentence the write just made
+	// false. Before the ledger, an HTMX revoke replaced the status island alone
+	// and left "a link is issued" standing next to "the feed was turned off".
+	return handler.respondEgressMutation(c, user, services.SettingsCalendarFeedRevokedStatus)
 }
 
 // ShowCalendarFeedRevealPage renders the subscribe URL exactly once. It reads
-// the sealed one-time reveal cookie, CLEARS it immediately, and shows the URL;
-// on any refresh or later visit the cookie is gone, so it redirects back to
-// /settings and the URL is never shown again.
+// the sealed one-time reveal cookie, CLAIMS the owner's server-side reveal mark,
+// clears the cookie, and shows the URL. A refresh, a later visit, or a replay of
+// the original sealed value finds the mark already claimed and redirects back to
+// /settings, so the URL is never shown again until a generate or rotate mints a
+// new token and re-arms the mark in the same write.
 func (handler *Handler) ShowCalendarFeedRevealPage(c fiber.Ctx) error {
 	user, ok := currentUser(c)
 	if !ok {
@@ -133,8 +153,34 @@ func (handler *Handler) ShowCalendarFeedRevealPage(c fiber.Ctx) error {
 	if state.FeedURL == "" {
 		return c.Redirect().Status(fiber.StatusSeeOther).To("/settings")
 	}
-	// Shown-once: drop the cookie now so a reload cannot re-reveal the URL.
+	// Shown-once is decided HERE, by the server-side consumption mark, not by the
+	// cookie retraction below: a client that kept the sealed value can present it
+	// again on this same session, and a retraction it never obeyed costs it
+	// nothing. The claim is a compare-and-set, so a replay and a concurrent
+	// second reveal both lose and land on /settings — the same place an absent
+	// cookie lands. A claim that errors is refused for the same reason: the mark
+	// is what makes the reveal single-use, and a reveal that cannot record itself
+	// is not single-use. The cost of refusing is one rotation from settings.
+	claimed, err := handler.calendarFeedSettings.ClaimFeedReveal(c.Context(), user.ID, time.Now())
+	if err != nil || !claimed {
+		// Audited on the same action data.export audits its own refusals on. An
+		// operator counting disclosures counts outcome="success"; one asking
+		// whether anybody tried to replay a spent reveal has nothing else to read,
+		// and silence here made the attempt indistinguishable from nobody visiting
+		// at all. The two arms take different outcomes on purpose — a claim that
+		// ERRORED is this side failing, not somebody being refused.
+		if err != nil {
+			handler.logEgressFailure(c, calendarFeedRevealEgress, "reveal_claim_failed") // codecov:ignore -- the claim errors only on a storage fault, which AuthRequired's own user load reaches first
+		} else {
+			handler.logEgressDenied(c, calendarFeedRevealEgress, "reveal_already_claimed")
+		}
+		handler.clearCalendarFeedRevealCookie(c)
+		return c.Redirect().Status(fiber.StatusSeeOther).To("/settings")
+	}
+	// Retract the cookie too: the mark refuses the replay, and this keeps an
+	// unusable value from lingering in the browser.
 	handler.clearCalendarFeedRevealCookie(c)
+	handler.logEgressSuccess(c, calendarFeedRevealEgress)
 
 	return handler.render(c, "calendar_feed_reveal", fiber.Map{
 		"Title":               localizedPageTitle(currentMessages(c), "meta.title.calendar_feed", "Ovumcy | Calendar feed"),
@@ -142,6 +188,29 @@ func (handler *Handler) ShowCalendarFeedRevealPage(c fiber.Ctx) error {
 		"CalendarFeedRotated": state.Rotated,
 		"HideNavigation":      true,
 	})
+}
+
+// refuseCalendarFeedRevealRequest is the first-party guard's exit
+// for GET /settings/calendar-feed: the page's own lost-race exit, back to
+// /settings where the owner can rotate and try again.
+//
+// It deliberately does NOT clear the reveal cookie. Clearing it would hand the
+// forged request the very outcome the guard exists to deny — the owner's one
+// reveal destroyed by someone else's link — where the refusal alone leaves the
+// sealed URL and the unclaimed mark both intact for the owner's own visit.
+// The refusal is audited only when the request carried a reveal cookie at all.
+// A visit with none had nothing to take, and the guard runs BEFORE the handler
+// that would have discovered that — so auditing unconditionally would fill the
+// stream with stray links and prefetches on sessions with no armed feed, and an
+// operator could not tell those from the one line this event exists to carry.
+// Presence is read off the raw cookie, which unseals nothing and decides nothing
+// else: whether the value is any good is still the handler's question, on the
+// owner's own visit.
+func (handler *Handler) refuseCalendarFeedRevealRequest(c fiber.Ctx, reason string) error {
+	if strings.TrimSpace(c.Cookies(calendarFeedRevealCookieName)) != "" {
+		handler.logEgressDenied(c, calendarFeedRevealEgress, reason)
+	}
+	return c.Redirect().Status(fiber.StatusSeeOther).To("/settings")
 }
 
 // calendarFeedSubscribeURL builds the absolute subscribe URL for a freshly
@@ -152,5 +221,5 @@ func (handler *Handler) ShowCalendarFeedRevealPage(c fiber.Ctx) error {
 // here it comes straight from GenerateCalendarFeedToken, so it is URL-path-safe.
 func calendarFeedSubscribeURL(c fiber.Ctx, token string) string {
 	base := strings.TrimRight(c.BaseURL(), "/")
-	return base + "/calendar/feed/" + token + ".ics"
+	return base + CalendarFeedRateLimitPrefix + "/" + token + calendarFeedRouteSuffix
 }

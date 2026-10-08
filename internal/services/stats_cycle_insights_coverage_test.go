@@ -30,6 +30,7 @@ func statscycleinsightsCovLog(t *testing.T, day string, isPeriod bool, symptoms 
 	return models.DailyLog{
 		Date:       statscycleinsightsCovDay(t, day),
 		IsPeriod:   isPeriod,
+		CycleStart: isPeriod,
 		SymptomIDs: symptoms,
 	}
 }
@@ -38,7 +39,7 @@ func statscycleinsightsCovBBTLog(t *testing.T, day string, bbt float64) models.D
 	t.Helper()
 	return models.DailyLog{
 		Date: statscycleinsightsCovDay(t, day),
-		BBT:  models.NewBBT(bbt),
+		BBT:  new(bbt),
 	}
 }
 
@@ -61,7 +62,7 @@ func TestStatsCycleInsightsBuildCompletedCycleSpansSingleStartReturnsNil(t *test
 		statscycleinsightsCovLog(t, "2026-01-01", true),
 		{Date: statscycleinsightsCovDay(t, "2026-01-03"), IsPeriod: false},
 	}
-	spans := buildCompletedCycleSpans(logs, time.UTC)
+	spans := buildCompletedCycleSpans(logs, time.UTC, BoundaryContext{})
 	if spans != nil {
 		t.Fatalf("expected nil with a single cycle start, got %v", spans)
 	}
@@ -75,7 +76,7 @@ func TestStatsCycleInsightsBuildCompletedCycleSpansTwoStartsYieldsOneSpan(t *tes
 		statscycleinsightsCovLog(t, "2026-01-01", true),
 		statscycleinsightsCovLog(t, "2026-01-29", true),
 	}
-	spans := buildCompletedCycleSpans(logs, time.UTC)
+	spans := buildCompletedCycleSpans(logs, time.UTC, BoundaryContext{})
 	if len(spans) != 1 {
 		t.Fatalf("expected exactly one completed span for two starts, got %d", len(spans))
 	}
@@ -96,7 +97,7 @@ func TestStatsCycleInsightsBuildCompletedCycleSpansCountMatchesStarts(t *testing
 		statscycleinsightsCovLog(t, "2026-01-29", true),
 		statscycleinsightsCovLog(t, "2026-02-26", true),
 	}
-	spans := buildCompletedCycleSpans(logs, time.UTC)
+	spans := buildCompletedCycleSpans(logs, time.UTC, BoundaryContext{})
 	if len(spans) != 2 {
 		t.Fatalf("expected two completed spans for three starts, got %d", len(spans))
 	}
@@ -119,7 +120,7 @@ func TestStatsCycleInsightsBuildCompletedCycleSpansPositiveCycleLengthKept(t *te
 		statscycleinsightsCovLog(t, "2026-01-01", true),
 		statscycleinsightsCovLog(t, "2026-01-07", true),
 	}
-	spans := buildCompletedCycleSpans(logs, time.UTC)
+	spans := buildCompletedCycleSpans(logs, time.UTC, BoundaryContext{})
 	if len(spans) != 1 {
 		t.Fatalf("expected one span for a 6-day cycle, got %d", len(spans))
 	}
@@ -142,17 +143,17 @@ func TestStatsCycleInsightsBuildCompletedCycleSpansPeriodLengthDefaultsWhenZero(
 	// IsPeriod=true. Looking at buildCycles: it counts consecutive IsPeriod days
 	// starting at 'start'. If the start log itself is IsPeriod=true, periodLength>=1.
 	// Only when IsPeriod is false at the start does it stay 0.
-	// ObservedCycleStarts uses period clusters so start days always have IsPeriod.
+	// CycleBoundaries uses period clusters so start days always have IsPeriod.
 	// The actual PeriodLength recorded in detectedCycle is therefore always >= 1.
 	// This means line 55 ("if periodLength <= 0") is a defensive guard for future
 	// code and is currently unreachable — marking as equivalent below.
 	// We still verify that the fallback path does not corrupt span output when it
 	// would be reached: we check that a normal span has a non-zero PeriodLength.
 	logs := []models.DailyLog{
-		{Date: statscycleinsightsCovDay(t, "2026-01-01"), IsPeriod: true},
-		{Date: statscycleinsightsCovDay(t, "2026-01-29"), IsPeriod: true},
+		{Date: statscycleinsightsCovDay(t, "2026-01-01"), IsPeriod: true, CycleStart: true},
+		{Date: statscycleinsightsCovDay(t, "2026-01-29"), IsPeriod: true, CycleStart: true},
 	}
-	spans := buildCompletedCycleSpans(logs, time.UTC)
+	spans := buildCompletedCycleSpans(logs, time.UTC, BoundaryContext{})
 	if len(spans) != 1 {
 		t.Fatalf("expected one span, got %d", len(spans))
 	}
@@ -629,7 +630,7 @@ func TestStatsCycleInsightsBBTChartCoverlineAndMarkerFromSharedDetector(t *testi
 		statscycleinsightsCovBBTLog(t, "2026-01-12", 36.55), // ≥ 36.30+0.2
 	}
 
-	chart := buildCurrentCycleBBTChart(stats, logs, now, time.UTC)
+	chart := buildCurrentCycleBBTChart("en", stats, logs, now, time.UTC)
 	if !chart.HasBaseline {
 		t.Fatalf("expected coverline present after a detected shift")
 	}
@@ -642,6 +643,49 @@ func TestStatsCycleInsightsBBTChartCoverlineAndMarkerFromSharedDetector(t *testi
 	// First elevated day = 10 → marker day 9 → zero-based index 8.
 	if chart.MarkerIndex != 8 {
 		t.Fatalf("expected marker index 8 (day 9), got %d", chart.MarkerIndex)
+	}
+}
+
+// TestStatsCycleInsightsBBTChartPointsSpellOutTheDrawnSeries pins the text half
+// of the chart: one point per plotted day, dated by walking the cycle start,
+// and the reading rendered once, here. 36.25 is why it is rendered once — it is
+// exactly representable in binary, so Go (tie to even) prints 36.2 where
+// JavaScript's toFixed (tie up) prints 36.3. Both surfaces read this string, so
+// the table cannot contradict the crosshair beside it.
+func TestStatsCycleInsightsBBTChartPointsSpellOutTheDrawnSeries(t *testing.T) {
+	cycleStart := statscycleinsightsCovDay(t, "2026-01-01")
+	stats := CycleStats{LastPeriodStart: cycleStart}
+	now := statscycleinsightsCovDay(t, "2026-01-14")
+
+	logs := []models.DailyLog{
+		statscycleinsightsCovBBTLog(t, "2026-01-01", 36.20),
+		statscycleinsightsCovBBTLog(t, "2026-01-02", 36.25),
+		statscycleinsightsCovBBTLog(t, "2026-01-03", 36.30),
+		statscycleinsightsCovBBTLog(t, "2026-01-04", 36.22),
+		statscycleinsightsCovBBTLog(t, "2026-01-05", 36.24),
+		// 2026-01-06 unlogged: a gap the chart breaks its line on.
+		statscycleinsightsCovBBTLog(t, "2026-01-07", 36.21),
+	}
+
+	chart := buildCurrentCycleBBTChart("en", stats, logs, now, time.UTC)
+	if len(chart.Points) != len(chart.Labels) {
+		t.Fatalf("expected one point per drawn label (%d), got %d", len(chart.Labels), len(chart.Points))
+	}
+
+	second := chart.Points[1]
+	if second.Day != 2 || second.DayLabel != "2" {
+		t.Fatalf("expected the second point to be cycle day 2, got day %d label %q", second.Day, second.DayLabel)
+	}
+	if second.Date != LocalizedDateShort("en", statscycleinsightsCovDay(t, "2026-01-02")) {
+		t.Fatalf("expected cycle day 2 to be dated from the cycle start, got %q", second.Date)
+	}
+	if !second.HasValue || second.ValueText != "36.2" {
+		t.Fatalf("expected 36.25 to render once, as 36.2, got %q", second.ValueText)
+	}
+
+	gap := chart.Points[5]
+	if gap.HasValue || gap.ValueText != "" {
+		t.Fatalf("expected cycle day 6 to stay an unlogged gap, got %q", gap.ValueText)
 	}
 }
 
@@ -663,7 +707,7 @@ func TestStatsCycleInsightsBBTChartNoShiftHidesCoverlineAndMarker(t *testing.T) 
 		statscycleinsightsCovBBTLog(t, "2026-01-07", 36.31),
 	}
 
-	chart := buildCurrentCycleBBTChart(stats, logs, now, time.UTC)
+	chart := buildCurrentCycleBBTChart("en", stats, logs, now, time.UTC)
 	if len(chart.Labels) == 0 {
 		t.Fatalf("expected chart series rendered with ≥5 recorded values")
 	}

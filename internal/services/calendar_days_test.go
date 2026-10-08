@@ -1,6 +1,8 @@
 package services
 
 import (
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -55,11 +57,37 @@ func TestCalendarLogRange(t *testing.T) {
 	monthStart := time.Date(2026, time.February, 1, 0, 0, 0, 0, time.UTC)
 	from, to := CalendarLogRange(monthStart)
 
-	if from.Format("2006-01-02") != "2025-11-23" {
-		t.Fatalf("expected range start 2025-11-23, got %s", from.Format("2006-01-02"))
+	if from.Format("2006-01-02") != "2025-10-24" {
+		t.Fatalf("expected range start 2025-10-24, got %s", from.Format("2006-01-02"))
 	}
-	if to.Format("2006-01-02") != "2026-05-09" {
-		t.Fatalf("expected range end 2026-05-09, got %s", to.Format("2006-01-02"))
+	if to.Format("2006-01-02") != "2026-06-08" {
+		t.Fatalf("expected range end 2026-06-08, got %s", to.Format("2006-01-02"))
+	}
+}
+
+// A two-day bleeding run straddling the edge of the days the calendar READS (70
+// days before the month) must reach the boundary rule whole: if the load were cut
+// there, its first day would be dropped, the surviving lone day would open no
+// cycle, and the historical pass would lose that start.
+func TestCalendarLogRangeKeepsATwoDayRunStraddlingTheReadEdgeWhole(t *testing.T) {
+	monthStart := time.Date(2026, time.February, 1, 0, 0, 0, 0, time.UTC)
+	from, to := CalendarLogRange(monthStart)
+
+	readEdge := monthStart.AddDate(0, 0, -calendarLogReadDays)
+	run := []models.DailyLog{
+		{Date: readEdge.AddDate(0, 0, -1), IsPeriod: true},
+		{Date: readEdge, IsPeriod: true},
+	}
+	loaded := make([]models.DailyLog, 0, len(run))
+	for _, entry := range run {
+		if !entry.Date.Before(from) && !entry.Date.After(to) {
+			loaded = append(loaded, entry)
+		}
+	}
+
+	starts := CycleBoundaries(loaded, BoundaryContext{})
+	if len(starts) != 1 || !starts[0].Equal(run[0].Date) {
+		t.Fatalf("starts = %v, want the run's first day %s: the load cut the run", starts, run[0].Date.Format("2006-01-02"))
 	}
 }
 
@@ -68,6 +96,10 @@ func TestBuildCalendarDayStatesProjectsOvulationIntoFutureCycles(t *testing.T) {
 	now := time.Date(2026, time.February, 23, 0, 0, 0, 0, time.UTC)
 
 	stats := CycleStats{
+		// CompletedCycleCount lifts the fixture above the completed-cycle floor
+		// (FertilityProjectionSuppressed): these cases pin the window math, not
+		// the tier that withholds a window with too little history behind it.
+		CompletedCycleCount:  3,
 		MedianCycleLength:    28,
 		AveragePeriodLength:  5,
 		LastPeriodStart:      time.Date(2026, time.February, 10, 0, 0, 0, 0, time.UTC),
@@ -99,11 +131,269 @@ func TestBuildCalendarDayStatesProjectsOvulationIntoFutureCycles(t *testing.T) {
 	}
 }
 
+// TestBuildCalendarDayStatesPaintsAProjectedCycleOnTheLastGridDay pins the
+// projection loop's boundary against the shape mismatch a midnight-skipping
+// DST zone creates. In America/Santiago no instant exists at 2026-09-06 00:00,
+// so a cycle anchored on that date starts at 01:00-03 and every cycle chained
+// after it carries the same 01:00 wall clock, while the grid bounds are plain
+// AddDate arithmetic sitting at 00:00. Compared as instants, a projected cycle
+// falling exactly on the last grid day looks like it is past the grid: the
+// loop stops one iteration early and that cycle's predicted-period and
+// fertile markers are never painted. The boundary is a calendar-day question,
+// not an instant one.
+//
+// October 2026 with a Monday week start is the reproducing month: its grid
+// ends on Sunday 2026-11-01, which is 2026-09-06 plus two 28-day cycles. The
+// grid deliberately starts after the transition date — a rendered range that
+// spans a skipped midnight loses a cell to the day loop's own AddDate
+// arithmetic, which is a separate defect this test must not depend on.
+func TestBuildCalendarDayStatesPaintsAProjectedCycleOnTheLastGridDay(t *testing.T) {
+	santiago, err := time.LoadLocation("America/Santiago")
+	if err != nil {
+		t.Fatalf("load America/Santiago: %v", err)
+	}
+
+	user := &models.User{WeekStartsOn: models.WeekStartMonday}
+	monthStart := time.Date(2026, time.October, 1, 0, 0, 0, 0, santiago)
+	now := time.Date(2026, time.October, 20, 15, 0, 0, 0, time.UTC)
+
+	stats := CycleStats{
+		MedianCycleLength:   28,
+		AveragePeriodLength: 5,
+		CurrentCycleDay:     12,
+		LastPeriodStart:     time.Date(2026, time.August, 9, 0, 0, 0, 0, time.UTC),
+		NextPeriodStart:     time.Date(2026, time.September, 6, 0, 0, 0, 0, time.UTC),
+	}
+
+	days := BuildCalendarDayStates(user, monthStart, nil, stats, now, santiago)
+
+	last := days[len(days)-1]
+	if last.DateString != "2026-11-01" {
+		t.Fatalf("expected the grid to end on 2026-11-01, got %s", last.DateString)
+	}
+	if !last.IsPredicted {
+		t.Fatalf("expected the projected cycle starting on the last grid day 2026-11-01 to be painted")
+	}
+
+	// The cycle before it, comfortably inside the grid, must stay painted too.
+	if middle := findCalendarDayStateByDateString(t, days, "2026-10-04"); !middle.IsPredicted {
+		t.Fatalf("expected the projected cycle starting on 2026-10-04 to be painted")
+	}
+}
+
+// expectedCalendarDayKeys lists the ISO keys of the inclusive calendar range
+// [first, last], computed in UTC — a zone with no transitions — so the
+// expectation never inherits the arithmetic it is meant to check.
+func expectedCalendarDayKeys(first time.Time, last time.Time) []string {
+	keys := make([]string, 0, 16)
+	end := dateOnly(last)
+	for day := dateOnly(first); !day.After(end); day = day.AddDate(0, 0, 1) {
+		keys = append(keys, day.Format("2006-01-02"))
+	}
+	return keys
+}
+
+// assertCalendarDayKeySet compares the marked keys as one ordered list, so a
+// dropped day, a repeated one collapsing into its neighbour and a day painted
+// past the range all surface in a single message. It reports rather than
+// aborts: each builder is an independent subject of the same case.
+func assertCalendarDayKeySet(t *testing.T, subject string, actual map[string]bool, expected []string) {
+	t.Helper()
+
+	got := strings.Join(sortedCalendarDayKeys(actual), " ")
+	want := strings.Join(expected, " ")
+	if got != want {
+		t.Errorf("%s: expected calendar days [%s], got [%s]", subject, want, got)
+	}
+}
+
+func sortedCalendarDayKeys(source map[string]bool) []string {
+	keys := make([]string, 0, len(source))
+	for key, marked := range source {
+		if marked {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// TestCalendarRangeBuildersCoverEveryCalendarDayOfTheirRange pins the three
+// builders that write the prediction maps — appendCalendarDateRange,
+// appendPredictedPeriod and appendFertilityWindow — against the shape mismatch
+// a midnight-skipping DST zone creates. Adding 24h-ish increments to an instant
+// and testing that instant against a bound is not calendar-day arithmetic: in
+// America/Santiago (2026-09-06) and America/Havana (2026-03-08) local midnight
+// does not exist, and AddDate resolves the missing wall clock BACKWARD into the
+// previous calendar day. The step then writes that day's key a second time and
+// the range loses a day — the transition day itself for an offset-indexed
+// builder, its own last day for one that walks to a bound.
+//
+// The maps are sets, so a repeat write collapses and the observable damage is
+// the missing day plus the day-count mismatch; the visit ORDER is pinned
+// separately on the shared iterator below.
+func TestCalendarRangeBuildersCoverEveryCalendarDayOfTheirRange(t *testing.T) {
+	testCases := []struct {
+		name  string
+		zone  string
+		first time.Time
+		last  time.Time
+	}{
+		{
+			name:  "santiago range spanning the skipped midnight",
+			zone:  "America/Santiago",
+			first: time.Date(2026, time.September, 3, 0, 0, 0, 0, time.UTC),
+			last:  time.Date(2026, time.September, 9, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			name:  "havana range spanning the skipped midnight",
+			zone:  "America/Havana",
+			first: time.Date(2026, time.March, 5, 0, 0, 0, 0, time.UTC),
+			last:  time.Date(2026, time.March, 11, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			name:  "santiago control month without a transition",
+			zone:  "America/Santiago",
+			first: time.Date(2026, time.November, 3, 0, 0, 0, 0, time.UTC),
+			last:  time.Date(2026, time.November, 9, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			name:  "utc control",
+			zone:  "UTC",
+			first: time.Date(2026, time.September, 3, 0, 0, 0, 0, time.UTC),
+			last:  time.Date(2026, time.September, 9, 0, 0, 0, 0, time.UTC),
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			location, err := time.LoadLocation(testCase.zone)
+			if err != nil {
+				t.Fatalf("load %s: %v", testCase.zone, err)
+			}
+
+			start := CalendarDay(testCase.first, location)
+			end := CalendarDay(testCase.last, location)
+			expected := expectedCalendarDayKeys(testCase.first, testCase.last)
+
+			dateRange := make(map[string]bool)
+			appendCalendarDateRange(dateRange, start, end)
+			assertCalendarDayKeySet(t, "appendCalendarDateRange", dateRange, expected)
+
+			predictedPeriod := make(map[string]bool)
+			appendPredictedPeriod(predictedPeriod, start, len(expected))
+			assertCalendarDayKeySet(t, "appendPredictedPeriod", predictedPeriod, expected)
+
+			// The ovulation date sits on the last day of the window, so the
+			// closing three days are the peak and everything before them the edge.
+			fertilityEdge := make(map[string]bool)
+			fertilityPeak := make(map[string]bool)
+			appendFertilityWindow(fertilityEdge, fertilityPeak, start, end, end)
+
+			window := make(map[string]bool, len(fertilityEdge)+len(fertilityPeak))
+			for key := range fertilityEdge {
+				window[key] = true
+			}
+			for key := range fertilityPeak {
+				if window[key] {
+					t.Fatalf("appendFertilityWindow: %s marked as both edge and peak", key)
+				}
+				window[key] = true
+			}
+			assertCalendarDayKeySet(t, "appendFertilityWindow", window, expected)
+			assertCalendarDayKeySet(t, "appendFertilityWindow peak", fertilityPeak, expected[len(expected)-3:])
+		})
+	}
+}
+
+// TestCalendarDateRangeEndsOnItsLastDayWithMixedMidnightShapes covers the same
+// bound with operands built from different midnights: the projected and
+// historical pre-fertile bands start on a request-location midnight and end on
+// the UTC midnight PredictCycleWindow produces. Compared as instants in any
+// UTC-minus zone, the location-midnight step passes the UTC-midnight bound a
+// few hours early and the band loses its closing day in every month, not only
+// across a transition.
+func TestCalendarDateRangeEndsOnItsLastDayWithMixedMidnightShapes(t *testing.T) {
+	santiago, err := time.LoadLocation("America/Santiago")
+	if err != nil {
+		t.Fatalf("load America/Santiago: %v", err)
+	}
+
+	first := time.Date(2026, time.November, 17, 0, 0, 0, 0, time.UTC)
+	last := time.Date(2026, time.November, 19, 0, 0, 0, 0, time.UTC)
+
+	dateRange := make(map[string]bool)
+	appendCalendarDateRange(dateRange, CalendarDay(first, santiago), dateOnly(last))
+
+	assertCalendarDayKeySet(t, "appendCalendarDateRange", dateRange, expectedCalendarDayKeys(first, last))
+}
+
+// TestForEachCalendarDayVisitsEveryDayOnceInOrder pins the property the three
+// range builders share through their one stepping point: ascending, one visit
+// per calendar day, ending on the range's last day whatever the zone does to
+// the clock inside it. The span deliberately spans both hemispheres' 2026
+// transitions.
+func TestForEachCalendarDayVisitsEveryDayOnceInOrder(t *testing.T) {
+	for _, zone := range []string{"America/Santiago", "America/Havana", "UTC"} {
+		t.Run(zone, func(t *testing.T) {
+			location, err := time.LoadLocation(zone)
+			if err != nil {
+				t.Fatalf("load %s: %v", zone, err)
+			}
+
+			first := time.Date(2026, time.March, 4, 0, 0, 0, 0, time.UTC)
+			expected := expectedCalendarDayKeys(first, time.Date(2026, time.September, 10, 0, 0, 0, 0, time.UTC))
+
+			visited := make([]string, 0, len(expected))
+			forEachCalendarDay(CalendarDay(first, location), len(expected), func(day time.Time) {
+				visited = append(visited, CalendarDayKey(day))
+			})
+
+			if strings.Join(visited, " ") != strings.Join(expected, " ") {
+				t.Fatalf("expected visits [%s], got [%s]", strings.Join(expected, " "), strings.Join(visited, " "))
+			}
+		})
+	}
+}
+
+// TestBuildCalendarDayStatesShadesThePredictedPeriodDayThatSkipsMidnight is the
+// owner-visible half of the same defect: a predicted period running across
+// 2026-09-06 in America/Santiago left that day unshaded on the grid.
+func TestBuildCalendarDayStatesShadesThePredictedPeriodDayThatSkipsMidnight(t *testing.T) {
+	santiago, err := time.LoadLocation("America/Santiago")
+	if err != nil {
+		t.Fatalf("load America/Santiago: %v", err)
+	}
+
+	user := &models.User{WeekStartsOn: models.WeekStartMonday}
+	monthStart := time.Date(2026, time.September, 1, 0, 0, 0, 0, santiago)
+	now := time.Date(2026, time.September, 12, 15, 0, 0, 0, time.UTC)
+
+	stats := CycleStats{
+		MedianCycleLength:   28,
+		AveragePeriodLength: 5,
+		CurrentCycleDay:     10,
+		LastPeriodStart:     CalendarDay(time.Date(2026, time.September, 3, 0, 0, 0, 0, time.UTC), santiago),
+	}
+
+	days := BuildCalendarDayStates(user, monthStart, nil, stats, now, santiago)
+
+	for _, dateString := range []string{"2026-09-03", "2026-09-04", "2026-09-05", "2026-09-06", "2026-09-07"} {
+		if day := findCalendarDayStateByDateString(t, days, dateString); !day.IsPredicted {
+			t.Fatalf("expected predicted period day %s to be shaded, got %#v", dateString, day)
+		}
+	}
+	if day := findCalendarDayStateByDateString(t, days, "2026-09-08"); day.IsPredicted {
+		t.Fatalf("expected 2026-09-08 to sit past the predicted period, got %#v", day)
+	}
+}
+
 func TestBuildCalendarDayStatesIncludesCurrentBaselinePeriodWindow(t *testing.T) {
 	monthStart := time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC)
 	now := time.Date(2026, time.March, 12, 0, 0, 0, 0, time.UTC)
 
 	stats := CycleStats{
+		CompletedCycleCount: 3,
 		AveragePeriodLength: 5,
 		LastPeriodStart:     time.Date(2026, time.March, 8, 0, 0, 0, 0, time.UTC),
 	}
@@ -124,6 +414,88 @@ func TestBuildCalendarDayStatesIncludesCurrentBaselinePeriodWindow(t *testing.T)
 		}
 		if day.IsPredicted || day.IsFertility || day.IsOvulation {
 			t.Fatalf("expected baseline pre-fertile day %s to stay distinct from other prediction states", dateString)
+		}
+	}
+}
+
+// TestBuildCalendarDayStatesMarksThePredictedStartWindow pins the two facts the
+// grid used to render with one shading: the days the next period may START on
+// (the dashboard's "Next period: X — Y") and the projected bleeding days that
+// follow the first of them. The window is the dashboard's own range, so the two
+// surfaces cannot disagree, and it stops at the next cycle.
+func TestBuildCalendarDayStatesMarksThePredictedStartWindow(t *testing.T) {
+	monthStart := time.Date(2026, time.April, 1, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2026, time.March, 20, 0, 0, 0, 0, time.UTC)
+
+	stats := CycleStats{
+		MedianCycleLength:   28,
+		AveragePeriodLength: 5,
+		CompletedCycleCount: 4,
+		CycleLengthStdDev:   2,
+		LastPeriodStart:     time.Date(2026, time.March, 8, 0, 0, 0, 0, time.UTC),
+		NextPeriodStart:     time.Date(2026, time.April, 5, 0, 0, 0, 0, time.UTC),
+	}
+
+	rangeStart, rangeEnd, hasRange := DashboardPredictionRange(nil, stats, stats.NextPeriodStart, time.UTC)
+	if !hasRange || CalendarDayKey(rangeStart) != "2026-04-03" || CalendarDayKey(rangeEnd) != "2026-04-07" {
+		t.Fatalf("test setup expects the dashboard range 2026-04-03..2026-04-07, got %s..%s (hasRange=%t)",
+			CalendarDayKey(rangeStart), CalendarDayKey(rangeEnd), hasRange)
+	}
+
+	days := BuildCalendarDayStates(nil, monthStart, nil, stats, now, time.UTC)
+
+	for _, dateString := range []string{"2026-04-03", "2026-04-04", "2026-04-05", "2026-04-06", "2026-04-07"} {
+		if !findCalendarDayStateByDateString(t, days, dateString).IsPredictedStartWindow {
+			t.Fatalf("expected %s to be marked as a predicted start-window day", dateString)
+		}
+	}
+
+	// Ahead of the window the period has not been projected to start yet, and
+	// past its end the remaining projected bleeding days are a different fact.
+	beforeWindow := findCalendarDayStateByDateString(t, days, "2026-04-02")
+	if beforeWindow.IsPredictedStartWindow || beforeWindow.IsPredicted {
+		t.Fatalf("expected 2026-04-02 to carry no period projection, got %#v", beforeWindow)
+	}
+
+	afterWindow := findCalendarDayStateByDateString(t, days, "2026-04-08")
+	if afterWindow.IsPredictedStartWindow {
+		t.Fatalf("expected 2026-04-08 to sit outside the start window, got %#v", afterWindow)
+	}
+	if !afterWindow.IsPredicted {
+		t.Fatalf("expected 2026-04-08 to stay a projected period day, got %#v", afterWindow)
+	}
+
+	// The cycle chained after the next one is a projection of a projection: it
+	// keeps the plain projected shading and gets no window of its own.
+	mayDays := BuildCalendarDayStates(nil, time.Date(2026, time.May, 1, 0, 0, 0, 0, time.UTC), nil, stats, now, time.UTC)
+	chained := findCalendarDayStateByDateString(t, mayDays, "2026-05-03")
+	if !chained.IsPredicted || chained.IsPredictedStartWindow {
+		t.Fatalf("expected the chained cycle on 2026-05-03 to stay a plain projected period day, got %#v", chained)
+	}
+}
+
+// A start window is a projection, so it follows every suppression the other
+// projected states follow — including the one that empties the grid entirely.
+func TestBuildCalendarDayStatesWithholdsTheStartWindowWhenPredictionsAreOff(t *testing.T) {
+	monthStart := time.Date(2026, time.April, 1, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2026, time.March, 20, 0, 0, 0, 0, time.UTC)
+	user := &models.User{Role: models.RoleOwner, UnpredictableCycle: true}
+
+	stats := CycleStats{
+		MedianCycleLength:   28,
+		AveragePeriodLength: 5,
+		CompletedCycleCount: 4,
+		CycleLengthStdDev:   2,
+		LastPeriodStart:     time.Date(2026, time.March, 8, 0, 0, 0, 0, time.UTC),
+		NextPeriodStart:     time.Date(2026, time.April, 5, 0, 0, 0, 0, time.UTC),
+	}
+
+	days := BuildCalendarDayStates(user, monthStart, nil, stats, now, time.UTC)
+
+	for _, dateString := range []string{"2026-04-03", "2026-04-05", "2026-04-07"} {
+		day := findCalendarDayStateByDateString(t, days, dateString)
+		if day.IsPredictedStartWindow || day.IsPredicted {
+			t.Fatalf("unpredictable-cycle mode must paint no period projection on %s, got %#v", dateString, day)
 		}
 	}
 }
@@ -186,6 +558,98 @@ func TestBuildCalendarDayStatesSuppressesPredictionsWhenPregnancyPaused(t *testi
 	}
 }
 
+// overdueCalendarLogs is a stable 28-day history ending 2026-02-26: four logged
+// cycle starts a cycle apart, so the observed average and median are both 28 and
+// stats.NextPeriodStart lands on 2026-03-26.
+func overdueCalendarLogs() []models.DailyLog {
+	logs := make([]models.DailyLog, 0, 4)
+	for _, day := range []time.Time{
+		time.Date(2025, time.December, 4, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, time.January, 29, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, time.February, 26, 0, 0, 0, 0, time.UTC),
+	} {
+		logs = append(logs, models.DailyLog{Date: day, IsPeriod: true, CycleStart: true})
+	}
+	return logs
+}
+
+// TestBuildCalendarDayStatesSuppressesPredictionsForOverdueCycle covers the third
+// medical-safety gate on the grid, and the shading it withheld is the strangest
+// of the three surfaces.
+//
+// appendPredictedCycles chains from stats.NextPeriodStart, which is NOT rolled
+// forward: with the last logged cycle start on 2026-02-26 it stays 2026-03-26
+// even once "today" is 2026-04-20. So an overdue account saw a predicted period
+// painted in the PAST — on days that came and went with no period logged — and
+// then a phantom window every cycle length after it, indefinitely. Both are
+// asserted here, in the month each falls in, against a same-account control on a
+// date inside the reference length.
+func TestBuildCalendarDayStatesSuppressesPredictionsForOverdueCycle(t *testing.T) {
+	user := &models.User{Role: models.RoleOwner, CycleLength: 28, PeriodLength: 5, LutealPhase: 14}
+	logs := overdueCalendarLogs()
+	march := time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC)
+	april := time.Date(2026, time.April, 1, 0, 0, 0, 0, time.UTC)
+
+	statsAt := func(now time.Time) CycleStats {
+		return NewStatsService(nil, nil).BuildCycleStatsFromLogs(user, logs, now, time.UTC)
+	}
+
+	t.Run("a cycle inside its reference length still paints its prediction", func(t *testing.T) {
+		now := time.Date(2026, time.March, 23, 0, 0, 0, 0, time.UTC)
+		stats := statsAt(now)
+		if DashboardCycleOverdue(user, stats) {
+			t.Fatalf("control must not be overdue: cycle day %d against reference %d",
+				stats.CurrentCycleDay, DashboardCycleReferenceLength(user, stats))
+		}
+
+		days := BuildCalendarDayStates(user, march, logs, stats, now, time.UTC)
+		if !findCalendarDayStateByDateString(t, days, "2026-03-26").IsPredicted {
+			t.Fatalf("expected the predicted period on 2026-03-26 for a cycle inside its reference length")
+		}
+	})
+
+	t.Run("an overdue cycle paints no prediction, past or future", func(t *testing.T) {
+		now := time.Date(2026, time.April, 20, 0, 0, 0, 0, time.UTC)
+		stats := statsAt(now)
+		if !DashboardCycleOverdue(user, stats) {
+			t.Fatalf("test setup expects an overdue cycle: cycle day %d against reference %d",
+				stats.CurrentCycleDay, DashboardCycleReferenceLength(user, stats))
+		}
+		if got := CalendarDayKey(stats.NextPeriodStart); got != "2026-03-26" {
+			t.Fatalf("test setup expects the un-rolled next period start 2026-03-26, got %s", got)
+		}
+
+		// The past-painted period: 2026-03-26 is behind "today" and no period was
+		// ever logged there.
+		marchDays := BuildCalendarDayStates(user, march, logs, stats, now, time.UTC)
+		pastPainted := findCalendarDayStateByDateString(t, marchDays, "2026-03-26")
+		if pastPainted.IsPredicted {
+			t.Fatalf("an overdue cycle must not paint a predicted period in the past, got %#v", pastPainted)
+		}
+		if pastPainted.IsPredictedStartWindow || pastPainted.IsPreFertile || pastPainted.IsFertility || pastPainted.IsOvulation || pastPainted.IsTentativeOvulation {
+			t.Fatalf("an overdue cycle must not paint any prediction state on 2026-03-26, got %#v", pastPainted)
+		}
+
+		// The phantom future window, one projected cycle further on.
+		aprilDays := BuildCalendarDayStates(user, april, logs, stats, now, time.UTC)
+		for _, dateString := range []string{"2026-04-09", "2026-04-23"} {
+			day := findCalendarDayStateByDateString(t, aprilDays, dateString)
+			if day.IsPredicted || day.IsPredictedStartWindow || day.IsPreFertile || day.IsFertility || day.IsOvulation || day.IsTentativeOvulation {
+				t.Fatalf("an overdue cycle must not paint a projected window on %s, got %#v", dateString, day)
+			}
+		}
+
+		// Recorded facts are untouched: the logged cycle start still reads as a
+		// period day with data.
+		februaryDays := BuildCalendarDayStates(user, time.Date(2026, time.February, 1, 0, 0, 0, 0, time.UTC), logs, stats, now, time.UTC)
+		logged := findCalendarDayStateByDateString(t, februaryDays, "2026-02-26")
+		if !logged.IsPeriod || !logged.HasData {
+			t.Fatalf("suppression must leave recorded facts alone, got %#v", logged)
+		}
+	})
+}
+
 func TestBuildCalendarDayStatesOpensEditDirectlyForFutureEmptyDays(t *testing.T) {
 	monthStart := time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC)
 	now := time.Date(2026, time.March, 12, 0, 0, 0, 0, time.UTC)
@@ -203,17 +667,18 @@ func TestBuildCalendarDayStatesMarksTentativeOvulationWhenBBTHasNoShift(t *testi
 	now := time.Date(2026, time.March, 14, 0, 0, 0, 0, time.UTC)
 
 	logs := []models.DailyLog{
-		{Date: time.Date(2026, time.March, 1, 7, 0, 0, 0, time.UTC), BBT: models.NewBBT(36.40)},
-		{Date: time.Date(2026, time.March, 2, 7, 0, 0, 0, time.UTC), BBT: models.NewBBT(36.42)},
-		{Date: time.Date(2026, time.March, 3, 7, 0, 0, 0, time.UTC), BBT: models.NewBBT(36.41)},
-		{Date: time.Date(2026, time.March, 4, 7, 0, 0, 0, time.UTC), BBT: models.NewBBT(36.39)},
-		{Date: time.Date(2026, time.March, 5, 7, 0, 0, 0, time.UTC), BBT: models.NewBBT(36.43)},
-		{Date: time.Date(2026, time.March, 6, 7, 0, 0, 0, time.UTC), BBT: models.NewBBT(36.44)},
-		{Date: time.Date(2026, time.March, 7, 7, 0, 0, 0, time.UTC), BBT: models.NewBBT(36.45)},
-		{Date: time.Date(2026, time.March, 8, 7, 0, 0, 0, time.UTC), BBT: models.NewBBT(36.43)},
+		{Date: time.Date(2026, time.March, 1, 7, 0, 0, 0, time.UTC), BBT: new(36.40)},
+		{Date: time.Date(2026, time.March, 2, 7, 0, 0, 0, time.UTC), BBT: new(36.42)},
+		{Date: time.Date(2026, time.March, 3, 7, 0, 0, 0, time.UTC), BBT: new(36.41)},
+		{Date: time.Date(2026, time.March, 4, 7, 0, 0, 0, time.UTC), BBT: new(36.39)},
+		{Date: time.Date(2026, time.March, 5, 7, 0, 0, 0, time.UTC), BBT: new(36.43)},
+		{Date: time.Date(2026, time.March, 6, 7, 0, 0, 0, time.UTC), BBT: new(36.44)},
+		{Date: time.Date(2026, time.March, 7, 7, 0, 0, 0, time.UTC), BBT: new(36.45)},
+		{Date: time.Date(2026, time.March, 8, 7, 0, 0, 0, time.UTC), BBT: new(36.43)},
 	}
 
 	stats := CycleStats{
+		CompletedCycleCount:  3,
 		LastPeriodStart:      time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC),
 		NextPeriodStart:      time.Date(2026, time.March, 29, 0, 0, 0, 0, time.UTC),
 		OvulationDate:        time.Date(2026, time.March, 15, 0, 0, 0, 0, time.UTC),
@@ -252,9 +717,10 @@ func TestBuildCalendarDayStatesKeepsBBTDemotedDashInGridOnEveryRunDate(t *testin
 		todayKey := today.Format("2006-01-02")
 		cycleStart := today.AddDate(0, 0, -13)
 		stats := CycleStats{
-			LastPeriodStart: cycleStart,
-			OvulationDate:   today,
-			NextPeriodStart: cycleStart.AddDate(0, 0, 28),
+			CompletedCycleCount: 3,
+			LastPeriodStart:     cycleStart,
+			OvulationDate:       today,
+			NextPeriodStart:     cycleStart.AddDate(0, 0, 28),
 		}
 		monthStart := time.Date(today.Year(), today.Month(), 1, 0, 0, 0, 0, location)
 
@@ -293,6 +759,7 @@ func TestBuildCalendarDayStatesSeparatesFertilityEdgeAndPeak(t *testing.T) {
 	now := time.Date(2026, time.March, 12, 0, 0, 0, 0, time.UTC)
 
 	stats := CycleStats{
+		CompletedCycleCount:  3,
 		LastPeriodStart:      time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC),
 		NextPeriodStart:      time.Date(2026, time.March, 29, 0, 0, 0, 0, time.UTC),
 		OvulationDate:        time.Date(2026, time.March, 15, 0, 0, 0, 0, time.UTC),
@@ -318,24 +785,31 @@ func TestBuildCalendarDayStatesSeparatesFertilityEdgeAndPeak(t *testing.T) {
 	}
 }
 
+// This fixture's projected ovulation day and the detector's confirmed day are
+// the SAME date (Mar 15), so it says only that a shift leaves a solid marker
+// standing somewhere — it cannot see which of the two days carries it. The day
+// the marker lands on is pinned by
+// TestBuildCalendarDayStatesMovesConfirmedOvulationToTheDetectorsDay below,
+// whose two dates differ on purpose.
 func TestBuildCalendarDayStatesKeepsConfirmedOvulationWhenBBTHasShift(t *testing.T) {
 	monthStart := time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC)
 	now := time.Date(2026, time.March, 18, 0, 0, 0, 0, time.UTC)
 
 	logs := []models.DailyLog{
 		// 6-day coverline window (max 36.43), then a 3-day rise Mar16-18.
-		{Date: time.Date(2026, time.March, 10, 7, 0, 0, 0, time.UTC), BBT: models.NewBBT(36.40)},
-		{Date: time.Date(2026, time.March, 11, 7, 0, 0, 0, time.UTC), BBT: models.NewBBT(36.42)},
-		{Date: time.Date(2026, time.March, 12, 7, 0, 0, 0, time.UTC), BBT: models.NewBBT(36.41)},
-		{Date: time.Date(2026, time.March, 13, 7, 0, 0, 0, time.UTC), BBT: models.NewBBT(36.39)},
-		{Date: time.Date(2026, time.March, 14, 7, 0, 0, 0, time.UTC), BBT: models.NewBBT(36.43)},
-		{Date: time.Date(2026, time.March, 15, 7, 0, 0, 0, time.UTC), BBT: models.NewBBT(36.42)},
-		{Date: time.Date(2026, time.March, 16, 7, 0, 0, 0, time.UTC), BBT: models.NewBBT(36.66)},
-		{Date: time.Date(2026, time.March, 17, 7, 0, 0, 0, time.UTC), BBT: models.NewBBT(36.67)},
-		{Date: time.Date(2026, time.March, 18, 7, 0, 0, 0, time.UTC), BBT: models.NewBBT(36.69)},
+		{Date: time.Date(2026, time.March, 10, 7, 0, 0, 0, time.UTC), BBT: new(36.40)},
+		{Date: time.Date(2026, time.March, 11, 7, 0, 0, 0, time.UTC), BBT: new(36.42)},
+		{Date: time.Date(2026, time.March, 12, 7, 0, 0, 0, time.UTC), BBT: new(36.41)},
+		{Date: time.Date(2026, time.March, 13, 7, 0, 0, 0, time.UTC), BBT: new(36.39)},
+		{Date: time.Date(2026, time.March, 14, 7, 0, 0, 0, time.UTC), BBT: new(36.43)},
+		{Date: time.Date(2026, time.March, 15, 7, 0, 0, 0, time.UTC), BBT: new(36.42)},
+		{Date: time.Date(2026, time.March, 16, 7, 0, 0, 0, time.UTC), BBT: new(36.66)},
+		{Date: time.Date(2026, time.March, 17, 7, 0, 0, 0, time.UTC), BBT: new(36.67)},
+		{Date: time.Date(2026, time.March, 18, 7, 0, 0, 0, time.UTC), BBT: new(36.69)},
 	}
 
 	stats := CycleStats{
+		CompletedCycleCount:  1,
 		LastPeriodStart:      time.Date(2026, time.March, 10, 0, 0, 0, 0, time.UTC),
 		NextPeriodStart:      time.Date(2026, time.April, 7, 0, 0, 0, 0, time.UTC),
 		OvulationDate:        time.Date(2026, time.March, 15, 0, 0, 0, 0, time.UTC),
@@ -351,6 +825,72 @@ func TestBuildCalendarDayStatesKeepsConfirmedOvulationWhenBBTHasShift(t *testing
 	}
 	if ovulationDay.IsTentativeOvulation {
 		t.Fatalf("expected tentative ovulation marker to stay off when BBT shift exists")
+	}
+}
+
+// A detected BBT shift confirms an ovulation that already happened, so the grid
+// must mark the day the shared 3-over-6 detector named — not the day the model
+// projected before the temperatures arrived. The two surfaces that read one
+// detector are checked against each other here: the calendar's solid marker and
+// the stats chart's marker index.
+func TestBuildCalendarDayStatesMovesConfirmedOvulationToTheDetectorsDay(t *testing.T) {
+	monthStart := time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC)
+	cycleStart := time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2026, time.March, 20, 0, 0, 0, 0, time.UTC)
+
+	// Cycle day 1 is Mar 1, so a 28-day cycle with a 14-day luteal phase projects
+	// ovulation onto cycle day 14 (Mar 14). The recorded temperatures put the
+	// 3-over-6 shift on cycle days 18-20 (Mar 18-20), which confirms cycle day 17
+	// (Mar 17) — three days off the projection, on purpose.
+	logs := []models.DailyLog{
+		// 6-day coverline window (max 36.43) on cycle days 12-17.
+		{Date: time.Date(2026, time.March, 12, 7, 0, 0, 0, time.UTC), BBT: new(36.40)},
+		{Date: time.Date(2026, time.March, 13, 7, 0, 0, 0, time.UTC), BBT: new(36.42)},
+		{Date: time.Date(2026, time.March, 14, 7, 0, 0, 0, time.UTC), BBT: new(36.41)},
+		{Date: time.Date(2026, time.March, 15, 7, 0, 0, 0, time.UTC), BBT: new(36.39)},
+		{Date: time.Date(2026, time.March, 16, 7, 0, 0, 0, time.UTC), BBT: new(36.43)},
+		{Date: time.Date(2026, time.March, 17, 7, 0, 0, 0, time.UTC), BBT: new(36.42)},
+		// Three-day rise, the third at least 0.2 °C over the coverline.
+		{Date: time.Date(2026, time.March, 18, 7, 0, 0, 0, time.UTC), BBT: new(36.66)},
+		{Date: time.Date(2026, time.March, 19, 7, 0, 0, 0, time.UTC), BBT: new(36.67)},
+		{Date: time.Date(2026, time.March, 20, 7, 0, 0, 0, time.UTC), BBT: new(36.69)},
+	}
+
+	stats := CycleStats{
+		CompletedCycleCount:  1,
+		LastPeriodStart:      cycleStart,
+		NextPeriodStart:      time.Date(2026, time.March, 29, 0, 0, 0, 0, time.UTC),
+		OvulationDate:        time.Date(2026, time.March, 14, 0, 0, 0, 0, time.UTC),
+		FertilityWindowStart: time.Date(2026, time.March, 9, 0, 0, 0, 0, time.UTC),
+		FertilityWindowEnd:   time.Date(2026, time.March, 14, 0, 0, 0, 0, time.UTC),
+	}
+
+	days := BuildCalendarDayStates(&models.User{TrackBBT: true}, monthStart, logs, stats, now, time.UTC)
+
+	confirmedDay := findCalendarDayStateByDateString(t, days, "2026-03-17")
+	if !confirmedDay.IsOvulation {
+		t.Fatalf("expected the detector's day to carry the solid ovulation marker, got %#v", confirmedDay)
+	}
+	if confirmedDay.IsTentativeOvulation {
+		t.Fatalf("expected the confirmed day to be solid, not tentative, got %#v", confirmedDay)
+	}
+
+	projectedDay := findCalendarDayStateByDateString(t, days, "2026-03-14")
+	if projectedDay.IsOvulation {
+		t.Fatalf("expected the superseded projection to lose the ovulation marker, got %#v", projectedDay)
+	}
+	if projectedDay.IsTentativeOvulation {
+		t.Fatalf("expected the superseded projection to carry no ovulation marker at all, got %#v", projectedDay)
+	}
+
+	// Same logs, same detector: the stats chart marker must name the same day.
+	chart := buildCurrentCycleBBTChart("en", stats, logs, now, time.UTC)
+	if !chart.HasMarker {
+		t.Fatalf("expected the stats chart to carry a marker for the same logs")
+	}
+	chartMarkerDate := CalendarDayKey(cycleStart.AddDate(0, 0, chart.MarkerIndex))
+	if chartMarkerDate != "2026-03-17" {
+		t.Fatalf("stats chart marker is on %s, calendar marker on 2026-03-17", chartMarkerDate)
 	}
 }
 
@@ -424,5 +964,397 @@ func TestBuildCalendarDayStatesHidesHistoricalFertileWindowsByDefault(t *testing
 		if day.IsFertility || day.IsOvulation {
 			t.Fatalf("expected no historical fertility paint on %s when toggle is off, got %#v", dateString, day)
 		}
+	}
+}
+
+// TestBuildCalendarDayStatesEmitsEveryCalendarDayOnce pins the grid's own
+// shape invariant, independent of anything painted on it: one cell per
+// calendar day of the grid range, in ascending order, no day repeated, and
+// both the first and the last day of the range present.
+//
+// The zones that break it are the UTC-minus ones whose DST jump lands on
+// midnight — America/Santiago on 2026-09-06, America/Havana on 2026-03-08.
+// No instant exists at 00:00 local on those dates, and stepping the grid with
+// plain AddDate resolved the missing midnight BACKWARD into the previous
+// calendar day: that day was emitted twice, every later step carried its 23:00
+// wall clock, and the instant-valued loop bound then stopped one step early so
+// the last day of the range never rendered. The two controls — the same zone
+// in a month nowhere near a transition, and UTC — hold the ordinary path.
+func TestBuildCalendarDayStatesEmitsEveryCalendarDayOnce(t *testing.T) {
+	santiago, err := time.LoadLocation("America/Santiago")
+	if err != nil {
+		t.Fatalf("load America/Santiago: %v", err)
+	}
+	havana, err := time.LoadLocation("America/Havana")
+	if err != nil {
+		t.Fatalf("load America/Havana: %v", err)
+	}
+
+	testCases := []struct {
+		name       string
+		location   *time.Location
+		weekStart  string
+		year       int
+		month      time.Month
+		firstDay   string
+		lastDay    string
+		crossesDST string
+	}{
+		{
+			name:       "santiago september crosses a skipped midnight",
+			location:   santiago,
+			weekStart:  models.WeekStartSunday,
+			year:       2026,
+			month:      time.September,
+			firstDay:   "2026-08-30",
+			lastDay:    "2026-10-03",
+			crossesDST: "2026-09-06",
+		},
+		{
+			name:       "santiago september with a monday week start",
+			location:   santiago,
+			weekStart:  models.WeekStartMonday,
+			year:       2026,
+			month:      time.September,
+			firstDay:   "2026-08-31",
+			lastDay:    "2026-10-04",
+			crossesDST: "2026-09-06",
+		},
+		{
+			name:       "havana march crosses a skipped midnight",
+			location:   havana,
+			weekStart:  models.WeekStartSunday,
+			year:       2026,
+			month:      time.March,
+			firstDay:   "2026-03-01",
+			lastDay:    "2026-04-04",
+			crossesDST: "2026-03-08",
+		},
+		{
+			name:      "control: santiago november, no transition in range",
+			location:  santiago,
+			weekStart: models.WeekStartSunday,
+			year:      2026,
+			month:     time.November,
+			firstDay:  "2026-11-01",
+			lastDay:   "2026-12-05",
+		},
+		{
+			name:      "control: utc september",
+			location:  time.UTC,
+			weekStart: models.WeekStartSunday,
+			year:      2026,
+			month:     time.September,
+			firstDay:  "2026-08-30",
+			lastDay:   "2026-10-03",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			user := &models.User{WeekStartsOn: testCase.weekStart}
+			monthStart := time.Date(testCase.year, testCase.month, 1, 0, 0, 0, 0, testCase.location)
+			now := time.Date(testCase.year, testCase.month, 15, 12, 0, 0, 0, time.UTC)
+
+			days := BuildCalendarDayStates(user, monthStart, nil, CycleStats{}, now, testCase.location)
+
+			assertCalendarGridCoversEachDayOnce(t, days, testCase.firstDay, testCase.lastDay)
+
+			if testCase.crossesDST != "" {
+				// The transition date itself must be one of the cells: it is the
+				// day the broken step resolved backward and never emitted.
+				findCalendarDayStateByDateString(t, days, testCase.crossesDST)
+			}
+		})
+	}
+}
+
+// assertCalendarGridCoversEachDayOnce checks the grid emits exactly the
+// calendar days of [firstDay, lastDay], one cell each, in ascending order. The
+// per-cell comparison is what names the culprit: it reports the first cell
+// whose date is not the one the calendar demands, which is the repeated day.
+func assertCalendarGridCoversEachDayOnce(t *testing.T, days []CalendarDayState, firstDay string, lastDay string) {
+	t.Helper()
+
+	first, err := time.Parse("2006-01-02", firstDay)
+	if err != nil {
+		t.Fatalf("parse first grid day %s: %v", firstDay, err)
+	}
+	last, err := time.Parse("2006-01-02", lastDay)
+	if err != nil {
+		t.Fatalf("parse last grid day %s: %v", lastDay, err)
+	}
+
+	wantCount := CalendarDaysBetween(first, last) + 1
+	if len(days) != wantCount {
+		t.Fatalf("grid cell count: want %d (%s..%s), got %d", wantCount, firstDay, lastDay, len(days))
+	}
+
+	seen := make(map[string]int, len(days))
+	for index, day := range days {
+		want := first.AddDate(0, 0, index).Format("2006-01-02")
+		if day.DateString != want {
+			t.Fatalf("grid cell %d: want %s, got %s — the grid must run in ascending calendar-day order with no day repeated", index, want, day.DateString)
+		}
+		if got := day.Date.Format("2006-01-02"); got != day.DateString {
+			t.Fatalf("grid cell %d: Date %s disagrees with DateString %s", index, got, day.DateString)
+		}
+		if day.Day != day.Date.Day() {
+			t.Fatalf("grid cell %d (%s): Day %d disagrees with its own date", index, day.DateString, day.Day)
+		}
+		seen[day.DateString]++
+	}
+
+	for _, day := range days {
+		if seen[day.DateString] > 1 {
+			t.Fatalf("grid repeats %s %d times", day.DateString, seen[day.DateString])
+		}
+	}
+
+	if days[len(days)-1].DateString != lastDay {
+		t.Fatalf("last grid day: want %s, got %s", lastDay, days[len(days)-1].DateString)
+	}
+}
+
+// TestBuildCalendarDayStatesStopsThePeriodBandAtTheOvulationDay pins the grid's
+// half of "the published day wins": the projected period band is drawn from the
+// owner's AVERAGE period length, and an owner with a long average period and a
+// short cycle has that band reach over the very day the same grid marks as the
+// ovulation and shades as fertile. One cell then carried the expected-bleeding
+// shading, the fertile shading and the ovulation marker at once. The band now
+// ends the day before the published ovulation day; the days before it are
+// unaffected, and a day the owner logged bleeding on is drawn from the log.
+func TestBuildCalendarDayStatesStopsThePeriodBandAtTheOvulationDay(t *testing.T) {
+	monthStart := time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2026, time.March, 6, 0, 0, 0, 0, time.UTC)
+
+	stats := CycleStats{
+		CompletedCycleCount:  3,
+		MedianCycleLength:    21,
+		AverageCycleLength:   21,
+		AveragePeriodLength:  10,
+		LastPeriodStart:      time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC),
+		NextPeriodStart:      time.Date(2026, time.March, 22, 0, 0, 0, 0, time.UTC),
+		OvulationDate:        time.Date(2026, time.March, 6, 0, 0, 0, 0, time.UTC),
+		FertilityWindowStart: time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC),
+		FertilityWindowEnd:   time.Date(2026, time.March, 6, 0, 0, 0, 0, time.UTC),
+	}
+
+	days := BuildCalendarDayStates(nil, monthStart, nil, stats, now, time.UTC)
+
+	ovulationDay := findCalendarDayStateByDateString(t, days, "2026-03-06")
+	if !ovulationDay.IsOvulation {
+		t.Fatalf("fixture: the grid must mark 2026-03-06 as the ovulation day")
+	}
+	if ovulationDay.IsPredicted {
+		t.Fatalf("the ovulation day must not also be shaded as an expected period day")
+	}
+	for _, dateString := range []string{"2026-03-07", "2026-03-08", "2026-03-09", "2026-03-10"} {
+		if day := findCalendarDayStateByDateString(t, days, dateString); day.IsPredicted {
+			t.Fatalf("%s: the projected period band must end before the published ovulation day, not run past it", dateString)
+		}
+	}
+	if day := findCalendarDayStateByDateString(t, days, "2026-03-03"); !day.IsPredicted {
+		t.Fatalf("2026-03-03: the clamp shortens the projected period band, it does not remove it")
+	}
+}
+
+// TestBuildCalendarDayStatesMarksTheOverlapOfTheBandAndTheWindow is the other
+// half of the case the clamp above only narrowed. Clamping the band at the
+// ovulation day leaves the days BEFORE it carrying both statements at once: the
+// projected period band and the fertile window are true on the same cell, which
+// is what a short cycle with a long average period produces and what a
+// bleeding-inside-the-fertile-window cycle really looks like. The grid paints
+// one fill per cell, so before the overlap state existed the band's fill simply
+// outranked the window's and the window lost days it actually has.
+//
+// The fixture is the reported one: a 10-day average period against a 21-day
+// cycle whose ovulation falls on cycle day 6, so the band runs 03-01..03-05 and
+// the window 03-01..03-06. Every overlap day is asserted to keep BOTH source
+// flags — the derived reading must not be a way of clearing one of them, which
+// is exactly the alternative this fix rejected.
+func TestBuildCalendarDayStatesMarksTheOverlapOfTheBandAndTheWindow(t *testing.T) {
+	monthStart := time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2026, time.March, 6, 0, 0, 0, 0, time.UTC)
+
+	stats := CycleStats{
+		CompletedCycleCount:  3,
+		MedianCycleLength:    21,
+		AverageCycleLength:   21,
+		AveragePeriodLength:  10,
+		LastPeriodStart:      time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC),
+		NextPeriodStart:      time.Date(2026, time.March, 22, 0, 0, 0, 0, time.UTC),
+		OvulationDate:        time.Date(2026, time.March, 6, 0, 0, 0, 0, time.UTC),
+		FertilityWindowStart: time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC),
+		FertilityWindowEnd:   time.Date(2026, time.March, 6, 0, 0, 0, 0, time.UTC),
+	}
+
+	days := BuildCalendarDayStates(nil, monthStart, nil, stats, now, time.UTC)
+
+	for _, dateString := range []string{"2026-03-01", "2026-03-02", "2026-03-03", "2026-03-04", "2026-03-05"} {
+		day := findCalendarDayStateByDateString(t, days, dateString)
+		if !day.IsPredictedFertileOverlap {
+			t.Errorf("%s: the band and the window are both true here, expected the overlap state", dateString)
+		}
+		if !day.IsPredicted {
+			t.Errorf("%s: the overlap must not clear the projected period band", dateString)
+		}
+		if !day.IsFertilityEdge && !day.IsFertilityPeak {
+			t.Errorf("%s: the overlap must not clear the fertile window", dateString)
+		}
+		if !day.IsFertility {
+			t.Errorf("%s: the overlap must not clear the narrowed fertile reading either", dateString)
+		}
+	}
+
+	// The ovulation day itself: the band already stops before it, so it is a
+	// window day and nothing else. It must not be swept into the overlap by a
+	// predicate that reads the window alone.
+	ovulationDay := findCalendarDayStateByDateString(t, days, "2026-03-06")
+	if !ovulationDay.IsFertilityPeak || !ovulationDay.IsOvulation {
+		t.Fatalf("fixture: 2026-03-06 must be the ovulation day inside the window")
+	}
+	if ovulationDay.IsPredicted || ovulationDay.IsPredictedFertileOverlap {
+		t.Errorf("2026-03-06: the clamped band ends before the ovulation day, so there is no overlap on it")
+	}
+
+	// The band-only control, from the chained cycle: its band runs 03-22..03-31
+	// while its window is 03-23..03-28, so 03-30 is a projected period day with
+	// no window over it. A predicate that read the band alone would paint the
+	// new fill here. (03-06 above is the window-only control — a window day the
+	// clamp left outside the band.)
+	bandOnly := findCalendarDayStateByDateString(t, days, "2026-03-30")
+	if !bandOnly.IsPredicted {
+		t.Fatalf("fixture: 2026-03-30 must be a projected period day of the chained cycle")
+	}
+	if bandOnly.IsFertilityEdge || bandOnly.IsFertilityPeak || bandOnly.IsPredictedFertileOverlap {
+		t.Errorf("2026-03-30: a band day outside every window must keep the plain projected-period state")
+	}
+}
+
+// The same overlap where the predicted START window also covers it. The grid
+// ranks the start window above the projected band, so without a rung of its own
+// those days paint as start-window only and cut a hole through the middle of a
+// window whose remaining days now carry the overlap fill. The flag itself stays
+// anchored to the band — a start-window day the band does not cover is not an
+// overlap, because the start window projects no bleeding on the day.
+//
+// The fixture is the one above plus a cycle-length spread, which is what turns
+// the start window on: three completed cycles and StdDev 2.4 give a span of two
+// days either side of the projected start, so the window is 03-20..03-24 while
+// the chained cycle's band and fertile window both reach 03-23.
+func TestBuildCalendarDayStatesMarksTheStartWindowInsideTheFertileWindow(t *testing.T) {
+	monthStart := time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2026, time.March, 6, 0, 0, 0, 0, time.UTC)
+
+	stats := CycleStats{
+		CompletedCycleCount:  3,
+		MedianCycleLength:    21,
+		AverageCycleLength:   21,
+		AveragePeriodLength:  10,
+		CycleLengthStdDev:    2.4,
+		LastPeriodStart:      time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC),
+		NextPeriodStart:      time.Date(2026, time.March, 22, 0, 0, 0, 0, time.UTC),
+		OvulationDate:        time.Date(2026, time.March, 6, 0, 0, 0, 0, time.UTC),
+		FertilityWindowStart: time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC),
+		FertilityWindowEnd:   time.Date(2026, time.March, 6, 0, 0, 0, 0, time.UTC),
+	}
+
+	days := BuildCalendarDayStates(nil, monthStart, nil, stats, now, time.UTC)
+
+	for _, dateString := range []string{"2026-03-23", "2026-03-24"} {
+		day := findCalendarDayStateByDateString(t, days, dateString)
+		if !day.IsPredictedStartWindow {
+			t.Fatalf("fixture: %s must be a predicted start-window day", dateString)
+		}
+		if !day.IsPredicted || (!day.IsFertilityEdge && !day.IsFertilityPeak) {
+			t.Fatalf("fixture: %s must be a projected bleeding day inside the fertile window", dateString)
+		}
+		if !day.IsPredictedFertileOverlap {
+			t.Errorf("%s: the start window ranking above the band does not stop the day being an overlap", dateString)
+		}
+	}
+
+	// The control on the same rung: a start-window day with no window over it
+	// keeps the plain start-window state, so the new rung cannot swallow the
+	// range whole.
+	startWindowOnly := findCalendarDayStateByDateString(t, days, "2026-03-21")
+	if !startWindowOnly.IsPredictedStartWindow {
+		t.Fatalf("fixture: 2026-03-21 must be a predicted start-window day")
+	}
+	if startWindowOnly.IsFertilityEdge || startWindowOnly.IsFertilityPeak || startWindowOnly.IsPredictedFertileOverlap {
+		t.Errorf("2026-03-21: a start-window day outside every fertile window is not an overlap")
+	}
+}
+
+// TestAppendCurrentBaselinePeriodDrawsNothingWhenTheOvulationIsTheCycleStart
+// covers the band's own floor. The clamp shortens the projected period so it
+// stops before the published ovulation day; when that day IS the cycle start
+// there is no period left to shade, and a zero-length band must be no band
+// rather than a call into appendPredictedPeriod with a length of zero.
+func TestAppendCurrentBaselinePeriodDrawsNothingWhenTheOvulationIsTheCycleStart(t *testing.T) {
+	cycleStart := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	stats := CycleStats{LastPeriodStart: cycleStart, AveragePeriodLength: 5}
+
+	empty := map[string]bool{}
+	appendCurrentBaselinePeriod(empty, stats, cycleStart, time.UTC)
+	if len(empty) != 0 {
+		t.Errorf("expected no period band when the ovulation lands on the cycle start, got %v", empty)
+	}
+
+	// Control: a day inside the projected period shortens the band instead of
+	// removing it, so the emptiness above is the floor and not the clamp
+	// swallowing every case.
+	shortened := map[string]bool{}
+	appendCurrentBaselinePeriod(shortened, stats, cycleStart.AddDate(0, 0, 3), time.UTC)
+	if len(shortened) != 3 {
+		t.Errorf("expected a three-day band up to the ovulation day, got %v", shortened)
+	}
+}
+
+// TestAppendPredictedCyclesCapsIterationCountRegardlessOfGridEnd is the WEB-14
+// SEC-H5 iteration-cap regression. appendPredictedCycles chains forward from
+// stats.NextPeriodStart to gridEnd one cycle at a time; before the fix, gridEnd
+// descended straight from an unclamped ?month= (the audit's "9999-12"), so this
+// loop's cost was proportional to the distance between "now" and whatever
+// month the request named. maxProjectedCyclesInGrid is the loop's OWN cap,
+// independent of any clamp a caller applies upstream — this test drives the
+// function directly with a gridEnd 500 years out and a 1-day cycle length (the
+// shortest step the loop ever takes), the worst case regardless of the
+// month-level clamp tested in calendar_view_policy_test.go.
+func TestAppendPredictedCyclesCapsIterationCountRegardlessOfGridEnd(t *testing.T) {
+	predictedPeriodMap := map[string]bool{}
+	preFertileMap := map[string]bool{}
+	fertilityEdgeMap := map[string]bool{}
+	fertilityPeakMap := map[string]bool{}
+	ovulationMap := map[string]bool{}
+
+	nextPeriodStart := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	stats := CycleStats{
+		MedianCycleLength:   1,
+		NextPeriodStart:     nextPeriodStart,
+		AveragePeriodLength: 1,
+	}
+	gridEnd := nextPeriodStart.AddDate(500, 0, 0)
+
+	appendPredictedCycles(predictedPeriodMap, preFertileMap, fertilityEdgeMap, fertilityPeakMap, ovulationMap, stats, gridEnd, time.UTC, false)
+
+	if got := len(predictedPeriodMap); got > maxProjectedCyclesInGrid {
+		t.Fatalf("predicted period map holds %d days, want at most the %d-cycle cap", got, maxProjectedCyclesInGrid)
+	}
+
+	// Positive anchor: the first cycle, comfortably inside the cap, must still
+	// be painted — otherwise the assertion above would pass just as well with
+	// the whole map builder disabled.
+	firstDay := CalendarDayKey(nextPeriodStart)
+	if !predictedPeriodMap[firstDay] {
+		t.Fatalf("expected the first predicted cycle day %s to be marked", firstDay)
+	}
+
+	// A day only reachable by chaining past the cap must be absent — proves the
+	// loop stopped at the cap rather than merely finishing before gridEnd.
+	farBeyondCap := CalendarDayKey(AddCalendarDays(nextPeriodStart, maxProjectedCyclesInGrid+10, time.UTC))
+	if predictedPeriodMap[farBeyondCap] {
+		t.Fatalf("expected day %s (past the %d-cycle cap) to be unmarked; the cap did not fire", farBeyondCap, maxProjectedCyclesInGrid)
 	}
 }

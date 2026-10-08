@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/ovumcy/ovumcy-web/internal/db"
 	"github.com/ovumcy/ovumcy-web/internal/models"
+	"github.com/ovumcy/ovumcy-web/internal/security"
 	"github.com/ovumcy/ovumcy-web/internal/services"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -31,7 +33,7 @@ func createCLIWebhookDatabase(t *testing.T) string {
 	t.Helper()
 
 	databasePath := filepath.Join(t.TempDir(), "cli-webhook-test.db")
-	database, err := db.OpenSQLite(databasePath)
+	database, err := db.OpenDatabase(db.Config{Driver: db.DriverSQLite, SQLitePath: databasePath})
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
@@ -46,7 +48,7 @@ func createCLIWebhookDatabase(t *testing.T) string {
 func createCLIWebhookOwner(t *testing.T, databasePath string, email string) models.User {
 	t.Helper()
 
-	database, err := db.OpenSQLite(databasePath)
+	database, err := db.OpenDatabase(db.Config{Driver: db.DriverSQLite, SQLitePath: databasePath})
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
@@ -84,7 +86,7 @@ func createCLIWebhookOwner(t *testing.T, databasePath string, email string) mode
 func loadWebhookRow(t *testing.T, databasePath string, userID uint) models.User {
 	t.Helper()
 
-	database, err := db.OpenSQLite(databasePath)
+	database, err := db.OpenDatabase(db.Config{Driver: db.DriverSQLite, SQLitePath: databasePath})
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
@@ -235,6 +237,73 @@ func TestRunWebhookCommandShowNotConfigured(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "not configured") {
 		t.Fatalf("expected 'not configured', got %q", output.String())
+	}
+}
+
+// TestRunWebhookCommandShowReportsAnUnreadableEndpoint proves the third status
+// this line can print. An endpoint sealed under key material this instance no
+// longer holds is neither "not configured" nor "configured (host …)": both of
+// those are claims about a value the process cannot read. It used to be
+// unreachable here because the resolve path aborted the whole command, which
+// hid the one row an operator has to act on and blocked the clear that would fix
+// it. Nothing about the stored value may appear in the line.
+func TestRunWebhookCommandShowReportsAnUnreadableEndpoint(t *testing.T) {
+	t.Parallel()
+
+	databasePath := createCLIWebhookDatabase(t)
+	owner := createCLIWebhookOwner(t, databasePath, "unreadable@example.com")
+	sealUnreadableWebhookEndpoint(t, databasePath, owner.ID, "https://ntfy.example.com/secret-topic?token=abc123")
+
+	var output bytes.Buffer
+	if err := runWebhookCommand(
+		sqliteConfig(databasePath),
+		testWebhookSecretKey,
+		[]string{"show", "unreadable@example.com"},
+		strings.NewReader(""),
+		&output,
+	); err != nil {
+		t.Fatalf("runWebhookCommand(show) returned error: %v", err)
+	}
+
+	rendered := output.String()
+	if !strings.Contains(rendered, "unreadable by this instance") {
+		t.Fatalf("expected the unreadable status, got %q", rendered)
+	}
+	if strings.Contains(rendered, "not configured") {
+		t.Fatal("an endpoint this instance cannot read must not be reported as absent")
+	}
+	if strings.Contains(rendered, "ntfy.example.com") {
+		t.Fatal("no host may be named for a value the instance never opened")
+	}
+	assertNoSecretLeak(t, rendered)
+}
+
+// sealUnreadableWebhookEndpoint stores a ciphertext bound to a DIFFERENT owner
+// id, which is what a rotated SECRET_KEY leaves behind from this instance's
+// point of view: a value that is present and will not open.
+func sealUnreadableWebhookEndpoint(t *testing.T, databasePath string, userID uint, plaintextURL string) {
+	t.Helper()
+
+	ciphertext, err := security.EncryptField(plaintextURL, []byte(testWebhookSecretKey), []byte(fmt.Sprintf("ovumcy.field.webhook_url:%d", userID+1)))
+	if err != nil {
+		t.Fatalf("seal the unreadable endpoint: %v", err)
+	}
+
+	database, err := db.OpenDatabase(db.Config{Driver: db.DriverSQLite, SQLitePath: databasePath})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	sqlDB, err := database.DB()
+	if err != nil {
+		t.Fatalf("open sql db: %v", err)
+	}
+	defer func() { _ = sqlDB.Close() }()
+
+	if err := database.Model(&models.User{}).Where("id = ?", userID).Updates(map[string]any{
+		"webhook_url":     ciphertext,
+		"webhook_enabled": true,
+	}).Error; err != nil {
+		t.Fatalf("store the unreadable endpoint: %v", err)
 	}
 }
 
@@ -414,6 +483,135 @@ func TestRunWebhookCommandURLFromEnv(t *testing.T) {
 	}
 	if plaintext != testWebhookURLWithToken {
 		t.Fatalf("env URL round-trip mismatch: got %q", plaintext)
+	}
+}
+
+// testWebhookURLFromStdin is a second fake endpoint, distinct from the env-var
+// fixture, so a test can tell which of the two sources a save actually used.
+const testWebhookURLFromStdin = "https://gotify.example/message?token=tk_STDINVALUE456"
+
+// TestRunWebhookCommandEnvAndStdinRejected is the precedence guard: when the
+// endpoint arrives from BOTH the OVUMCY_WEBHOOK_URL environment variable and
+// --url-stdin, the command refuses instead of silently picking one. A stale
+// exported value (an operator profile, a prior invocation, a compose env_file
+// inherited by `docker compose run`) would otherwise arm this owner's reminders
+// at an endpoint the operator never typed — on a household instance plausibly
+// another owner's topic. The refusal happens before the database is opened, so
+// neither URL is persisted.
+func TestRunWebhookCommandEnvAndStdinRejected(t *testing.T) {
+	// Not parallel: mutates process env.
+	databasePath := createCLIWebhookDatabase(t)
+	owner := createCLIWebhookOwner(t, databasePath, "owner@example.com")
+
+	t.Setenv(webhookURLEnv, testWebhookURLWithToken)
+
+	var output bytes.Buffer
+	err := runWebhookCommand(
+		sqliteConfig(databasePath),
+		testWebhookSecretKey,
+		[]string{"set", "owner@example.com", "--enabled=true", "--url-stdin"},
+		strings.NewReader(testWebhookURLFromStdin+"\n"),
+		&output,
+	)
+	if err == nil {
+		t.Fatal("supplying the endpoint from both the environment and --url-stdin must be refused")
+	}
+	// The refusal names both sources so the operator knows what to remove.
+	for _, want := range []string{webhookURLEnv, "--url-stdin"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("ambiguity error should name %q, got %q", want, err.Error())
+		}
+	}
+	// Neither endpoint may be echoed back, by the error or the output.
+	assertNoSecretLeak(t, err.Error())
+	assertNoSecretLeak(t, output.String())
+
+	// Nothing was written: no endpoint stored, delivery still off.
+	row := loadWebhookRow(t, databasePath, owner.ID)
+	if row.WebhookURL != "" {
+		t.Fatalf("an ambiguous invocation must persist no endpoint, got %q", row.WebhookURL)
+	}
+	if row.WebhookEnabled {
+		t.Fatal("an ambiguous invocation must not enable delivery")
+	}
+}
+
+// TestRunWebhookCommandStdinAloneStillReadsStdin is the counterpart to the guard
+// above: with no OVUMCY_WEBHOOK_URL in the environment, --url-stdin still reads
+// the piped endpoint and stores exactly it. It pins that the ambiguity check did
+// not turn into an unconditional refusal of --url-stdin.
+func TestRunWebhookCommandStdinAloneStillReadsStdin(t *testing.T) {
+	// Not parallel: mutates process env (clearing it for this test).
+	databasePath := createCLIWebhookDatabase(t)
+	owner := createCLIWebhookOwner(t, databasePath, "owner@example.com")
+
+	t.Setenv(webhookURLEnv, "")
+
+	var output bytes.Buffer
+	if err := runWebhookCommand(
+		sqliteConfig(databasePath),
+		testWebhookSecretKey,
+		[]string{"set", "owner@example.com", "--enabled=true", "--url-stdin"},
+		strings.NewReader(testWebhookURLFromStdin+"\n"),
+		&output,
+	); err != nil {
+		t.Fatalf("runWebhookCommand(set stdin url) returned error: %v", err)
+	}
+	assertNoSecretLeak(t, output.String())
+
+	row := loadWebhookRow(t, databasePath, owner.ID)
+	svc := services.NewWebhookSettingsService(nil, []byte(testWebhookSecretKey))
+	plaintext, err := svc.DecryptWebhookURL(owner.ID, row.WebhookURL)
+	if err != nil {
+		t.Fatalf("DecryptWebhookURL: %v", err)
+	}
+	if plaintext != testWebhookURLFromStdin {
+		t.Fatalf("stdin URL round-trip mismatch: got %q", plaintext)
+	}
+}
+
+// TestRunWebhookCommandClearURLWinsOverEnv pins the deliberate carve-out from the
+// guard above: --clear-url removes any stored endpoint even with
+// OVUMCY_WEBHOOK_URL exported. Clearing cannot arm the wrong endpoint, so a stale
+// environment variable must not stand between an operator and disarming a
+// webhook.
+func TestRunWebhookCommandClearURLWinsOverEnv(t *testing.T) {
+	// Not parallel: mutates process env.
+	databasePath := createCLIWebhookDatabase(t)
+	owner := createCLIWebhookOwner(t, databasePath, "owner@example.com")
+
+	t.Setenv(webhookURLEnv, testWebhookURLWithToken)
+
+	// Arm the endpoint first (env-only path), then clear it with the same variable
+	// still exported.
+	var armed bytes.Buffer
+	if err := runWebhookCommand(
+		sqliteConfig(databasePath),
+		testWebhookSecretKey,
+		[]string{"set", "owner@example.com", "--enabled=true"},
+		strings.NewReader(""),
+		&armed,
+	); err != nil {
+		t.Fatalf("runWebhookCommand(arm) returned error: %v", err)
+	}
+	if loadWebhookRow(t, databasePath, owner.ID).WebhookURL == "" {
+		t.Fatal("setup failed: expected an endpoint stored before the clear")
+	}
+
+	var cleared bytes.Buffer
+	if err := runWebhookCommand(
+		sqliteConfig(databasePath),
+		testWebhookSecretKey,
+		[]string{"set", "owner@example.com", "--enabled=false", "--clear-url"},
+		strings.NewReader(""),
+		&cleared,
+	); err != nil {
+		t.Fatalf("runWebhookCommand(clear with env set) returned error: %v", err)
+	}
+
+	row := loadWebhookRow(t, databasePath, owner.ID)
+	if row.WebhookURL != "" {
+		t.Fatalf("--clear-url must win over an exported %s, got %q", webhookURLEnv, row.WebhookURL)
 	}
 }
 
@@ -664,6 +862,11 @@ func TestMapWebhookError(t *testing.T) {
 		{"email required", services.ErrOperatorUserEmailRequired, "email is required"},
 		{"email invalid", services.ErrOperatorUserEmailInvalid, "invalid email address"},
 		{"url invalid", services.ErrWebhookURLInvalid, "webhook url invalid"},
+		// webhook show|set has no --id form, so an ambiguous address (two rows
+		// on one mailbox) falls through to the default wrap rather than a
+		// dedicated case: services.AmbiguousEmailError.Error() already names
+		// every matching id, and this command has no flag to point at instead.
+		{"ambiguous address", &services.AmbiguousEmailError{Email: "owner@example.com", IDs: []uint{5, 18}}, "matches more than one account (ids 5, 18)"},
 		{"default wraps", errors.New("some other failure"), "configure webhook"},
 	}
 	for _, tc := range cases {

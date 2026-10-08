@@ -23,25 +23,28 @@ func (stubLogoutAuthRepo) ExistsByNormalizedEmail(context.Context, string) (bool
 	return false, nil
 }
 
-func (stubLogoutAuthRepo) FindByNormalizedEmail(context.Context, string) (models.User, error) {
-	return models.User{}, nil
-}
-
-func (stubLogoutAuthRepo) FindByNormalizedEmailOptional(context.Context, string) (models.User, bool, error) {
-	return models.User{}, false, nil
+func (stubLogoutAuthRepo) FindAllByNormalizedEmail(context.Context, string) ([]models.User, error) {
+	return nil, nil
 }
 
 func (stubLogoutAuthRepo) FindByID(context.Context, uint) (models.User, error) {
 	return models.User{}, nil
 }
 
+func (stubLogoutAuthRepo) FindByIDOptional(context.Context, uint) (models.User, bool, error) {
+	return models.User{}, false, nil
+}
+
 func (stubLogoutAuthRepo) Create(context.Context, *models.User) error { return nil }
 
-func (stubLogoutAuthRepo) UpdateRecoveryCodeHashAndRevokeSessions(context.Context, uint, string) error {
+func (stubLogoutAuthRepo) UpdateRecoveryCodeHashAndRevokeSessions(_ context.Context, _ uint, _ int, _ string, beforeCommit func(sessionVersion int) error) error {
+	if beforeCommit != nil {
+		return beforeCommit(1)
+	}
 	return nil
 }
 
-func (stubLogoutAuthRepo) UpdatePasswordAndRevokeSessions(context.Context, uint, string, bool) error {
+func (stubLogoutAuthRepo) UpdatePasswordAndRevokeSessions(context.Context, uint, int, string, bool) error {
 	return nil
 }
 
@@ -49,17 +52,29 @@ func (stubLogoutAuthRepo) ForceResetPasswordAndRevokeSessions(context.Context, u
 	return nil
 }
 
-func (stubLogoutAuthRepo) UpdatePasswordRecoveryCodeAndRevokeSessions(context.Context, uint, string, string, bool) error {
+func (stubLogoutAuthRepo) UpdatePasswordRecoveryCodeAndRevokeSessions(_ context.Context, _ uint, _ int, _ string, _ string, _ bool, beforeCommit func(sessionVersion int) error) error {
+	if beforeCommit != nil {
+		return beforeCommit(1)
+	}
 	return nil
 }
 
-func (stubLogoutAuthRepo) UpdatePasswordRecoveryCodeAndRevokeSessionsCAS(context.Context, uint, string, string, string) error {
+func (stubLogoutAuthRepo) UpdatePasswordRecoveryCodeAndRevokeSessionsCAS(_ context.Context, _ uint, _ string, _ int, _ string, _ string, beforeCommit func(sessionVersion int) error) error {
+	if beforeCommit != nil {
+		return beforeCommit(1)
+	}
 	return nil
 }
 
-func (stubLogoutAuthRepo) UpdatePasswordHashOnly(context.Context, uint, string) error { return nil }
+func (stubLogoutAuthRepo) UpgradePasswordHashCAS(context.Context, uint, string, string) (bool, error) {
+	return true, nil
+}
 
 func (stubLogoutAuthRepo) BumpAuthSessionVersion(context.Context, uint) error { return nil }
+
+func (stubLogoutAuthRepo) ClaimRecoveryCodeReveal(context.Context, uint, time.Time) (bool, error) {
+	return false, nil
+}
 
 // TestLogoutHandlerEnforcesPerAccountRateLimit asserts that Handler.Logout
 // returns 429 with the documented error message when the per-account logout

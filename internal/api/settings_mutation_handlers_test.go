@@ -111,9 +111,10 @@ func authCookieAuthenticates(t *testing.T, app *fiber.App, authCookieValue strin
 //     in-memory bump must match the atomically bumped DB row so the re-issued
 //     ovumcy_auth cookie authenticates. `- 1` mints a cookie with the wrong
 //     version, which the next request rejects.
-//   - handlers_settings_2fa.go:109 (`refreshCurrentSession(...); err != nil`):
-//     negating to `== nil` returns early before the HTMX success markup, so the
-//     success body disappears.
+//   - the re-issue guard in VerifyTOTP2FAEnrollment
+//     (`refreshCurrentSession(...); !ok`): negating it answers the mapped error
+//     and returns before the HTMX success markup, so the success body
+//     disappears.
 func TestVerifyTOTP2FAEnrollment_ReissuedCookieStaysValidAndReturnsSuccess(t *testing.T) {
 	ctx := newTOTPSettingsContext(t, "totp-enroll-reissue@example.com")
 
@@ -121,7 +122,7 @@ func TestVerifyTOTP2FAEnrollment_ReissuedCookieStaysValidAndReturnsSuccess(t *te
 	if err != nil {
 		t.Fatalf("GenerateSetupKey: %v", err)
 	}
-	setupCookie := sealTOTPSetupCookieForTest(t, []byte("test-secret-key"), key.Secret())
+	setupCookie := sealTOTPSetupCookieForTest(t, []byte("test-secret-key"), ctx.user.ID, key.Secret())
 	code, err := totp.GenerateCode(key.Secret(), time.Now())
 	if err != nil {
 		t.Fatalf("GenerateCode: %v", err)
@@ -159,11 +160,11 @@ func TestVerifyTOTP2FAEnrollment_ReissuedCookieStaysValidAndReturnsSuccess(t *te
 }
 
 // TestDisableTOTP2FA_ReissuedCookieStaysValidAndReturnsSuccess pins the disable-side
-// twins of the above: handlers_settings_2fa.go:161 (`... + 1`) and :164
-// (`refreshCurrentSession(...); err != nil`).
+// twins of the above: the `... + 1` bump in DisableTOTP2FA and the re-issue
+// guard right after it (`refreshCurrentSession(...); !ok`).
 func TestDisableTOTP2FA_ReissuedCookieStaysValidAndReturnsSuccess(t *testing.T) {
 	ctx := newTOTPSettingsContext(t, "totp-disable-reissue@example.com")
-	if err := getTOTPServiceForTest(ctx.database).EnableTOTP(context.Background(), ctx.user.ID, "JBSWY3DPEHPK3PXP"); err != nil {
+	if err := getTOTPServiceForTest(ctx.database).EnableTOTP(context.Background(), ctx.user.ID, ctx.user.AuthSessionVersion, "JBSWY3DPEHPK3PXP", verifiedEnrollmentStepForTest(t, "JBSWY3DPEHPK3PXP")); err != nil {
 		t.Fatalf("EnableTOTP setup: %v", err)
 	}
 	ctx.refreshAuthCookie(t)
@@ -303,12 +304,12 @@ func TestStepupReauthMaxAgeConstant(t *testing.T) {
 
 // --- handlers_settings_cycle_helpers.go ---
 
-// TestUpdateCycleSettings_JSONBodyPersistsLastPeriodStart pins the JSON-body
-// `input.LastPeriodStart != ""` decision (handlers_settings_cycle_helpers.go:22):
-// a non-empty last_period_start supplied via a JSON body must mark the field as
-// set so it is validated and persisted. Negating to `== ""` drops the flag for a
-// real date, so the start date is silently ignored. Uses a no-CSRF app to isolate
-// JSON body parsing/negotiation (per the testing rules).
+// TestUpdateCycleSettings_JSONBodyPersistsLastPeriodStart pins the non-empty
+// decision in `SettingsService.ResolveCycleSettingsPatch`: a non-empty
+// last_period_start supplied via a JSON body must mark the field as set so it is
+// validated and persisted. Negating it drops the flag for a real date, so the
+// start date is silently ignored. Uses a no-CSRF app to isolate JSON body
+// parsing/negotiation (per the testing rules).
 func TestUpdateCycleSettings_JSONBodyPersistsLastPeriodStart(t *testing.T) {
 	app, database := newOnboardingTestApp(t)
 	user := createOnboardingTestUser(t, database, "settings-cycle-json@example.com", "StrongPass1", true)
@@ -343,13 +344,12 @@ func TestUpdateCycleSettings_JSONBodyPersistsLastPeriodStart(t *testing.T) {
 }
 
 // TestCompleteLocalPasswordSetupReauth_SuccessIssuesRecoveryCode drives the OIDC
-// step-up password-setup callback all the way through its happy path to pin
-// handlers_settings_password.go:193 (`refreshPasswordChangeSession(...); err !=
-// nil`). On success the handler must set the recovery-code issuance cookie and
-// redirect to /recovery-code. Negating the guard to `== nil` returns early right
-// after the (successful) session refresh, so neither the redirect nor the
-// recovery cookie is produced. Existing step-up coverage only exercises the error
-// arms (no session / already-local), leaving this success arm uncovered.
+// step-up password-setup callback all the way through its happy path to pin the
+// delivery guard in completeLocalPasswordSetupReauth (`delivery.failure != nil`).
+// On success the handler must set the recovery-code issuance cookie and hand
+// over to /recovery-code. Negating the guard returns early on a delivery that
+// succeeded, so neither the handoff nor the recovery cookie is produced. The
+// failing arm is TestLocalPasswordSetupDeliveryFailureLeavesTheAccountAsItWas.
 func TestCompleteLocalPasswordSetupReauth_SuccessIssuesRecoveryCode(t *testing.T) {
 	stub := &stubOIDCWorkflowService{enabled: true, localPublicAuthEnabled: true} // ValidateReauthExchange -> nil
 	app, database, handler := newSettingsMutationStepupApp(t, stub)
@@ -385,12 +385,21 @@ func TestCompleteLocalPasswordSetupReauth_SuccessIssuesRecoveryCode(t *testing.T
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Success path: 303 -> /recovery-code with the recovery-code issuance cookie.
-	if resp.StatusCode != http.StatusSeeOther {
-		t.Fatalf("stepup success status = %d, want 303 (body %q)", resp.StatusCode, mustReadBodyString(t, resp.Body))
+	// Success path: a same-origin handoff to /recovery-code with the
+	// recovery-code issuance cookie. It is a document and not a 303 because the
+	// reveal's first-party guard reads the whole redirect CHAIN, which this
+	// provider callback starts off-origin —
+	// TestOIDCCompleteLocalPasswordSetupHandsTheRevealOverSameOrigin is the
+	// regression for the refusal that shape avoids.
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stepup success status = %d, want 200 (body %q)", resp.StatusCode, mustReadBodyString(t, resp.Body))
 	}
-	if loc := resp.Header.Get("Location"); loc != "/recovery-code" {
-		t.Fatalf("stepup success redirect = %q, want /recovery-code", loc)
+	body := mustReadBodyString(t, resp.Body)
+	if !strings.Contains(body, `http-equiv="refresh"`) || !strings.Contains(body, "/recovery-code") {
+		t.Fatalf("stepup success body = %q, want a meta-refresh handoff to /recovery-code", body)
+	}
+	if loc := resp.Header.Get("Location"); loc != "" {
+		t.Fatalf("stepup success must not redirect into the guarded reveal; got Location %q", loc)
 	}
 	if cookie := responseCookie(resp.Cookies(), recoveryCodeCookieName); cookie == nil || strings.TrimSpace(cookie.Value) == "" {
 		t.Fatalf("stepup success must set the %s issuance cookie", recoveryCodeCookieName)
@@ -414,7 +423,7 @@ func newSettingsMutationStepupApp(t *testing.T, stub *stubOIDCWorkflowService) (
 	t.Helper()
 
 	databasePath := filepath.Join(t.TempDir(), "ovumcy-settings-stepup-test.db")
-	database, err := db.OpenSQLite(databasePath)
+	database, err := db.OpenDatabase(db.Config{Driver: db.DriverSQLite, SQLitePath: databasePath})
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
@@ -437,7 +446,7 @@ func newSettingsMutationStepupApp(t *testing.T, stub *stubOIDCWorkflowService) (
 	app := fiber.New()
 	app.Use(handler.LanguageMiddleware)
 	app.Get("/__seed/stepup", func(c fiber.Ctx) error {
-		userID := uint(fiber.Query[int](c, "user_id", 0))
+		userID := uint(fiber.Query(c, "user_id", 0))
 		state, stateErr := newOIDCStepupState(time.Now(), oidcStepupPurposeLocalPasswordSetup, userID, "prepared-hash")
 		if stateErr != nil {
 			return c.Status(fiber.StatusInternalServerError).SendString(stateErr.Error())

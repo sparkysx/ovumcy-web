@@ -48,8 +48,18 @@ func newSettingsSecurityTestContextWithOptions(t *testing.T, email string, optio
 
 func newOIDCOnlySettingsSecurityTestContext(t *testing.T, email string) settingsSecurityTestContext {
 	t.Helper()
+	return newOIDCOnlySettingsSecurityTestContextWithOptions(t, email, onboardingTestAppOptions{enableCSRF: true})
+}
 
-	app, database := newOnboardingTestAppWithCSRF(t)
+// newOIDCOnlySettingsSecurityTestContextWithOptions is the audit-flag-aware
+// twin of newOIDCOnlySettingsSecurityTestContext, for regressions that need to
+// capture the security log (e.g. the WEB-54 reauth_cause field) rather than
+// only the response.
+func newOIDCOnlySettingsSecurityTestContextWithOptions(t *testing.T, email string, options onboardingTestAppOptions) settingsSecurityTestContext {
+	t.Helper()
+
+	options.enableCSRF = true
+	app, database := newOnboardingTestAppWithOptions(t, options)
 	user := models.User{
 		Email:               strings.ToLower(strings.TrimSpace(email)),
 		LocalAuthEnabled:    false,
@@ -70,6 +80,47 @@ func newOIDCOnlySettingsSecurityTestContext(t *testing.T, email string) settings
 	}
 	if persisted.LocalAuthEnabled {
 		t.Fatal("expected oidc-only test user to persist with local auth disabled")
+	}
+
+	authCookie := issueAuthCookieForUser(t, user)
+	csrfCookie, csrfToken := loadSettingsCSRFContext(t, app, authCookie)
+
+	return settingsSecurityTestContext{
+		app:        app,
+		database:   database,
+		user:       user,
+		authCookie: authCookie,
+		csrfCookie: csrfCookie,
+		csrfToken:  csrfToken,
+	}
+}
+
+// newLocalAuthEnabledEmptyHashSettingsTestContext builds a settings test
+// context for the data-integrity edge state ValidatePasswordChange treats as
+// "no local password": LocalAuthEnabled is true (so ChangePassword's own
+// OIDC-reauth-required gate does not intercept the request before the
+// mapper ever sees it) but PasswordHash is empty. It is the password-change
+// analogue of newOIDCOnlySettingsSecurityTestContextWithOptions, which
+// bypasses the normal onboarding flow the same way to reach a state the
+// ordinary handlers never produce themselves.
+func newLocalAuthEnabledEmptyHashSettingsTestContext(t *testing.T, email string) settingsSecurityTestContext {
+	t.Helper()
+
+	app, database := newOnboardingTestAppWithOptions(t, onboardingTestAppOptions{enableCSRF: true, auditLogEnabled: true})
+	user := models.User{
+		Email:               strings.ToLower(strings.TrimSpace(email)),
+		PasswordHash:        "",
+		LocalAuthEnabled:    true,
+		Role:                models.RoleOwner,
+		OnboardingCompleted: true,
+		AuthSessionVersion:  1,
+		CycleLength:         28,
+		PeriodLength:        5,
+		AutoPeriodFill:      true,
+		CreatedAt:           time.Now().UTC(),
+	}
+	if err := database.Create(&user).Error; err != nil {
+		t.Fatalf("create local-auth-enabled empty-hash test user: %v", err)
 	}
 
 	authCookie := issueAuthCookieForUser(t, user)
@@ -155,5 +206,12 @@ func settingsFormRequestWithCSRF(t *testing.T, ctx settingsSecurityTestContext, 
 	if err != nil {
 		t.Fatalf("settings request %s %s failed: %v", method, path, err)
 	}
+	// The helper that opens the body closes it, exactly as mustAppResponse
+	// does — the choice is not left to ninety call sites, where an unclosed
+	// body reads as an oversight and as intent equally well. Regression:
+	// TestSettingsFormRequestWithCSRFClosesItsResponseBody.
+	t.Cleanup(func() {
+		_ = response.Body.Close()
+	})
 	return response
 }

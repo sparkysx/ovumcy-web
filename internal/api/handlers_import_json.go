@@ -34,12 +34,12 @@ func (handler *Handler) ImportJSON(c fiber.Ctx) error {
 		return handler.failMutation(c, dayImportMutation, mapImportError(err))
 	}
 
-	handler.logSecurityEvent(
+	// The counts ride along as extra fields on the typed path; assembling the
+	// domain and target here by hand would put this line outside the one place
+	// that writes them, where a later change to the tagging would skip it.
+	handler.logMutationSuccess(
 		c,
-		dayImportMutation.action,
-		"success",
-		securityEventField("domain", "health_data"),
-		securityEventField("target", dayImportMutation.target),
+		dayImportMutation,
 		securityEventField("added", strconv.Itoa(result.Added)),
 		securityEventField("skipped", strconv.Itoa(result.Skipped)),
 		securityEventField("rejected", strconv.Itoa(result.Rejected)),
@@ -49,7 +49,7 @@ func (handler *Handler) ImportJSON(c fiber.Ctx) error {
 
 func (handler *Handler) respondImportSuccess(c fiber.Ctx, result services.ImportResult) error {
 	if isHTMX(c) {
-		return c.SendString(htmxSettingsSuccessMarkup(c, "data_imported", "Restored your data."))
+		return sendHTMLFragment(c, htmxSettingsSuccessMarkup(c, "data_imported", "Restored your data."))
 	}
 	if acceptsJSON(c) {
 		return c.JSON(fiber.Map{

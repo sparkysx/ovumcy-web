@@ -12,9 +12,13 @@ import (
 type stubSettingsViewLoader struct {
 	user models.User
 	err  error
+
+	// Captured userID argument — used to prove the read is owner-scoped.
+	settingsUserID uint
 }
 
-func (stub *stubSettingsViewLoader) LoadSettings(ctx context.Context, _ uint) (models.User, error) {
+func (stub *stubSettingsViewLoader) LoadSettings(ctx context.Context, userID uint) (models.User, error) {
+	stub.settingsUserID = userID
 	if stub.err != nil {
 		return models.User{}, stub.err
 	}
@@ -26,59 +30,175 @@ type stubSettingsViewExportBuilder struct {
 	responses []ExportSummary
 	err       error
 	called    bool
-	callIndex int
 	calls     []settingsViewSummaryCall
+
+	// Captured userID arguments, one per call — used to prove every summary
+	// read is owner-scoped, not just the first.
+	summaryUserIDs []uint
 }
 
-func (stub *stubSettingsViewExportBuilder) BuildSummary(ctx context.Context, _ uint, from *time.Time, to *time.Time, location *time.Location) (ExportSummary, error) {
+// The responses stay a pair — the whole history first, the window ending today
+// second — now returned by one call rather than by two.
+func (stub *stubSettingsViewExportBuilder) BuildSummaryHistoryAndWindow(ctx context.Context, userID uint, through time.Time, location *time.Location) (ExportSummary, ExportSummary, error) {
 	stub.called = true
-	stub.calls = append(stub.calls, newSettingsViewSummaryCall(from, to, location))
+	stub.summaryUserIDs = append(stub.summaryUserIDs, userID)
+	stub.calls = append(stub.calls, newSettingsViewSummaryCall(through, location))
 	if stub.err != nil {
-		return ExportSummary{}, stub.err
+		return ExportSummary{}, ExportSummary{}, stub.err
 	}
-	if stub.callIndex < len(stub.responses) {
-		response := stub.responses[stub.callIndex]
-		stub.callIndex++
-		return response, nil
+
+	history, window := stub.summary, stub.summary
+	if len(stub.responses) > 0 {
+		history = stub.responses[0]
 	}
-	return stub.summary, nil
+	if len(stub.responses) > 1 {
+		window = stub.responses[1]
+	}
+	return history, window, nil
 }
 
 type settingsViewSummaryCall struct {
-	HasFrom bool
-	HasTo   bool
-	From    string
-	To      string
+	Through string
 }
 
-func newSettingsViewSummaryCall(from *time.Time, to *time.Time, location *time.Location) settingsViewSummaryCall {
-	call := settingsViewSummaryCall{
-		HasFrom: from != nil,
-		HasTo:   to != nil,
-	}
-	if from != nil {
-		call.From = from.In(location).Format("2006-01-02")
-	}
-	if to != nil {
-		call.To = to.In(location).Format("2006-01-02")
-	}
-	return call
+func newSettingsViewSummaryCall(through time.Time, location *time.Location) settingsViewSummaryCall {
+	return settingsViewSummaryCall{Through: through.In(location).Format("2006-01-02")}
 }
 
 type stubSettingsViewSymptomProvider struct {
 	symptoms []models.SymptomType
 	err      error
 	called   bool
+
+	// Captured userID argument — used to prove the read is owner-scoped.
+	symptomsUserID uint
 }
 
-func (stub *stubSettingsViewSymptomProvider) FetchSymptoms(ctx context.Context, _ uint) ([]models.SymptomType, error) {
+func (stub *stubSettingsViewSymptomProvider) FetchSymptoms(ctx context.Context, userID uint) ([]models.SymptomType, error) {
 	stub.called = true
+	stub.symptomsUserID = userID
 	if stub.err != nil {
 		return nil, stub.err
 	}
 	result := make([]models.SymptomType, len(stub.symptoms))
 	copy(result, stub.symptoms)
 	return result, nil
+}
+
+// stubSettingsViewWebhookStatusBuilder records the owner id the view forwards
+// into the webhook projection. The id is the AAD the ciphertext is bound to, so
+// a hard-coded one would silently report every owner's webhook unconfigured.
+type stubSettingsViewWebhookStatusBuilder struct {
+	display WebhookURLDisplay
+
+	// Captured userID argument — used to prove the read is owner-scoped.
+	webhookUserID uint
+}
+
+func (stub *stubSettingsViewWebhookStatusBuilder) BuildWebhookURLDisplay(userID uint, _ string) WebhookURLDisplay {
+	stub.webhookUserID = userID
+	return stub.display
+}
+
+// stubSettingsViewCalendarFeedStatusBuilder records the owner id the view
+// forwards into the .ics feed status, which reports whether a feed is armed.
+type stubSettingsViewCalendarFeedStatusBuilder struct {
+	status CalendarFeedStatus
+
+	// Captured userID argument — used to prove the read is owner-scoped.
+	feedUserID uint
+}
+
+func (stub *stubSettingsViewCalendarFeedStatusBuilder) BuildFeedStatus(ctx context.Context, userID uint) CalendarFeedStatus {
+	stub.feedUserID = userID
+	return stub.status
+}
+
+// TestBuildSettingsPageViewDataReadsTheOwnersEntriesOnce pins the cost of the
+// settings render against the real ExportService rather than a summary stub.
+// The page needs two aggregates — everything the owner has, for the export
+// panel's selectable bounds, and everything up to today, for its default window
+// — and it used to ask for them with two calls that each fetched EVERY
+// daily_logs row and walked it in Go. Two full reads of the owner's whole
+// history, on every settings render, for three numbers, on a page that shows
+// none of them until the export panel is opened; the shape hid it, because the
+// second call reads as a cheap narrowing of the first.
+//
+// The figures are asserted beside the count: one read must not become one read
+// of the wrong thing.
+// TestCompareISODateComparesTheSameOperandsInBothArms pins one comparison to
+// one reading of its operands. The equality arm trimmed and the ordering arm
+// did not, so a padded value was "not equal" and then ordered by the space:
+// 0x20 sorts below every digit, which made a padded LATER date read as earlier.
+// Both callers pass canonical values today — the trim in front of the raw
+// comparison is exactly what made a padded one look safe to pass — and the
+// function decides the export panel's selectable bounds, so the wrong branch
+// would silently offer a range that excludes the owner's own data.
+func TestCompareISODateComparesTheSameOperandsInBothArms(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		left  string
+		right string
+		want  int
+	}{
+		{name: "canonical earlier", left: "2024-01-02", right: "2024-01-05", want: -1},
+		{name: "canonical later", left: "2024-01-05", right: "2024-01-02", want: 1},
+		{name: "canonical equal", left: "2024-01-05", right: "2024-01-05", want: 0},
+		{name: "padded later left", left: " 2024-01-05", right: "2024-01-02", want: 1},
+		{name: "padded earlier left", left: " 2024-01-02", right: "2024-01-05", want: -1},
+		{name: "padded right", left: "2024-01-05", right: "2024-01-02 ", want: 1},
+		{name: "padded equal", left: " 2024-01-05 ", right: "2024-01-05", want: 0},
+		{name: "empty against a date", left: "", right: "2024-01-05", want: -1},
+	} {
+		if got := compareISODate(testCase.left, testCase.right); got != testCase.want {
+			t.Fatalf("%s: compareISODate(%q, %q) = %d, want %d", testCase.name, testCase.left, testCase.right, got, testCase.want)
+		}
+	}
+}
+
+func TestBuildSettingsPageViewDataReadsTheOwnersEntriesOnce(t *testing.T) {
+	days := &stubExportDayReader{logs: []models.DailyLog{
+		{Date: mustParseSettingsViewDay(t, "2026-02-01"), Notes: "first"},
+		{Date: mustParseSettingsViewDay(t, "2026-02-21"), Notes: "today"},
+		// A future-dated entry: inside the owner's history, outside the
+		// default export window that stops at today.
+		{Date: mustParseSettingsViewDay(t, "2026-03-05"), Notes: "ahead"},
+	}}
+	exportService := NewExportService(days, &stubExportSymptomReader{})
+	settingsLoader := &stubSettingsViewLoader{user: models.User{CycleLength: 28, PeriodLength: 5}}
+	service := NewSettingsViewService(settingsLoader, exportService, nil, nil)
+
+	owner := &models.User{ID: 77, Role: models.RoleOwner}
+	viewData, err := service.BuildSettingsPageViewData(
+		context.Background(), owner, "en", SettingsViewInput{},
+		mustParseSettingsViewDay(t, "2026-02-21"), time.UTC,
+	)
+	if err != nil {
+		t.Fatalf("BuildSettingsPageViewData() unexpected error: %v", err)
+	}
+
+	if len(days.ownerIDs) != 1 {
+		t.Fatalf("one settings render fetched the owner's entries %d times; the whole history is materialized on each", len(days.ownerIDs))
+	}
+	if days.ownerIDs[0] != owner.ID {
+		t.Fatalf("the read must stay scoped to the acting owner %d, got %d", owner.ID, days.ownerIDs[0])
+	}
+
+	if viewData.Export.SelectableDateMax != "2026-03-05" {
+		t.Fatalf("the selectable range covers everything the owner has, got max %q", viewData.Export.SelectableDateMax)
+	}
+	if viewData.Export.SelectableDateMin != "2026-02-01" {
+		t.Fatalf("the selectable range starts at the earliest entry, got min %q", viewData.Export.SelectableDateMin)
+	}
+	if viewData.Export.DefaultDateTo != "2026-02-21" {
+		t.Fatalf("the default window still ends today, got %q", viewData.Export.DefaultDateTo)
+	}
+	if viewData.Export.SummaryTotalEntries != 2 {
+		t.Fatalf("the default window summarizes the two entries up to today, got %d", viewData.Export.SummaryTotalEntries)
+	}
+	if viewData.Export.SummaryDateFrom != "2026-02-01" || viewData.Export.SummaryDateTo != "2026-02-21" {
+		t.Fatalf("expected the default window summary 2026-02-01..2026-02-21, got %q..%q", viewData.Export.SummaryDateFrom, viewData.Export.SummaryDateTo)
+	}
 }
 
 func TestBuildSettingsPageViewDataClassifiesChangePasswordError(t *testing.T) {
@@ -90,7 +210,7 @@ func TestBuildSettingsPageViewDataClassifiesChangePasswordError(t *testing.T) {
 			LastPeriodStart: nil,
 		},
 	}
-	service := NewSettingsViewService(settingsLoader, nil, nil, nil, nil)
+	service := NewSettingsViewService(settingsLoader, nil, nil, nil)
 
 	user := &models.User{ID: 1, Role: models.RoleOwner}
 	viewData, err := service.BuildSettingsPageViewData(context.Background(), user, "en", SettingsViewInput{
@@ -129,7 +249,7 @@ func TestBuildSettingsPageViewDataOwnerLoadsExportSummary(t *testing.T) {
 			{ID: 3, Name: "Caffeine crash", ArchivedAt: ptrSettingsViewTime(mustParseSettingsViewDay(t, "2026-02-01"))},
 		},
 	}
-	service := NewSettingsViewService(settingsLoader, exportBuilder, symptomProvider, nil, nil)
+	service := NewSettingsViewService(settingsLoader, exportBuilder, symptomProvider, nil)
 
 	user := &models.User{ID: 2, Role: models.RoleOwner}
 	viewData, err := service.BuildSettingsPageViewData(context.Background(), user, "ru", SettingsViewInput{}, mustParseSettingsViewDay(t, "2026-02-21"), time.UTC)
@@ -144,8 +264,7 @@ func TestBuildSettingsPageViewDataOwnerLoadsExportSummary(t *testing.T) {
 		t.Fatalf("expected FetchSymptoms to be called for owner")
 	}
 	assertSettingsViewOwnerSummaryCalls(t, exportBuilder.calls, []settingsViewSummaryCall{
-		{HasFrom: false, HasTo: false},
-		{HasFrom: true, HasTo: true, From: "2026-02-01", To: "2026-02-21"},
+		{Through: "2026-02-21"},
 	})
 	assertOwnerSymptomsViewData(t, viewData)
 	assertOwnerExportViewData(t, viewData, ownerExportViewExpectation{
@@ -156,6 +275,70 @@ func TestBuildSettingsPageViewDataOwnerLoadsExportSummary(t *testing.T) {
 		summaryFromDisplay: "01.02.2026",
 		summaryToDisplay:   "21.02.2026",
 	})
+}
+
+// The settings page reads five separate stores for the acting owner: the
+// persisted settings row, the export summary, the custom symptom catalogue, the
+// webhook URL projection and the .ics feed status. Each read must carry the
+// authenticated owner's id, so this pins every operand against a non-zero owner
+// id no fixture supplies by default — a hard-coded owner would otherwise render
+// one owner's health settings, symptom catalogue, export summary or feed state
+// to another. The two status builders are covered here rather than left nil
+// precisely because a nil collaborator returns early and observes nothing.
+func TestBuildSettingsPageViewDataScopesEveryOwnerReadToTheAuthenticatedOwner(t *testing.T) {
+	settingsLoader := &stubSettingsViewLoader{
+		user: models.User{
+			CycleLength:    28,
+			PeriodLength:   5,
+			AutoPeriodFill: true,
+		},
+	}
+	exportBuilder := &stubSettingsViewExportBuilder{
+		responses: []ExportSummary{
+			{TotalEntries: 2, HasData: true, DateFrom: "2026-02-01", DateTo: "2026-02-21"},
+			{TotalEntries: 2, HasData: true, DateFrom: "2026-02-01", DateTo: "2026-02-21"},
+		},
+	}
+	symptomProvider := &stubSettingsViewSymptomProvider{
+		symptoms: []models.SymptomType{{ID: 2, Name: "Joint stiffness"}},
+	}
+	webhookStatus := &stubSettingsViewWebhookStatusBuilder{
+		display: WebhookURLDisplay{Readability: WebhookURLReadable, Host: "hooks.example.test"},
+	}
+	calendarFeedStatus := &stubSettingsViewCalendarFeedStatusBuilder{
+		status: CalendarFeedStatus{Known: true, Configured: true},
+	}
+	// The two builders are supplied through the REAL ledger service rather than
+	// stubbed one layer higher: the seam the view now holds is the ledger, and a
+	// stub of the ledger itself would leave both owner-carrying reads below it
+	// unobserved — which is the shape of guard this test exists to refuse.
+	service := NewSettingsViewService(settingsLoader, exportBuilder, symptomProvider, NewEgressLedgerService(webhookStatus, calendarFeedStatus, true))
+
+	owner := &models.User{ID: 4242, Role: models.RoleOwner}
+	if _, err := service.BuildSettingsPageViewData(context.Background(), owner, "en", SettingsViewInput{}, mustParseSettingsViewDay(t, "2026-02-21"), time.UTC); err != nil {
+		t.Fatalf("BuildSettingsPageViewData() unexpected error: %v", err)
+	}
+
+	if settingsLoader.settingsUserID != owner.ID {
+		t.Fatalf("expected settings read scoped to owner id %d, got %d", owner.ID, settingsLoader.settingsUserID)
+	}
+	if len(exportBuilder.summaryUserIDs) == 0 {
+		t.Fatalf("expected at least one export summary read for the owner")
+	}
+	for index, summaryUserID := range exportBuilder.summaryUserIDs {
+		if summaryUserID != owner.ID {
+			t.Fatalf("expected export summary read %d scoped to owner id %d, got %d", index, owner.ID, summaryUserID)
+		}
+	}
+	if symptomProvider.symptomsUserID != owner.ID {
+		t.Fatalf("expected symptom read scoped to owner id %d, got %d", owner.ID, symptomProvider.symptomsUserID)
+	}
+	if webhookStatus.webhookUserID != owner.ID {
+		t.Fatalf("expected webhook projection scoped to owner id %d, got %d", owner.ID, webhookStatus.webhookUserID)
+	}
+	if calendarFeedStatus.feedUserID != owner.ID {
+		t.Fatalf("expected calendar feed status scoped to owner id %d, got %d", owner.ID, calendarFeedStatus.feedUserID)
+	}
 }
 
 func TestBuildSettingsPageViewDataOwnerClampsExportDefaultToRequestLocalToday(t *testing.T) {
@@ -174,16 +357,17 @@ func TestBuildSettingsPageViewDataOwnerClampsExportDefaultToRequestLocalToday(t 
 		},
 	}
 
-	service := NewSettingsViewService(settingsLoader, exportBuilder, nil, nil, nil)
+	service := NewSettingsViewService(settingsLoader, exportBuilder, nil, nil)
 	user := &models.User{ID: 5, Role: models.RoleOwner}
 	viewData, err := service.BuildSettingsPageViewData(context.Background(), user, "ru", SettingsViewInput{}, mustParseSettingsViewDay(t, "2026-03-12"), time.UTC)
 	if err != nil {
 		t.Fatalf("BuildSettingsPageViewData() unexpected error: %v", err)
 	}
 
+	// The window the page asks for ends at request-local today, not at the
+	// server's day: that cutoff is the whole point of this case.
 	assertSettingsViewOwnerSummaryCalls(t, exportBuilder.calls, []settingsViewSummaryCall{
-		{HasFrom: false, HasTo: false},
-		{HasFrom: true, HasTo: true, From: "2026-03-12", To: "2026-03-12"},
+		{Through: "2026-03-12"},
 	})
 	if viewData.Export.DefaultDateTo != "2026-03-12" {
 		t.Fatalf("expected export default to date to use request-local today, got %q", viewData.Export.DefaultDateTo)
@@ -210,7 +394,7 @@ func TestBuildSettingsPageViewDataSanitizesFutureLastPeriodStartForForm(t *testi
 		},
 	}
 
-	service := NewSettingsViewService(settingsLoader, nil, nil, nil, nil)
+	service := NewSettingsViewService(settingsLoader, nil, nil, nil)
 	user := &models.User{ID: 6, Role: models.RoleOwner}
 	viewData, err := service.BuildSettingsPageViewData(context.Background(), user, "ru", SettingsViewInput{}, mustParseSettingsViewDay(t, "2026-03-12"), time.UTC)
 	if err != nil {
@@ -235,7 +419,7 @@ func TestBuildSettingsPageViewDataPartnerSkipsExportSummary(t *testing.T) {
 	}
 	exportBuilder := &stubSettingsViewExportBuilder{}
 	symptomProvider := &stubSettingsViewSymptomProvider{}
-	service := NewSettingsViewService(settingsLoader, exportBuilder, symptomProvider, nil, nil)
+	service := NewSettingsViewService(settingsLoader, exportBuilder, symptomProvider, nil)
 
 	user := &models.User{ID: 3, Role: "legacy_viewer"}
 	viewData, err := service.BuildSettingsPageViewData(context.Background(), user, "en", SettingsViewInput{}, mustParseSettingsViewDay(t, "2026-02-21"), time.UTC)
@@ -264,7 +448,6 @@ func TestBuildSettingsPageViewDataReturnsTypedErrors(t *testing.T) {
 		nil,
 		nil,
 		nil,
-		nil,
 	)
 	if _, err := settingsErrService.BuildSettingsPageViewData(context.Background(), user, "en", SettingsViewInput{}, mustParseSettingsViewDay(t, "2026-02-21"), time.UTC); !errors.Is(err, ErrSettingsViewLoadSettings) {
 		t.Fatalf("expected ErrSettingsViewLoadSettings, got %v", err)
@@ -273,7 +456,6 @@ func TestBuildSettingsPageViewDataReturnsTypedErrors(t *testing.T) {
 	exportErrService := NewSettingsViewService(
 		&stubSettingsViewLoader{user: models.User{CycleLength: 28, PeriodLength: 5, AutoPeriodFill: true}},
 		&stubSettingsViewExportBuilder{err: errors.New("export fail")},
-		nil,
 		nil,
 		nil,
 	)
@@ -285,7 +467,6 @@ func TestBuildSettingsPageViewDataReturnsTypedErrors(t *testing.T) {
 		&stubSettingsViewLoader{user: models.User{CycleLength: 28, PeriodLength: 5, AutoPeriodFill: true}},
 		nil,
 		&stubSettingsViewSymptomProvider{err: errors.New("symptom fail")},
-		nil,
 		nil,
 	)
 	if _, err := symptomErrService.BuildSettingsPageViewData(context.Background(), user, "en", SettingsViewInput{}, mustParseSettingsViewDay(t, "2026-02-21"), time.UTC); !errors.Is(err, ErrSettingsViewLoadSymptoms) {

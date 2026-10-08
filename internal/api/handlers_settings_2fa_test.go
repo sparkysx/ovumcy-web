@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,17 +12,23 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gofiber/fiber/v3"
 	"github.com/ovumcy/ovumcy-web/internal/models"
 	"github.com/ovumcy/ovumcy-web/internal/services"
+	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
 	"gorm.io/gorm"
 )
 
 // --- helpers ---
 
-func sealTOTPSetupCookieForTest(t *testing.T, secretKey []byte, rawSecret string) string {
+// sealTOTPSetupCookieForTest seals a pending-enrollment payload attributed to
+// userID. Passing 0 produces the unattributed payload the writer now refuses to
+// mint, which is how the read-side guard is exercised on its own.
+func sealTOTPSetupCookieForTest(t *testing.T, secretKey []byte, userID uint, rawSecret string) string {
 	t.Helper()
 	payload := totpSetupCookiePayload{
+		UserID:    userID,
 		RawSecret: rawSecret,
 		ExpiresAt: time.Now().Add(5 * time.Minute),
 	}
@@ -48,6 +55,71 @@ func newTOTPSettingsContext(t *testing.T, email string) settingsSecurityTestCont
 
 func getTOTPServiceForTest(database *gorm.DB) *services.TOTPService {
 	return services.NewTOTPService(&dbUserRepoForTest{database}, []byte("test-secret-key"), nil)
+}
+
+// verifiedEnrollmentStepForTest is the step a real confirmation of secret
+// records, found by VerifyEnrollmentCode as the enrollment handler finds it.
+// The code is one step old, so a code the test generates now stays above the
+// replay floor EnableTOTP sets. A step boundary falling between generating and
+// verifying it puts it out of the skew window; the second try does not straddle
+// one.
+func verifiedEnrollmentStepForTest(t *testing.T, secret string) services.TOTPEnrollmentStep {
+	t.Helper()
+	svc := getTOTPServiceForTest(nil)
+	for range 2 {
+		code, err := totp.GenerateCode(secret, time.Now().Add(-30*time.Second))
+		if err != nil {
+			t.Fatalf("GenerateCode: %v", err)
+		}
+		step, err := svc.VerifyEnrollmentCode(svc.EnrollCodeBudget([]byte("test-secret-key")), services.ReauthAttempt{ClientKey: "fixture"}, secret, code)
+		if err == nil {
+			return step
+		}
+		if !errors.Is(err, services.ErrTOTPEnrollCodeInvalid) {
+			t.Fatalf("VerifyEnrollmentCode: %v", err)
+		}
+	}
+	t.Fatal("VerifyEnrollmentCode refused a one-step-old code twice")
+	return services.TOTPEnrollmentStep{}
+}
+
+// invalidTOTPCodeForSkewWindow returns a 6-digit code proven NOT to validate
+// against secret across the whole ±1-step skew window the enrollment handler's
+// totp.Validate call checks at the instant it runs (there is no injectable
+// clock on that path — it reads time.Now() itself — so this stays
+// deterministic without one). It computes the codes for a wider window (±3
+// steps, i.e. ±90s around "now") than Validate's own ±1-step skew (±30s) so a
+// step boundary crossed between this computation and the request under test
+// cannot land the excluded set short; the caller re-asserts the precondition
+// with totp.Validate immediately before sending the request.
+func invalidTOTPCodeForSkewWindow(t *testing.T, secret string) string {
+	t.Helper()
+	opts := totp.ValidateOpts{
+		Period:    30,
+		Skew:      1,
+		Digits:    otp.DigitsSix,
+		Algorithm: otp.AlgorithmSHA1,
+	}
+	now := time.Now()
+	excluded := make(map[string]bool, 7)
+	for i := -3; i <= 3; i++ {
+		at := now.Add(time.Duration(i) * 30 * time.Second)
+		code, err := totp.GenerateCodeCustom(secret, at, opts)
+		if err != nil {
+			t.Fatalf("GenerateCodeCustom: %v", err)
+		}
+		excluded[code] = true
+	}
+	for _, candidate := range []string{
+		"000000", "111111", "222222", "333333", "444444",
+		"555555", "666666", "777777", "888888", "999999",
+	} {
+		if !excluded[candidate] {
+			return candidate
+		}
+	}
+	t.Fatal("invalidTOTPCodeForSkewWindow: every candidate collided with the skew window — widen the candidate set")
+	return ""
 }
 
 // --- ShowTOTPSetupPage ---
@@ -95,7 +167,7 @@ func TestShowTOTPSetupPage_TOTPNotEnabled_RendersQRAndSecret(t *testing.T) {
 func TestShowTOTPSetupPage_TOTPEnabled_ShowsManagementView(t *testing.T) {
 	ctx := newTOTPSettingsContext(t, "totp-setup-enabled@example.com")
 	svc := getTOTPServiceForTest(ctx.database)
-	if err := svc.EnableTOTP(context.Background(), ctx.user.ID, "JBSWY3DPEHPK3PXP"); err != nil {
+	if err := svc.EnableTOTP(context.Background(), ctx.user.ID, ctx.user.AuthSessionVersion, "JBSWY3DPEHPK3PXP", verifiedEnrollmentStepForTest(t, "JBSWY3DPEHPK3PXP")); err != nil {
 		t.Fatalf("EnableTOTP: %v", err)
 	}
 	// EnableTOTP bumps auth_session_version atomically, so the pre-enable
@@ -130,6 +202,34 @@ func TestShowTOTPSetupPage_TOTPEnabled_ShowsManagementView(t *testing.T) {
 	}
 }
 
+// TestShowTOTPSetupPage_HEAD_RefusesAndMintsNoSetupCookie pins GET /settings/2fa
+// joining shownOnceGETRoutes: while TOTP is not yet enabled, ShowTOTPSetupPage
+// mints a fresh secret and seals it into the setup cookie on every visit, and a
+// HEAD can neither show the QR code nor let the owner scan it — it would only
+// overwrite whatever secret a concurrent GET enrollment already staged in the
+// same cookie jar, so the owner's own PUT against the code she already scanned
+// would refuse. Mirrors
+// TestHeadOnOIDCStartDoesNotMintStateCookieOrStartTheHandshake.
+func TestShowTOTPSetupPage_HEAD_RefusesAndMintsNoSetupCookie(t *testing.T) {
+	ctx := newTOTPSettingsContext(t, "totp-setup-head@example.com")
+
+	req := httptest.NewRequest(http.MethodHead, "/settings/2fa", nil)
+	req.Header.Set("Accept-Language", "en")
+	req.Header.Set("Cookie", ctx.authCookie)
+	resp, err := ctx.app.Test(req, testConfigNoTimeout)
+	if err != nil {
+		t.Fatalf("HEAD /settings/2fa: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", resp.StatusCode)
+	}
+	if cookie := responseCookie(resp.Cookies(), totpSetupCookieName); cookie != nil {
+		t.Fatalf("expected HEAD /settings/2fa to mint no setup cookie, got Set-Cookie %#v", cookie)
+	}
+}
+
 // --- VerifyTOTP2FAEnrollment ---
 
 func TestVerifyTOTP2FAEnrollment_ValidCode_EnablesTOTP(t *testing.T) {
@@ -140,7 +240,7 @@ func TestVerifyTOTP2FAEnrollment_ValidCode_EnablesTOTP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateSetupKey: %v", err)
 	}
-	setupCookie := sealTOTPSetupCookieForTest(t, []byte("test-secret-key"), key.Secret())
+	setupCookie := sealTOTPSetupCookieForTest(t, []byte("test-secret-key"), ctx.user.ID, key.Secret())
 
 	code, err := totp.GenerateCode(key.Secret(), time.Now())
 	if err != nil {
@@ -183,9 +283,14 @@ func TestVerifyTOTP2FAEnrollment_InvalidCode_DoesNotEnable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateSetupKey: %v", err)
 	}
-	setupCookie := sealTOTPSetupCookieForTest(t, []byte("test-secret-key"), key.Secret())
+	setupCookie := sealTOTPSetupCookieForTest(t, []byte("test-secret-key"), ctx.user.ID, key.Secret())
 
-	form := url.Values{"code": {"000000"}, "password": {"StrongPass1"}}
+	code := invalidTOTPCodeForSkewWindow(t, key.Secret())
+	if totp.Validate(code, key.Secret()) {
+		t.Fatalf("test setup produced code %q which validates against the secret right now — precondition failed, cannot prove the negative", code)
+	}
+
+	form := url.Values{"code": {code}, "password": {"StrongPass1"}}
 	cloned := cloneFormValues(form)
 	cloned.Set("csrf_token", ctx.csrfToken)
 
@@ -204,7 +309,15 @@ func TestVerifyTOTP2FAEnrollment_InvalidCode_DoesNotEnable(t *testing.T) {
 		t.Fatalf("reload user: %v", err)
 	}
 	if reloaded.TOTPEnabled {
-		t.Error("TOTPEnabled should be false after invalid code (unless 000000 was coincidentally valid)")
+		t.Error("TOTPEnabled should be false after invalid code (code was proven invalid across the whole skew window above)")
+	}
+
+	// TOTPEnabled==false is satisfied by any refusal, including ones that never reach
+	// the code check: with a corrupted csrf_token this assertion held while the
+	// request died in middleware. Pin the status so the test proves enrollment
+	// verification ran and rejected the code.
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 from the enrollment code check, got %d — the request may have been refused before verification", resp.StatusCode)
 	}
 }
 
@@ -242,12 +355,342 @@ func TestVerifyTOTP2FAEnrollment_MissingSetupCookie_ReturnsError(t *testing.T) {
 	}
 }
 
+// totpEnrollmentRequest submits the enrollment confirmation for the session in
+// ctx, carrying an explicitly supplied setup cookie so a test can present a
+// payload the session did not mint.
+func totpEnrollmentRequest(t *testing.T, ctx settingsSecurityTestContext, code string, setupCookie string) *http.Response {
+	t.Helper()
+
+	form := url.Values{"code": {code}, "password": {"StrongPass1"}}
+	cloned := cloneFormValues(form)
+	cloned.Set("csrf_token", ctx.csrfToken)
+
+	request := httptest.NewRequest(http.MethodPut, "/api/v1/users/current/2fa", strings.NewReader(cloned.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Accept-Language", "en")
+	request.Header.Set("Cookie", joinCookieHeader(ctx.authCookie, cookiePair(ctx.csrfCookie), setupCookie))
+
+	response, err := ctx.app.Test(request, testConfigNoTimeout)
+	if err != nil {
+		t.Fatalf("enrollment request failed: %v", err)
+	}
+	return response
+}
+
+// signInSecondOwner opens a second independent owner's authenticated session on
+// the same instance — the household self-hosting shape, where two owners share
+// one deployment and nothing else.
+func signInSecondOwner(t *testing.T, host settingsSecurityTestContext, email string) settingsSecurityTestContext {
+	t.Helper()
+
+	user := createOnboardingTestUser(t, host.database, email, "StrongPass1", true)
+	authCookie := loginAndExtractAuthCookieWithCSRF(t, host.app, user.Email, "StrongPass1")
+	csrfCookie, csrfToken := loadSettingsCSRFContext(t, host.app, authCookie)
+
+	return settingsSecurityTestContext{
+		app:        host.app,
+		database:   host.database,
+		user:       user,
+		authCookie: authCookie,
+		csrfCookie: csrfCookie,
+		csrfToken:  csrfToken,
+	}
+}
+
+func totpStateForUser(t *testing.T, ctx settingsSecurityTestContext, userID uint) models.User {
+	t.Helper()
+
+	var reloaded models.User
+	if err := ctx.database.First(&reloaded, userID).Error; err != nil {
+		t.Fatalf("reload user %d: %v", userID, err)
+	}
+	return reloaded
+}
+
+// TestVerifyTOTP2FAEnrollmentRefusesSetupCookieNotMintedForThisOwner pins the
+// owner binding on the sealed enrollment cookie at the handler boundary.
+//
+// The cookie carries the RAW TOTP secret across the enrollment form submission.
+// Without an owner id sealed into it, a setup payload minted for one owner and
+// presented on another owner's session would enrol the first owner's pending
+// secret as the second owner's own credential — credential confusion on a
+// household instance, where two owners share one deployment. So the confirm step
+// refuses a payload that names a different account, and refuses one that names
+// no account at all rather than treating the missing id as a comparison that
+// does not apply.
+//
+// Both payloads below are sealed under the app's own secret and carry a code
+// that genuinely validates, and the presenting session supplies its own correct
+// password, so the owner check is the only thing left between the request and
+// enrollment. The positive anchor at the end proves enrollment still completes
+// for the owner the payload was minted for, so the refusals above cannot be
+// satisfied by an endpoint that enrols nobody.
+func TestVerifyTOTP2FAEnrollmentRefusesSetupCookieNotMintedForThisOwner(t *testing.T) {
+	ownerA := newTOTPSettingsContext(t, "totp-enroll-scope-a@example.com")
+	ownerB := signInSecondOwner(t, ownerA, "totp-enroll-scope-b@example.com")
+
+	key, err := getTOTPServiceForTest(ownerA.database).GenerateSetupKey("Ovumcy", ownerA.user.Email)
+	if err != nil {
+		t.Fatalf("GenerateSetupKey: %v", err)
+	}
+	freshCode := func() string {
+		t.Helper()
+		code, codeErr := totp.GenerateCode(key.Secret(), time.Now())
+		if codeErr != nil {
+			t.Fatalf("GenerateCode: %v", codeErr)
+		}
+		return code
+	}
+
+	// Owner A's pending secret, presented on owner B's session.
+	crossOwner := sealTOTPSetupCookieForTest(t, []byte("test-secret-key"), ownerA.user.ID, key.Secret())
+	crossResponse := totpEnrollmentRequest(t, ownerB, freshCode(), crossOwner)
+	defer func() { _ = crossResponse.Body.Close() }()
+
+	if crossResponse.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected a setup cookie minted for another owner to be refused with 401, got %d", crossResponse.StatusCode)
+	}
+	if cleared := responseCookie(crossResponse.Cookies(), totpSetupCookieName); cleared == nil || cleared.Value != "" {
+		t.Fatal("expected the refused setup cookie to be cleared, not left presentable on a retry")
+	}
+	if state := totpStateForUser(t, ownerB, ownerB.user.ID); state.TOTPEnabled || state.TOTPSecret != "" {
+		t.Fatal("another owner's pending secret must not be enrolled as this owner's credential")
+	}
+	if state := totpStateForUser(t, ownerA, ownerA.user.ID); state.TOTPEnabled || state.TOTPSecret != "" {
+		t.Fatal("a refused cross-owner enrollment must not enable TOTP on the account the secret belongs to either")
+	}
+
+	// The same secret in a payload that names no owner at all.
+	unattributed := sealTOTPSetupCookieForTest(t, []byte("test-secret-key"), 0, key.Secret())
+	unattributedResponse := totpEnrollmentRequest(t, ownerB, freshCode(), unattributed)
+	defer func() { _ = unattributedResponse.Body.Close() }()
+
+	if unattributedResponse.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected an unattributed setup cookie to be refused with 401, got %d", unattributedResponse.StatusCode)
+	}
+	if cleared := responseCookie(unattributedResponse.Cookies(), totpSetupCookieName); cleared == nil || cleared.Value != "" {
+		t.Fatal("expected the refused unattributed setup cookie to be cleared")
+	}
+	if state := totpStateForUser(t, ownerB, ownerB.user.ID); state.TOTPEnabled || state.TOTPSecret != "" {
+		t.Fatal("an unattributed pending secret must not be enrolled against whichever session presented it")
+	}
+
+	// Positive anchor: the owner the payload was minted for enrols normally.
+	ownedResponse := totpEnrollmentRequest(t, ownerA, freshCode(), crossOwner)
+	defer func() { _ = ownedResponse.Body.Close() }()
+
+	if ownedResponse.StatusCode != http.StatusOK && ownedResponse.StatusCode != http.StatusSeeOther {
+		t.Fatalf("owner A must still complete its own enrollment, got %d", ownedResponse.StatusCode)
+	}
+	enrolled := totpStateForUser(t, ownerA, ownerA.user.ID)
+	if !enrolled.TOTPEnabled || enrolled.TOTPSecret == "" {
+		t.Fatal("owner A's own enrollment must persist the encrypted secret and enable TOTP")
+	}
+	if state := totpStateForUser(t, ownerB, ownerB.user.ID); state.TOTPEnabled || state.TOTPSecret != "" {
+		t.Fatal("owner A completing its own enrollment must leave owner B untouched")
+	}
+}
+
+// TestVerifyTOTP2FAEnrollmentClearsASetupCookieItCannotUse extends the owner
+// binding above to the rest of the refusals. The owner mismatch was cleared;
+// an expired or unopenable payload was not, and this cookie carries the RAW
+// TOTP secret of an enrollment nobody completed. Session-scoped at path "/", it
+// then rode on every request for the rest of the browser session while being
+// good for nothing — the payload's own ExpiresAt refuses it server-side, so the
+// cost is blast radius rather than a usable enrollment.
+//
+// Every branch answers the same session-expired spec, so the assertions here
+// are about what the response DOES, not what it says: the refusal must not be
+// distinguishable from an owner mismatch.
+//
+// Anchored twice, because a clear-everything reader would satisfy the refusals
+// on its own: the enrollment page still mints a usable cookie, and a wrong
+// six-digit code — a refusal about the code, not the cookie — leaves the
+// enrollment in place so the owner can retype it.
+func TestVerifyTOTP2FAEnrollmentClearsASetupCookieItCannotUse(t *testing.T) {
+	ctx := newTOTPSettingsContext(t, "totp-enroll-clear@example.com")
+	secretKey := []byte("test-secret-key")
+
+	key, err := getTOTPServiceForTest(ctx.database).GenerateSetupKey("Ovumcy", ctx.user.Email)
+	if err != nil {
+		t.Fatalf("GenerateSetupKey: %v", err)
+	}
+
+	// Anchor 1: the enrollment page mints a usable cookie in the first place.
+	pageRequest := httptest.NewRequest(http.MethodGet, "/settings/2fa", nil)
+	pageRequest.Header.Set("Accept-Language", "en")
+	pageRequest.Header.Set("Cookie", ctx.authCookie)
+	setupPage := mustAppResponse(t, ctx.app, pageRequest)
+	if setupPage.StatusCode != http.StatusOK {
+		t.Fatalf("expected the enrollment page to render, got %d", setupPage.StatusCode)
+	}
+	if minted := responseCookie(setupPage.Cookies(), totpSetupCookieName); minted == nil || minted.Value == "" {
+		t.Fatal("expected the enrollment page to mint a setup cookie — the rest of this test has no premise without it")
+	}
+
+	// Anchor 2: a wrong code refuses the code, not the enrollment.
+	usable := sealTOTPSetupCookieForTest(t, secretKey, ctx.user.ID, key.Secret())
+	wrongCode := totpEnrollmentRequest(t, ctx, "000000", usable)
+	defer func() { _ = wrongCode.Body.Close() }()
+	if wrongCode.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected a wrong enrollment code to be refused with 401, got %d", wrongCode.StatusCode)
+	}
+	assertTOTPCookieLeftInPlace(t, wrongCode, totpSetupCookieName)
+
+	sealedUsable := strings.TrimPrefix(usable, totpSetupCookieName+"=")
+	expired := sealTOTPCookiePayloadForTest(t, secretKey, totpSetupCookieName, totpSetupCookiePayload{
+		UserID:    ctx.user.ID,
+		RawSecret: key.Secret(),
+		ExpiresAt: time.Now().Add(-1 * time.Minute),
+	})
+
+	unusable := map[string]string{
+		"expired":  totpSetupCookieName + "=" + expired,
+		"tampered": totpSetupCookieName + "=" + flipLastBaseEncodedByte(t, sealedUsable),
+	}
+	for name, setupCookie := range unusable {
+		t.Run(name, func(t *testing.T) {
+			response := totpEnrollmentRequest(t, ctx, "123456", setupCookie)
+			defer func() { _ = response.Body.Close() }()
+
+			if response.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("expected the %s setup cookie to be refused with 401, got %d", name, response.StatusCode)
+			}
+			assertTOTPCookieCleared(t, response, totpSetupCookieName)
+			if state := totpStateForUser(t, ctx, ctx.user.ID); state.TOTPEnabled || state.TOTPSecret != "" {
+				t.Fatalf("a %s setup cookie must not enrol anything", name)
+			}
+			if body := mustReadBodyString(t, response.Body); strings.Contains(body, key.Secret()) {
+				t.Fatal("a refused setup cookie must not surface the pending secret")
+			}
+		})
+	}
+}
+
+// probeVerifyTOTPEnrollment drives VerifyTOTP2FAEnrollment on a route of its
+// own, for the same reason probeApplyClearData does: the refusal under test is
+// provoked through the ROLE gate inside setAuthCookie, and no registered route
+// can carry a non-owner session into this handler — /api/v1/users/current/2fa
+// sits behind AuthRequired and OwnerOnly, which resolve an owner first.
+func probeVerifyTOTPEnrollment(t *testing.T, handler *Handler, user *models.User, code string, setupCookie string) *http.Response {
+	t.Helper()
+
+	app := fiber.New()
+	app.Use(handler.LanguageMiddleware)
+	app.Post("/__probe/2fa/verify", func(c fiber.Ctx) error {
+		c.Locals(contextUserKey, user)
+		return handler.VerifyTOTP2FAEnrollment(c)
+	})
+
+	form := url.Values{"password": {"StrongPass1"}, "code": {code}}
+	request := httptest.NewRequest(http.MethodPost, "/__probe/2fa/verify", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Accept-Language", "en")
+	request.Header.Set("Cookie", setupCookie)
+
+	return mustAppResponse(t, app, request)
+}
+
+// TestVerifyTOTP2FAEnrollmentClearsTheSetupCookieWhenTheSessionReissueIsRefused
+// pins the teardown on the handler's LAST refusal arm, the one that fires after
+// the enrollment has already been committed.
+//
+// By the time the session re-issue runs, EnableTOTP has persisted the encrypted
+// secret: the sealed setup cookie's raw seed is spent, and the enrollment page's
+// sanctioned exception for holding it — "until the first code verifies" — has
+// expired with it. The clear used to happen below, in the success arm, which a
+// refusal reached only because the guard above it could never fire; making that
+// guard real gave the arm an exit that skipped the clear, leaving the raw seed
+// on the browser for the rest of its TTL.
+//
+// The two cases are the same request with one field changed, and their auth
+// cookie is what says which arm ran: a refused re-issue clears it (setAuthCookie
+// failed, clearAuthCookie followed), a completed one seals a fresh value into
+// it. The setup cookie must be gone in both.
+func TestVerifyTOTP2FAEnrollmentClearsTheSetupCookieWhenTheSessionReissueIsRefused(t *testing.T) {
+	for _, testCase := range []struct {
+		name             string
+		slug             string
+		role             string
+		wantReissuedAuth bool
+	}{
+		{
+			name: "the session re-issue is refused",
+			slug: "refused",
+			// The one non-owner value the users table's CHECK constraint still
+			// accepts, which makes the arm reachable from a row rather than only
+			// from a fault injected into the AEAD codec.
+			role:             "partner",
+			wantReissuedAuth: false,
+		},
+		{
+			name:             "the session is re-issued",
+			slug:             "reissued",
+			role:             models.RoleOwner,
+			wantReissuedAuth: true,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			stub := newStubOIDCWorkflowService(true)
+			_, database, handler := newSettingsMutationStepupApp(t, stub)
+
+			user := createOnboardingTestUser(t, database, "totp-enroll-reissue-"+testCase.slug+"@example.com", "StrongPass1", true)
+			if testCase.role != models.RoleOwner {
+				if err := database.Model(&models.User{}).Where("id = ?", user.ID).Update("role", testCase.role).Error; err != nil {
+					t.Fatalf("set the account role under test: %v", err)
+				}
+				user.Role = testCase.role
+			}
+
+			key, err := getTOTPServiceForTest(database).GenerateSetupKey("Ovumcy", user.Email)
+			if err != nil {
+				t.Fatalf("GenerateSetupKey: %v", err)
+			}
+			code, err := totp.GenerateCode(key.Secret(), time.Now())
+			if err != nil {
+				t.Fatalf("GenerateCode: %v", err)
+			}
+			setupCookie := sealTOTPSetupCookieForTest(t, []byte("test-secret-key"), user.ID, key.Secret())
+
+			response := probeVerifyTOTPEnrollment(t, handler, &user, code, setupCookie)
+			defer func() { _ = response.Body.Close() }()
+
+			// Anti-vacuity: the enrollment must have been committed, or the
+			// request stopped at the password, the cookie or the code and never
+			// reached the arm under test.
+			var enrolled models.User
+			if err := database.First(&enrolled, user.ID).Error; err != nil {
+				t.Fatalf("reload the account under test: %v", err)
+			}
+			if !enrolled.TOTPEnabled || enrolled.TOTPSecret == "" {
+				t.Fatal("the probe never reached the session re-issue: EnableTOTP did not persist the enrollment")
+			}
+
+			authCookie := responseCookie(response.Cookies(), authCookieName)
+			if authCookie == nil {
+				t.Fatal("expected the response to write the auth cookie either way — its value is what says which arm ran")
+			}
+			if reissued := authCookie.Value != ""; reissued != testCase.wantReissuedAuth {
+				t.Fatalf("auth cookie re-issued = %t, want %t: the case did not take the arm it was built for", reissued, testCase.wantReissuedAuth)
+			}
+
+			cleared := responseCookie(response.Cookies(), totpSetupCookieName)
+			if cleared == nil || cleared.Value != "" {
+				t.Fatal("the spent setup cookie survived the response: EnableTOTP already persisted the secret, so the raw enrollment seed this cookie carries must not ride the browser for the rest of its TTL")
+			}
+			if body := mustReadBodyString(t, response.Body); strings.Contains(body, key.Secret()) {
+				t.Fatal("the response surfaced the raw enrollment seed")
+			}
+		})
+	}
+}
+
 // --- DisableTOTP2FA ---
 
 func TestDisableTOTP2FA_CorrectPassword_DisablesTOTP(t *testing.T) {
 	ctx := newTOTPSettingsContext(t, "totp-disable-correct@example.com")
 	svc := getTOTPServiceForTest(ctx.database)
-	if err := svc.EnableTOTP(context.Background(), ctx.user.ID, "JBSWY3DPEHPK3PXP"); err != nil {
+	if err := svc.EnableTOTP(context.Background(), ctx.user.ID, ctx.user.AuthSessionVersion, "JBSWY3DPEHPK3PXP", verifiedEnrollmentStepForTest(t, "JBSWY3DPEHPK3PXP")); err != nil {
 		t.Fatalf("EnableTOTP: %v", err)
 	}
 	// EnableTOTP bumped auth_session_version, so refresh the cookie before
@@ -277,7 +720,7 @@ func TestDisableTOTP2FA_CorrectPassword_DisablesTOTP(t *testing.T) {
 func TestDisableTOTP2FA_WrongPassword_ReturnsError(t *testing.T) {
 	ctx := newTOTPSettingsContext(t, "totp-disable-wrong@example.com")
 	svc := getTOTPServiceForTest(ctx.database)
-	if err := svc.EnableTOTP(context.Background(), ctx.user.ID, "JBSWY3DPEHPK3PXP"); err != nil {
+	if err := svc.EnableTOTP(context.Background(), ctx.user.ID, ctx.user.AuthSessionVersion, "JBSWY3DPEHPK3PXP", verifiedEnrollmentStepForTest(t, "JBSWY3DPEHPK3PXP")); err != nil {
 		t.Fatalf("EnableTOTP: %v", err)
 	}
 	// EnableTOTP bumped auth_session_version; without a refreshed cookie the
@@ -304,12 +747,12 @@ func TestDisableTOTP2FA_WrongPassword_ReturnsError(t *testing.T) {
 
 // TestDisableTOTP2FA_RateLimited_AfterRepeatedWrongPassword guards against an
 // authenticated session-stealing attacker brute-forcing the password to disable
-// 2FA. After DefaultTOTPDisableAttemptsLimit failures, a subsequent attempt
+// 2FA. After DefaultSettingsReauthAttemptsLimit failures, a subsequent attempt
 // (even with the correct password) must be rejected by the rate limiter.
 func TestDisableTOTP2FA_RateLimited_AfterRepeatedWrongPassword(t *testing.T) {
 	ctx := newTOTPSettingsContext(t, "totp-disable-rl@example.com")
 	svc := getTOTPServiceForTest(ctx.database)
-	if err := svc.EnableTOTP(context.Background(), ctx.user.ID, "JBSWY3DPEHPK3PXP"); err != nil {
+	if err := svc.EnableTOTP(context.Background(), ctx.user.ID, ctx.user.AuthSessionVersion, "JBSWY3DPEHPK3PXP", verifiedEnrollmentStepForTest(t, "JBSWY3DPEHPK3PXP")); err != nil {
 		t.Fatalf("EnableTOTP: %v", err)
 	}
 
@@ -319,7 +762,7 @@ func TestDisableTOTP2FA_RateLimited_AfterRepeatedWrongPassword(t *testing.T) {
 	ctx.refreshAuthCookie(t)
 
 	wrongForm := url.Values{"password": {"WrongPassword1"}}
-	for attempt := range services.DefaultTOTPDisableAttemptsLimit {
+	for attempt := range services.DefaultSettingsReauthAttemptsLimit {
 		resp := settingsFormRequestWithCSRF(t, ctx, http.MethodDelete, "/api/v1/users/current/2fa", wrongForm, map[string]string{"Accept-Language": "en", "Accept": "application/json"})
 		if resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusTooManyRequests {
 			t.Fatalf("attempt %d: status = %d, want 401 or 429", attempt, resp.StatusCode)

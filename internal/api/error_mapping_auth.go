@@ -39,6 +39,13 @@ func totpDisableRateLimitedErrorSpec() APIErrorSpec {
 	return settingsFormErrorSpec(fiber.StatusTooManyRequests, APIErrorCategoryRateLimited, "totp too many attempts")
 }
 
+// totpEnrollRateLimitedErrorSpec answers a spent totp.enroll budget the way the
+// disable route answers a spent re-auth one: a settings-form refusal under
+// the same key, so it needs no message of its own.
+func totpEnrollRateLimitedErrorSpec() APIErrorSpec {
+	return settingsFormErrorSpec(fiber.StatusTooManyRequests, APIErrorCategoryRateLimited, "totp too many attempts")
+}
+
 func invalidResetTokenErrorSpec() APIErrorSpec {
 	return authValidationErrorSpec("invalid reset token")
 }
@@ -53,6 +60,8 @@ func mapAuthRegisterError(err error) APIErrorSpec {
 		return authFormErrorSpec(fiber.StatusForbidden, APIErrorCategoryForbidden, "registration disabled")
 	case errors.Is(err, services.ErrAuthPasswordMismatch):
 		return authFormErrorSpec(fiber.StatusBadRequest, APIErrorCategoryValidation, "password mismatch")
+	case errors.Is(err, services.ErrAuthPasswordTooLong):
+		return authFormErrorSpec(fiber.StatusBadRequest, APIErrorCategoryValidation, "password too long")
 	case errors.Is(err, services.ErrAuthWeakPassword):
 		return authFormErrorSpec(fiber.StatusBadRequest, APIErrorCategoryValidation, "weak password")
 	case errors.Is(err, services.ErrAuthEmailExists):
@@ -61,8 +70,9 @@ func mapAuthRegisterError(err error) APIErrorSpec {
 		return authFormErrorSpec(fiber.StatusBadRequest, APIErrorCategoryValidation, "invalid input")
 	case errors.Is(err, services.ErrRegistrationSeedSymptoms):
 		return globalErrorSpec(fiber.StatusInternalServerError, APIErrorCategoryInternal, "failed to seed symptoms")
-	case errors.Is(err, services.ErrAuthRegisterFailed):
-		return globalErrorSpec(fiber.StatusInternalServerError, APIErrorCategoryInternal, "failed to create account")
+	// services.ErrAuthRegisterFailed and an unrecognized error share the
+	// default: registration reports one internal outcome, and narrowing it
+	// further would tell an unauthenticated caller where the flow stopped.
 	default:
 		return globalErrorSpec(fiber.StatusInternalServerError, APIErrorCategoryInternal, "failed to create account")
 	}
@@ -76,19 +86,23 @@ func mapAuthLoginError(err error) APIErrorSpec {
 		return authWebSignInUnavailableErrorSpec()
 	case errors.Is(err, services.ErrLoginResetTokenIssue):
 		return authResetTokenCreateErrorSpec()
-	case errors.Is(err, services.ErrAuthInvalidCreds):
-		return authFormErrorSpec(fiber.StatusUnauthorized, APIErrorCategoryUnauthorized, "invalid credentials")
+	// services.ErrAuthInvalidCreds and an unrecognized error share the default
+	// deliberately: any login failure the arms above did not name answers as
+	// "invalid credentials", so no login response reveals account existence or
+	// which factor failed.
 	default:
 		return authFormErrorSpec(fiber.StatusUnauthorized, APIErrorCategoryUnauthorized, "invalid credentials")
 	}
 }
 
+// mapAuthOIDCError narrows only the outcomes the owner can act on; the
+// callback-invalid and authentication-failed sentinels share the default with
+// an unrecognized error, so provider state never leaks through error
+// granularity.
 func mapAuthOIDCError(err error) APIErrorSpec {
 	switch {
 	case errors.Is(err, services.ErrOIDCDisabled), errors.Is(err, services.ErrOIDCUnavailable):
 		return authOIDCUnavailableErrorSpec()
-	case errors.Is(err, services.ErrOIDCCallbackInvalid), errors.Is(err, services.ErrOIDCAuthenticationFailed):
-		return authOIDCAuthenticationFailedErrorSpec()
 	case errors.Is(err, services.ErrOIDCAccountUnavailable):
 		return authOIDCAccountUnavailableErrorSpec()
 	case errors.Is(err, services.ErrOIDCIdentityResolveFailed), errors.Is(err, services.ErrOIDCLinkFailed), errors.Is(err, services.ErrOIDCProvisionFailed):
@@ -123,15 +137,37 @@ func mapPasswordRecoveryStartError(err error) APIErrorSpec {
 	}
 }
 
+// mapRecoveryCodeDeliveryError maps a delivery that could not be sealed. The
+// rotation it belonged to was rolled back, so the refusal names what failed
+// and nothing was spent: the reveal, a role the web surface does not serve,
+// or the session itself.
+func mapRecoveryCodeDeliveryError(err error) APIErrorSpec {
+	switch {
+	case errors.Is(err, errRecoveryCodeRevealSeal):
+		return authRecoveryCodePersistErrorSpec()
+	case errors.Is(err, services.ErrAuthUnsupportedRole):
+		return authWebSignInUnavailableErrorSpec()
+	default:
+		return authSessionCreateErrorSpec()
+	}
+}
+
 func mapPasswordResetCompleteError(err error) APIErrorSpec {
 	switch {
 	case errors.Is(err, services.ErrAuthPasswordMismatch):
 		return authFormErrorSpec(fiber.StatusBadRequest, APIErrorCategoryValidation, "password mismatch")
+	case errors.Is(err, services.ErrAuthPasswordTooLong):
+		return authFormErrorSpec(fiber.StatusBadRequest, APIErrorCategoryValidation, "password too long")
 	case errors.Is(err, services.ErrAuthWeakPassword):
 		return authFormErrorSpec(fiber.StatusBadRequest, APIErrorCategoryValidation, "weak password")
 	case errors.Is(err, services.ErrAuthResetInvalid):
 		return authInvalidInputErrorSpec()
 	case errors.Is(err, services.ErrInvalidResetToken):
+		return invalidResetTokenErrorSpec()
+	case errors.Is(err, services.ErrResetTokenAlreadyConsumed):
+		// A concurrent redeem of the same token won the compare-and-swap, so the
+		// token is spent: the loser gets the answer a replay after the win gets,
+		// and the caller clears the sealed reset cookie on this key.
 		return invalidResetTokenErrorSpec()
 	default:
 		return globalErrorSpec(fiber.StatusInternalServerError, APIErrorCategoryInternal, "failed to reset password")
@@ -140,6 +176,39 @@ func mapPasswordResetCompleteError(err error) APIErrorSpec {
 
 func authSessionCreateErrorSpec() APIErrorSpec {
 	return globalErrorSpec(fiber.StatusInternalServerError, APIErrorCategoryInternal, "failed to create session")
+}
+
+// authIdentityChangeAppliedSignInAgainErrorSpec answers a link or unlink whose
+// AuthSessionVersion bump already committed but whose session could not be
+// carried forward — a revocation raced the post-commit reload, or the re-mint
+// itself failed. Unlike authSessionCreateErrorSpec, this tells the owner the
+// change went through rather than leaving them to guess whether anything
+// happened: "failed to create session" describes a write that never landed,
+// which is false here. 401 rather than 500: the account's cookie has already
+// been cleared by the caller, so the correct next step is signing in again,
+// not retrying a request that already succeeded.
+func authIdentityChangeAppliedSignInAgainErrorSpec() APIErrorSpec {
+	return authFormErrorSpec(fiber.StatusUnauthorized, APIErrorCategoryUnauthorized, "identity change applied sign in again")
+}
+
+// totpEnabledSignInAgainErrorSpec answers a TOTP enrollment whose EnableTOTP
+// write (the encrypted secret and the AuthSessionVersion bump) already
+// committed but whose session could not be re-issued afterward. Same
+// reasoning as authIdentityChangeAppliedSignInAgainErrorSpec above: the
+// enrollment went through, so "failed to create session" would be false, and
+// 401 says the right next step is signing in again, since the caller has
+// already cleared the cookie. Built with authFormErrorSpec rather than
+// settingsFormErrorSpec, matching totpInvalidCodeErrorSpec and its siblings on
+// the same VerifyTOTP2FAEnrollment route.
+func totpEnabledSignInAgainErrorSpec() APIErrorSpec {
+	return authFormErrorSpec(fiber.StatusUnauthorized, APIErrorCategoryUnauthorized, "two factor enabled sign in again")
+}
+
+// totpDisabledSignInAgainErrorSpec is totpEnabledSignInAgainErrorSpec's
+// counterpart for DisableTOTP2FA: the disable already committed, only the
+// follow-up re-issue failed.
+func totpDisabledSignInAgainErrorSpec() APIErrorSpec {
+	return authFormErrorSpec(fiber.StatusUnauthorized, APIErrorCategoryUnauthorized, "two factor disabled sign in again")
 }
 
 func authSessionRevokeErrorSpec() APIErrorSpec {
@@ -174,34 +243,12 @@ func authOIDCAccountUnavailableErrorSpec() APIErrorSpec {
 	return authFormErrorSpec(fiber.StatusForbidden, APIErrorCategoryForbidden, "sso sign-in unavailable")
 }
 
-func authOIDCLinkConfirmExpiredErrorSpec() APIErrorSpec {
-	return authFormErrorSpec(fiber.StatusUnauthorized, APIErrorCategoryUnauthorized, "sso link confirmation expired")
-}
-
-func authOIDCLinkConfirmInvalidPasswordErrorSpec() APIErrorSpec {
-	return authFormErrorSpec(fiber.StatusUnauthorized, APIErrorCategoryUnauthorized, "sso link confirmation invalid password")
-}
-
-func authOIDCLinkConfirmRateLimitedErrorSpec() APIErrorSpec {
-	return authFormErrorSpec(fiber.StatusTooManyRequests, APIErrorCategoryRateLimited, "too many login attempts")
-}
-
-// mapOIDCLinkConfirmPasswordError maps failures of the link-confirm password
-// verification (which runs through LoginService.Authenticate) onto the
-// link-confirm error contract: rate-limited and reset-token-issue failures
-// keep their own specs, everything else is the generic invalid-password
-// response so account state never leaks through error granularity.
-func mapOIDCLinkConfirmPasswordError(err error) APIErrorSpec {
-	switch {
-	case errors.Is(err, services.ErrAuthLoginRateLimited):
-		return authOIDCLinkConfirmRateLimitedErrorSpec()
-	case errors.Is(err, services.ErrLoginResetTokenIssue):
-		return authResetTokenCreateErrorSpec()
-	default:
-		return authOIDCLinkConfirmInvalidPasswordErrorSpec()
-	}
-}
-
+// authOIDCLinkConfirmUnavailableErrorSpec answers CompleteOIDCLogin's
+// ErrOIDCLinkRequiresConfirmation handoff (handlers_auth_oidc.go): a fresh
+// (issuer, subject) resolved to a pre-existing local user by email, but the
+// pair has never been linked, and this repo mints no pending-link cookie for
+// that case in any configuration (#701) — the only two ways to complete a
+// link are the authenticated Settings step-up and the operator CLI.
 func authOIDCLinkConfirmUnavailableErrorSpec() APIErrorSpec {
 	return authFormErrorSpec(fiber.StatusForbidden, APIErrorCategoryForbidden, "sso link confirmation unavailable")
 }

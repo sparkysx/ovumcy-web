@@ -1,17 +1,40 @@
 package api
 
 import (
+	"time"
+
 	"github.com/gofiber/fiber/v3"
 	"github.com/ovumcy/ovumcy-web/internal/models"
 	"github.com/ovumcy/ovumcy-web/internal/services"
 )
 
+// The two erasure endpoints are the most destructive health-data mutations the
+// product exposes, so they are audited through the typed mechanism like every
+// other one. Neither acts on a single record: clear-data wipes the account's
+// tracked data and resets its settings, delete-account removes the account with
+// everything attached to it. The target therefore names that scope — a fixed
+// designator that never carries an email, an id, or any free text.
+var (
+	clearDataMutation     = healthMutationKind{action: "settings.clear_data", target: "account_data"}
+	deleteAccountMutation = healthMutationKind{action: "settings.delete_account", target: "account"}
+)
+
+// clearDataValidateAction names the password pre-check behind the clear-data
+// confirmation dialog. It answers whether the password is right and mutates
+// nothing, so it stays on the plain security-event path rather than claiming a
+// health-data domain — but the name still lives here, not at the call site.
+const clearDataValidateAction = "settings.clear_data_validate"
+
 func (handler *Handler) ValidateClearDataPassword(c fiber.Ctx) error {
-	_, spec, valid := handler.validateSettingsActionPassword(c)
+	reauth, spec, cause, valid := handler.validateSettingsActionPassword(c)
 	if !valid {
-		handler.logSecurityError(c, "settings.clear_data_validate", spec)
+		handler.logSecurityError(c, clearDataValidateAction, spec, cause)
 		return handler.respondMappedError(c, spec)
 	}
+	// The pre-check writes nothing, so the correct password is the whole of what
+	// it authorised and the budget clears at once. The wipe itself re-asks the
+	// password and clears the budget again only once it has committed.
+	reauth.resetBudget()
 
 	if acceptsJSON(c) {
 		return c.JSON(fiber.Map{"ok": true})
@@ -20,28 +43,27 @@ func (handler *Handler) ValidateClearDataPassword(c fiber.Ctx) error {
 }
 
 func (handler *Handler) ClearAllData(c fiber.Ctx) error {
-	user, spec, valid := handler.validateSettingsActionPassword(c)
+	reauth, spec, cause, valid := handler.validateSettingsActionPassword(c)
 	if !valid {
-		handler.logSecurityError(c, "settings.clear_data", spec)
+		return handler.failMutation(c, clearDataMutation, spec, cause)
+	}
+	// The wipe itself lives in applyClearData, shared with the OIDC step-up
+	// callback, so the session-version bump has exactly one implementation.
+	spec, outcome := handler.applyClearData(c, reauth.user)
+	switch outcome {
+	case clearDataRefusedSignedOut:
+		return handler.respondSignedOutRefusal(c, spec)
+	case clearDataRefused:
 		return handler.respondMappedError(c, spec)
+	case clearDataAppliedSignedOut:
+		// The wipe committed; only carrying this session past it failed.
+		reauth.resetBudget()
+		return handler.respondSignedOutRefusal(c, spec)
 	}
-	if err := handler.settingsService.ClearAllData(c.Context(), user.ID); err != nil {
-		spec := settingsClearDataErrorSpec()
-		handler.logSecurityError(c, "settings.clear_data", spec)
-		return handler.respondMappedError(c, spec)
-	}
+	// Only a wipe that committed clears the budget: a correct password whose
+	// wipe was refused proved nothing lasting.
+	reauth.resetBudget()
 
-	// ClearAllDataAndResetSettings bumps auth_session_version atomically;
-	// mirror the bump in memory and re-issue the auth cookie so this device
-	// stays signed in while every other session that existed before the
-	// wipe is invalidated on its next request. Matches the contract used by
-	// password change, recovery-code regen, and 2FA toggle.
-	user.AuthSessionVersion = services.NormalizeAuthSessionVersion(user.AuthSessionVersion) + 1
-	if err := handler.refreshCurrentSession(c, user, "settings.clear_data"); err != nil {
-		return err
-	}
-
-	handler.logSecurityEvent(c, "settings.clear_data", "success")
 	if acceptsJSON(c) {
 		return c.JSON(fiber.Map{"ok": true})
 	}
@@ -50,20 +72,18 @@ func (handler *Handler) ClearAllData(c fiber.Ctx) error {
 }
 
 func (handler *Handler) DeleteAccount(c fiber.Ctx) error {
-	user, spec, valid := handler.validateSettingsActionPassword(c)
+	reauth, spec, cause, valid := handler.validateSettingsActionPassword(c)
 	if !valid {
-		handler.logSecurityError(c, "settings.delete_account", spec)
-		return handler.respondMappedError(c, spec)
+		return handler.failMutation(c, deleteAccountMutation, spec, cause)
 	}
 
-	if err := handler.settingsService.DeleteAccount(c.Context(), user.ID); err != nil {
-		spec := settingsDeleteAccountErrorSpec()
-		handler.logSecurityError(c, "settings.delete_account", spec)
+	// Shared with the OIDC step-up callback; see applyClearData above.
+	if spec, applied := handler.applyDeleteAccount(c, reauth.user); !applied {
 		return handler.respondMappedError(c, spec)
 	}
+	// After the delete committed, like every other settings.reauth caller.
+	reauth.resetBudget()
 
-	handler.clearAuthRelatedCookies(c)
-	handler.logSecurityEvent(c, "settings.delete_account", "success")
 	if acceptsJSON(c) {
 		return c.JSON(fiber.Map{"ok": true})
 	}
@@ -72,7 +92,10 @@ func (handler *Handler) DeleteAccount(c fiber.Ctx) error {
 
 func parsePasswordProtectedSettingsAction(c fiber.Ctx) (string, APIErrorSpec, bool) {
 	input := passwordProtectedSettingsInput{}
-	if err := c.Bind().Body(&input); err != nil && hasJSONBody(c) {
+	// A body the binder rejected is refused whole, whatever its type: a decoder
+	// may have filled the password before it stopped, and a password taken from
+	// half a body is not one the client sent.
+	if err := bindRequestBody(c, &input); err != nil {
 		spec := settingsMissingPasswordErrorSpec()
 		return "", spec, false
 	}
@@ -83,19 +106,55 @@ func parsePasswordProtectedSettingsAction(c fiber.Ctx) (string, APIErrorSpec, bo
 	return input.Password, APIErrorSpec{}, true
 }
 
-func (handler *Handler) validateSettingsActionPassword(c fiber.Ctx) (*models.User, APIErrorSpec, bool) {
+// settingsReauth is what a passed settings re-auth hands its caller: the
+// session user it verified and the attempt it booked against settings.reauth.
+// The check does not clear the budget. A caller that writes calls resetBudget
+// once that write has committed, where its success response is decided, so a
+// correct password whose write was then refused (a revocation, a storage fault,
+// a failed delivery) keeps the count it found. A caller that writes nothing
+// resets at once, and says so where it does.
+type settingsReauth struct {
+	user    *models.User
+	budget  services.ReauthBudget
+	attempt services.ReauthAttempt
+}
+
+func (reauth settingsReauth) resetBudget() {
+	reauth.budget.Reset(reauth.attempt)
+}
+
+// validateSettingsActionPassword returns, alongside the mapped spec, a
+// SecurityEventField naming the underlying VerifyReauthPassword cause (WEB-54:
+// the mapped spec no longer distinguishes "no local password" from "wrong
+// password", but the caller should still log which one happened). The field
+// is the zero value — silently dropped by emitSecurityEvent — on every other
+// refusal (missing password, rate limited) and on success. On success it
+// returns the settingsReauth whose resetBudget the caller owes (see above).
+func (handler *Handler) validateSettingsActionPassword(c fiber.Ctx) (settingsReauth, APIErrorSpec, SecurityEventField, bool) {
 	user, ok := currentUser(c)
 	if !ok {
-		return nil, unauthorizedErrorSpec(), false
+		// codecov:ignore:start -- every caller hangs off the usersCurrent group,
+		// which carries AuthRequired, so a request reaching this helper always
+		// has a resolved session. Kept for the same reason the OIDC identity-link
+		// step-up's own duplicate check does: the helper must stay safe if it is
+		// ever called from somewhere that is not behind AuthRequired.
+		return settingsReauth{}, unauthorizedErrorSpec(), SecurityEventField{}, false
+		// codecov:ignore:end
 	}
 
 	password, spec, valid := parsePasswordProtectedSettingsAction(c)
 	if !valid {
-		return nil, spec, false
+		return settingsReauth{}, spec, SecurityEventField{}, false
 	}
-	if err := handler.settingsService.ValidateCurrentPassword(user.PasswordHash, password); err != nil {
-		return nil, mapSettingsDeleteAccountPasswordError(err), false
+	// Budgeted re-auth: the erasure gate is a password check reachable with a
+	// session already in hand, so it must not be a faster oracle than the login
+	// form. VerifyReauthPassword refuses even a correct password once the budget
+	// is spent, and never clears it: that is the caller's step, after its write.
+	attempt := services.ReauthAttempt{ClientKey: c.IP(), UserID: user.ID, Now: time.Now()}
+	budget, err := handler.settingsService.VerifyReauthPassword(attempt, user, password)
+	if err != nil {
+		return settingsReauth{}, mapSettingsDeleteAccountPasswordError(err), settingsReauthCauseField(err), false
 	}
 
-	return user, APIErrorSpec{}, true
+	return settingsReauth{user: user, budget: budget, attempt: attempt}, APIErrorSpec{}, SecurityEventField{}, true
 }

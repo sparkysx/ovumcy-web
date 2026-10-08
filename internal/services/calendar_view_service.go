@@ -37,6 +37,7 @@ type CalendarPageViewData struct {
 	HasPredictionExplanationPrimary   bool
 	HasPredictionExplanationSecondary bool
 	IsOwner                           bool
+	CanDrawTentativeOvulation         bool
 }
 
 type CalendarViewService struct {
@@ -58,15 +59,22 @@ func (service *CalendarViewService) BuildCalendarPageViewData(ctx context.Contex
 		return CalendarPageViewData{}, fmt.Errorf("%w: %v", ErrCalendarViewLoadLogs, err)
 	}
 
-	stats, statsLogs, err := service.stats.BuildCycleStatsForRange(ctx, user, now.AddDate(-2, 0, 0), now, now, location)
+	statsFrom, statsTo := StatsOverviewRange(now)
+	stats, statsLogs, err := service.stats.BuildCycleStatsForRange(ctx, user, statsFrom, statsTo, now, location)
 	if err != nil {
 		return CalendarPageViewData{}, fmt.Errorf("%w: %v", ErrCalendarViewLoadStats, err)
 	}
 
 	minMonth := CalendarMinimumNavigableMonth(user, location)
-	prevMonth, nextMonth := CalendarAdjacentMonthValuesWithinBounds(monthStart, minMonth)
+	maxMonth := CalendarMaximumNavigableMonth(now, location)
+	prevMonth, nextMonth := CalendarAdjacentMonthValuesWithinBounds(monthStart, minMonth, maxMonth)
 	dayStates := BuildCalendarDayStates(user, monthStart, logs, stats, now, location)
-	cycleContext := BuildDashboardCycleContext(user, stats, DateAtLocation(now, location), location)
+	// statsLogs, not the grid's set: `logs` is the window around the MONTH being
+	// viewed (CalendarLogRange), so a past month excludes the current cycle
+	// entirely and the confirmation would answer "no shift" purely because of
+	// where the owner navigated. The cycle context describes the cycle the owner
+	// is in, and the stats window is anchored on now.
+	cycleContext := BuildDashboardCycleContext(user, statsLogs, stats, DateAtLocation(now, location), location)
 	cycleFactorExplanation, hasCycleFactorExplanation := buildStatsCycleFactorExplanation(user, statsLogs, stats, now, location)
 	predictionExplanation := BuildOwnerPredictionExplanation(user, cycleContext, hasCycleFactorExplanation && len(cycleFactorExplanation.HintFactorKeys) > 0)
 
@@ -85,5 +93,6 @@ func (service *CalendarViewService) BuildCalendarPageViewData(ctx context.Contex
 		HasPredictionExplanationPrimary:   predictionExplanation.PrimaryKey != "",
 		HasPredictionExplanationSecondary: predictionExplanation.SecondaryKey != "",
 		IsOwner:                           IsOwnerUser(user),
+		CanDrawTentativeOvulation:         CalendarCanDrawTentativeOvulation(user),
 	}, nil
 }

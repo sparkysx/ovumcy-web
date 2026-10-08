@@ -82,13 +82,36 @@ func TestShouldSuggestManualCycleStart_RequiresPeriodNonStart(t *testing.T) {
 	}
 }
 
+// observedCyclesBefore seeds the recorded history the implantation hint
+// requires: with fewer than four recorded cycle starts there are fewer than
+// three completed cycles, the completed-cycle floor inside
+// FertilityProjectionSuppressed withholds the hint, and a fixture probing the
+// window arithmetic would never reach that arithmetic. The starts are 28 days
+// apart — the length these tests were already written against — so every
+// ovulation date below is unchanged from when the fixture carried no logs at
+// all.
+func observedCyclesBefore(start time.Time) []models.DailyLog {
+	logs := make([]models.DailyLog, 0, 20)
+	for _, cycleStart := range []time.Time{start.AddDate(0, 0, -84), start.AddDate(0, 0, -56), start.AddDate(0, 0, -28), start} {
+		for offset := range 5 {
+			logs = append(logs, models.DailyLog{
+				Date:       cycleStart.AddDate(0, 0, offset),
+				IsPeriod:   true,
+				CycleStart: offset == 0,
+			})
+		}
+	}
+	return logs
+}
+
 func TestPotentialImplantationGapDays_WindowBoundary(t *testing.T) {
-	// With no prior logs the cycle length resolves to the user's configured 28
-	// days and the luteal phase to the 14-day default, so ovulation for a cycle
-	// starting 2026-02-26 lands on 2026-03-11. The implantation warning fires
-	// only for a gap of 6..12 days after that ovulation date.
+	// Three recorded 28-day cycles put an observed length behind the projection
+	// and the luteal phase resolves to the 14-day default, so ovulation for the
+	// cycle starting 2026-02-26 lands on 2026-03-11. The implantation warning
+	// fires only for a gap of 6..12 days after that ovulation date.
 	user := &models.User{CycleLength: 28}
 	previousStart := mustParseCycleStartPolicyDay(t, "2026-02-26")
+	logs := observedCyclesBefore(previousStart)
 	cases := []struct {
 		name      string
 		targetDay string
@@ -103,7 +126,7 @@ func TestPotentialImplantationGapDays_WindowBoundary(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			targetDay := mustParseCycleStartPolicyDay(t, tc.targetDay)
-			gap, ok := potentialImplantationGapDays(user, nil, targetDay, previousStart)
+			gap, ok := potentialImplantationGapDays(user, logs, targetDay, previousStart)
 			if gap != tc.wantGap || ok != tc.wantOK {
 				t.Fatalf("potentialImplantationGapDays(target %s) = (%d,%t), want (%d,%t)",
 					tc.targetDay, gap, ok, tc.wantGap, tc.wantOK)
@@ -144,11 +167,61 @@ func TestResolveManualCycleStartPolicy_ShortGapBoundary(t *testing.T) {
 // it one calendar day backward in UTC-minus locales, inflating the gap by
 // one: a 5-day gap (too early) was reported as a 6-day implantation
 // candidate and a true 12-day gap fell outside the 6..12 window.
+// TestResolveManualCycleStartPolicy_CompetingStartCrossTimezone pins the
+// issue-#48-class fix on the replace-confirmation flow. The period-cluster
+// bounds are UTC-midnight values (buildPeriodClusters via dateOnly) while the
+// days compared against them are rebuilt at location midnight. Those are
+// different instants under a non-zero UTC offset, so the day on the edge of
+// its own cluster fell outside the bounds: ahead of UTC a competing cycle
+// start on the FIRST cluster day went undetected, behind UTC one on the LAST
+// day did. The owner then saw no replace confirmation and kept two cycle
+// starts inside one bleeding cluster. An interior day was detected either way
+// and is the control here.
+func TestResolveManualCycleStartPolicy_CompetingStartCrossTimezone(t *testing.T) {
+	// Europe/Belgrade in early March, and its UTC-minus mirror.
+	belgrade := time.FixedZone("UTC+1", 1*60*60)
+	lima := time.FixedZone("UTC-5", -5*60*60)
+
+	cases := []struct {
+		name      string
+		location  *time.Location
+		competing string
+	}{
+		{"UTC+1 competing start on the first cluster day", belgrade, "2026-03-01"},
+		{"UTC+1 competing start on an interior cluster day", belgrade, "2026-03-04"},
+		{"UTC-5 competing start on the last cluster day", lima, "2026-03-05"},
+		{"UTC-5 competing start on an interior cluster day", lima, "2026-03-02"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := make([]models.DailyLog, 0, 5)
+			for _, day := range []string{"2026-03-01", "2026-03-02", "2026-03-03", "2026-03-04", "2026-03-05"} {
+				logs = append(logs, models.DailyLog{
+					Date:       mustParseCycleStartPolicyDay(t, day),
+					IsPeriod:   true,
+					CycleStart: day == tc.competing,
+				})
+			}
+
+			// The selected day arrives as ParseDayDate leaves it: midnight in
+			// the request location, while the stored logs above are
+			// UTC-midnight date-only values.
+			targetDay := time.Date(2026, 3, 3, 0, 0, 0, 0, tc.location)
+
+			policy := ResolveManualCycleStartPolicy(&models.User{}, logs, targetDay, targetDay, tc.location)
+			if got := CalendarDayKey(policy.ConflictDate); got != tc.competing {
+				t.Fatalf("ResolveManualCycleStartPolicy conflict date = %q, want %q", got, tc.competing)
+			}
+		})
+	}
+}
+
 func TestPotentialImplantationGapDays_CrossTimezone(t *testing.T) {
 	// Same geometry as the window-boundary test: ovulation for a 28-day cycle
 	// starting 2026-02-26 lands on 2026-03-11.
 	user := &models.User{CycleLength: 28}
 	previousStart := mustParseCycleStartPolicyDay(t, "2026-02-26")
+	logs := observedCyclesBefore(previousStart)
 	tokyo := time.FixedZone("UTC+9", 9*60*60)
 	lima := time.FixedZone("UTC-5", -5*60*60)
 
@@ -166,10 +239,54 @@ func TestPotentialImplantationGapDays_CrossTimezone(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			gap, ok := potentialImplantationGapDays(user, nil, tc.targetDay, previousStart)
+			gap, ok := potentialImplantationGapDays(user, logs, tc.targetDay, previousStart)
 			if gap != tc.wantGap || ok != tc.wantOK {
 				t.Fatalf("potentialImplantationGapDays(target %s) = (%d,%t), want (%d,%t)",
 					tc.targetDay.Format(time.RFC3339), gap, ok, tc.wantGap, tc.wantOK)
+			}
+		})
+	}
+}
+
+// TestResolveManualCycleStartPolicy_ZeroDayIsRefusedInEveryLocation pins the
+// zero-day guard onto the RAW input, the way IsAllowedManualCycleStartDate
+// already tests it. The guard used to run on the projected day, and
+// DateAtLocation has no zero short-circuit: a zero time.Time is 0001-01-01 in
+// UTC, but projected into any zone with a non-zero offset it is an ordinary
+// calendar day (0001-01-01 east of UTC, 0000-12-31 west of it) whose IsZero()
+// is false. The refusal therefore fired only in UTC, and everywhere else the
+// policy was computed against a year-1 calendar — empty by accident whenever
+// no log sits there, and, as the fixture below shows, not empty when one does.
+func TestResolveManualCycleStartPolicy_ZeroDayIsRefusedInEveryLocation(t *testing.T) {
+	// Two period days at the very start of the calendar, the second one a
+	// cycle start: the only fixture a year-1 target day can reach.
+	logs := []models.DailyLog{
+		{Date: time.Date(1, time.January, 1, 0, 0, 0, 0, time.UTC), IsPeriod: true},
+		{Date: time.Date(1, time.January, 2, 0, 0, 0, 0, time.UTC), IsPeriod: true, CycleStart: true},
+	}
+	now := mustParseCycleStartPolicyDay(t, "2026-03-03")
+
+	cases := []struct {
+		name     string
+		location *time.Location
+	}{
+		{"UTC", time.UTC},
+		{"east of UTC", time.FixedZone("UTC+1", 1*60*60)},
+		{"west of UTC", time.FixedZone("UTC-5", -5*60*60)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			policy := ResolveManualCycleStartPolicy(&models.User{}, logs, time.Time{}, now, tc.location)
+			if !policy.ConflictDate.IsZero() {
+				t.Fatalf("zero day yielded a conflict date %s", CalendarDayKey(policy.ConflictDate))
+			}
+			if !policy.PreviousStart.IsZero() || policy.ShortGapDays != 0 {
+				t.Fatalf("zero day yielded a previous start %s / short gap %d",
+					CalendarDayKey(policy.PreviousStart), policy.ShortGapDays)
+			}
+			if policy.PotentialImplantation || policy.ImplantationGapDays != 0 {
+				t.Fatalf("zero day yielded an implantation flag (%t, %d days)",
+					policy.PotentialImplantation, policy.ImplantationGapDays)
 			}
 		})
 	}

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/ovumcy/ovumcy-web/internal/httpx"
@@ -23,37 +22,49 @@ func htmxDismissibleSuccessStatusMarkup(messages map[string]string, message stri
 func htmxSettingsSuccessMarkup(c fiber.Ctx, status string, defaultMessage string) string {
 	messages := currentMessages(c)
 	messageKey := services.SettingsStatusTranslationKey(status)
-	message := translateMessage(messages, messageKey)
-	if message == "" || message == messageKey {
+	message, translated := lookupMessage(messages, messageKey)
+	if !translated {
 		message = defaultMessage
 	}
 	return htmxDismissibleSuccessStatusMarkup(messages, message)
 }
 
 func localizedStatusDismissLabel(messages map[string]string) string {
-	closeLabel := translateMessage(messages, "common.close")
-	if closeLabel == "" || closeLabel == "common.close" {
+	closeLabel, translated := lookupMessage(messages, "common.close")
+	if !translated {
 		return "Close"
 	}
 	return closeLabel
 }
 
-func setEncodedResponseNotice(c fiber.Ctx, message string) {
+// setEncodedResponseNotice carries a day-save toast to the client out of band,
+// in a header, because the response body is the saved entry rather than a page.
+//
+// It emits the rendered sentence AND its catalogue key. The sentence is what
+// the toast shows; the key is what anything asserting on the notice keys off,
+// so a test does not have to re-type localized copy the catalogue owns — the
+// same split the rendered surfaces express as data-explainer-key next to their
+// text. A blank message emits neither header, so "no notice" stays observable
+// as the absence of both.
+func setEncodedResponseNotice(c fiber.Ctx, noticeKey string, message string) {
 	trimmed := strings.TrimSpace(message)
 	if trimmed == "" {
 		return
 	}
 	c.Set("X-Ovumcy-Notice", url.QueryEscape(trimmed))
+	if key := strings.TrimSpace(noticeKey); key != "" {
+		c.Set("X-Ovumcy-Notice-Key", key)
+	}
 }
 
 func (handler *Handler) sendDaySaveStatus(c fiber.Ctx, messageKey string) error {
-	timestamp := time.Now().In(handler.requestLocation(c)).Format("15:04")
+	timestamp := handler.clockNow().In(handler.requestLocation(c)).Format("15:04")
 	patternKey := messageKey
 	if patternKey == "" {
 		patternKey = "common.saved_at"
 	}
-	pattern := translateMessage(currentMessages(c), patternKey)
-	if pattern == "" || pattern == patternKey {
+	pattern, translated := lookupMessage(currentMessages(c), patternKey)
+	if !translated {
 		if patternKey == "common.saved_at" {
 			pattern = "Saved at %s"
 		} else {
@@ -64,5 +75,20 @@ func (handler *Handler) sendDaySaveStatus(c fiber.Ctx, messageKey string) error 
 	if patternKey == "common.saved_at" {
 		message = fmt.Sprintf(pattern, timestamp)
 	}
-	return c.SendString(htmxDismissibleSuccessStatusMarkup(currentMessages(c), message))
+	markup := httpx.DismissibleStatusOKMarkupOfKind(message, localizedStatusDismissLabel(currentMessages(c)), daySaveStatusKind(messageKey))
+	return sendHTMLFragment(c, markup)
+}
+
+// daySaveStatusKind renders the services-level kind of a day-save sentence as
+// the status kind the client reads: the safety line is persistent, the bare
+// confirmation neutral, and a routine line declares nothing.
+func daySaveStatusKind(messageKey string) string {
+	switch services.ClassifyDaySaveMessage(messageKey) {
+	case services.DaySaveMessageSafety:
+		return httpx.StatusKindPersistent
+	case services.DaySaveMessageConfirmation:
+		return httpx.StatusKindNeutral
+	default:
+		return ""
+	}
 }

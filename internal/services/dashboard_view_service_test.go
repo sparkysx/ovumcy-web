@@ -12,16 +12,23 @@ import (
 type stubDashboardStatsProvider struct {
 	stats CycleStats
 	err   error
+
+	// Captured user arguments — used to prove the cycle-stats reads, which
+	// derive the predictions the dashboard renders, carry the session owner.
+	rangeUsers   []*models.User
+	fromLogUsers []*models.User
 }
 
-func (stub *stubDashboardStatsProvider) BuildCycleStatsForRange(ctx context.Context, _ *models.User, _ time.Time, _ time.Time, _ time.Time, _ *time.Location) (CycleStats, []models.DailyLog, error) {
+func (stub *stubDashboardStatsProvider) BuildCycleStatsForRange(ctx context.Context, user *models.User, _ time.Time, _ time.Time, _ time.Time, _ *time.Location) (CycleStats, []models.DailyLog, error) {
+	stub.rangeUsers = append(stub.rangeUsers, user)
 	if stub.err != nil {
 		return CycleStats{}, nil, stub.err
 	}
 	return stub.stats, nil, nil
 }
 
-func (stub *stubDashboardStatsProvider) BuildCycleStatsFromLogs(_ *models.User, _ []models.DailyLog, _ time.Time, _ *time.Location) CycleStats {
+func (stub *stubDashboardStatsProvider) BuildCycleStatsFromLogs(user *models.User, _ []models.DailyLog, _ time.Time, _ *time.Location) CycleStats {
+	stub.fromLogUsers = append(stub.fromLogUsers, user)
 	return stub.stats
 }
 
@@ -29,9 +36,13 @@ type stubDashboardViewerProvider struct {
 	logEntry models.DailyLog
 	symptoms []models.SymptomType
 	err      error
+
+	// Captured user arguments — used to prove reads carry the session owner.
+	viewerUsers []*models.User
 }
 
-func (stub *stubDashboardViewerProvider) FetchDayLogForViewer(ctx context.Context, _ *models.User, _ time.Time, _ *time.Location) (models.DailyLog, []models.SymptomType, error) {
+func (stub *stubDashboardViewerProvider) FetchDayLogForViewer(ctx context.Context, user *models.User, _ time.Time, _ *time.Location) (models.DailyLog, []models.SymptomType, error) {
+	stub.viewerUsers = append(stub.viewerUsers, user)
 	if stub.err != nil {
 		return models.DailyLog{}, nil, stub.err
 	}
@@ -44,16 +55,22 @@ type stubDashboardDayStateProvider struct {
 	hasData bool
 	err     error
 	logs    []models.DailyLog
+
+	// Captured userID arguments — used to prove reads are owner-scoped.
+	dayStateUserIDs []uint
+	allLogsUserIDs  []uint
 }
 
-func (stub *stubDashboardDayStateProvider) DayHasDataForDate(ctx context.Context, _ uint, _ time.Time, _ *time.Location) (bool, error) {
+func (stub *stubDashboardDayStateProvider) DayHasDataForDate(ctx context.Context, userID uint, _ time.Time, _ *time.Location) (bool, error) {
+	stub.dayStateUserIDs = append(stub.dayStateUserIDs, userID)
 	if stub.err != nil {
 		return false, stub.err
 	}
 	return stub.hasData, nil
 }
 
-func (stub *stubDashboardDayStateProvider) FetchAllLogsForUser(ctx context.Context, _ uint) ([]models.DailyLog, error) {
+func (stub *stubDashboardDayStateProvider) FetchAllLogsForUser(ctx context.Context, userID uint) ([]models.DailyLog, error) {
+	stub.allLogsUserIDs = append(stub.allLogsUserIDs, userID)
 	if stub.err != nil {
 		return nil, stub.err
 	}
@@ -156,8 +173,8 @@ func TestBuildDayEditorViewData(t *testing.T) {
 		&stubDashboardStatsProvider{},
 		&stubDashboardViewerProvider{
 			logEntry: models.DailyLog{
-				Date:       day,
-				IsPeriod:   true,
+				Date:     day,
+				IsPeriod: true, CycleStart: true,
 				Flow:       models.FlowLight,
 				SymptomIDs: []uint{7},
 			},
@@ -225,8 +242,66 @@ func TestBuildDashboardViewDataShowsHighFertilityBadgeForEggWhiteMucus(t *testin
 	user := &models.User{ID: 6, Role: models.RoleOwner, CycleLength: 28, TrackCervicalMucus: true}
 	today := mustParseDashboardServiceDay(t, "2026-02-21")
 
+	viewData := buildEggWhiteBadgeViewData(t, user, today, CycleStats{
+		CompletedCycleCount: 3,
+		MedianCycleLength:   28,
+		LastPeriodStart:     mustParseDashboardServiceDay(t, "2026-02-10"),
+		NextPeriodStart:     mustParseDashboardServiceDay(t, "2026-03-10"),
+	})
+	if viewData.CycleContext.FertilitySuppressed {
+		t.Fatalf("control fixture must clear the fertility floor")
+	}
+	if !viewData.ShowHighFertilityBadge {
+		t.Fatalf("expected high-fertility badge for egg-white mucus once the fertility half is shown")
+	}
+}
+
+func TestBuildDashboardViewDataWithholdsHighFertilityBadgeWhileFertilitySuppressed(t *testing.T) {
+	today := mustParseDashboardServiceDay(t, "2026-02-21")
+	lastPeriod := mustParseDashboardServiceDay(t, "2026-02-10")
+	nextPeriod := mustParseDashboardServiceDay(t, "2026-03-10")
+
+	cases := []struct {
+		name  string
+		user  *models.User
+		stats CycleStats
+	}{
+		{
+			name:  "first cycle, trying to conceive",
+			user:  &models.User{ID: 6, Role: models.RoleOwner, CycleLength: 28, TrackCervicalMucus: true, UsageGoal: models.UsageGoalTrying},
+			stats: CycleStats{LastPeriodStart: lastPeriod},
+		},
+		{
+			name:  "irregular mode before its range exists",
+			user:  &models.User{ID: 6, Role: models.RoleOwner, CycleLength: 28, TrackCervicalMucus: true, IrregularCycle: true},
+			stats: CycleStats{CompletedCycleCount: 2, MedianCycleLength: 28, LastPeriodStart: lastPeriod, NextPeriodStart: nextPeriod},
+		},
+		{
+			name:  "pregnancy pause",
+			user:  &models.User{ID: 6, Role: models.RoleOwner, CycleLength: 28, TrackCervicalMucus: true},
+			stats: CycleStats{CompletedCycleCount: 3, MedianCycleLength: 28, LastPeriodStart: lastPeriod, NextPeriodStart: nextPeriod, PregnancyPaused: true},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			viewData := buildEggWhiteBadgeViewData(t, tc.user, today, tc.stats)
+			if !viewData.CycleContext.FertilitySuppressed {
+				t.Fatalf("fixture must be a suppressed tier")
+			}
+			if viewData.ShowFertilityStatus {
+				t.Fatalf("fixture must hold the fertility header back")
+			}
+			if viewData.ShowHighFertilityBadge {
+				t.Fatalf("high-fertility badge must not render beside the withheld fertility header")
+			}
+		})
+	}
+}
+
+func buildEggWhiteBadgeViewData(t *testing.T, user *models.User, today time.Time, stats CycleStats) DashboardViewData {
+	t.Helper()
 	service := NewDashboardViewService(
-		&stubDashboardStatsProvider{},
+		&stubDashboardStatsProvider{stats: stats},
 		&stubDashboardViewerProvider{
 			logEntry: models.DailyLog{
 				Date:          today,
@@ -235,14 +310,11 @@ func TestBuildDashboardViewDataShowsHighFertilityBadgeForEggWhiteMucus(t *testin
 		},
 		&stubDashboardDayStateProvider{},
 	)
-
 	viewData, err := service.BuildDashboardViewData(context.Background(), user, "en", today, time.UTC)
 	if err != nil {
 		t.Fatalf("BuildDashboardViewData() unexpected error: %v", err)
 	}
-	if !viewData.ShowHighFertilityBadge {
-		t.Fatalf("expected high-fertility badge for egg-white mucus")
-	}
+	return viewData
 }
 
 func TestBuildDashboardViewDataAddsPredictionFactorHintForVariablePatterns(t *testing.T) {
@@ -264,13 +336,13 @@ func TestBuildDashboardViewDataAddsPredictionFactorHintForVariablePatterns(t *te
 		},
 		&stubDashboardDayStateProvider{
 			logs: []models.DailyLog{
-				{Date: mustParseDashboardServiceDay(t, "2026-01-01"), IsPeriod: true},
+				{Date: mustParseDashboardServiceDay(t, "2026-01-01"), IsPeriod: true, CycleStart: true},
 				{Date: mustParseDashboardServiceDay(t, "2026-01-03"), CycleFactorKeys: []string{models.CycleFactorStress}},
-				{Date: mustParseDashboardServiceDay(t, "2026-01-25"), IsPeriod: true},
+				{Date: mustParseDashboardServiceDay(t, "2026-01-25"), IsPeriod: true, CycleStart: true},
 				{Date: mustParseDashboardServiceDay(t, "2026-01-28"), CycleFactorKeys: []string{models.CycleFactorTravel}},
-				{Date: mustParseDashboardServiceDay(t, "2026-03-10"), IsPeriod: true},
+				{Date: mustParseDashboardServiceDay(t, "2026-03-10"), IsPeriod: true, CycleStart: true},
 				{Date: mustParseDashboardServiceDay(t, "2026-03-12"), CycleFactorKeys: []string{models.CycleFactorStress}},
-				{Date: mustParseDashboardServiceDay(t, "2026-04-20"), IsPeriod: true},
+				{Date: mustParseDashboardServiceDay(t, "2026-04-20"), IsPeriod: true, CycleStart: true},
 			},
 		},
 	)
@@ -341,6 +413,114 @@ func TestBuildDayEditorViewDataReturnsTypedErrors(t *testing.T) {
 	}
 }
 
+// TestDashboardViewProvidersReadOnlyTheSessionOwner pins owner propagation on
+// the dashboard's whole read path. Every provider call these two builders make
+// reads special-category health data, so each must carry the acting session
+// owner and nothing else: the viewer fetch takes the user itself, the day-state
+// reads take its id. The stubs record what they were handed, and the account id
+// is deliberately not 1 — an unscoped or hard-coded read would otherwise agree
+// with the fixture by accident. Each provider is asserted to have been reached
+// at least once, so a run that recorded nothing fails here instead of passing
+// as "no mismatch found".
+func TestDashboardViewProvidersReadOnlyTheSessionOwner(t *testing.T) {
+	const sessionOwnerID uint = 4242
+
+	user := &models.User{ID: sessionOwnerID, Role: models.RoleOwner, CycleLength: 28}
+	now := mustParseDashboardServiceDay(t, "2026-02-21")
+	day := mustParseDashboardServiceDay(t, "2026-02-20")
+
+	viewer := &stubDashboardViewerProvider{
+		logEntry: models.DailyLog{Date: now, Notes: "owner-note"},
+		symptoms: []models.SymptomType{{ID: 3, Name: "Headache"}},
+	}
+	days := &stubDashboardDayStateProvider{
+		hasData: true,
+		logs: []models.DailyLog{
+			{Date: mustParseDashboardServiceDay(t, "2026-02-01"), IsPeriod: true, CycleStart: true},
+			{Date: now, IsPeriod: true, CycleStart: true},
+		},
+	}
+	stats := &stubDashboardStatsProvider{stats: CycleStats{MedianCycleLength: 28}}
+	service := NewDashboardViewService(stats, viewer, days)
+
+	if _, err := service.BuildDashboardViewData(context.Background(), user, "en", now, time.UTC); err != nil {
+		t.Fatalf("BuildDashboardViewData() unexpected error: %v", err)
+	}
+	if _, err := service.BuildDayEditorViewData(context.Background(), user, "en", day, now, time.UTC); err != nil {
+		t.Fatalf("BuildDayEditorViewData() unexpected error: %v", err)
+	}
+
+	if len(viewer.viewerUsers) == 0 {
+		t.Fatal("expected the viewer provider to be reached; it recorded no call")
+	}
+	for index, captured := range viewer.viewerUsers {
+		if captured == nil {
+			t.Fatalf("viewer call %d received no user at all", index)
+		}
+		if captured.ID != sessionOwnerID {
+			t.Fatalf("viewer call %d read owner id %d, want the session owner %d", index, captured.ID, sessionOwnerID)
+		}
+	}
+
+	if len(days.dayStateUserIDs) == 0 {
+		t.Fatal("expected the day-state provider to be reached; it recorded no DayHasDataForDate call")
+	}
+	for index, capturedID := range days.dayStateUserIDs {
+		if capturedID != sessionOwnerID {
+			t.Fatalf("DayHasDataForDate call %d read owner id %d, want the session owner %d", index, capturedID, sessionOwnerID)
+		}
+	}
+
+	if len(days.allLogsUserIDs) == 0 {
+		t.Fatal("expected the day-state provider to be reached; it recorded no FetchAllLogsForUser call")
+	}
+	for index, capturedID := range days.allLogsUserIDs {
+		if capturedID != sessionOwnerID {
+			t.Fatalf("FetchAllLogsForUser call %d read owner id %d, want the session owner %d", index, capturedID, sessionOwnerID)
+		}
+	}
+
+	// The cycle-stats reads decide what the dashboard predicts, so a session
+	// mixed up here shows one account's phase and fertile window on another's
+	// dashboard — the same boundary, one layer further in. An owner view
+	// derives its stats from the entry-context logs, so this path reaches
+	// BuildCycleStatsFromLogs and never BuildCycleStatsForRange.
+	if len(stats.fromLogUsers) == 0 {
+		t.Fatal("expected the stats provider to be reached; it recorded no BuildCycleStatsFromLogs call")
+	}
+	for index, captured := range stats.fromLogUsers {
+		if captured == nil {
+			t.Fatalf("BuildCycleStatsFromLogs call %d received no user at all", index)
+		}
+		if captured.ID != sessionOwnerID {
+			t.Fatalf("BuildCycleStatsFromLogs call %d read owner id %d, want the session owner %d", index, captured.ID, sessionOwnerID)
+		}
+	}
+
+	// The ranged stats read is the other half of the same seam and is reached
+	// only by a session that needs no entry-context logs, so it gets its own
+	// session user rather than being left unobserved.
+	const rangeSessionID uint = 7373
+
+	rangeStats := &stubDashboardStatsProvider{stats: CycleStats{MedianCycleLength: 28}}
+	rangeSession := &models.User{ID: rangeSessionID, Role: "viewer", CycleLength: 28}
+	rangeService := NewDashboardViewService(rangeStats, &stubDashboardViewerProvider{}, &stubDashboardDayStateProvider{})
+	if _, err := rangeService.BuildDashboardViewData(context.Background(), rangeSession, "en", now, time.UTC); err != nil {
+		t.Fatalf("BuildDashboardViewData() unexpected error on the ranged stats path: %v", err)
+	}
+	if len(rangeStats.rangeUsers) == 0 {
+		t.Fatal("expected the stats provider to be reached; it recorded no BuildCycleStatsForRange call")
+	}
+	for index, captured := range rangeStats.rangeUsers {
+		if captured == nil {
+			t.Fatalf("BuildCycleStatsForRange call %d received no user at all", index)
+		}
+		if captured.ID != rangeSessionID {
+			t.Fatalf("BuildCycleStatsForRange call %d read session id %d, want %d", index, captured.ID, rangeSessionID)
+		}
+	}
+}
+
 func TestFirstMissingTrackedDayIgnoresDaysBeforeTrackingStart(t *testing.T) {
 	today := mustParseDashboardServiceDay(t, "2026-02-21")
 	trackingStart := mustParseDashboardServiceDay(t, "2026-02-18")
@@ -374,6 +554,301 @@ func TestFirstMissingTrackedDayFindsTrackedGap(t *testing.T) {
 	}
 }
 
+// TestResolveDashboardTimingFrameGatesTheOvulationEstimateOnEverySuppression
+// pins which cycle states the goal-aware ovulation item survives. The frame
+// answers a question about the goal, but the estimate it adds is a prediction:
+// it must disappear wherever the next-period window does — an unpredictable
+// cycle, a pregnancy pause, and a cycle overdue past reference + 7, where the
+// projection has nothing left to say — and also before the first completed
+// cycle, where the bridge line stands in for it. The temperature's placement
+// answers the goal question alone and is unmoved by any of them.
+//
+// The cases feed a (user, stats) pair through BuildDashboardCycleContext rather
+// than hand-building the context, because the frame no longer recombines the
+// suppression signals: the ovulation estimate reads the FertilitySuppressed
+// decision the context resolved once. A hand-built context can set
+// PredictionDisabled without the decision that follows from it, which is a state
+// the builder never emits — asserting against one would pin the frame to a
+// fixture rather than to the policy.
+func TestResolveDashboardTimingFrameGatesTheOvulationEstimateOnEverySuppression(t *testing.T) {
+	today := mustParseDashboardServiceDay(t, dashboardSuppressionDay)
+	visibility := dashboardOwnerVisibility{ShowBBTField: true}
+
+	for name, testCase := range map[string]struct {
+		mutateUser   func(*models.User)
+		mutateStats  func(*CycleStats)
+		wantEstimate bool
+		wantBridge   bool
+		wantMore     bool
+	}{
+		"stable cycle": {
+			wantEstimate: true,
+		},
+		"awaiting more cycles, one completed": {
+			mutateStats: func(stats *CycleStats) { stats.CompletedCycleCount = 1 },
+			wantMore:    true,
+		},
+		"awaiting more cycles, two completed": {
+			mutateStats: func(stats *CycleStats) { stats.CompletedCycleCount = 2 },
+			wantMore:    true,
+		},
+		"awaiting more cycles with predictions off": {
+			mutateUser:  func(user *models.User) { user.UnpredictableCycle = true },
+			mutateStats: func(stats *CycleStats) { stats.CompletedCycleCount = 2 },
+		},
+		"awaiting more cycles, irregular owner has its own caption": {
+			mutateUser:  func(user *models.User) { user.IrregularCycle = true },
+			mutateStats: func(stats *CycleStats) { stats.CompletedCycleCount = 2 },
+		},
+		"predictions suppressed": {
+			mutateUser:   func(user *models.User) { user.UnpredictableCycle = true },
+			wantEstimate: false,
+		},
+		"pregnancy pause": {
+			mutateStats:  func(stats *CycleStats) { stats.PregnancyPaused = true },
+			wantEstimate: false,
+		},
+		"cycle overdue": {
+			mutateStats:  func(stats *CycleStats) { stats.CurrentCycleDay = 54 },
+			wantEstimate: false,
+		},
+		"awaiting the first completed cycle": {
+			mutateStats:  func(stats *CycleStats) { stats.CompletedCycleCount = 0 },
+			wantEstimate: false,
+			wantBridge:   true,
+		},
+		"awaiting the first cycle with predictions off": {
+			mutateUser:   func(user *models.User) { user.UnpredictableCycle = true },
+			mutateStats:  func(stats *CycleStats) { stats.CompletedCycleCount = 0 },
+			wantEstimate: false,
+			wantBridge:   false,
+		},
+		// The two rows below are the bridge's own boundary, and they are here
+		// because a shared boolean moved under it. The bridge names NO date —
+		// it says the window arrives after the first cycle closes — so a paused
+		// projection has nothing to withhold from it, and an overdue first cycle
+		// is exactly when the owner most needs to be told that. Both the
+		// irregular and the regular account reach it: they differ only in which
+		// branch of buildDashboardPredictionDisplay claims the display, which is
+		// not a fact about the copy.
+		"awaiting the first cycle, overdue": {
+			mutateStats: func(stats *CycleStats) {
+				stats.CompletedCycleCount = 0
+				stats.CurrentCycleDay = 54
+			},
+			wantEstimate: false,
+			wantBridge:   true,
+		},
+		"awaiting the first cycle, overdue, irregular": {
+			mutateUser: func(user *models.User) { user.IrregularCycle = true },
+			mutateStats: func(stats *CycleStats) {
+				stats.CompletedCycleCount = 0
+				stats.CurrentCycleDay = 54
+			},
+			wantEstimate: false,
+			wantBridge:   true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			user := &models.User{ID: 13, Role: models.RoleOwner, UsageGoal: models.UsageGoalTrying, CycleLength: 28, PeriodLength: 5, LutealPhase: 14}
+			if testCase.mutateUser != nil {
+				testCase.mutateUser(user)
+			}
+			stats := dashboardSuppressionStats(t)
+			if testCase.mutateStats != nil {
+				testCase.mutateStats(&stats)
+			}
+			frame := resolveDashboardTimingFrame(user, BuildDashboardCycleContext(user, nil, stats, today, time.UTC), visibility)
+			if frame.ShowOvulationEstimate != testCase.wantEstimate {
+				t.Fatalf("expected ovulation estimate=%v, got %v", testCase.wantEstimate, frame.ShowOvulationEstimate)
+			}
+			if frame.ShowFirstCycleBridge != testCase.wantBridge {
+				t.Fatalf("expected the first-cycle bridge line=%v, got %v", testCase.wantBridge, frame.ShowFirstCycleBridge)
+			}
+			if frame.ShowMoreCyclesBridge != testCase.wantMore {
+				t.Fatalf("expected the more-cycles bridge line=%v, got %v", testCase.wantMore, frame.ShowMoreCyclesBridge)
+			}
+			if !frame.BBTInVisibleTier {
+				t.Fatalf("expected the temperature field to stay in the visible tier for this goal")
+			}
+		})
+	}
+}
+
+// TestBuildDashboardViewDataHoldsFertilityBackUntilTheFirstCompletedCycle pins
+// the early data tier at its boundary — zero completed cycles against one — for
+// both the goal that asks about timing and the neutral one.
+//
+// With no completed cycle the fertile window and the ovulation date are the
+// onboarding cycle-length slider projected forward, so the header withholds both
+// and an account tracking to conceive reads one bridge line in the ovulation
+// item's place instead. The moment a single cycle closes, the account has an
+// observation to reason from and the header renders exactly as it did before.
+// The count itself is the stats reliability signal (CompletedCycleCount), read
+// rather than recomputed here.
+func TestBuildDashboardViewDataHoldsFertilityBackUntilTheFirstCompletedCycle(t *testing.T) {
+	today := mustParseDashboardServiceDay(t, "2026-02-21")
+
+	for name, testCase := range map[string]struct {
+		completedCycles int
+		goal            string
+		wantFertility   bool
+		wantOvulation   bool
+		wantBridge      bool
+		wantMoreBridge  bool
+	}{
+		"trying, no completed cycle": {
+			completedCycles: 0,
+			goal:            models.UsageGoalTrying,
+			wantBridge:      true,
+		},
+		// One and two completed cycles are still below the floor: the header
+		// withholds the date and says the window arrives after three.
+		"trying, one completed cycle": {
+			completedCycles: 1,
+			goal:            models.UsageGoalTrying,
+			wantMoreBridge:  true,
+		},
+		"trying, two completed cycles": {
+			completedCycles: 2,
+			goal:            models.UsageGoalTrying,
+			wantMoreBridge:  true,
+		},
+		"trying, three completed cycles": {
+			completedCycles: 3,
+			goal:            models.UsageGoalTrying,
+			wantFertility:   true,
+			wantOvulation:   true,
+		},
+		"health, no completed cycle": {
+			completedCycles: 0,
+			goal:            models.UsageGoalHealth,
+		},
+		"health, two completed cycles": {
+			completedCycles: 2,
+			goal:            models.UsageGoalHealth,
+		},
+		"health, three completed cycles": {
+			completedCycles: 3,
+			goal:            models.UsageGoalHealth,
+			wantFertility:   true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			user := &models.User{ID: 9, Role: models.RoleOwner, CycleLength: 28, UsageGoal: testCase.goal, TrackBBT: true}
+			service := NewDashboardViewService(
+				&stubDashboardStatsProvider{stats: CycleStats{
+					CompletedCycleCount: testCase.completedCycles,
+					CurrentCycleDay:     5,
+					MedianCycleLength:   28,
+					LastPeriodStart:     mustParseDashboardServiceDay(t, "2026-02-17"),
+					NextPeriodStart:     mustParseDashboardServiceDay(t, "2026-03-17"),
+				}},
+				&stubDashboardViewerProvider{logEntry: models.DailyLog{Date: today}},
+				&stubDashboardDayStateProvider{},
+			)
+
+			viewData, err := service.BuildDashboardViewData(context.Background(), user, "en", today, time.UTC)
+			if err != nil {
+				t.Fatalf("BuildDashboardViewData() unexpected error: %v", err)
+			}
+			if viewData.ShowFertilityStatus != testCase.wantFertility {
+				t.Fatalf("expected fertility status shown=%v, got %v", testCase.wantFertility, viewData.ShowFertilityStatus)
+			}
+			if viewData.ShowOvulationEstimate != testCase.wantOvulation {
+				t.Fatalf("expected ovulation estimate=%v, got %v", testCase.wantOvulation, viewData.ShowOvulationEstimate)
+			}
+			if viewData.ShowFirstCycleBridge != testCase.wantBridge {
+				t.Fatalf("expected the first-cycle bridge line=%v, got %v", testCase.wantBridge, viewData.ShowFirstCycleBridge)
+			}
+			if viewData.ShowMoreCyclesBridge != testCase.wantMoreBridge {
+				t.Fatalf("expected the more-cycles bridge line=%v, got %v", testCase.wantMoreBridge, viewData.ShowMoreCyclesBridge)
+			}
+			// The tier moves nothing else: the cycle day and the next-period
+			// estimate the header shows beside them are untouched by it.
+			if viewData.Stats.CurrentCycleDay != 5 {
+				t.Fatalf("expected the cycle day to survive the tier, got %d", viewData.Stats.CurrentCycleDay)
+			}
+			if viewData.CycleContext.DisplayNextPeriodStart.IsZero() {
+				t.Fatal("expected the next-period estimate to survive the tier")
+			}
+		})
+	}
+}
+
+// TestBuildDashboardViewDataHeroWithholdsTheOvulationDayForTheFirstCycleCohort
+// pins the second path a suppressed ovulation day can leak through. Round 4
+// closed the leak in the published copy (PublishedStats recomputes
+// CurrentPhase from cleared fields), but the dashboard hero is built from
+// confirmedStats — the pre-publication copy — in
+// DashboardViewService.BuildDashboardViewData, so a cohort the shared
+// suppression predicate withholds the fertile window from can still read the
+// day off the hero's phase label and its "ovulation" phase card.
+//
+// The fixture is the earliest tier: no completed cycle yet
+// (DashboardAwaitingFirstCycle), a regular (non-irregular) account, a cycle
+// that is neither paused nor overdue — so FertilityProjectionSuppressed is
+// true for exactly one reason, and every OTHER gate the hero checks
+// (canRenderDashboardCycleHero) is satisfied. currentDay is placed exactly on
+// the projected ovulation day so the leak is unambiguous: CurrentPhase names
+// "ovulation" and the phase-card list carries an "ovulation" entry pinned to
+// that same day.
+func TestBuildDashboardViewDataHeroWithholdsTheOvulationDayForTheFirstCycleCohort(t *testing.T) {
+	today := mustParseDashboardServiceDay(t, "2026-02-21")
+	user := &models.User{ID: 13, Role: models.RoleOwner, CycleLength: 28, PeriodLength: 5, LutealPhase: 14, UsageGoal: models.UsageGoalHealth}
+	stats := CycleStats{
+		CompletedCycleCount: 0,
+		CurrentCycleDay:     14,
+		MedianCycleLength:   28,
+		AveragePeriodLength: 5,
+		LutealPhase:         14,
+		LastPeriodStart:     mustParseDashboardServiceDay(t, "2026-02-08"),
+		NextPeriodStart:     mustParseDashboardServiceDay(t, "2026-03-08"),
+	}
+
+	// Fixture invariant: the cohort this test is about is the first-cycle
+	// floor alone, not a second suppression signal riding along with it.
+	if !FertilityProjectionSuppressed(user, stats) {
+		t.Fatal("fixture: expected the shared predicate to suppress this cohort")
+	}
+	if user.IrregularCycle || stats.PregnancyPaused || DashboardCycleOverdue(user, stats) {
+		t.Fatal("fixture: expected the first-cycle floor to be the only suppression signal armed")
+	}
+
+	service := NewDashboardViewService(
+		&stubDashboardStatsProvider{stats: stats},
+		&stubDashboardViewerProvider{logEntry: models.DailyLog{Date: today}},
+		&stubDashboardDayStateProvider{},
+	)
+	viewData, err := service.BuildDashboardViewData(context.Background(), user, "en", today, time.UTC)
+	if err != nil {
+		t.Fatalf("BuildDashboardViewData() unexpected error: %v", err)
+	}
+
+	if !viewData.CycleContext.FertilitySuppressed {
+		t.Fatal("fixture: expected the resolved context to carry the suppression")
+	}
+
+	// The published copy already withholds the day — this is the guard from
+	// round 4, restated here as the fixture's other half: if this ever went
+	// red, the assertions on CycleHero below would be proving nothing new.
+	if !viewData.Stats.OvulationDate.IsZero() {
+		t.Fatal("fixture: expected the published copy to already withhold the ovulation date")
+	}
+
+	if !viewData.CycleHero.Visible {
+		t.Fatal("expected the cycle hero (axis, days, today marker) to stay visible under suppression")
+	}
+	if viewData.CycleHero.CurrentPhase == "ovulation" {
+		t.Error("CycleHero.CurrentPhase names \"ovulation\" for a cohort the shared predicate suppresses the ovulation day for")
+	}
+	for _, card := range viewData.CycleHero.PhaseCards {
+		if card.Phase == "ovulation" {
+			t.Errorf("CycleHero.PhaseCards names an \"ovulation\" card (day %d) for a cohort the shared predicate suppresses the ovulation day for", card.StartDay)
+		}
+	}
+}
+
 func mustParseDashboardServiceDay(t *testing.T, raw string) time.Time {
 	t.Helper()
 	parsed, err := time.ParseInLocation("2006-01-02", raw, time.UTC)
@@ -381,4 +856,91 @@ func mustParseDashboardServiceDay(t *testing.T, raw string) time.Time {
 		t.Fatalf("parse day %q: %v", raw, err)
 	}
 	return parsed
+}
+
+// TestBuildDashboardViewDataSuppressedRibbonKeepsAStatusPastTheMenstrualBlock
+// pins what round 5 left open. Withholding the follicular/ovulation/luteal
+// cards stopped the ribbon naming the suppressed day, and left the days those
+// cards used to cover with no card at all — so dashboardCycleHeroPhaseForDay
+// fell through to "beyond", whose CSS paints nothing because it means the
+// projection ENDED. A mid-cycle owner read a flat colourless tail as tracking
+// having stopped.
+//
+// The fixture is the one the round-4/5 guard above already establishes as the
+// first-cycle floor alone. The assertions walk every cell of the axis and give
+// each day exactly one expected status, so a mutant that drops the withheld
+// card (days go "beyond"), widens it past the cycle length (the start-window
+// tail stops being "beyond") or lets it start on the menstrual block is red.
+func TestBuildDashboardViewDataSuppressedRibbonKeepsAStatusPastTheMenstrualBlock(t *testing.T) {
+	today := mustParseDashboardServiceDay(t, "2026-02-21")
+	user := &models.User{ID: 13, Role: models.RoleOwner, CycleLength: 28, PeriodLength: 5, LutealPhase: 14, UsageGoal: models.UsageGoalHealth}
+	stats := CycleStats{
+		CompletedCycleCount: 0,
+		CurrentCycleDay:     14,
+		MedianCycleLength:   28,
+		AveragePeriodLength: 5,
+		LutealPhase:         14,
+		LastPeriodStart:     mustParseDashboardServiceDay(t, "2026-02-08"),
+		NextPeriodStart:     mustParseDashboardServiceDay(t, "2026-03-08"),
+	}
+
+	if !FertilityProjectionSuppressed(user, stats) {
+		t.Fatal("fixture: expected the shared predicate to suppress this cohort")
+	}
+
+	service := NewDashboardViewService(
+		&stubDashboardStatsProvider{stats: stats},
+		&stubDashboardViewerProvider{logEntry: models.DailyLog{Date: today}},
+		&stubDashboardDayStateProvider{},
+	)
+	viewData, err := service.BuildDashboardViewData(context.Background(), user, "en", today, time.UTC)
+	if err != nil {
+		t.Fatalf("BuildDashboardViewData() unexpected error: %v", err)
+	}
+
+	hero := viewData.CycleHero
+	if !hero.Visible {
+		t.Fatal("fixture: expected the cycle hero to stay visible under suppression")
+	}
+	if len(hero.PhaseCards) != 2 {
+		t.Fatalf("expected the suppressed breakdown to be the menstrual card and one withheld card, got %#v", hero.PhaseCards)
+	}
+	menstrual, withheld := hero.PhaseCards[0], hero.PhaseCards[1]
+	if menstrual.Phase != "menstrual" {
+		t.Fatalf("expected the first card to stay menstrual, got %q", menstrual.Phase)
+	}
+	if withheld.Phase != "withheld" {
+		t.Fatalf("expected the second card to carry the withheld status, got %q", withheld.Phase)
+	}
+	if withheld.StartDay != menstrual.EndDay+1 {
+		t.Errorf("withheld card starts on day %d, expected the day after the menstrual block ends (%d)", withheld.StartDay, menstrual.EndDay+1)
+	}
+	if withheld.EndDay != hero.CycleLength {
+		t.Errorf("withheld card ends on day %d, expected the projected cycle length %d", withheld.EndDay, hero.CycleLength)
+	}
+
+	// A regular account's axis stops at the cycle length, so every cell of THIS
+	// fixture is inside the cycle and none of them may read "beyond". That the
+	// days past the cycle length still do is pinned where the axis can be made
+	// to run past it directly — TestDashboardCycleHeroSuppressedAxisStillEndsAtBeyond.
+	if hero.AxisDays != hero.CycleLength {
+		t.Fatalf("fixture: expected the axis to stop at the cycle length %d, got %d", hero.CycleLength, hero.AxisDays)
+	}
+
+	for _, day := range hero.Days {
+		want := "withheld"
+		if day.Day <= menstrual.EndDay {
+			want = "menstrual"
+		}
+		if day.Phase != want {
+			t.Errorf("ribbon day %d carries phase %q, want %q", day.Day, day.Phase, want)
+		}
+	}
+
+	if hero.CurrentPhase != "withheld" {
+		t.Errorf("CycleHero.CurrentPhase is %q on a suppressed mid-cycle day, want the same status the ribbon cells carry", hero.CurrentPhase)
+	}
+	if viewData.PredictionExplanationPrimaryKey != "prediction.explainer.awaiting_first_cycle" {
+		t.Errorf("prediction explainer is %q, want the first-cycle floor named on the page that goes quiet because of it", viewData.PredictionExplanationPrimaryKey)
+	}
 }

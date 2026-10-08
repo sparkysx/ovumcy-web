@@ -5,6 +5,9 @@ on:
     branches:
       - main
   pull_request:
+  # Merge-queue validation runs: every workflow that owns a required status
+  # check must also report on merge_group, or a queued merge waits forever.
+  merge_group:
   release:
     types:
       - published
@@ -17,28 +20,99 @@ permissions:
 # string of fixup pushes doesn't queue every intermediate run to completion.
 # Only cancels pull_request runs — push (main), release, and workflow_dispatch
 # always run to completion, since each may gate a deploy.
+#
+# Those non-PR events therefore take one group PER COMMIT. Sharing a group per
+# ref made them queue behind each other instead, and GitHub holds at most one
+# pending run per group: on 2026-08-18 the push run for 6ad13ff5 sat queued and
+# never started, while the run for the commit after it completed. A commit on
+# main is a state to test, not a draft to supersede, and the lanes only this
+# event runs go with it — e2e-cross-browser, image-smoke, e2e-postgres-smoke.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  # Split from a single `test` job into test-go/test-frontend: the two halves
+  # Split from a single `test` job into a Go half and a frontend half: the two
   # never depended on each other's output, so running them as parallel jobs
   # instead of sequential steps shortens wall-clock to roughly max(go, frontend)
-  # instead of their sum. Downstream jobs that only need the Go side (coverage
-  # upload, patch-coverage) depend on test-go alone; jobs that gate on "did
-  # everything basic pass" (e2e, e2e-postgres-smoke) depend on both.
-  test-go:
+  # instead of their sum. Jobs that gate on "did everything basic pass" (e2e,
+  # e2e-postgres-smoke) depend on both.
+  #
+  # The Go half is now three jobs, because ONE package ruled it. Measured on
+  # run 32081716803: `Go test with coverage` was 369 s of a 463 s job, and
+  # internal/api alone reported 353.040 s of that 369 s — every other package
+  # in the module finished inside the remaining 16 s, in parallel with it. A
+  # split by PACKAGE would therefore have bought nothing at all: the wall-clock
+  # IS one package's test binary. So the split is by TEST NAME inside
+  # internal/api (test-go-shard, the same `-run` partition the race lane
+  # already runs on internal/services), with every other package in one whole
+  # lane beside it (test-go-rest) and the analysis tools in a third
+  # (test-go-analysis) — those are a fixed cost that must not be paid N times,
+  # and their binary cache key would be, too.
+  #
+  # Sharding a coverage run splits its profile with it, so the lanes hand their
+  # profiles to `coverage-merge`, which folds them back into the single
+  # `coverage-out` artifact that coverage-upload and the required patch-coverage
+  # gate have always consumed. Neither consumer learned about the split.
+  test-go-shard:
     runs-on: ubuntu-latest
+    # Whole-job skip on `run_unit` (see the `changes` job), the narrower slice
+    # of `run_core`: it clears for a docs-only diff, for a `push` to `main`
+    # where the merge queue already ran this lane on the identical commit, and
+    # for a diff that is browser specs alone — a Playwright spec is neither
+    # compiled into the Go binary nor go:embed'ed, so it can move no Go test,
+    # lint finding or coverage line. coverage-merge, and through it
+    # coverage-upload and patch-coverage, cascade off this job's skip along
+    # their needs edges, and the thin `test` gate job follows every unit lane
+    # the same way.
+    #
+    # The shape the whole battery shares: run unless `changes` positively
+    # determined this run does not need it. A detection job that failed leaves
+    # the output empty, which is not 'false', so the lane still runs — a
+    # skipped required check would otherwise pass the merge on no evidence.
+    needs:
+      - changes
+    if: ${{ !cancelled() && needs.changes.outputs.run_unit != 'false' }}
     permissions:
       contents: read
 
+    # internal/api carries the timezone/zoneinfo regressions (calendar,
+    # export, day-upsert canonicalization); scripts/racepartition splits this
+    # package's tests by NAME across the three shards below, so any shard may
+    # draw one. Without this variable a runner whose tzdata is missing or
+    # broken SKIPS them instead of failing, and no job here asserted they ran
+    # — see internal/testenv's OVUMCY_REQUIRE_TZDATA gate. The ubuntu runner
+    # always ships tzdata, so an absence here is a broken runner, never a
+    # legitimate developer-host allowance.
+    env:
+      OVUMCY_REQUIRE_TZDATA: "1"
+
+    outputs:
+      # coverage-merge has to know how many profiles it is owed, and the shard
+      # count lives in exactly ONE place: the matrix below. Every shard writes
+      # the same value here, so last-writer-wins is the value all of them
+      # wrote; a literal in the merge job would be a count keyed on a SPELLING,
+      # silently wrong on the day the matrix grows and reading only as a
+      # coverage drop.
+      shard-total: ${{ steps.shard-total.outputs.value }}
+    strategy:
+      # One shard's failure must not cancel its siblings: the point of the
+      # split is to learn everything the Go suite knows in one run.
+      fail-fast: false
+      matrix:
+        shard:
+          - 1
+          - 2
+          - 3
+
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -46,9 +120,380 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Record the shard count for the merge job
+        id: shard-total
+        run: echo "value=${{ strategy.job-total }}" >> "$GITHUB_OUTPUT"
+
+      - name: Go test with coverage — internal/api shard
+        # The names come from `go test -list`, never from a hand-written
+        # pattern: a pattern keyed on a SPELLING would leave a new test
+        # matching no shard at all, running NOWHERE while every shard reported
+        # success. scripts/racepartition owns that split, and its tests pin
+        # exhaustiveness and disjointness against a synthesised listing. The
+        # divisor comes from `strategy.job-total`, computed from the matrix
+        # above, so adding a shard cannot leave a second literal behind.
+        #
+        # `set -e` is what makes a failing listing stop the shard: the pattern
+        # is taken through a command substitution, whose status the assignment
+        # carries, and a shard that silently fell back to an empty pattern
+        # would report success having run nothing at all.
+        #
+        # `-coverpkg` and `-timeout 20m` are the whole lane's, unchanged — see
+        # test-go-rest below, which carries the note for both. What `-run`
+        # changes is only WHICH tests credit those packages, which is what
+        # coverage-merge puts back together.
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -list '.*' ./internal/api/ > "$RUNNER_TEMP/tests.txt"
+          run_pattern="$(go run ./scripts/racepartition -shard=${{ matrix.shard }} -of=${{ strategy.job-total }} < "$RUNNER_TEMP/tests.txt")"
+          echo "shard ${{ matrix.shard }}/${{ strategy.job-total }} selects its share of $(grep -cE '^(Test|Example|Fuzz)' "$RUNNER_TEMP/tests.txt") listed tests"
+          go test ./internal/api/ -timeout 20m -run "$run_pattern" -coverprofile=coverage.out -covermode=atomic -coverpkg=./cmd/...,./internal/...,./migrations/...,./scripts/...,./web/...
+
+      - name: Upload the shard coverage profile
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-shard-api-${{ matrix.shard }}
+          path: coverage.out
+          if-no-files-found: error
+          retention-days: 1
+
+  test-go-rest:
+    runs-on: ubuntu-latest
+    needs:
+      - changes
+    # Same fail-safe gate, and the same slice, as test-go-shard above: the
+    # three Go lanes are one suite and are excused together or not at all.
+    if: ${{ !cancelled() && needs.changes.outputs.run_unit != 'false' }}
+    permissions:
+      contents: read
+
+    # This is the only lane that runs the Postgres integration suite —
+    # internal/db, internal/services and scripts/backuprestoredoc all reach it
+    # through internal/testdb, and internal/api (test-go-shard) has none of it.
+    # Those tests start a throwaway container, and without this variable a host
+    # that cannot start one SKIPS them; a skipped test is a lane reporting
+    # success for a suite that never ran, and no job asserted the suite ran.
+    # The ubuntu runner has docker, so here an unavailable docker is a broken
+    # runner, not a legitimate absence: the variable turns that skip into a
+    # failure. It is deliberately NOT set at workflow level and NOT on
+    # test-go-shard — a lane with no Postgres test would only be asserting
+    # something about a suite it does not run — and it is absent from a
+    # developer machine, where no docker still means "not my test to run".
+    #
+    # This is also the only lane that runs scripts/releasegate,
+    # scripts/backuprestoredoc and scripts/changelogd (via `go list
+    # ./scripts/...` below) and the whole of internal/services, and each of the
+    # four resources below is owed by one of them:
+    #
+    #   bash    — the release gate's own script and the runbook's documented
+    #             commands are run through a shell, not reassembled as argv.
+    #   docker  — the runbook's named-volume backup and restore commands are
+    #             executed for real, against real volumes. This lane is where
+    #             they belong because it is the one already provisioned for
+    #             containers (OVUMCY_REQUIRE_POSTGRES above); declaring docker
+    #             on a lane that has none would assert a check nothing runs.
+    #   git     — changelogd builds a fixture repository to probe against, and
+    #             the release gate's ancestry step runs inside a real clone.
+    #   tzdata  — every cycle/day timezone regression in internal/services
+    #             loads an IANA zone.
+    #
+    # The ubuntu runner ships all four, so an absence here means the runner is
+    # broken, not that a developer skipped a tool they were never going to
+    # install. See internal/testenv for the shared gate these variables arm
+    # (OVUMCY_REQUIRE_<RESOURCE>, one switch each).
+    env:
+      OVUMCY_REQUIRE_POSTGRES: "1"
+      OVUMCY_REQUIRE_BASH: "1"
+      OVUMCY_REQUIRE_DOCKER: "1"
+      OVUMCY_REQUIRE_GIT: "1"
+      OVUMCY_REQUIRE_TZDATA: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Go test with coverage — every package but the sharded one
+        # The package list is DERIVED from the toolchain and one exclusion,
+        # never written out: a hand-kept list is a rule keyed on a spelling, and
+        # here its failure would be a new package tested by no lane at all while
+        # both lanes stayed green. `go list` over the same trees `-coverpkg`
+        # names is the full set; internal/api is removed because test-go-shard
+        # runs it. The count check is what makes the exclusion honest — if it
+        # ever drops none, or more than one, this step fails instead of quietly
+        # testing less. (Renaming internal/api would land it back HERE, whole
+        # and slow: visible, never silent.)
+        #
+        # -coverpkg credits a line when ANY test exercises it (including
+        # cross-package integration tests), not only its own package's unit
+        # tests. The patch-coverage gate consumes the merged profile. Scoped to
+        # the module trees (see the note above the Staticcheck step in
+        # test-go-analysis).
+        #
+        # `-timeout 20m` declares a budget that was previously left implicit.
+        # Go's default is 10 minutes PER PACKAGE, and internal/api sits right at
+        # that edge: measured 2026-08-15 on a dev host, 603 s run alone and 610 s
+        # inside `go test ./...`, with coverage instrumentation slower still
+        # (-covermode=atomic adds an atomic counter per block). The lane passed
+        # only because the runner happens to be faster than a dev host, which is
+        # not a margin anyone chose. Sharding does not retire the budget: a
+        # shard runs a third of one package, and the budget is per package in
+        # every other lane too.
+        #
+        # What the budget prevents does not read as "this needed more time": the
+        # runtime panics with `test timed out after 10m0s` and dumps every
+        # goroutine, so a required check fails with a stack trace that reads like
+        # a product bug. Every `go test` in this file that runs a suite declares
+        # the same budget — fixing only the lane where the pressure was measured
+        # would leave the identical default armed in the other spellings.
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Both listings go through a command substitution first: `set -e`
+          # carries a failing `go list` out of one, and would NOT out of a
+          # process substitution feeding `mapfile` — there the status read is
+          # mapfile's, so a listing that died half-way would arrive as a
+          # shorter package set and test less, quietly.
+          sharded="$(go list ./internal/api)"
+          all="$(go list ./cmd/... ./internal/... ./migrations/... ./scripts/... ./web/...)"
+          rest="$(printf '%s\n' "$all" | grep -vFx "$sharded")"
+          mapfile -t rest_packages <<< "$rest"
+          dropped=$(( $(printf '%s\n' "$all" | wc -l) - ${#rest_packages[@]} ))
+          if [ "$dropped" -ne 1 ]; then
+            echo "::error::excluding $sharded dropped $dropped package(s), expected exactly 1"
+            exit 1
+          fi
+          echo "testing ${#rest_packages[@]} package(s); $sharded runs in test-go-shard"
+          go test "${rest_packages[@]}" -timeout 20m -coverprofile=coverage.out -covermode=atomic -coverpkg=./cmd/...,./internal/...,./migrations/...,./scripts/...,./web/...
+
+      - name: Upload the whole-package coverage profile
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-shard-rest
+          path: coverage.out
+          if-no-files-found: error
+          retention-days: 1
+
+  # Sharding a coverage run splits its profile with it. This job folds the
+  # pieces back into the single `coverage-out` artifact that coverage-upload
+  # and the required patch-coverage gate have always downloaded, so neither of
+  # them learned anything about the split.
+  #
+  # A UNION with summed counts, not a concatenation: every lane runs with the
+  # same `-coverpkg` over the whole module, so every profile lists every
+  # coverable block, and a block its own lane did not execute is present at 0.
+  # Dropping those zeros would be the expensive mistake — patchcov treats a
+  # line ABSENT from the profile as non-coverable and ignores it, so a lost
+  # block turns an uncovered modified line into one the required gate never
+  # judges. scripts/covmerge owns the fold and its tests pin both halves.
+  coverage-merge:
+    runs-on: ubuntu-latest
+    needs:
+      - test-go-shard
+      - test-go-rest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download the lane coverage profiles
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: coverage-shard-*
+          path: .coverage-shards
+
+      - name: Merge the lane coverage profiles
+        # `-expect` is the guard for the failure that leaves no other trace: an
+        # artifact that never arrived merges into a profile which parses
+        # cleanly, covers less, and reads downstream as a coverage drop this
+        # pull request caused. The matrix half of the count is read from the
+        # matrix itself; `+ 1` is test-go-rest, the one whole-package lane.
+        env:
+          SHARD_TOTAL: ${{ needs.test-go-shard.outputs.shard-total }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$SHARD_TOTAL" ]; then
+            echo "::error::the shard matrix reported no size — refusing to guess how many profiles are owed"
+            exit 1
+          fi
+          go run ./scripts/covmerge -in .coverage-shards -glob coverage.out -out coverage.out -expect "$((SHARD_TOTAL + 1))"
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-out
+          path: coverage.out
+          if-no-files-found: error
+          retention-days: 1
+
+  test-go-analysis:
+    runs-on: ubuntu-latest
+    # Same fail-safe gate, and the same slice, as test-go-shard above, for the
+    # same reason: this lane's skip is judged by the `test` gate, never taken
+    # for a pass. The analysis tools read Go sources too, so a browser-spec-only
+    # diff excuses them exactly as it excuses the suite.
+    needs:
+      - changes
+    if: ${{ !cancelled() && needs.changes.outputs.run_unit != 'false' }}
+    permissions:
+      contents: read
+
+    # Each pinned analysis-tool version lives here, in exactly ONE place,
+    # because the binary cache key below is built from these same values. A key
+    # repeating the version as its own literal would be keyed on a SPELLING
+    # rather than on the thing: bumping a `go install` line and forgetting the
+    # key hands every later run the OLD binary out of cache, silently, while the
+    # workflow reads as though it had been bumped.
+    env:
+      # git SHA for v0.8.1 (tag 2026.2.1): 1285a6a5ec1e0ebb658f49e82b6c566a878cc3cb (verified via go list -m -json)
+      STATICCHECK_VERSION: v0.8.1
+      # git SHA for golang.org/x/tools v0.49.0: 18332fec72972efbb8ab9881984fec2d8cfc2b58 (verified via go list -m -json)
+      DEADCODE_VERSION: v0.49.0
+      # git SHA for v2.13.2: 27774aaf853a4fd21f1dd5e69439459dc1b26e68 (verified via go list -m -json)
+      GOLANGCI_LINT_VERSION: v2.13.2
+      # git SHA for v1.7.12: 914e7df21a07ef503a81201c76d2b11c789d3fca (verified via go list -m -json)
+      ACTIONLINT_VERSION: v1.7.12
+      # git SHA for v1.6.0: 5348b744d0983d85713295ea08a20cca1654a45e (verified via go list -m -json)
+      # Not in the binary cache below: the licenses step runs it via `go run
+      # <module>@version`, which is version-exact by construction and needs no
+      # verify line.
+      GO_LICENSES_VERSION: v1.6.0
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The published binary is built by the Dockerfile's builder stage; every
+      # job in this workflow builds and tests with the toolchain named by
+      # go.mod's `go` directive (`go-version-file: go.mod`, in this step and in
+      # every other Go lane). Nothing tied the two together, and GOTOOLCHAIN
+      # only ever upgrades: a builder tag AHEAD of the directive is not
+      # downgraded to it, it simply wins. That is how `golang:1.27rc2-alpine3.24`
+      # came to compile the release image while the whole suite ran under 1.26.6
+      # — a release candidate shipping code no test had ever run under.
+      #
+      # Cheap, needs no toolchain, and sits before `Setup Go` so it reports
+      # before anything is installed. This lane feeds the required `test` gate,
+      # and any diff that can move either file (`Dockerfile`, `go.mod`) leaves
+      # `run_unit` true in the `changes` job, so the assertion cannot be skipped
+      # by the very change that breaks it.
+      - name: Builder toolchain matches go.mod
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          matches="$(grep -c '^FROM golang:' Dockerfile || true)"
+          if [ "$matches" != "1" ]; then
+            echo "::error file=Dockerfile::expected exactly one \`FROM golang:\` builder line, found ${matches}."
+            exit 1
+          fi
+
+          builder_tag="$(sed -n 's/^FROM golang:\([^@[:space:]]*\).*/\1/p' Dockerfile)"
+          builder_version="${builder_tag%%-*}"
+
+          # `toolchain` wins where it is present, because that is what
+          # actions/setup-go does with `go-version-file: go.mod`: the `go` line
+          # is a MINIMUM, the `toolchain` line is the version actually built
+          # with. Reading only the `go` line would leave this guard comparing
+          # the builder against a directive CI had stopped building under, so
+          # the drift it exists to catch would pass green the day one is added —
+          # a guard that holds only until a routine event re-arms it. go.mod
+          # carries no `toolchain` line today; this is what keeps that from
+          # being load-bearing. `toolchain default` names no version and so
+          # falls through to the `go` line, which is what it means anyway.
+          directive="toolchain"
+          wanted="$(sed -n 's/^toolchain go\([0-9][0-9A-Za-z.]*\)[[:space:]]*$/\1/p' go.mod)"
+          if [ -z "$wanted" ]; then
+            directive="go"
+            wanted="$(sed -n 's/^go \([0-9][0-9A-Za-z.]*\)[[:space:]]*$/\1/p' go.mod)"
+          fi
+          if [ -z "$wanted" ]; then
+            echo "::error file=go.mod::could not read a \`go\` or \`toolchain\` directive."
+            exit 1
+          fi
+
+          if [ "$builder_version" != "$wanted" ]; then
+            echo "::error file=Dockerfile::the builder stage is golang:${builder_tag} (Go ${builder_version}) but go.mod's \`${directive}\` directive asks for ${wanted}. Every CI Go job resolves its toolchain from go.mod, so the published binary would be built by a toolchain nothing in this repository tests. Pin the builder to ${wanted}, or move go.mod first."
+            exit 1
+          fi
+
+          echo "builder toolchain golang:${builder_tag} matches go.mod's \`${directive}\` directive (${wanted})."
+
+      - name: Setup Go
+        id: setup-go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Caches the tool BINARIES. This is NOT the forbidden analysis cache, and
+      # the difference is the whole reason it is allowed: golangci-lint's
+      # analysis cache stores facts derived from a source tree that an
+      # actions/cache key cannot name, so a hit can carry a verdict computed
+      # against different code — that is what produced six deterministic phantom
+      # SA5011 findings (2026-08-03; see the note above the golangci-lint step).
+      # A compiled binary carries no facts about this repository at all: it is a
+      # pure function of its pinned version and the toolchain that built it, and
+      # the key names both in full.
+      #
+      # No `restore-keys`: a prefix match would serve a binary of a DIFFERENT
+      # pinned version, the exact failure the full key exists to prevent. A miss
+      # costs the 54 s below and nothing else.
+      #
+      # Measured 2026-08-15 on run 31849738519: `Install golangci-lint` 41 s,
+      # `Install staticcheck` 9 s, `Install deadcode` 4 s, on a 7 min 23 s job.
+      - name: Cache Go tool binaries
+        id: go-tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/go/bin
+          key: ${{ runner.os }}-gotools-go${{ steps.setup-go.outputs.go-version }}-staticcheck${{ env.STATICCHECK_VERSION }}-deadcode${{ env.DEADCODE_VERSION }}-golangcilint${{ env.GOLANGCI_LINT_VERSION }}-actionlint${{ env.ACTIONLINT_VERSION }}
+
+      - name: Verify the restored binaries are the pinned versions
+        # A cache hit is only as good as its key, and a key that quietly stopped
+        # tracking a bump would lint this repository with the wrong tool while
+        # every step stayed green. This turns that into a red step.
+        #
+        # Both tools print the version WITHOUT the leading `v` (measured
+        # 2026-08-15: `staticcheck.exe 2025.1.1 (0.6.1)` and `golangci-lint has
+        # version 2.12.2 built with ...`), so the pin is matched with `${VAR#v}`
+        # — grepping the tag as written would fail every cache hit. `deadcode`
+        # has no version flag; the key covers it and its own step fails loudly
+        # if the binary is missing.
+        if: steps.go-tools.outputs.cache-hit == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$(go env GOPATH)/bin"
+          "$bin/staticcheck" -version | grep -F "(${STATICCHECK_VERSION#v})"
+          "$bin/golangci-lint" --version | grep -F "version ${GOLANGCI_LINT_VERSION#v} "
+          "$bin/actionlint" -version | grep -Fx "$ACTIONLINT_VERSION"
+          test -x "$bin/deadcode"
+
       - name: Install staticcheck
-        # git SHA for v0.6.1 (tag 2025.1.1): b8ec13ce4d00445d75da053c47498e6f9ec5d7d6 (verified via go list -m -json)
-        run: go install honnef.co/go/tools/cmd/staticcheck@v0.6.1
+        if: steps.go-tools.outputs.cache-hit != 'true'
+        run: go install "honnef.co/go/tools/cmd/staticcheck@$STATICCHECK_VERSION"
 
       # The Go wildcards in this job are scoped to our module's package trees
       # (cmd, internal, migrations, scripts, web) instead of ./... — this job
@@ -59,52 +504,133 @@ jobs:
       - name: Staticcheck
         run: '"$(go env GOPATH)/bin/staticcheck" ./cmd/... ./internal/... ./migrations/... ./scripts/... ./web/...'
 
+      # THIRD_PARTY_LICENSES.md's Go-module section is generated, and a
+      # generated compliance list drifts the day a dependency moves: this
+      # regenerates the report over the SHIPPED binary's build graph and
+      # refuses a tree whose committed block disagrees. The graph is pinned to
+      # the Dockerfile's build environment (GOOS=linux, CGO_ENABLED=0) because
+      # the graph is GOOS-dependent — measured 2026-08-28:
+      # github.com/ncruces/go-strftime enters only off-linux, so a table
+      # generated on a Windows host differed from this runner's by one row.
+      # The tool is installed into a scratch GOBIN so the cached ~/go/bin
+      # keeps holding exactly the four pinned analysis binaries the verify
+      # step above asserts. pipefail makes a go-licenses failure fail the
+      # step rather than hand licensesdoc an empty report — though the empty
+      # report is refused too, so either half failing is loud.
+      - name: Licenses inventory matches the dependency graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          GOBIN="$RUNNER_TEMP/licenses-bin" go install "github.com/google/go-licenses@$GO_LICENSES_VERSION"
+          GOOS=linux CGO_ENABLED=0 "$RUNNER_TEMP/licenses-bin/go-licenses" report ./cmd/ovumcy | go run ./scripts/licensesdoc -check
+
+      - name: Install deadcode
+        if: steps.go-tools.outputs.cache-hit != 'true'
+        run: go install "golang.org/x/tools/cmd/deadcode@$DEADCODE_VERSION"
+
+      # A barrier, not a detector: this reports nothing on the tree it was added
+      # to, and its job is to keep it that way. Measured 2026-08-15 — it found
+      # none of the ~40 declarations the dead-code campaign removed, because it
+      # analyses functions only (types and vars are out of scope) and counts a
+      # caller as a caller even when the caller is itself dead: three services
+      # functions were reached from a templateFuncMap entry no template used.
+      # What it does catch is a NEW function that nothing can reach.
+      #
+      # -test keeps deliberate test seams out of the verdict, and the scope
+      # without it is deliberately NOT wired.
+      #
+      # Decision (2026-08-15): the nine declarations that were reachable only
+      # from tests are resolved — moved into test files, or re-pointed at the
+      # production path they were shadowing — and the production scope is still
+      # red, on two seams no code change removes. internal/testdb is test support
+      # shared by several packages' tests, so it can never live in a _test.go;
+      # i18n.PluralCategories is the single source of truth for a language's CLDR
+      # category set and is read from two packages' tests for the same reason.
+      # Wiring the scope would therefore mean carrying an exception list, and a
+      # list that grows by one line per audit is what it was meant to replace.
+      #
+      # The reachability it would have guaranteed is covered by purpose-built
+      # barriers instead, each failing on the layer deadcode cannot see:
+      # TestEveryTemplateFuncIsCalledByATemplate (internal/api) and
+      # TestEveryLocaleKeyIsReachableFromTheApplication (internal/i18n).
+      #
+      # deadcode exits 0 with findings on stdout, so the output is what decides.
+      - name: Go dead code
+        shell: bash
+        run: |
+          findings="$("$(go env GOPATH)/bin/deadcode" -test ./cmd/... ./internal/... ./migrations/... ./scripts/... ./web/...)"
+          if [[ -n "${findings}" ]]; then
+            printf '%s\n' "${findings}"
+            exit 1
+          fi
+
       - name: Install golangci-lint
-        # git SHA for v2.12.2: c0d3ddc9cf3faa61a4e378e879ece580256d76e5 (verified via go list -m -json)
-        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+        if: steps.go-tools.outputs.cache-hit != 'true'
+        run: go install "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$GOLANGCI_LINT_VERSION"
 
-      - name: Cache golangci-lint analysis cache
-        # golangci-lint keeps its own per-file analysis cache under
-        # ~/.cache/golangci-lint, separate from the Go build/module caches
-        # setup-go already restores above. Falls back to the newest same-OS
-        # cache on a go.sum/config miss (still faster than empty) instead of
-        # requiring an exact key match.
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.cache/golangci-lint
-          key: ${{ runner.os }}-golangci-lint-${{ hashFiles('go.sum', '.golangci.yml') }}
-          restore-keys: |
-            ${{ runner.os }}-golangci-lint-
+      - name: Install actionlint
+        if: steps.go-tools.outputs.cache-hit != 'true'
+        run: go install "github.com/rhysd/actionlint/cmd/actionlint@$ACTIONLINT_VERSION"
 
+      # The workflows are 1757 lines across ten files, a good deal of it bash
+      # inside `run:`, and nothing checked any of it. actionlint reads what YAML
+      # alone cannot: undefined `steps.*`/`needs.*` references, contexts used
+      # where they are not available, and `${{ }}` interpolated straight into a
+      # shell script (the script-injection class). Proved in both directions on
+      # 2026-08-15 — the ten workflows report nothing, and a copy carrying a
+      # bogus `steps.*` reference plus an interpolated PR title reports both and
+      # exits 1.
+      #
+      # shellcheck is DISABLED explicitly rather than left to the runner. The
+      # ubuntu image ships shellcheck, so actionlint would silently add a whole
+      # second analyser whose findings this repository has never measured, at a
+      # version the image chooses and can change under us — a barrier that means
+      # something different on each runner is not a barrier. Enabling it is a
+      # separate change that starts by measuring the findings.
+      - name: Lint the workflows
+        run: '"$(go env GOPATH)/bin/actionlint" -shellcheck='
+
+      # No cache for golangci-lint's own analysis cache: its key can only name
+      # go.sum and .golangci.yml, never the source tree, so a branch whose
+      # dependencies are unchanged but whose commits moved reuses facts computed
+      # against a different tree. That produced six deterministic phantom
+      # SA5011 findings on a dependency bump (2026-08-03) that reproduced on no
+      # other machine, and deleting the entry turned the same commit green.
+      # Restoring it bought 1-5 s on a ~6 min job, against ~40 s just to install
+      # the linter — reinstate only with a key that covers the sources.
       - name: golangci-lint
         run: '"$(go env GOPATH)/bin/golangci-lint" run ./cmd/... ./internal/... ./migrations/... ./scripts/... ./web/...'
 
       - name: Go vet
         run: go vet ./cmd/... ./internal/... ./migrations/... ./scripts/... ./web/...
 
-      - name: Go test with coverage
-        # -coverpkg credits a line when ANY test exercises it (including
-        # cross-package integration tests), not only its own package's unit
-        # tests. The patch-coverage gate consumes this profile. Scoped to the
-        # module trees (see the note above the Staticcheck step).
-        run: go test ./cmd/... ./internal/... ./migrations/... ./scripts/... ./web/... -coverprofile=coverage.out -covermode=atomic -coverpkg=./cmd/...,./internal/...,./migrations/...,./scripts/...,./web/...
-
-      - name: Upload coverage artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: coverage-out
-          path: coverage.out
-          if-no-files-found: error
-          retention-days: 1
+      # The architecture contract asked of the TREE: transport imports no
+      # persistence, the layers import in one direction only, and no schema is
+      # migrated at runtime. Two of those are also refused at the moment of an
+      # edit and all three again at commit, and this is the backstop neither a
+      # local skip nor a hook that was never installed reaches. What it decides,
+      # and why syntax answers the import rules while types are needed for the
+      # schema one, is in the command's own doc comment.
+      - name: Architecture invariants
+        run: go run ./scripts/archcheck
 
   test-frontend:
     runs-on: ubuntu-latest
+    needs:
+      - changes
+    # Same fail-safe shape as test-go-shard above (`!= 'false'`, never `==
+    # 'true'`, so an absent or crashed output still runs it), but its own
+    # ground: `run_frontend`, not `run_core` — a backend-only diff has
+    # nothing for this job's lint/build/test steps to see.
+    if: ${{ !cancelled() && needs.changes.outputs.run_frontend != 'false' }}
     permissions:
       contents: read
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -116,7 +642,24 @@ jobs:
         run: npm ci
 
       - name: Frontend lint
+        # Now scoped over e2e/ and playwright.config.ts as well. Until it was,
+        # the 47 .ts files of the browser suite were checked by nothing at all:
+        # this script never named them and TypeScript was not a dependency.
+        # Type-AWARE for those files, which is what buys `no-floating-promises`
+        # — a Playwright call whose `await` went missing still passes today,
+        # because the assertion it should have made never runs before the test
+        # ends. Measured 2026-08-15: 6.1 s locally for the whole scope.
         run: npm run lint:js
+
+      - name: Type-check the browser e2e suite
+        # The other half of the same hole. A broken signature or a dangling
+        # import in e2e/ used to reach CI only as a failing spec, minutes into
+        # a browser run; `tsc --noEmit` reports it in seconds. The first run of
+        # this check found six defects — three declarations nothing read and
+        # three reads of a possibly-null response — which are fixed in the same
+        # change, because a barrier that ships with a baseline is a list, not a
+        # barrier. Measured 2026-08-15: 2.4 s locally.
+        run: npm run lint:types
 
       - name: Frontend unit tests
         run: npm run test:unit
@@ -140,25 +683,221 @@ jobs:
   # repos/ovumcy/ovumcy-web/rules/branches/main`). Renaming or removing the
   # `test` job outright would leave that required check permanently
   # unsatisfied and block every future PR; this job keeps the name while the
-  # actual work runs in the parallel test-go/test-frontend jobs above.
+  # actual work runs in the parallel Go and frontend lanes above.
   test:
     runs-on: ubuntu-latest
     needs:
-      - test-go
+      - test-go-shard
+      - test-go-rest
+      - test-go-analysis
+      - coverage-merge
       - test-frontend
+    # WITHOUT AN `if`, A FAILED DEPENDENCY SKIPS THIS JOB — and a skipped
+    # required check counts as satisfied, so a failing Go suite left no required
+    # context red at all. Measured 2026-08-08 on a throwaway branch carrying one
+    # deliberately failing test: `test-go` failed, and `test`, `e2e` and
+    # `patch-coverage` — three of the fourteen required contexts — all reported
+    # SKIPPED. `race` gates on `changes` rather than on this job, so it ran and
+    # passed, and nothing else covered the unit suite.
+    #
+    # `!cancelled()` makes this job RUN whatever its dependencies did, and the
+    # step below turns their results into this context's verdict. A cancelled
+    # run is still excluded: a superseded PR run must not report a failure.
+    #
+    # `coverage-merge` is judged here for the same measured reason, one layer
+    # further down: patch-coverage consumes its artifact, so a merge that
+    # FAILED would skip patch-coverage, and a skipped required check is
+    # satisfied. Judging it here is what keeps a broken coverage hand-off red
+    # somewhere. It has no `if:` of its own, so it is skipped whenever a lane
+    # it needs failed — and the lane's own result is what colours this gate then.
+    if: ${{ !cancelled() }}
     permissions:
       contents: read
     steps:
-      - run: echo "test-go and test-frontend passed."
+      - name: Judge the unit lanes
+        env:
+          SHARD_RESULT: ${{ needs.test-go-shard.result }}
+          REST_RESULT: ${{ needs.test-go-rest.result }}
+          ANALYSIS_RESULT: ${{ needs.test-go-analysis.result }}
+          MERGE_RESULT: ${{ needs.coverage-merge.result }}
+          FRONTEND_RESULT: ${{ needs.test-frontend.result }}
+        run: |
+          set -euo pipefail
+          echo "test-go-shard=$SHARD_RESULT test-go-rest=$REST_RESULT test-go-analysis=$ANALYSIS_RESULT coverage-merge=$MERGE_RESULT test-frontend=$FRONTEND_RESULT"
+          # `skipped` is a PASS here and only here: the `changes` job cleared
+          # the output the lane gates on — `run_core` for the four Go/coverage
+          # lanes, `run_frontend` for test-frontend — either because the diff
+          # is irrelevant to it (docs-only for `run_core`; none of the inputs
+          # listed at `frontend_changes` in the `changes` job for
+          # `run_frontend`) or because this is a `push` whose core suite AND
+          # test-frontend the merge queue already ran on the identical
+          # commit. Either way it is a decision not to run, not a failure to
+          # run. Anything else — failure, cancelled, or a state this gate has
+          # never seen — is this context's failure, because the whole point of
+          # the job is to have a verdict to report.
+          for result in "$SHARD_RESULT" "$REST_RESULT" "$ANALYSIS_RESULT" "$MERGE_RESULT" "$FRONTEND_RESULT"; do
+            case "$result" in
+              success|skipped) ;;
+              *) echo "::error::a unit lane reported \"$result\""; exit 1 ;;
+            esac
+          done
+          echo "every unit lane passed."
 
-  race:
+  # internal/services alone was 461 s of the race lane's 589 s (measured
+  # 2026-08-15), and 75% of THAT sits in the 99 tests whose files hash
+  # passwords: bcrypt is deliberately expensive and the race detector
+  # multiplies that kind of code hardest — about four times harder than the
+  # rest of the package. No race can live in those tests (they spawn no
+  # goroutines), so they were paying the lane's largest bill for a check that
+  # finds nothing in them.
+  #
+  # Go has no test sharding below package granularity, so the split is a `-run`
+  # regexp — and the names come from `go test -list`, never from a hand-written
+  # pattern. A pattern keyed on a SPELLING would leave a new test matching no
+  # shard at all, running NOWHERE while every shard reported success. See
+  # scripts/racepartition, whose tests pin exhaustiveness and disjointness
+  # against a synthesised listing.
+  race-services:
     runs-on: ubuntu-latest
+    needs:
+      - changes
+    # Same shape as the Go lanes above, on the slice of its own: `run_race`
+    # clears when a diff carries no compiled Go and no workflow change.
+    if: ${{ !cancelled() && needs.changes.outputs.run_race != 'false' }}
+    permissions:
+      contents: read
+
+    # internal/services carries the tz/zoneinfo cycle regressions, split by
+    # name across the shards below exactly as test-go-shard splits
+    # internal/api — any shard may draw one. Same reasoning as test-go-shard's
+    # OVUMCY_REQUIRE_TZDATA: the ubuntu runner always has tzdata, so its
+    # absence here is a broken runner.
+    env:
+      OVUMCY_REQUIRE_TZDATA: "1"
+
+    # Four cells, not three: once internal/db left race-rest (race-db below),
+    # the slowest of three cells here (8.2-10.2 min over five full-battery runs
+    # on 2026-09-24) became the longest race lane.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - 1
+          - 2
+          - 3
+          - 4
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Go test with race detector — internal/services shard
+        # The listing is taken WITHOUT -race: the names are the same and the
+        # instrumented build is the expensive half. The divisor comes from
+        # `strategy.job-total`, computed from the matrix above, so adding a
+        # shard cannot leave a second literal behind.
+        #
+        # `set -o pipefail` matters here: without it the exit status would come
+        # from `racepartition` and a failing listing would read as a pass.
+        env:
+          CGO_ENABLED: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -list '.*' ./internal/services/ > "$RUNNER_TEMP/tests.txt"
+          run_pattern="$(go run ./scripts/racepartition -shard=${{ matrix.shard }} -of=${{ strategy.job-total }} < "$RUNNER_TEMP/tests.txt")"
+          echo "shard ${{ matrix.shard }}/${{ strategy.job-total }} selects $(grep -cE '^(Test|Example|Fuzz)' "$RUNNER_TEMP/tests.txt") listed tests split by racepartition"
+          # checkptr stays on for this module's own code; only modernc.org/... (the SQLite driver) skips it
+          go test -race -gcflags='modernc.org/...=-d=checkptr=0' -timeout 20m -run "$run_pattern" ./internal/services/
+
+  # internal/db alone was 849.550 s of the 866.827 s race-rest's package sweep
+  # reported (job 105883670056, 2026-09-19), against 156 s without the
+  # detector, and the next package in that lane took 13 s: the lane WAS this
+  # one package, and it was the critical path of every full pull-request and
+  # merge-queue run. Its SQLite driver is pure Go (modernc.org/sqlite, C
+  # transpiled to Go), which the detector instruments line by line. Split by
+  # test NAME exactly as race-services splits internal/services: the names
+  # come from `go test -list`, scripts/racepartition owns the split, and every
+  # listed test runs in exactly one cell.
+  race-db:
+    runs-on: ubuntu-latest
+    needs:
+      - changes
+    # Same slice as the other race lanes: `run_race`, read fail-safe.
+    if: ${{ !cancelled() && needs.changes.outputs.run_race != 'false' }}
+    permissions:
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - 1
+          - 2
+          - 3
+          - 4
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Go test with race detector — internal/db shard
+        # No OVUMCY_REQUIRE_POSTGRES, for the reason race-rest gives below:
+        # test-go-rest owns the container suite and declares the variable.
+        #
+        # The count check runs before the split. With fewer listed tests than
+        # cells, a cell's pattern matches nothing, that cell runs nothing and
+        # reports success — and a listing that came back empty would do that
+        # in EVERY cell, a green lane with no test behind it. Round-robin over
+        # at least as many names as cells gives every cell one or more.
+        #
+        # `./internal/db/...`, the tree race-rest raced, not the one package:
+        # a subpackage added later is listed, split and raced by construction
+        # instead of dropping out of every race lane.
+        env:
+          CGO_ENABLED: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -list '.*' ./internal/db/... > "$RUNNER_TEMP/tests.txt"
+          listed="$(grep -cE '^(Test|Example|Fuzz)' "$RUNNER_TEMP/tests.txt" || true)"
+          if [ "$listed" -lt ${{ strategy.job-total }} ]; then
+            echo "::error::internal/db lists $listed test(s) for ${{ strategy.job-total }} cells: a cell would select none and pass having run nothing"
+            exit 1
+          fi
+          run_pattern="$(go run ./scripts/racepartition -shard=${{ matrix.shard }} -of=${{ strategy.job-total }} < "$RUNNER_TEMP/tests.txt")"
+          echo "shard ${{ matrix.shard }}/${{ strategy.job-total }} takes its share of $listed listed tests"
+          go test -race -gcflags='modernc.org/...=-d=checkptr=0' -timeout 20m -run "$run_pattern" ./internal/db/...
+
+  race-rest:
+    runs-on: ubuntu-latest
+    needs:
+      - changes
+    if: ${{ !cancelled() && needs.changes.outputs.run_race != 'false' }}
     permissions:
       contents: read
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -175,14 +914,98 @@ jobs:
         # the memory-store GC goroutine) that never occurs with the single app
         # instance in production — racing it only produces library noise, not ovumcy
         # bugs. The concurrency that is ours lives in the packages below.
+        #
+        # internal/services and internal/db are NOT here: each is sharded in a
+        # lane of its own above (race-services, race-db). The three trees left
+        # reported 17.277 s together (security 13.029, i18n 3.221, httpx 1.027;
+        # job 105883670056), so they stay whole — splitting them would buy
+        # nothing and cost a job.
+        #
+        # No OVUMCY_REQUIRE_POSTGRES here, deliberately, and it is not an
+        # oversight to be tidied up: internal/i18n does reach internal/testdb's
+        # gate (as internal/db does in race-db), so a broken database would skip
+        # those cases quietly on these lanes. test-go-rest OWNS that suite and declares the
+        # variable; a lane declares what it owns, and this one only brushes it.
+        # Declaring it here would instead start running container-backed tests
+        # under the race detector on a required lane — real added cost and a
+        # new failure surface, bought for a verdict test-go-rest already gives
+        # on the same commit.
         env:
           CGO_ENABLED: "1"
-        run: go test -race ./internal/services/... ./internal/db/... ./internal/security/... ./internal/i18n/... ./internal/httpx/...
+        # `-timeout 20m`: the declared budget from the coverage lanes above.
+        # The race detector is strictly slower per test, so an undeclared
+        # 10-minute default is armed harder here than where it was measured.
+        run: go test -race -gcflags='modernc.org/...=-d=checkptr=0' -timeout 20m ./internal/security/... ./internal/i18n/... ./internal/httpx/...
 
-  coverage-upload:
+      - name: Go test with race detector — cross-owner isolation
+        # The exclusion above is by package, not by property, and the property
+        # this test carries — two owners served concurrently through one app —
+        # is the one place where instrumentation is worth the compile. It runs
+        # a SINGLE Fiber app, so the library-internal race that rules the rest
+        # of internal/api out never arms; keep it a named test, never a widening
+        # back to the package.
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race -gcflags='modernc.org/...=-d=checkptr=0' -timeout 20m -count=1 -run TestOwnerIsolationHoldsUnderConcurrentCrossOwnerRequests ./internal/api/
+
+  # Thin gate job named exactly `race` — branch protection's required status
+  # check is pinned to that literal name, which a matrix job cannot provide
+  # (its contexts are `race-services (1)`, `race-db (1)`, ...). Same shape and
+  # same reasoning as the `test` and `e2e` gates: WITHOUT AN `if`, A FAILED
+  # DEPENDENCY SKIPS THIS JOB, and a skipped required check counts as
+  # satisfied — which would report a green `race` on a run where every shard
+  # failed. Every race lane is judged here by name; a lane missing from this
+  # list would run, fail, and leave `race` green.
+  race:
     runs-on: ubuntu-latest
     needs:
-      - test-go
+      - race-services
+      - race-db
+      - race-rest
+    if: ${{ !cancelled() }}
+    permissions:
+      contents: read
+    steps:
+      - name: Judge the race lanes
+        env:
+          SERVICES_RESULT: ${{ needs.race-services.result }}
+          DB_RESULT: ${{ needs.race-db.result }}
+          REST_RESULT: ${{ needs.race-rest.result }}
+        run: |
+          set -euo pipefail
+          echo "race-services=$SERVICES_RESULT race-db=$DB_RESULT race-rest=$REST_RESULT"
+          # `skipped` is a PASS here and only here, for the same reason as in
+          # the other two gates: the `changes` job cleared `run_race`, which is
+          # a decision not to run rather than a failure to run.
+          for result in "$SERVICES_RESULT" "$DB_RESULT" "$REST_RESULT"; do
+            case "$result" in
+              success|skipped) ;;
+              *) echo "::error::a race lane reported \"$result\""; exit 1 ;;
+            esac
+          done
+          echo "every race lane passed."
+
+  coverage-upload:
+    # Codecov's record of `main` is written from the MERGE-QUEUE run, not from
+    # the `push` that follows it. It always was — the queue run reaches Codecov
+    # first — and measurement says Codecov files it correctly: across 420
+    # branches it knows for this repository there is not one
+    # `gh-readonly-queue/*` entry, and commit 97f641e2… carries `branch: main`
+    # (api.codecov.io/api/v2/github/ovumcy/repos/ovumcy-web, queried
+    # 2026-08-18). The push run only ever added a second session for the same
+    # numbers. It no longer runs at all: this job cascades to skipped off the
+    # unit lanes, which `run_core` clears on push.
+    #
+    # A merge_group entry the `changes` job finds already proven clears the
+    # unit lanes too, so for that commit Codecov receives no upload from the
+    # queue OR the push: its `main` history skips the point. Accepted — the
+    # entry's own pull_request run uploaded the same tree's numbers.
+    #
+    # `coverage-merge` rather than a test lane: the artifact name and contents
+    # are unchanged, only the job that produces `coverage-out` moved.
+    runs-on: ubuntu-latest
+    needs:
+      - coverage-merge
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       contents: read
@@ -190,7 +1013,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Download coverage artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -200,8 +1025,19 @@ jobs:
 
       - name: Upload coverage to Codecov
         id: codecov
-        continue-on-error: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        # Tolerate a Codecov ingest failure everywhere except a pull request.
+        # The gate that actually protects coverage is the local patch-coverage
+        # job below; Codecov's own statuses are informational and no `codecov/*`
+        # check is required on main. `merge_group` joined this list when the
+        # authoritative upload moved here: an external ingest flake must not
+        # colour the run that the README badge now reads, and it never had the
+        # standing to, since the same flake was forgiven one event later. The
+        # `push` arm stays for the fail-safe path — a `changes` job that dies
+        # leaves `run_core` empty and this job runs on push after all — and
+        # `workflow_dispatch` so that re-running a green run by hand cannot fail
+        # on a flake the other events forgive.
+        continue-on-error: ${{ github.event_name != 'pull_request' }}
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: coverage.out
           use_oidc: true
@@ -214,21 +1050,33 @@ jobs:
           use_pypi: true
 
       - name: Warn on non-blocking Codecov failure
-        if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.codecov.outcome == 'failure' }}
-        run: echo "::warning::Codecov upload failed. Coverage artifact was generated successfully, but Codecov ingest returned an external error."
+        if: ${{ github.event_name != 'pull_request' && steps.codecov.outcome == 'failure' }}
+        run: echo "::warning::Codecov upload failed on ${{ github.event_name }}. Coverage artifact was generated successfully, but Codecov ingest returned an external error."
 
   patch-coverage:
     runs-on: ubuntu-latest
+    # The profile this gate reads is now merged from the sharded lanes
+    # (coverage-merge above); the artifact it downloads, `coverage-out`, is the
+    # same name carrying the same whole-suite coverage it always did. This is a
+    # REQUIRED check, and a failed dependency would skip it into a satisfied
+    # state — the `test` gate judges coverage-merge for exactly that reason.
     needs:
-      - test-go
-    if: github.event_name == 'pull_request'
+      - coverage-merge
+    # REL-6: this is a REQUIRED check, but it used to run only on
+    # `pull_request` — in the merge_group suite that actually decides queue
+    # admission it reported `skipped`, and a skipped required check is
+    # satisfied. `coverage-merge` above carries no such restriction, so the
+    # profile this gate needs already exists in that suite; it just never
+    # consumed it.
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     permissions:
       contents: read
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Setup Go
@@ -243,118 +1091,616 @@ jobs:
           name: coverage-out
           path: .
 
-      - name: Fetch base branch
-        run: git fetch --no-tags origin ${{ github.event.pull_request.base.ref }}
+      - name: Determine base ref
+        # `pull_request.base.ref` does not exist under `merge_group` — the
+        # queue's base commit lives in `merge_group.base_sha` instead. Mirrors
+        # the same split (and the same fetch-if-absent caution) the `changes`
+        # job already makes below. Exported via $GITHUB_ENV, and every fetch
+        # uses a quoted shell variable rather than splicing the expression
+        # into the command directly.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          QUEUE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "merge_group" ]; then
+            base="$QUEUE_BASE_SHA"
+            if [ -z "$base" ]; then
+              echo "::error::no base commit in the merge_group payload"
+              exit 1
+            fi
+            if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+              git fetch --no-tags origin "$base" || true
+            fi
+            if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+              echo "::error::merge_group base commit $base unreachable after fetch"
+              exit 1
+            fi
+            echo "BASE_REF=$base" >> "$GITHUB_ENV"
+          else
+            git fetch --no-tags origin "$PR_BASE_REF"
+            echo "BASE_REF=origin/$PR_BASE_REF" >> "$GITHUB_ENV"
+          fi
 
       - name: Enforce patch coverage
         # Fails when a modified, coverable Go line is not covered by tests. This
         # is the in-CI, self-contained replacement for the external codecov patch
         # status, which can stall and deadlock a required check. See
         # scripts/patchcov for the gate logic (test files and tooling excluded).
+        # BASE_REF comes from the step above, already resolved for the event.
         env:
           COVERAGE_FILE: coverage.out
-          BASE_REF: origin/${{ github.event.pull_request.base.ref }}
         run: go run ./scripts/patchcov
 
   changes:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # Least-privilege additions for the merge_group proven-tree check below:
+      # `pull-requests: read` reads the queued PR's head sha and the PRs that
+      # head belongs to, `actions: read` reads that head sha's own
+      # `pull_request` CI verdict.
+      # Both are read-only and unused by every other event this job handles.
+      pull-requests: read
+      actions: read
     outputs:
       run_e2e: ${{ steps.detect.outputs.run_e2e }}
+      # "Run the core suite" — the unit halves, both race lanes and the browser
+      # shards: every lane whose evidence the merge queue has already produced
+      # for this exact tree. It is `run_e2e` minus the work the queue did, so it
+      # clears on a docs-only diff, on a `push` to `main`, AND on a
+      # `merge_group` run whose one queued PR already ran this exact tree
+      # through `ci.yml`'s own `pull_request` suite to success (detected
+      # below); `run_e2e` above stays true on push, because e2e-cross-browser,
+      # image-smoke and the Postgres smoke are exactly the lanes the queue
+      # does NOT run.
+      #
+      # Unlike e2e's historical step-level gating below, the unit and race jobs
+      # skip at the job level: GitHub reports a skipped job as a satisfied
+      # required check (proven in practice on the sibling sync-community/managed
+      # repos, whose whole Go battery merges this way).
+      run_core: ${{ steps.detect.outputs.run_core }}
+      # Two narrower slices of `run_core`, each with its own ground. They are
+      # separate outputs rather than one, because what makes a change
+      # irrelevant to the race detector has nothing to do with what makes it
+      # irrelevant to the Go suite, and folding them would hide that.
+      #
+      # `run_race` — the race lanes. The detector instruments COMPILED Go, so a
+      # change carrying no `.go`, no `go.mod` and no `go.sum` cannot introduce a
+      # data race: the binaries are identical and the same tests still run
+      # unraced in the Go lanes. Locales, templates and web assets are go:embed'ed
+      # DATA — changing them changes what the binary contains, never how it
+      # synchronises. `.github/**` is carved back IN even though it compiles
+      # nothing: a pull request editing the race job itself must not be judged
+      # irrelevant by the job it is editing.
+      run_race: ${{ steps.detect.outputs.run_race }}
+      # `run_unit` — the three Go lanes (test-go-shard, test-go-rest,
+      # test-go-analysis). A Playwright spec is neither compiled into the Go
+      # binary nor go:embed'ed, so an `e2e/**`-only change cannot alter a Go
+      # test, a lint finding or a coverage line. test-frontend does not gate on
+      # this output: its own `run_frontend` below is what decides it, because a
+      # backend-only change (Go, migrations, locales) has nothing for
+      # `lint:js`/`lint:types`/`test:unit`/`build` to see either.
+      run_unit: ${{ steps.detect.outputs.run_unit }}
+      # `run_frontend` — test-frontend alone. True on anything that job's own
+      # steps read; the list lives once, at `frontend_changes` in the detect
+      # step below. Independent of `run_core`/`run_unit` on purpose: a Go-only diff
+      # must not pay this job, and an e2e-spec-only one must, which is the
+      # opposite of what `run_unit` decides for the same diff. Unlike
+      # `run_frontend`'s own event-level fail-safes, `push` IS narrowed here,
+      # same as `run_core` and for the same reason (below): the merge queue
+      # already ran this job on the identical commit.
+      run_frontend: ${{ steps.detect.outputs.run_frontend }}
 
     steps:
+      # Only a pull request and a merge group carry a base to diff against, so
+      # only they pay for a full-history checkout; every other event reaches
+      # the detect step with no file list and runs everything it runs.
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
+
+      - name: List the files this diff changes
+        id: diff
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        uses: ./.github/actions/diff-against-base
 
       - name: Detect whether browser e2e is needed
         id: detect
         # Fail-safe default is to RUN the browser e2e jobs. The Playwright suite
         # exercises the real Go app end-to-end, so backend, template, asset,
         # locale, dependency, Docker, and CI changes can all affect it. We only
-        # skip when a pull request touches *nothing but* docs/meta files, or
+        # skip when a change touches *nothing but* docs/meta files, or
         # .clusterfuzzlite/ (a separate ClusterFuzzLite build sandbox that is
         # never compiled into the app binary or go:embed'd — see
-        # .clusterfuzzlite/Dockerfile), that cannot change the running app. Any
-        # path outside the allowlist runs e2e.
+        # .clusterfuzzlite/Dockerfile; its build.sh is the one file there a Go
+        # test reads, so the Go lanes still run for it, below), that cannot
+        # change the running app, or
+        # nothing but Go test files and Go-tree testdata/, which never reach
+        # the binary. Any other path runs e2e.
+        #
+        # Two events carry a base the diff can stand on: a pull request (its
+        # own base branch) and a merge-queue validation run
+        # (merge_group.base_sha — the queue branch is that base plus every pull
+        # request batched into the group, so one diff judges the whole batch).
+        # A merge-queue run is judged by the same allowlist as the pull request
+        # that produced it; until it was, a change already judged irrelevant on
+        # its own run still paid the full battery in the queue, `race` included
+        # — the lane the queue's 60-minute status-check timeout is measured
+        # against. Push (main), release and workflow_dispatch still run in
+        # full, so the post-merge safety net stays complete.
+        #
+        # Undetermined always means RUN — unknown event, missing or unreachable
+        # base, a failed diff, an empty file list. The list step reports each
+        # of them as an empty list with its reason, never as a narrower one,
+        # and the consumers below repeat the fail-safe once more (`!= 'false'`,
+        # evaluated even when this job dies), so a crash here cannot skip them.
         env:
           EVENT_NAME: ${{ github.event_name }}
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          CHANGED_FILES_PATH: ${{ steps.diff.outputs.files-path }}
+          DIFF_VERDICT: ${{ steps.diff.outputs.verdict }}
+          QUEUE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MERGE_GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # Deliberately no `set -e`: this job must never fail, because the
-          # required e2e jobs depend on it and a failed dependency would leave
-          # their required checks unsatisfied. Default to running e2e; only flip
-          # to false on a positive docs-only determination.
+          # This job must never fail: the required e2e jobs depend on it. The
+          # runner executes a step with no `shell:` as `bash -e`, so errexit IS
+          # on here — every command that may exit non-zero is guarded (`if`,
+          # `|| true`), and scripts/ciguards runs this step under `bash -e`
+          # against fixture diffs to prove it. Every branch falls through to
+          # the single verdict write at the end, and `run_e2e` starts at true
+          # so only a positive docs-only determination clears it.
           run_e2e=true
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            if git fetch --no-tags origin "$BASE_REF"; then
-              files="$(git diff --name-only "origin/${BASE_REF}...HEAD" || true)"
-              echo "Changed files:"
-              echo "$files"
-              if [ -n "$files" ]; then
-                # Anything NOT matching this docs/meta allowlist forces e2e to run.
-                app_changes="$(printf '%s\n' "$files" | grep -vE '^(docs/|\.clusterfuzzlite/|LICENSE$|\.gitignore$|\.gitattributes$|.*\.md$)' || true)"
-                if [ -z "$app_changes" ]; then
-                  echo "Docs/meta-only change: skipping browser e2e jobs."
-                  run_e2e=false
-                else
-                  echo "App-affecting change detected: running browser e2e jobs."
-                fi
-              else
-                echo "Empty diff: defaulting to running e2e."
-              fi
-            else
-              echo "Base ref fetch failed: defaulting to running e2e."
-            fi
-          else
-            echo "Non-PR event ($EVENT_NAME): running e2e."
-          fi
-          echo "run_e2e=$run_e2e" >> "$GITHUB_OUTPUT"
+          run_core=true
+          run_frontend=true
+          # The list step above skips every event but pull_request and
+          # merge_group, and reports every case it could not determine as an
+          # empty list: either way nothing is judged irrelevant here.
+          # A path is bytes, and a fork's pull request chooses them. Under the
+          # runner's C.UTF-8 locale GNU grep drops a line that is not valid
+          # UTF-8 (its "binary file matches" notice goes to stderr), so such a
+          # path would match no pattern: a positive gate would skip its lane,
+          # and a `-v` allowlist would read it as nothing changed. The C locale
+          # matches bytes.
+          export LC_ALL=C
 
-  e2e:
+          # What each Go lane's inputs are, one pattern each, written here and
+          # nowhere else. The release gate in docker-image.yml does not read
+          # them: when it accepts a Go job's success from an earlier commit it
+          # cuts THIS step's `run:` text out of the checked-out file and runs it
+          # as a pull_request over the paths that differ, then reads
+          # `run_unit` and `run_race` — so the question "what can change a Go
+          # lane's result" has one answer for the lane filter and the gate
+          # alike, and the step must keep running with nothing but the
+          # environment the gate gives it (the event, the list file, an output
+          # file), reaching no API on that event.
+          #   compiled_re   — what can change the compiled program, and so what
+          #                   the race lanes run for (the workflow directory
+          #                   included: an edit to the race job must run it).
+          #   runbook_re, licenses_re, doc_reader_re — the documents a Go test
+          #                   opens, which force the unit lanes below.
+          compiled_re='(\.go$|^go\.mod$|^go\.sum$|^\.github/)'
+          runbook_re='^docs/self-hosted\.md$'
+          licenses_re='^THIRD_PARTY_LICENSES\.md$'
+          doc_reader_re='^(docs/(openapi\.yaml|SECURITY_INVARIANTS\.md|gdpr\.md|notifications\.md|security/|examples/)|\.clusterfuzzlite/build\.sh$|README\.md$|CHANGELOG\.md$|SECURITY\.md$|changelog\.d/)'
+
+          # The list arrives as a file the diff action wrote, never through
+          # `env:` (one env string is capped at 128 KiB). No path, or a file
+          # that cannot be read, is an empty list: nothing is narrowed.
+          files=""
+          if [ -n "$CHANGED_FILES_PATH" ] && ! files="$(cat -- "$CHANGED_FILES_PATH")"; then
+            files=""
+            DIFF_VERDICT="the file list at $CHANGED_FILES_PATH could not be read"
+          fi
+          if [ -z "$files" ]; then
+            verdict="${DIFF_VERDICT:-$EVENT_NAME carries no base to diff against}: nothing is judged irrelevant here."
+          else
+            # Anything NOT matching this docs/meta allowlist forces e2e to run.
+            app_changes="$(printf '%s\n' "$files" | grep -vE '^(docs/|\.clusterfuzzlite/|LICENSE$|\.gitignore$|\.gitattributes$|.*\.md$)' || true)"
+            # One document is not inert text: scripts/backuprestoredoc reads
+            # the Postgres backup and restore commands out of the operator
+            # runbook and RUNS them against an ephemeral database, so an edit
+            # there breaks a test exactly as a Go edit does. It is caught by
+            # BOTH arms of the allowlist above (the `docs/` prefix and the
+            # `.md` suffix), so it is detected separately here — and consumed
+            # at `run_core` below, NOT here: the guard rides the Go lanes
+            # alone, and forcing it through `run_e2e` would buy a runbook
+            # typo a full browser battery that cannot look at it. Measured
+            # 2026-08-20: 10 of the 22 commits touching that file since June
+            # carried no other app-affecting file, so without the force
+            # nearly half of all runbook edits would land with the guard
+            # never having executed. The name is cross-checked from the
+            # guard's own package, so a rename cannot leave this filter
+            # pointing at nothing.
+            runbook_changes="$(printf '%s\n' "$files" | grep -E "$runbook_re" || true)"
+            # Second not-inert document, same shape: test-go-analysis
+            # regenerates the licenses report and refuses a stale committed
+            # THIRD_PARTY_LICENSES.md block, so an edit to the inventory
+            # alone must still run the lane that judges it — otherwise a
+            # hand edit lands ungated. Detected here beside the runbook and
+            # consumed at `run_core` below for the same reason.
+            licenses_changes="$(printf '%s\n' "$files" | grep -E "$licenses_re" || true)"
+            # The same shape for every other file a Go test opens. The two
+            # above were found one at a time, after a break had already
+            # landed; this is the class: the OpenAPI document, the security
+            # invariants and their per-topic pages, the operator pages a docs
+            # test parses, the example compose/proxy files, the readme, the
+            # changelog and its fragments, the security policy, and the fuzz
+            # build script a parity test reads. A diff confined to them is
+            # inert to the browser suite and not to the Go one, and without
+            # this force it reached `main` with every Go lane skipped while
+            # `test` and `race` stayed green (PR 885, run 36349190239; PR 896,
+            # run 36470070737). The list is not hand-kept in step with the
+            # tests: scripts/ciguards derives every path a Go test names and
+            # fails when one of them is inert here, so a document added to a
+            # test later fails there, not silently here.
+            doc_reader_changes="$(printf '%s\n' "$files" | grep -E "$doc_reader_re" || true)"
+            # Narrower still, and applied only to run_e2e below: a Go test
+            # file or its fixture data never reaches the compiled binary —
+            # `go build` excludes `_test.go`, and `testdata/` is excluded by
+            # the go tool itself (also skipped by scripts/archcheck's own
+            # walk) — so a diff confined to them cannot change what the
+            # browser suite exercises. This does NOT feed run_core below —
+            # a test file IS compiled Go, and running its assertions is
+            # exactly what the Go lanes are there for — so run_core is left
+            # untouched in the branch below that narrows only run_e2e.
+            # `testdata/` counts only inside the Go trees: one under e2e/ or
+            # web/ would be a browser-suite or bundle input, not a Go fixture.
+            e2e_inert='_test\.go$|^(cmd|internal|scripts)/(.*/)?testdata/'
+            e2e_irrelevant_changes="$(printf '%s\n' "$app_changes" | grep -E "$e2e_inert" || true)"
+            e2e_changes="$(printf '%s\n' "$app_changes" | grep -vE "$e2e_inert" || true)"
+            if [ -z "$app_changes" ]; then
+              run_e2e=false
+              run_core=false
+              if [ -n "$runbook_changes" ]; then
+                verdict="documentation-only change that touches the executed operator runbook: the browser e2e jobs and the race lanes report success without running, and the Go lanes run for it."
+              elif [ -n "$licenses_changes" ]; then
+                verdict="documentation-only change that touches the licenses inventory: the browser e2e jobs and the race lanes report success without running, and the Go lanes run so the analysis lane can judge the committed block."
+              elif [ -n "$doc_reader_changes" ]; then
+                verdict="documentation-only change that touches a file a Go test reads: the browser e2e jobs and the race lanes report success without running, and the Go lanes run for it."
+              else
+                verdict="docs/meta-only change: the browser e2e jobs and the unit/race battery report success without running."
+              fi
+            elif [ -z "$e2e_changes" ]; then
+              run_e2e=false
+              verdict="only Go test files and/or testdata changed ($(printf '%s\n' "$e2e_irrelevant_changes" | tr '\n' ' ')): they do not reach the compiled binary, so the browser e2e jobs report success without running; the Go lanes still run for them."
+            else
+              verdict="app-affecting change detected: running e2e and the battery."
+            fi
+
+            # test-frontend's own ground, independent of app_changes above:
+            # its steps read web/**, e2e/**, playwright.config.ts,
+            # scripts/*.mjs, package(-lock).json, eslint.config.mjs and
+            # tsconfig.json — PLUS every file outside web/ that
+            # web/src/css/input.css declares as a Tailwind `@source`. Those
+            # feed `npm run build`'s CSS step exactly as if they lived under
+            # web/, so a template-only diff must still run this job — miss
+            # it and "Committed bundles must match a fresh build" (below)
+            # never re-runs to catch the stale CSS. scripts/ciguards pins
+            # this pattern against every `@source` line in that file, so one
+            # added later fails CI here rather than drifting silently. And
+            # this workflow file: the job's own steps (Node version, npm
+            # scripts, the bundle check) live here, so an edit to them must
+            # run it. So does an edit to the diff action, which lists the
+            # files this detection reads and forced this job while it lived
+            # in this file. Anything else — a backend-only diff — leaves this
+            # job with nothing to lint, test or build.
+            frontend_changes="$(printf '%s\n' "$files" | grep -E '^(web/|e2e/|scripts/[^/]+\.mjs$|package(-lock)?\.json$|eslint\.config\.mjs$|tsconfig\.json$|playwright\.config\.ts$|\.github/workflows/ci\.yml$|\.github/actions/diff-against-base/|internal/templates/|internal/httpx/markup\.go$|internal/api/calendar_days_view_helpers\.go$)' || true)"
+            if [ -z "$frontend_changes" ]; then
+              run_frontend=false
+              echo "no frontend input changed: test-frontend reports success without running."
+            else
+              echo "frontend-affecting change detected: running test-frontend."
+            fi
+          fi
+
+          echo "$verdict"
+
+          # `run_core` was already set above, on the SAME allowlist verdict as
+          # run_e2e's docs-only branch (diverge there, never in a consumer, if
+          # the two ever need different file sets) — but NOT on the narrower
+          # test/testdata one that only demotes run_e2e, since a test file is
+          # still compiled Go the unit/race lanes must run. What follows drops
+          # the work the merge queue has already done.
+          #
+          # A `push` to `main` can only be a merge the queue built: the «Protect
+          # main» rule requires a pull request and the queue, and its bypass
+          # list is empty, so no other write reaches this branch. On this rebase
+          # queue the merge_group run's headSha is byte for byte the commit that
+          # becomes `main` — measured 2026-08-18, 97f641e2… identical in run
+          # 32081210308 and at the head of `main` — so the unit, frontend, race
+          # and browser-shard lanes here would re-test a tree proven minutes
+          # earlier. What the queue does NOT run stays: e2e-cross-browser and
+          # image-smoke gate themselves on the event, and e2e-postgres-smoke's
+          # own RUN_HEAVY keeps its work off pull requests and off the queue, so
+          # `push` is the only place it ever executes.
+          #
+          # Fail-safe in the same direction as everything above: the clear is
+          # written only inside the `push` branch, so an unknown event, a
+          # crashed job or an empty output all leave the core suite RUNNING.
+          # The runbook force, and the only place it is applied: the Go lanes
+          # execute the operator runbook (see the detection above), so a diff
+          # that touches it needs them even when everything else about the
+          # diff is documentation. It sits BEFORE the `push` branch on purpose
+          # — there the merge queue has already run the core suite, and this
+          # guard with it, on this exact commit, so `push` still wins.
+          if [ -n "${runbook_changes:-}" ]; then
+            run_core=true
+            echo "the executed operator runbook changed: the Go lanes run for it, the browser lanes do not."
+          fi
+          if [ -n "${licenses_changes:-}" ]; then
+            run_core=true
+            echo "the licenses inventory changed: the Go lanes run so the analysis lane can judge the committed block."
+          fi
+          if [ -n "${doc_reader_changes:-}" ]; then
+            run_core=true
+            echo "a file a Go test reads changed: the Go lanes run for it, the browser lanes do not."
+          fi
+          if [ "$EVENT_NAME" = "push" ]; then
+            run_core=false
+            run_frontend=false
+            echo "push to main: the merge queue already ran the core suite (test-frontend included) on this exact commit; running only the lanes it skips."
+          fi
+
+          # merge_group's own proven-tree skip. Every OTHER queue entry still
+          # runs the full battery: this clears run_core/run_frontend — and with
+          # run_core the Playwright e2e shards, which gate on it as RUN_SHARDS —
+          # only when this exact tree already ran `ci.yml`'s `pull_request`
+          # suite to success as the head of the PR this entry's head_ref
+          # names, against this queue's own base branch. That PR need not be
+          # queued alone: a batch passes too when the PRs ahead of it are
+          # already in its head (a PR stacked on them), because that run
+          # tested this same tree. It sits after the runbook/licenses
+          # forces (same reasoning as `push`: if that earlier PR run already
+          # covered the runbook/licenses guard on this identical tree, forcing
+          # it again here buys nothing) and is written so that ANY of the
+          # checks below failing — a head_ref that doesn't parse, an API error,
+          # a missing field, a tree mismatch, an unbound, unsuccessful or
+          # absent run — falls through to "not proven" and leaves
+          # run_core/run_frontend exactly as the branches above left them,
+          # which is the running direction.
+          #
+          # Residual, not closed here: a head that ran green against ANOTHER
+          # base and now sits in a PR on this one without a new push — a PR
+          # retargeted, or a closed PR's branch reopened as a new PR — keeps
+          # that green run. `edited` is not among the `pull_request` types that
+          # start a run, and every binding below reads the PRs as they are NOW
+          # (a run's `pull_requests` is computed at read time from the open
+          # PRs), while that run tested the head merged into the other base.
+          if [ "$EVENT_NAME" = "merge_group" ]; then
+            proven=""
+            # The base is held to a plain branch-name charset because it is
+            # spliced into a jq program below; any other name (`release/1.x`
+            # included) is simply not proven.
+            queue_entry="$(printf '%s' "$MERGE_GROUP_HEAD_REF" | sed -nE 's#^refs/heads/gh-readonly-queue/([A-Za-z0-9._-]+)/pr-([0-9]+)-[0-9a-f]+$#\1 \2#p')"
+            queue_base_ref="${queue_entry% *}"
+            pr_number="${queue_entry#* }"
+            if [ -z "$queue_entry" ]; then
+              echo "merge_group.head_ref ($MERGE_GROUP_HEAD_REF) does not match the gh-readonly-queue/<base>/pr-<N>-<sha> shape: cannot identify the queued PR, so this tree is not proven — running the full battery."
+            else
+              pr_head_sha="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" --jq '.head.sha // ""' 2>/dev/null || true)"
+              if ! printf '%s' "$pr_head_sha" | grep -Eq '^[0-9a-f]{40}$'; then
+                echo "could not read PR #$pr_number's head sha from the API (read as '${pr_head_sha:-<none>}'): not proven — running the full battery."
+              else
+                # A green `pull_request` run proves the head merged into the
+                # base AT THAT RUN, so the head must belong to exactly this PR
+                # and this PR must target this queue's base: the same sha in a
+                # second open PR, or this PR aimed at another branch, proves
+                # nothing here.
+                pr_binding="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${pr_head_sha}/pulls" --jq 'if length == 1 then "\(.[0].number)\t\(.[0].base.ref)" else "" end' 2>/dev/null || true)"
+                if [ "$pr_binding" != "$(printf '%s\t%s' "$pr_number" "$queue_base_ref")" ]; then
+                  echo "PR #$pr_number's head ($pr_head_sha) is not bound to exactly PR #$pr_number against $queue_base_ref (read as '${pr_binding:-<none>}'): not proven — running the full battery."
+                else
+                  # The PR's `pull_request` run tested the head merged into
+                  # the base as it stood THEN — an ancestor of this queue's
+                  # base because the base only moves forward, a premise that
+                  # holds for a force-push-protected branch, which `main` is;
+                  # the charset above admits other names without checking it.
+                  # With this base an ancestor of the head, that older base was
+                  # one too, so the merge the run tested is the head's own
+                  # tree; the queue tree must equal it as well — checked below
+                  # rather than assumed (an entry carrying a change the head
+                  # lacks, such as a batched PR it is not stacked on, fails
+                  # there).
+                  git fetch --no-tags origin "$pr_head_sha" || true
+                  if [ -z "$QUEUE_BASE_SHA" ] || ! git merge-base --is-ancestor "$QUEUE_BASE_SHA" "$pr_head_sha" 2>/dev/null; then
+                    echo "this merge group's base (${QUEUE_BASE_SHA:-<none>}) is not an ancestor of PR #$pr_number's head ($pr_head_sha) — a stale entry: not proven — running the full battery."
+                  else
+                    queue_tree="$(git rev-parse HEAD^{tree} 2>/dev/null || true)"
+                    pr_tree="$(git rev-parse "${pr_head_sha}^{tree}" 2>/dev/null || true)"
+                    if [ -z "$queue_tree" ] || [ -z "$pr_tree" ] || [ "$queue_tree" != "$pr_tree" ]; then
+                      echo "queue tree (${queue_tree:-<none>}) and PR #$pr_number head tree (${pr_tree:-<none>}) do not match: not proven — running the full battery."
+                    else
+                      # Same event, same workflow file, this exact head sha, a
+                      # run that names this PR against this base, its LATEST
+                      # attempt: the API returns one run object per
+                      # originally-triggered run and a rerun updates that same
+                      # object's own conclusion in place, so there is no older
+                      # attempt hiding behind a newer success to pick the wrong
+                      # one of. A run's `pull_requests` lists the PR only while
+                      # it is open, and never for a fork's PR — so a fork's
+                      # entry is never proven.
+                      runs_filter='[.workflow_runs[] | select(.path == ".github/workflows/ci.yml") | select(any(.pull_requests[]?; .number == '"$pr_number"' and .base.ref == "'"$queue_base_ref"'"))] | sort_by(.created_at) | last | .conclusion // ""'
+                      run_conclusion="$(
+                        gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${pr_head_sha}&event=pull_request&per_page=50" \
+                          --jq "$runs_filter" \
+                          2>/dev/null || true
+                      )"
+                      if [ "$run_conclusion" != "success" ]; then
+                        echo "no successful pull_request run of ci.yml bound to PR #$pr_number against $queue_base_ref found for its head ($pr_head_sha) — read as '${run_conclusion:-<none>}': not proven — running the full battery."
+                      else
+                        proven=1
+                      fi
+                    fi
+                  fi
+                fi
+              fi
+            fi
+
+            if [ -n "$proven" ]; then
+              run_core=false
+              run_frontend=false
+              echo "PR #$pr_number's head ($pr_head_sha) already ran ci.yml's pull_request suite to success on this identical tree against $queue_base_ref: the core Go/race/frontend lanes and the e2e shards report success without running here."
+            fi
+          fi
+
+          # The two narrower slices. Both start from `run_core`, so everything
+          # it already cleared stays cleared, and both are only ever narrowed
+          # inside a branch that has a real file list — an unknown event, a
+          # crashed diff or an empty listing leaves them exactly as `run_core`
+          # left them, which is the running direction.
+          run_race="$run_core"
+          run_unit="$run_core"
+          if [ -n "${files:-}" ]; then
+            # Anything that can change the compiled program, plus the workflow
+            # directory: a pull request that edits the race job must still run
+            # it. Measured 2026-08-18 over the last 59 merged pull requests:
+            # 22 carried no compiled Go, and 8 of those were `.github/**`, so
+            # this carve-out costs a third of the slice and is not optional.
+            compiled="$(printf '%s\n' "$files" | grep -E "$compiled_re" || true)"
+            if [ -z "$compiled" ]; then
+              run_race=false
+              echo "no compiled Go and no workflow change: the race lanes report success without running."
+            fi
+            # Browser-spec-only: the e2e allowlist plus the docs/meta one.
+            beyond_specs="$(printf '%s\n' "$files" | grep -vE '^(e2e/|docs/|\.clusterfuzzlite/|LICENSE$|\.gitignore$|\.gitattributes$|.*\.md$)' || true)"
+            # The runbook, licenses and test-read-file forces above reach
+            # `run_core`, and this slice would take them straight back:
+            # `beyond_specs` excuses every `^docs/` path and every `.md` file,
+            # so without the extra halves of this condition a runbook-only,
+            # inventory-only or test-read-file-only diff would clear the Go
+            # lanes again — the very lanes that run the guards reading them.
+            if [ -z "$beyond_specs" ] && [ -z "${runbook_changes:-}" ] && [ -z "${licenses_changes:-}" ] && [ -z "${doc_reader_changes:-}" ]; then
+              run_unit=false
+              echo "browser specs only: the Go suite reports success without running."
+            fi
+          fi
+
+          echo "run_e2e=$run_e2e" >> "$GITHUB_OUTPUT"
+          echo "run_core=$run_core" >> "$GITHUB_OUTPUT"
+          echo "run_race=$run_race" >> "$GITHUB_OUTPUT"
+          echo "run_unit=$run_unit" >> "$GITHUB_OUTPUT"
+          echo "run_frontend=$run_frontend" >> "$GITHUB_OUTPUT"
+
+  # The browser suite runs here, split across shards, and the required status
+  # check named `e2e` is the thin gate job below — the same shape branch
+  # protection already forces on `test`, and for the same reason: a matrix job
+  # reports one context per cell (`e2e-shard (1)`, ...), none of which is the
+  # literal name the required check is pinned to.
+  #
+  # Sharding is NOT raising parallelism inside one database — that stays ruled
+  # out for the SQLite-backed stateful flows.
+  # Every shard is its own runner: its own `go run` app, its own SQLite file
+  # under .tmp/e2e, and still `--workers=1` from the runner (`--mode=ci`). What
+  # changes is how many app instances exist, not how many tests share one.
+  # This is only safe because every spec provisions its own owner —
+  # `createCredentials` mints a unique address per call — so no spec depends on
+  # state another spec file left behind.
+  #
+  # Measured 2026-08-15: 200 tests over 33 spec files, 793 s in one lane; three
+  # shards split them 76/60/64. The shard count is NOT repeated in the
+  # `--shard=` argument — `strategy.job-total` reads it off the matrix itself,
+  # so adding a shard is a one-line edit that cannot leave the divisor behind.
+  e2e-shard:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
       contents: read
     needs:
-      - test
       - changes
-    # `e2e` is a required status check (branch protection) AND admins are
-    # enforced, so this job must always run and report a result. Skipping the
-    # whole job via a job-level `if` would leave the required check unsatisfied
-    # and could permanently block docs-only PRs. Instead the job always starts
-    # and each work step is gated: on a docs-only change every step is skipped
-    # and the job goes green in seconds, satisfying the required check.
+    # `!cancelled()` overrides the implicit success()-of-needs: without it a
+    # FAILED `changes` skips every shard, and the `e2e` gate below passes a
+    # skipped matrix. RUN_E2E/RUN_SHARDS then read empty, which runs the work.
+    if: ${{ !cancelled() }}
+    strategy:
+      # One shard's failure must not cancel its siblings: the point of the
+      # split is to learn everything the browser lane knows in one run.
+      fail-fast: false
+      # Four shards: after race-db, the slowest of three browser shards
+      # (6.6-7.2 min over five full-battery runs on 2026-09-24) sat right
+      # behind the race lanes on the critical path.
+      matrix:
+        shard:
+          - 1
+          - 2
+          - 3
+          - 4
+    # Historical note:
+    # this job gates each work STEP instead of using a job-level `if` because
+    # job-level skips were believed to leave the required check unsatisfied —
+    # that is not how GitHub behaves today (a skipped job reports as a
+    # satisfied required check; the unit/race battery above and the sibling
+    # repos rely on it). The step-gated shape is kept as-is, and it is now the
+    # thing that does the work: this job used to cascade to skipped on a
+    # docs-only change because its `test` dependency skipped first, but `test`
+    # judges its halves rather than disappearing, so on a docs-only pull request
+    # — or merge-queue run — it reports success and this job RUNS with every
+    # step gated off. The RUN_E2E guards are therefore load-bearing on the
+    # ordinary path, not only if the two allowlists in `changes` ever diverge.
+    # Those guards carry the battery's fail-safe form
+    # (`!= 'false'`): an absent output must not silently green a job that ran.
+    #
+    # NOT `needs: test`. That edge was the whole critical path: measured
+    # 2026-08-15 on run 31849738519, `test-go` ran 7 min 23 s and this job did
+    # not start until it finished, so a 13 min 48 s browser suite reported at
+    # 21 min 27 s. Nothing here consumes an artifact or an output of the unit
+    # battery — the edge only expressed "don't burn browser minutes until the
+    # cheap suites pass", which on a public repository buys nothing and costs
+    # every green run those 7 minutes twice over (pull_request, then again in
+    # merge_group).
+    #
+    # Dropping it also closes a hole rather than opening one. A failed
+    # dependency SKIPS a job, and a skipped required check counts as SATISFIED
+    # (measured 2026-08-08) — so while this edge existed, a failing `test-go`
+    # left `e2e` skipped, i.e. green, and the browser suite never judged that
+    # commit at all. Now it runs on its own evidence and reports its own
+    # verdict.
     env:
       RUN_E2E: ${{ needs.changes.outputs.run_e2e }}
+      # The browser lane no longer runs on `push` at all. It used to run a
+      # three-spec smoke there, whole on shard 1 with the other two standing
+      # down; the merge queue now runs the FULL sharded suite on the identical
+      # commit (see `run_core` in the `changes` job), so the smoke re-proved a
+      # strict subset of what had already passed. Cross-browser coverage, which
+      # the queue genuinely does not run, is e2e-cross-browser's job and gates
+      # itself on the event.
+      #
+      # Written in the fail-safe direction (`!= 'false'` at every use) like
+      # RUN_E2E: an expression that ever evaluates empty must leave the work
+      # running, never silently drop it.
+      RUN_SHARDS: ${{ needs.changes.outputs.run_core }}
 
     steps:
       - name: Checkout
-        if: env.RUN_E2E == 'true'
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: env.RUN_E2E != 'false' && env.RUN_SHARDS != 'false'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup Go
-        if: env.RUN_E2E == 'true'
+        if: env.RUN_E2E != 'false' && env.RUN_SHARDS != 'false'
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: false
 
       - name: Setup Node.js
-        if: env.RUN_E2E == 'true'
+        if: env.RUN_E2E != 'false' && env.RUN_SHARDS != 'false'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
 
       - name: Install frontend and e2e dependencies
-        if: env.RUN_E2E == 'true'
+        if: env.RUN_E2E != 'false' && env.RUN_SHARDS != 'false'
         run: npm ci
 
       - name: Cache Playwright browsers
-        if: env.RUN_E2E == 'true'
+        if: env.RUN_E2E != 'false' && env.RUN_SHARDS != 'false'
         id: playwright-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -362,25 +1708,56 @@ jobs:
           key: ${{ runner.os }}-playwright-chromium-${{ hashFiles('package-lock.json') }}
 
       - name: Install Playwright browser
-        if: env.RUN_E2E == 'true' && steps.playwright-cache.outputs.cache-hit != 'true'
-        run: npx playwright install --with-deps chromium
+        if: env.RUN_E2E != 'false' && env.RUN_SHARDS != 'false' && steps.playwright-cache.outputs.cache-hit != 'true'
+        # NO `--with-deps`: this downloads the browser binary and touches apt not
+        # at all. This lane is CHROMIUM-ONLY, which is what makes that safe — see
+        # the paragraph at the end. The apt half used to live here and in a second
+        # step below, and
+        # it was the single least reliable thing in CI — three hangs in 24 hours
+        # on an unresponsive Azure mirror (runs 32070919012, 32085785273 and,
+        # after the timeout bound landed, 32090266798 failing honestly at 905 s).
+        #
+        # What it was buying, read off the install log of run 32081716803:
+        # `0 upgraded, 9 newly installed, 0 to remove and 12 not upgraded`. Every
+        # real Playwright dependency is already on the ubuntu-latest image; the
+        # nine were all FONTS — fonts-ipafont-gothic (Japanese), fonts-wqy-zenhei
+        # (Chinese), fonts-tlwg-loma-otf (Thai), fonts-unifont, fonts-freefont-ttf
+        # and the xfonts-* set. This application ships six locales — de en es fr
+        # it ru — so no CJK or Thai text exists to render, no spec contains a CJK
+        # or Thai character, and Cyrillic is served by DejaVu, which the image
+        # already carries.
+        #
+        # Playwright asserts the DOM, not pixels: a missing glyph cannot fail
+        # `toHaveText`, and the suite makes no screenshot comparison at all
+        # (`toHaveScreenshot`/`toMatchSnapshot`: zero occurrences). It does make
+        # geometry assertions, which is the one way a font could matter — so this
+        # is a change the browser suite itself judges, and its verdict on this
+        # pull request is the evidence for it.
+        #
+        # SCOPE: this removal is correct for the chromium-only lanes and WRONG for
+        # e2e-cross-browser, which therefore keeps its apt steps. The delta apt
+        # actually computes differs by an order of magnitude — measured on push run
+        # 32081716803, same commit, same image: `9 newly installed` here and in
+        # e2e-postgres-smoke, against `181 newly installed` in the cross-browser
+        # lane, of which 165 are real libraries (gstreamer1.0-*, libav*, libcairo-*
+        # — WebKit's media stack), not fonts. Evidence gathered on a chromium lane
+        # does not carry to a lane that also builds Firefox and WebKit, and the
+        # pull-request run cannot catch the difference: e2e-cross-browser runs only
+        # on push, release and workflow_dispatch, so it would have broken on `main`.
+        #
+        # If Chromium ever fails to LAUNCH rather than to render, look here first:
+        # the claim above rests on one image's package list, and a future runner
+        # image could drop a dependency this no longer installs.
+        run: timeout 600 npx playwright install chromium
 
-      - name: Install Playwright OS dependencies (cache hit)
-        # The cache above only covers the downloaded browser binaries under
-        # ~/.cache/ms-playwright; system packages (apt) never persist across
-        # a fresh runner, so they still need installing even on a browser
-        # cache hit — this is the fast path (no browser download).
-        if: env.RUN_E2E == 'true' && steps.playwright-cache.outputs.cache-hit == 'true'
-        run: npx playwright install-deps chromium
-
-      - name: Run Playwright e2e (smoke on push, full otherwise)
-        if: env.RUN_E2E == 'true'
-        run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            npm run e2e:ci -- e2e/auth-login-register.spec.ts e2e/dashboard.spec.ts e2e/theme-dark-mode.spec.ts
-          else
-            npm run e2e:ci
-          fi
+      - name: Run Playwright e2e
+        # The divisor comes from `strategy.job-total`, which GitHub computes
+        # from the matrix above — never a second literal to keep in step with
+        # it. `--shard` splits by spec file, and each shard gets its own app
+        # and database, so the runner's own `--workers=1` still holds inside
+        # one shard.
+        if: env.RUN_E2E != 'false' && env.RUN_SHARDS != 'false'
+        run: npm run e2e:ci -- --shard=${{ matrix.shard }}/${{ strategy.job-total }}
         env:
           E2E_APP_PORT: 18080
 
@@ -388,12 +1765,48 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: playwright-artifacts
+          name: playwright-artifacts-shard-${{ matrix.shard }}
           path: |
             playwright-report
             test-results
             .tmp/e2e
           if-no-files-found: ignore
+
+  # Thin gate job named exactly `e2e` — branch protection's required status
+  # check is pinned to that literal context name, and a matrix job cannot
+  # provide it (its contexts are `e2e-shard (1)`, `e2e-shard (2)`, ...).
+  # Identical in shape and in reasoning to the `test` gate above: WITHOUT AN
+  # `if`, A FAILED DEPENDENCY SKIPS THIS JOB, and a skipped required check
+  # counts as satisfied — which would hand the merge a green `e2e` on a run
+  # where every shard failed.
+  #
+  # `needs.e2e-shard.result` is the aggregate over the whole matrix: `success`
+  # only when every shard succeeded, `failure` when any of them failed. With
+  # `fail-fast: false` above, all shards have reported by the time this runs.
+  e2e:
+    runs-on: ubuntu-latest
+    needs:
+      - e2e-shard
+    if: ${{ !cancelled() }}
+    permissions:
+      contents: read
+    steps:
+      - name: Judge the browser shards
+        env:
+          SHARDS_RESULT: ${{ needs.e2e-shard.result }}
+        run: |
+          set -euo pipefail
+          echo "e2e-shard=$SHARDS_RESULT"
+          # `skipped` is a PASS here and only here, for the same reason it is in
+          # the `test` gate: the `changes` job cleared `run_core`, which is a
+          # decision not to run rather than a failure to run. Anything else
+          # — failure, cancelled, or a state this gate has never seen — is this
+          # context's failure.
+          case "$SHARDS_RESULT" in
+            success|skipped) ;;
+            *) echo "::error::the browser shards reported \"$SHARDS_RESULT\""; exit 1 ;;
+          esac
+          echo "every browser shard passed."
 
   e2e-postgres-smoke:
     runs-on: ubuntu-latest
@@ -401,42 +1814,55 @@ jobs:
     permissions:
       contents: read
     needs:
-      - test
       - changes
+    # `!cancelled()`: a FAILED `changes` must not skip this required check into
+    # a satisfied one. RUN_E2E then reads empty, which runs the work.
+    if: ${{ !cancelled() }}
     # Required status check with admin enforcement: always run the job and gate
     # the work per step (see the `e2e` job above) so docs-only PRs stay green
     # without leaving this required check unsatisfied. The Postgres/multi-locale
     # coverage this job adds over the plain `e2e` job is also only needed on
     # push/release/dispatch, not on every PR, so RUN_HEAVY gates it further.
+    # The required context is therefore satisfied on a pull request and in the
+    # queue by a run that did no work: it cannot gate a merge, and its real
+    # verdict is the push run's, which the release gate and `publish-image` read.
+    #
+    # RUN_HEAVY excludes `merge_group` too, which makes this the ONE core-looking
+    # lane that `push` must keep: measured 2026-08-18, the job took 3 s in queue
+    # run 32081210308 (every step gated off) and 240 s in push run 32081716803
+    # doing the real work. Reading it as a third repeat of the browser suite and
+    # trimming it would delete the only Postgres evidence this repository has.
     env:
       RUN_E2E: ${{ needs.changes.outputs.run_e2e }}
       RUN_HEAVY: ${{ github.event_name == 'push' || github.event_name == 'release' || github.event_name == 'workflow_dispatch' }}
 
     steps:
       - name: Checkout
-        if: env.RUN_E2E == 'true' && env.RUN_HEAVY == 'true'
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: env.RUN_E2E != 'false' && env.RUN_HEAVY == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup Go
-        if: env.RUN_E2E == 'true' && env.RUN_HEAVY == 'true'
+        if: env.RUN_E2E != 'false' && env.RUN_HEAVY == 'true'
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: false
 
       - name: Setup Node.js
-        if: env.RUN_E2E == 'true' && env.RUN_HEAVY == 'true'
+        if: env.RUN_E2E != 'false' && env.RUN_HEAVY == 'true'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
 
       - name: Install frontend and e2e dependencies
-        if: env.RUN_E2E == 'true' && env.RUN_HEAVY == 'true'
+        if: env.RUN_E2E != 'false' && env.RUN_HEAVY == 'true'
         run: npm ci
 
       - name: Cache Playwright browsers
-        if: env.RUN_E2E == 'true' && env.RUN_HEAVY == 'true'
+        if: env.RUN_E2E != 'false' && env.RUN_HEAVY == 'true'
         id: playwright-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -444,15 +1870,50 @@ jobs:
           key: ${{ runner.os }}-playwright-chromium-${{ hashFiles('package-lock.json') }}
 
       - name: Install Playwright browser
-        if: env.RUN_E2E == 'true' && env.RUN_HEAVY == 'true' && steps.playwright-cache.outputs.cache-hit != 'true'
-        run: npx playwright install --with-deps chromium
-
-      - name: Install Playwright OS dependencies (cache hit)
-        if: env.RUN_E2E == 'true' && env.RUN_HEAVY == 'true' && steps.playwright-cache.outputs.cache-hit == 'true'
-        run: npx playwright install-deps chromium
+        if: env.RUN_E2E != 'false' && env.RUN_HEAVY == 'true' && steps.playwright-cache.outputs.cache-hit != 'true'
+        # NO `--with-deps`: this downloads the browser binary and touches apt not
+        # at all. This lane is CHROMIUM-ONLY, which is what makes that safe — see
+        # the paragraph at the end. The apt half used to live here and in a second
+        # step below, and
+        # it was the single least reliable thing in CI — three hangs in 24 hours
+        # on an unresponsive Azure mirror (runs 32070919012, 32085785273 and,
+        # after the timeout bound landed, 32090266798 failing honestly at 905 s).
+        #
+        # What it was buying, read off the install log of run 32081716803:
+        # `0 upgraded, 9 newly installed, 0 to remove and 12 not upgraded`. Every
+        # real Playwright dependency is already on the ubuntu-latest image; the
+        # nine were all FONTS — fonts-ipafont-gothic (Japanese), fonts-wqy-zenhei
+        # (Chinese), fonts-tlwg-loma-otf (Thai), fonts-unifont, fonts-freefont-ttf
+        # and the xfonts-* set. This application ships six locales — de en es fr
+        # it ru — so no CJK or Thai text exists to render, no spec contains a CJK
+        # or Thai character, and Cyrillic is served by DejaVu, which the image
+        # already carries.
+        #
+        # Playwright asserts the DOM, not pixels: a missing glyph cannot fail
+        # `toHaveText`, and the suite makes no screenshot comparison at all
+        # (`toHaveScreenshot`/`toMatchSnapshot`: zero occurrences). It does make
+        # geometry assertions, which is the one way a font could matter — so this
+        # is a change the browser suite itself judges, and its verdict on this
+        # pull request is the evidence for it.
+        #
+        # SCOPE: this removal is correct for the chromium-only lanes and WRONG for
+        # e2e-cross-browser, which therefore keeps its apt steps. The delta apt
+        # actually computes differs by an order of magnitude — measured on push run
+        # 32081716803, same commit, same image: `9 newly installed` here and in
+        # e2e-postgres-smoke, against `181 newly installed` in the cross-browser
+        # lane, of which 165 are real libraries (gstreamer1.0-*, libav*, libcairo-*
+        # — WebKit's media stack), not fonts. Evidence gathered on a chromium lane
+        # does not carry to a lane that also builds Firefox and WebKit, and the
+        # pull-request run cannot catch the difference: e2e-cross-browser runs only
+        # on push, release and workflow_dispatch, so it would have broken on `main`.
+        #
+        # If Chromium ever fails to LAUNCH rather than to render, look here first:
+        # the claim above rests on one image's package list, and a future runner
+        # image could drop a dependency this no longer installs.
+        run: timeout 600 npx playwright install chromium
 
       - name: Run Playwright Postgres smoke
-        if: env.RUN_E2E == 'true' && env.RUN_HEAVY == 'true'
+        if: env.RUN_E2E != 'false' && env.RUN_HEAVY == 'true'
         run: npm run e2e:ci:postgres -- e2e/auth-login-register.spec.ts e2e/dashboard.spec.ts e2e/theme-dark-mode.spec.ts
         env:
           E2E_APP_PORT: 18081
@@ -474,15 +1935,22 @@ jobs:
     permissions:
       contents: read
     needs:
-      - test
       - changes
-    # Not a required status check, so cross-browser coverage beyond the plain
-    # `e2e` job's Chromium run is deferred to push/release/dispatch.
-    if: needs.changes.outputs.run_e2e == 'true' && (github.event_name == 'push' || github.event_name == 'release' || github.event_name == 'workflow_dispatch')
+    # The ruleset lists this context as required, but it cannot gate a merge:
+    # the `if:` below runs it only on push, release and dispatch, so on a pull
+    # request and in the merge queue it is skipped, and a skipped job satisfies
+    # a required context. Its verdict is real only after the merge, on the push
+    # run, which is why docker-image.yml's release gate and `publish-image`
+    # read it from there and why a failure here holds the release, not the
+    # merge. The relevance half carries the battery's fail-safe form (`!= 'false'`): a
+    # `changes` job that died must not silently drop post-merge coverage.
+    if: ${{ !cancelled() && needs.changes.outputs.run_e2e != 'false' && (github.event_name == 'push' || github.event_name == 'release' || github.event_name == 'workflow_dispatch') }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -508,11 +1976,49 @@ jobs:
 
       - name: Install Playwright browsers
         if: steps.playwright-cache.outputs.cache-hit != 'true'
-        run: npx playwright install --with-deps chromium firefox webkit
+        # `playwright install --with-deps` is an apt front end, and apt hangs on an
+        # unresponsive mirror rather than failing. Unbounded, that hang runs until
+        # the JOB timeout — 45 minutes — and GitHub reports a timed-out job as
+        # `cancelled`, not `failed`, so a required check goes red with no failed
+        # step to look at. It happened twice inside 24 hours: run 32070919012 on
+        # 2026-08-17 (45 min, took the README badge red) and run 32085785273 on
+        # 2026-08-18, both on this same step.
+        #
+        # Bounded, and NOT retried. Both halves are measured, and the first
+        # attempt at this fix got both of them wrong (run 32087754303):
+        #
+        #   - the bound cannot be tight. The 11-50 s this step usually takes is
+        #     the path where the packages are already present; a cold run pulls
+        #     21.1 MB from the Azure mirror and legitimately ran past 300 s. The
+        #     bound exists to beat the 45-minute job timeout, nothing finer.
+        #   - a retry cannot work. `timeout` kills apt mid-transaction and the
+        #     orphan keeps /var/lib/dpkg/lock-frontend, so the next attempt dies
+        #     at once on `Could not get lock` — observed, exit 100. A bounded
+        #     single attempt fails honestly; a retry only fails twice.
+        run: timeout 1500 npx playwright install --with-deps chromium firefox webkit
 
       - name: Install Playwright OS dependencies (cache hit)
         if: steps.playwright-cache.outputs.cache-hit == 'true'
-        run: npx playwright install-deps chromium firefox webkit
+        # `playwright install-deps` is an apt front end, and apt hangs on an
+        # unresponsive mirror rather than failing. Unbounded, that hang runs until
+        # the JOB timeout — 45 minutes — and GitHub reports a timed-out job as
+        # `cancelled`, not `failed`, so a required check goes red with no failed
+        # step to look at. It happened twice inside 24 hours: run 32070919012 on
+        # 2026-08-17 (45 min, took the README badge red) and run 32085785273 on
+        # 2026-08-18, both on this same step.
+        #
+        # Bounded, and NOT retried. Both halves are measured, and the first
+        # attempt at this fix got both of them wrong (run 32087754303):
+        #
+        #   - the bound cannot be tight. The 11-50 s this step usually takes is
+        #     the path where the packages are already present; a cold run pulls
+        #     21.1 MB from the Azure mirror and legitimately ran past 300 s. The
+        #     bound exists to beat the 45-minute job timeout, nothing finer.
+        #   - a retry cannot work. `timeout` kills apt mid-transaction and the
+        #     orphan keeps /var/lib/dpkg/lock-frontend, so the next attempt dies
+        #     at once on `Could not get lock` — observed, exit 100. A bounded
+        #     single attempt fails honestly; a retry only fails twice.
+        run: timeout 1200 npx playwright install-deps chromium firefox webkit
 
       - name: Run Playwright cross-browser smoke
         run: npm run e2e:cross-browser
@@ -535,9 +2041,11 @@ jobs:
     # The unit/e2e jobs exercise the app under `go run`; only this job proves the
     # embedded templates/locales/web-static (go:embed) and the static.New asset
     # middleware serve correctly from the shell-less scratch image, and that the
-    # in-container `ovumcy healthcheck` self-probe passes. Not a required status
-    # check and the image isn't built on PRs at all, so this runs on
-    # push/release/dispatch, catching an asset/embed/packaging regression
+    # in-container `ovumcy healthcheck`/`readycheck` self-probes pass. Not in the
+    # ruleset, and the image isn't built on PRs at all, so this runs only on
+    # push/release/dispatch and cannot gate a merge (the queue reports it
+    # skipped); the release gate and `publish-image` read it from the push run,
+    # catching an asset/embed/packaging regression
     # before it reaches a release tag.
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -545,20 +2053,23 @@ jobs:
       contents: read
     needs:
       - changes
-    if: needs.changes.outputs.run_e2e == 'true' && (github.event_name == 'push' || github.event_name == 'release' || github.event_name == 'workflow_dispatch')
+    # Same fail-safe relevance form as the battery above.
+    if: ${{ !cancelled() && needs.changes.outputs.run_e2e != 'false' && (github.event_name == 'push' || github.event_name == 'release' || github.event_name == 'workflow_dispatch') }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Build runtime image
         # GHA-cached build (shared with the trivy-image build in security.yml
         # for the same ref) so this doesn't rebuild every layer from scratch
         # despite `trivy-image` staying a separate required check.
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: Dockerfile
@@ -585,6 +2096,11 @@ jobs:
 
           curl -fsS http://localhost:18080/healthz | grep -q '"status":"ok"'
 
+          # /readyz additionally proves the storage layer answers inside the
+          # image: it runs a real query against the container's own database,
+          # which no other assertion here reaches.
+          curl -fsS http://localhost:18080/readyz | grep -q '"status":"ok"'
+
           # /login renders from embedded templates.
           login="$(curl -fsS http://localhost:18080/login)"
           printf '%s' "$login" | grep -q 'id="login-form"'
@@ -596,7 +2112,130 @@ jobs:
           curl -fsS -D - -o /dev/null "http://localhost:18080$asset" \
             | tr -d '\r' | grep -iq '^cache-control: public, max-age=3600'
 
-          # The container's own HEALTHCHECK command (the binary self-probe).
+          # The container's own HEALTHCHECK command (the binary self-probe) and
+          # its readiness sibling, which an operator runs by hand on a shell-free
+          # image. The HEALTHCHECK directive deliberately stays on the liveness
+          # probe so a storage blip cannot restart the container.
           docker exec "$cid" /app/ovumcy healthcheck
+          docker exec "$cid" /app/ovumcy readycheck
 
-          echo "image smoke OK: healthz + login + static ($asset) + in-container healthcheck"
+          echo "image smoke OK: healthz + readyz + login + static ($asset) + in-container healthcheck/readycheck"
+
+  publish-image:
+    # Publishes `ghcr.io/<repo>:latest` (plus `main` and `sha-<short>`) for the
+    # commit now on `main`. The publish used to be its own push-triggered
+    # workflow, which put it in a race with the very checks meant to judge that
+    # commit — and it won: `:latest` was anonymously pullable before `test`,
+    # `e2e`, `image-smoke` or the Trivy scans had reported. Branch protection
+    # guards the merge, not the commit the merge produces, so nothing else
+    # covered this.
+    #
+    # `needs:` cannot cross workflow boundaries, so the gate has to live here,
+    # in the workflow that owns those jobs, and the publish is reached by
+    # calling the workflow that already publishes release tags. The scans in
+    # security.yml still cannot be depended on from here; the called workflow
+    # scans the exact image it is about to push instead, with the same gate as
+    # the required `trivy-image` check.
+    #
+    # `:latest` therefore now trails a push to `main` by a full CI run instead
+    # of appearing within a couple of minutes, and stays on the previous commit
+    # when any of these jobs fails. That is the intended trade.
+    needs:
+      - test
+      - race
+      - e2e
+      - e2e-postgres-smoke
+      - image-smoke
+      - e2e-cross-browser
+    # Never on a pull request, and never for the `release: published` event —
+    # release tags publish from their own tag push, through the same workflow.
+    # `workflow_dispatch` on `main` is kept as the manual re-publish path, gated
+    # the same way, since the Docker Image workflow no longer accepts one.
+    #
+    # THE `if` MUST CARRY A STATUS FUNCTION, AND THE FIVE RESULTS BY NAME.
+    #
+    # What was MEASURED, which is the outcome and not the mechanism: with an
+    # `if` naming only the event and the ref, this job was `skipped` while the
+    # run stayed green in every push run examined — 33217555948, 33213567903,
+    # 33188023148, 32905532451, 32882518209 and 32853636750, `skipped` in all
+    # six with `started_at == completed_at`, and in each of them all five jobs
+    # in `needs:` reported `success`. What those five have in common is that
+    # their OWN dependencies (`test-go-shard`, `test-go-rest`,
+    # `test-go-analysis`, `coverage-merge`, `test-frontend`, both race lanes)
+    # are `skipped` on `push` — `test-go-shard` through `coverage-merge`
+    # because `changes` clears `run_core` there unconditionally, and
+    # `test-frontend` for the matching reason on its own `run_frontend`
+    # output — which is also why this holds for every push and not only for
+    # those six: nothing about a particular commit takes part in it.
+    # At `4b3c01d7`, `latest`, `main` and `sha-3891c0f` all pointed at one
+    # index 242 commits behind `main`, and `sha-4b3c01d` did not exist at all.
+    #
+    # Two mechanisms explain that equally well, and nothing here has separated
+    # them. Either the implicit `success()` an `if` without a status-check
+    # function receives is evaluated over the whole ancestor graph rather than
+    # over the direct `needs:`; or a skip propagates transitively, so a gate
+    # that rescues ITSELF with `!cancelled()` does not rescue what depends on
+    # it. Every job shape in this workflow today is explained by both, the five
+    # gates above included — they run, and each reading says so for its own
+    # reason — so nothing here is evidence either way. DO NOT BUILD A SECOND
+    # GATE ON WHICHEVER READING SOUNDS RIGHT: work out first whether the two
+    # differ for the shape you are about to write, and probe it on a throwaway
+    # branch if they do.
+    #
+    # The condition below is correct under either reading, which is why it did
+    # not wait for that probe. `!cancelled()` suppresses the implicit predicate
+    # whatever that predicate ranges over; on its own it would then publish off
+    # a FAILED gate, so the six results are required by name and judged here
+    # rather than inferred from anything. `success` and nothing else: `skipped`
+    # must not publish, because a lane that did not run is not a lane that
+    # passed, and a required check reads the same either way.
+    #
+    # It is NOT true that a docs-only push leaves `image-smoke` skipped, which
+    # this comment used to say. `changes` only judges a diff for an event that
+    # carries a base — a pull request or a merge group — and `push` carries
+    # none, so it takes the fail-safe branch and `run_e2e` stays true there
+    # whatever the commit touched. `image-smoke` and `e2e-postgres-smoke`
+    # therefore boot the image on EVERY push to `main`: measured on 5049126f, a
+    # documentation-only merge, where `image-smoke` reports `success` in the
+    # push run. Only `run_core` and `run_frontend` are cleared on push, and
+    # together they clear the other three lanes (`test` included, through
+    # both its Go dependencies and `test-frontend`).
+    if: >-
+      ${{ !cancelled()
+      && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && github.ref == 'refs/heads/main'
+      && needs.test.result == 'success'
+      && needs.race.result == 'success'
+      && needs.e2e.result == 'success'
+      && needs.e2e-postgres-smoke.result == 'success'
+      && needs.image-smoke.result == 'success'
+      && needs.e2e-cross-browser.result == 'success' }}
+    # A caller cannot grant a called workflow more than it holds, so this must
+    # match the permissions the publish job declares — plus `actions: read`,
+    # for the tag gate that workflow runs ahead of the publish.
+    # That gate is skipped on this path (it is the tag path's substitute for the
+    # `needs:` above, which cannot cross a workflow boundary), but the ceiling
+    # has to cover a job the called workflow declares whether or not it runs: a
+    # scope this list does not carry fails the CALL, not the skipped job that
+    # asked for it, and would stop `:latest` following `main` again — so a
+    # permission ADDED over there is a line owed here. The publish job itself is
+    # unaffected: its own permissions block does not list `actions`, so it
+    # still does not receive it.
+    permissions:
+      actions: read
+      artifact-metadata: write
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    uses: ./.github/workflows/docker-image.yml
+    # Passed explicitly rather than with `secrets: inherit`: the publish job
+    # needs exactly these four — the first pair for authenticated base-image
+    # pulls, the second to mirror the signed digest to Docker Hub. All four are
+    # declared `required: false` over there, so `:latest` keeps following `main`
+    # in a fork or a clone where none of them is set.
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      DOCKERHUB_PUBLISH_USERNAME: ${{ secrets.DOCKERHUB_PUBLISH_USERNAME }}
+      DOCKERHUB_PUBLISH_TOKEN: ${{ secrets.DOCKERHUB_PUBLISH_TOKEN }}

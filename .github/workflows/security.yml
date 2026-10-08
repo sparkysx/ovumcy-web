@@ -2,13 +2,30 @@ name: Security
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # What the image scans below can and cannot see: the runtime image is
+  # `FROM scratch`, so it carries no package database (no `/lib/apk/db`), and
+  # Trivy's OS-package detector has nothing to read there. The two Alpine
+  # packages the Dockerfile copies in (tzdata, ca-certificates) are therefore
+  # invisible to `trivy-image` whatever their version; the pins in the
+  # Dockerfile's runtime-assets stage are their only record, and the scan
+  # still covers the Go binary's own modules.
   TRIVY_IMAGE: aquasec/trivy:0.68.2@sha256:05d0126976bdedcd0782a0336f77832dbea1c81b9cc5e4b3a5ea5d2ec863aca7
+  # Pinned once here — the binary cache key below is built from the same
+  # values, so a spelling repeated as a literal in the key would silently
+  # drift from the install line (see "Cache Go tool binaries" in ci.yml).
+  # git SHA for v2.29.0: deb54465fea23d19a77f037e11e6589021f8501d (verified via go list -m -json)
+  GOSEC_VERSION: v2.29.0
+  # git SHA for v1.3.0: 0782b76014f15f24e22a438f30f308df42899ba1 (verified via go list -m -json)
+  GOVULNCHECK_VERSION: v1.3.0
 
 on:
   push:
     branches:
       - main
   pull_request:
+  # Merge-queue validation runs: every workflow that owns a required status
+  # check must also report on merge_group, or a queued merge waits forever.
+  merge_group:
   schedule:
     - cron: "41 3 * * 1"
   workflow_dispatch:
@@ -25,7 +42,166 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Shares ci.yml's `changes` base resolution through the diff-against-base
+  # action, and its fail-safe (an unknown event, a missing base, a failed or
+  # empty diff all leave every scanner running): only pull_request/merge_group
+  # ever narrow anything — push (main), the weekly schedule and
+  # workflow_dispatch always get the full battery.
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      run_go: ${{ steps.detect.outputs.run_go }}
+      run_trivyfs: ${{ steps.detect.outputs.run_trivyfs }}
+      run_trivyimage: ${{ steps.detect.outputs.run_trivyimage }}
+
+    steps:
+      # Only a pull request and a merge group carry a base to diff against, so
+      # only they pay for a full-history checkout; every other event reaches
+      # the detect step with no file list and runs every scanner.
+      - name: Checkout
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: List the files this diff changes
+        id: diff
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        uses: ./.github/actions/diff-against-base
+
+      - name: Detect which scanners this diff can affect
+        id: detect
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CHANGED_FILES_PATH: ${{ steps.diff.outputs.files-path }}
+          DIFF_BASE: ${{ steps.diff.outputs.base }}
+          DIFF_VERDICT: ${{ steps.diff.outputs.verdict }}
+        run: |
+          # This job must never fail: a failed dependency would skip the
+          # scanner jobs into a SATISFIED required check instead of an honest
+          # run. The runner executes a step with no `shell:` as `bash -e`, so
+          # errexit IS on here — every command that may exit non-zero is
+          # guarded (`if`, `|| true`). Every output starts at true, and an
+          # empty file list (any event but pull_request/merge_group, or a
+          # base or diff the list step could not determine) leaves it there.
+          run_go=true
+          run_trivyfs=true
+          run_trivyimage=true
+
+          # A path is bytes, and a fork's pull request chooses them. Under the
+          # runner's C.UTF-8 locale GNU grep drops a line that is not valid
+          # UTF-8 (its "binary file matches" notice goes to stderr), so such a
+          # path would match no pattern: a positive gate would skip its lane,
+          # and a `-v` allowlist would read it as nothing changed. The C locale
+          # matches bytes.
+          export LC_ALL=C
+
+          # The list arrives as a file the diff action wrote, never through
+          # `env:` (one env string is capped at 128 KiB). No path, or a file
+          # that cannot be read, is an empty list: nothing is narrowed.
+          files=""
+          if [ -n "$CHANGED_FILES_PATH" ] && ! files="$(cat -- "$CHANGED_FILES_PATH")"; then
+            files=""
+            DIFF_VERDICT="the file list at $CHANGED_FILES_PATH could not be read"
+          fi
+          if [ -z "$files" ]; then
+            verdict="${DIFF_VERDICT:-$EVENT_NAME carries no base to diff against}: running every scanner."
+          else
+            # This workflow file itself: an edit can touch a shared env
+            # var, the concurrency group or an upload step that every
+            # job below depends on, so it forces every scanner rather
+            # than being judged by the path rules below. The diff action
+            # is this detection's other half — it decides which files the
+            # rules below ever see — so an edit to it forces every scanner
+            # too, as it did while that logic lived in this file.
+            workflow_changed="$(printf '%s\n' "$files" | grep -E '^\.github/workflows/security\.yml$|^\.github/actions/diff-against-base/' || true)"
+            # trivy-fs and trivy-image both `uses:` this local composite
+            # action (the retrying image pull); an edit to it can change
+            # what either job actually runs, so it forces both rather
+            # than being judged by the path rules below. gosec and
+            # govulncheck never reference it.
+            pull_retry_changed="$(printf '%s\n' "$files" | grep -E '^\.github/actions/docker-pull-retry/' || true)"
+
+            # gosec + govulncheck: both read compiled Go and nothing
+            # else (locales/templates are go:embed DATA, not source a
+            # Go vulnerability scanner or gosec's AST walk can act on).
+            go_changes="$(printf '%s\n' "$files" | grep -E '(\.go$|^go\.mod$|^go\.sum$)' || true)"
+            # trivy-fs walks the WHOLE tree for any manifest/lockfile it
+            # recognizes (--scanners vuln), not only the repo root — a
+            # nested package-lock.json under a workspace is scanned the
+            # same as the root one. Matched by basename at any depth: the
+            # manifests and lockfiles of Go, npm/yarn/pnpm/bun, Python
+            # (pip, Pipenv, Poetry, uv), Rust, Ruby, PHP, Java (Maven,
+            # Gradle, sbt), .NET (NuGet), Dart, Elixir, Swift/CocoaPods,
+            # Conan and Julia. A text format outside this list is not
+            # caught here; a binary one is, by the fallback below.
+            trivyfs_changes="$(printf '%s\n' "$files" | grep -E '(^|/)(go\.(mod|sum)|package(-lock)?\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?|requirements[^/]*\.txt|Pipfile\.lock|poetry\.lock|uv\.lock|pyproject\.toml|Cargo\.lock|Gemfile\.lock|composer\.(lock|json)|pom\.xml|build\.gradle(\.kts)?|[^/]*gradle\.lockfile|[^/]*\.sbt\.lock|packages\.lock\.json|packages\.config|[^/]*\.deps\.json|(Directory\.)?Packages\.props|pubspec\.lock|mix\.lock|Podfile\.lock|Package\.resolved|conan\.lock|(Julia)?Manifest\.toml)$' || true)"
+            # The manifest list above cannot be exhaustive — trivy's
+            # binary/language detectors also read file CONTENT no path
+            # pattern can name ahead of time (a compiled Go binary's
+            # embedded buildinfo, a JAR, ...). Simplest provably-covering
+            # fallback: git already knows which changed blobs are not
+            # text. `--numstat` marks a binary file with `-` in both
+            # count columns, never in a text file's, so any added or
+            # modified binary forces the scan rather than trying to
+            # enumerate every format trivy might inspect. Read on its own,
+            # not piped: this step has no pipefail, so a failed numstat
+            # would carry awk's status and read as "no binary changed".
+            numstat_failed=""
+            if ! numstat="$(git -c core.quotePath=false diff --no-renames --numstat "${DIFF_BASE}...HEAD")"; then
+              numstat=""
+              numstat_failed=1
+            fi
+            binary_changes="$(printf '%s\n' "$numstat" | awk -F'\t' '$1 == "-" && $2 == "-" {print $3}')"
+            # trivy-image scans the built runtime image, so its gate is
+            # everything the Dockerfile copies into the build: go.mod/go.sum,
+            # cmd/, internal/ (which also carries the go:embed'ed templates
+            # and locale JSON — non-Go data the image ships, unlike
+            # gosec/govulncheck above), migrations/, and web/ — web/embed.go
+            # and web/static/ both — minus web/src/ and *_test.go, which
+            # .dockerignore keeps out of the build context. scripts/ciguards
+            # derives that set from the Dockerfile and .dockerignore and
+            # holds this gate to every tracked file in it.
+            trivyimage_changes="$(printf '%s\n' "$files" | grep -vE '_test\.go$|^web/src/' | grep -E '^(Dockerfile(\..*)?|\.dockerignore)$|^go\.(mod|sum)$|^cmd/|^internal/|^migrations/|^web/' || true)"
+
+            if [ -n "$workflow_changed" ]; then
+              verdict="security.yml or the diff action it lists with changed: running every scanner."
+            else
+              run_go=false
+              run_trivyfs=false
+              run_trivyimage=false
+              [ -n "$go_changes" ] && run_go=true
+              [ -n "$trivyfs_changes" ] && run_trivyfs=true
+              [ -n "$binary_changes" ] && run_trivyfs=true
+              [ -n "$trivyimage_changes" ] && run_trivyimage=true
+              if [ -n "$pull_retry_changed" ]; then
+                run_trivyfs=true
+                run_trivyimage=true
+              fi
+              if [ -n "$numstat_failed" ]; then
+                run_trivyfs=true
+                echo "git diff --numstat against ${DIFF_BASE}...HEAD failed: which changed blobs are binary is unknown, so trivy-fs runs."
+              fi
+              verdict="scoped to what changed: gosec/govulncheck=$run_go trivy-fs=$run_trivyfs trivy-image=$run_trivyimage."
+            fi
+          fi
+
+          echo "$verdict"
+          echo "run_go=$run_go" >> "$GITHUB_OUTPUT"
+          echo "run_trivyfs=$run_trivyfs" >> "$GITHUB_OUTPUT"
+          echo "run_trivyimage=$run_trivyimage" >> "$GITHUB_OUTPUT"
+
   gosec:
+    needs: changes
+    # Fail-safe form: `!cancelled()` overrides the implicit success()-of-needs
+    # predicate, so a FAILED or cancelled `changes` job still runs this rather
+    # than skipping it into a satisfied required check; an absent or
+    # non-'false' output (crashed job, new/renamed output) leaves it running
+    # too. Mirrors ci.yml's own gated jobs exactly.
+    if: ${{ !cancelled() && needs.changes.outputs.run_go != 'false' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -35,17 +211,48 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup Go
+        id: setup-go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
 
+      # Caches the tool BINARY, not golangci-lint's forbidden analysis cache
+      # (see ci.yml's "Cache Go tool binaries" for why that distinction
+      # matters): a compiled binary is a pure function of its pinned version
+      # and the toolchain that built it, and the key names both in full.
+      # No `restore-keys` — a prefix match would serve a binary of a
+      # different pinned version, which is exactly what the full key exists
+      # to prevent.
+      - name: Cache gosec binary
+        id: gosec-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .bin
+          key: ${{ runner.os }}-gotools-go${{ steps.setup-go.outputs.go-version }}-gosec${{ env.GOSEC_VERSION }}
+
+      - name: Verify the restored binary is the pinned version
+        # go version -m reads the embedded module version regardless of
+        # build-time ldflags, unlike `gosec --version` which prints "dev" for
+        # a plain `go install`.
+        if: steps.gosec-cache.outputs.cache-hit == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          installed="$(go version -m "$GOBIN/gosec" | awk '$1=="mod" && $2=="github.com/securego/gosec/v2" {print $3}')"
+          if [ "$installed" != "$GOSEC_VERSION" ]; then
+            echo "::error::cached gosec is ${installed:-<none>}, expected $GOSEC_VERSION"
+            exit 1
+          fi
+
       - name: Install gosec
-        # git SHA for v2.22.4: 6decf96c3d272d5a8bbdcf9fddb5789d0be16a8d (verified via go list -m -json)
-        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.22.4
+        if: steps.gosec-cache.outputs.cache-hit != 'true'
+        run: go install "github.com/securego/gosec/v2/cmd/gosec@$GOSEC_VERSION"
 
       - name: Prepare security artifact directory
         run: mkdir -p .tmp/security
@@ -55,7 +262,7 @@ jobs:
 
       - name: Upload gosec SARIF
         if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-        uses: github/codeql-action/upload-sarif@7188fc363630916deb702c7fdcf4e481b751f97a # v4.37.1
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
           sarif_file: .tmp/security/gosec.sarif
           category: gosec
@@ -69,6 +276,8 @@ jobs:
           if-no-files-found: error
 
   govulncheck:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.run_go != 'false' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -77,16 +286,40 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup Go
+        id: setup-go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
 
+      # See the gosec job's "Cache gosec binary" step for why caching a
+      # compiled tool binary is not the forbidden analysis cache.
+      - name: Cache govulncheck binary
+        id: govulncheck-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .bin
+          key: ${{ runner.os }}-gotools-go${{ steps.setup-go.outputs.go-version }}-govulncheck${{ env.GOVULNCHECK_VERSION }}
+
+      - name: Verify the restored binary is the pinned version
+        if: steps.govulncheck-cache.outputs.cache-hit == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          installed="$(go version -m "$GOBIN/govulncheck" | awk '$1=="mod" && $2=="golang.org/x/vuln" {print $3}')"
+          if [ "$installed" != "$GOVULNCHECK_VERSION" ]; then
+            echo "::error::cached govulncheck is ${installed:-<none>}, expected $GOVULNCHECK_VERSION"
+            exit 1
+          fi
+
       - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@v1.3.0
+        if: steps.govulncheck-cache.outputs.cache-hit != 'true'
+        run: go install "golang.org/x/vuln/cmd/govulncheck@$GOVULNCHECK_VERSION"
 
       - name: Run govulncheck
         # Call-graph reachability gate: govulncheck exits non-zero only when the
@@ -96,6 +329,8 @@ jobs:
         run: ./.bin/govulncheck ./...
 
   trivy-fs:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.run_trivyfs != 'false' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -105,13 +340,15 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Log in to Docker Hub
         # Skipped on fork PRs where the secret is unavailable; authenticated pulls
         # on trusted runs avoid the anonymous Docker Hub rate limit.
         if: ${{ env.DOCKERHUB_USERNAME != '' }}
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -119,12 +356,20 @@ jobs:
       - name: Prepare security artifact directory
         run: mkdir -p .tmp/security
 
+      - name: Pull Trivy image
+        uses: ./.github/actions/docker-pull-retry
+        with:
+          image: ${{ env.TRIVY_IMAGE }}
+
       - name: Run Trivy filesystem scan
-        run: docker run --rm -v "${{ github.workspace }}:/work" -w /work "${{ env.TRIVY_IMAGE }}" fs --scanners vuln --skip-version-check --severity HIGH,CRITICAL --ignore-unfixed --include-dev-deps --skip-dirs .tmp --skip-dirs .tmp_docker_ctx --skip-dirs web/static --format sarif --output .tmp/security/trivy-fs.sarif --exit-code 1 .
+        # No --ignore-unfixed: this SARIF is also what the Security tab shows
+        # (upload step below), so a CRITICAL with no upstream fix yet must
+        # stay visible in both the gate and the tab, not disappear from each.
+        run: docker run --rm -v "${{ github.workspace }}:/work" -w /work "${{ env.TRIVY_IMAGE }}" fs --scanners vuln --skip-version-check --severity HIGH,CRITICAL --include-dev-deps --skip-dirs .tmp --skip-dirs web/static --format sarif --output .tmp/security/trivy-fs.sarif --exit-code 1 .
 
       - name: Upload Trivy filesystem SARIF
         if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-        uses: github/codeql-action/upload-sarif@7188fc363630916deb702c7fdcf4e481b751f97a # v4.37.1
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
           sarif_file: .tmp/security/trivy-fs.sarif
           category: trivy-fs
@@ -137,7 +382,115 @@ jobs:
           path: .tmp/security/trivy-fs.sarif
           if-no-files-found: error
 
+  # The linux/arm64 half of the required `trivy-image` check. The release ships
+  # every platform in docker-image.yml's IMAGE_PLATFORMS, and this workflow
+  # cannot read that list at run time, so what each image job builds is a
+  # `platforms:` of its own that a guard in scripts/publishorder holds equal to
+  # the release's list. Native arm runner rather than QEMU: the Dockerfile
+  # compiles in the target platform's own builder stage (no BUILDPLATFORM
+  # cross-compile), so emulation would run `go mod download` and `go build`
+  # under QEMU — the push in docker-image.yml, which does, takes 10-11 minutes.
+  #
+  # It posts no required context, so `trivy-image` judges it: that job reads
+  # this one's verdict FILE, not its job result, because a job that needs
+  # `changes` may read `needs` only as a fail-safe `changes` comparison. The
+  # verdict is Trivy's exit code, and the job's first step writes a verdict that
+  # is no exit code at all: an attempt that fails before the scan (checkout,
+  # login, build) still uploads that placeholder and replaces what an earlier
+  # attempt of the same run left, so a re-run whose first step ran cannot be
+  # judged on its predecessor's `0`. An attempt that dies before any step (a
+  # lost runner) uploads nothing, and the gate reads the earlier attempt's
+  # verdict: a scan of the same commit in the same run. The verdict lives under the runner's temp directory, not
+  # in the workspace: on a fresh runner `actions/checkout` empties a workspace
+  # that has no `.git`, and would take a placeholder written there with it. The
+  # findings are in this job's log; the one SARIF entry in the Security tab
+  # stays `trivy-image`'s.
+  trivy-image-arm64:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.run_trivyimage != 'false' }}
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+
+    steps:
+      - name: Mark the verdict unscanned
+        # First, before anything that can fail: whatever stops this attempt
+        # afterwards, the upload below still has a file to send, and it reads
+        # `unscanned`, which `trivy-image` refuses. The scan overwrites it. The
+        # file is outside the workspace, which the checkout after this step may
+        # empty; the runner's temp directory is per job and left alone by it.
+        run: |
+          mkdir -p "${{ runner.temp }}/trivy-image-arm64"
+          echo unscanned > "${{ runner.temp }}/trivy-image-arm64/verdict"
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Log in to Docker Hub
+        if: ${{ env.DOCKERHUB_USERNAME != '' }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build runtime image for scanning
+        # Reads the default cache scope, where the release push leaves its
+        # arm64 layers, but writes its own: two jobs exporting one scope
+        # replace each other's index, and `trivy-image` already owns the
+        # default one for linux/amd64.
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/arm64
+          load: true
+          push: false
+          tags: ovumcy-security:${{ github.sha }}
+          cache-from: |
+            type=gha
+            type=gha,scope=trivy-image-arm64
+          cache-to: type=gha,mode=max,scope=trivy-image-arm64
+
+      - name: Pull Trivy image
+        uses: ./.github/actions/docker-pull-retry
+        with:
+          image: ${{ env.TRIVY_IMAGE }}
+
+      - name: Run Trivy image scan
+        # Same scanner, threshold and `--exit-code 1` as `trivy-image`'s own
+        # scan (a guard compares the flags), and no `--ignore-unfixed` for the
+        # same reason. The exit code is kept, then re-raised: it replaces the
+        # placeholder verdict whether or not the scan found anything.
+        run: |
+          rc=0
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "${{ github.workspace }}:/work" -w /work "${{ env.TRIVY_IMAGE }}" image --scanners vuln --skip-version-check --severity HIGH,CRITICAL --format table --exit-code 1 ovumcy-security:${{ github.sha }} || rc=$?
+          echo "$rc" > "${{ runner.temp }}/trivy-image-arm64/verdict"
+          exit "$rc"
+
+      - name: Hand the verdict to trivy-image
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verdict-trivy-image-arm64
+          path: ${{ runner.temp }}/trivy-image-arm64/verdict
+          # `if: always()` plus `overwrite`: every attempt of this job, however
+          # far it got, replaces the artifact an earlier attempt left, or
+          # `trivy-image` would go on reading the old verdict, red or green.
+          overwrite: true
+          if-no-files-found: error
+
   trivy-image:
+    needs:
+      - changes
+      - trivy-image-arm64
+    if: ${{ !cancelled() && needs.changes.outputs.run_trivyimage != 'false' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -147,19 +500,21 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Log in to Docker Hub
         # Skipped on fork PRs where the secret is unavailable; authenticated pulls
         # on trusted runs avoid the anonymous Docker Hub rate limit.
         if: ${{ env.DOCKERHUB_USERNAME != '' }}
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Build runtime image for scanning
         # GHA-cached build (shared with the image-smoke build in ci.yml for the
@@ -167,10 +522,14 @@ jobs:
         # merged into a shared build-once job without reconfiguring branch
         # protection required checks; this cache is the honest dedup available
         # without that change.
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: Dockerfile
+          # Named rather than left to the runner: a guard holds the platforms
+          # every image job here builds equal to the release's list, and this
+          # job's half of it is linux/amd64 (`trivy-image-arm64` has the rest).
+          platforms: linux/amd64
           load: true
           push: false
           tags: ovumcy-security:${{ github.sha }}
@@ -180,8 +539,32 @@ jobs:
       - name: Prepare security artifact directory
         run: mkdir -p .tmp/security
 
+      - name: Pull Trivy image
+        # Covers the scan step immediately below (same cached image). The SBOM
+        # step further down pulls again — see its own comment — because it must
+        # still run even if this pull's retries are exhausted.
+        uses: ./.github/actions/docker-pull-retry
+        with:
+          image: ${{ env.TRIVY_IMAGE }}
+
       - name: Run Trivy image scan
-        run: docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "${{ github.workspace }}:/work" -w /work "${{ env.TRIVY_IMAGE }}" image --scanners vuln --skip-version-check --severity HIGH,CRITICAL --ignore-unfixed --format sarif --output .tmp/security/trivy-image.sarif --exit-code 1 ovumcy-security:${{ github.sha }}
+        # No --ignore-unfixed: same reason as trivy-fs above — this SARIF feeds
+        # the Security tab, so an unfixed CRITICAL must stay visible there too.
+        run: docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "${{ github.workspace }}:/work" -w /work "${{ env.TRIVY_IMAGE }}" image --scanners vuln --skip-version-check --severity HIGH,CRITICAL --format sarif --output .tmp/security/trivy-image.sarif --exit-code 1 ovumcy-security:${{ github.sha }}
+
+      - name: Pull Trivy image for SBOM
+        # Generate CycloneDX SBOM below runs `if: always()` so it still executes
+        # when the scan step above fails on findings (--exit-code 1) or when the
+        # pull step above never completed (retries exhausted). The latter used to
+        # fall straight through to `docker run`'s own single, un-retried implicit
+        # pull, which is what let a Docker Hub timeout cascade into the SARIF and
+        # artifact upload steps (run 30202113726). Repeating the retrying pull
+        # here is a cache-hit no-op on the common path and a real retry on the
+        # failure path.
+        if: always()
+        uses: ./.github/actions/docker-pull-retry
+        with:
+          image: ${{ env.TRIVY_IMAGE }}
 
       - name: Generate CycloneDX SBOM
         if: always()
@@ -189,7 +572,7 @@ jobs:
 
       - name: Upload Trivy image SARIF
         if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-        uses: github/codeql-action/upload-sarif@7188fc363630916deb702c7fdcf4e481b751f97a # v4.37.1
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
           sarif_file: .tmp/security/trivy-image.sarif
           category: trivy-image
@@ -203,3 +586,25 @@ jobs:
             .tmp/security/trivy-image.sarif
             .tmp/security/ovumcy-image.cdx.json
           if-no-files-found: error
+
+      - name: Fetch the linux/arm64 verdict
+        # `if: always()` on this and the judgement below: the scan above may
+        # have failed, and the arm64 verdict is owed all the same.
+        if: always()
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: verdict-trivy-image-arm64
+          path: .tmp/security/arm64
+
+      - name: Judge the linux/arm64 verdict
+        # The gate for the platform `trivy-image-arm64` scanned. Only a verdict
+        # file reading exactly `0` passes: none (the job never reached its
+        # scan, or its artifact did not arrive) and any other code are both a
+        # refusal, so this cannot pass on a scan nobody ran.
+        if: always()
+        run: |
+          verdict=.tmp/security/arm64/verdict
+          if [ ! -f "$verdict" ] || [ "$(cat "$verdict")" != "0" ]; then
+            echo "::error::the linux/arm64 scan in trivy-image-arm64 left no clean verdict (found: $( [ -f "$verdict" ] && cat "$verdict" || echo none )); its log names the findings."
+            exit 1
+          fi

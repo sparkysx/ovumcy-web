@@ -8,6 +8,19 @@ import (
 	"github.com/ovumcy/ovumcy-web/internal/models"
 )
 
+// minimumPhaseInsightCycles is the PATTERN minimum: the number of completed
+// cycles below which a stats surface may not claim a pattern rather than a
+// single observation. It is named for the phase insights it was introduced
+// for, and it now gates every such surface — the phase mood and symptom
+// insights, the symptom-recurrence statements, the irregular-spread reading,
+// the reliability label, and the cycle-length trend sentence, whose window is
+// counted in completed cycles like the rest.
+//
+// It is deliberately NOT the same name as statsReliableTrendCycles, which
+// counts trend POINTS for the chart's reliability flag. Both are 3 today and a
+// reader may collapse them on that basis; they answer different questions, and
+// TestStatsThresholdsAreNamedPerSurface fails if one starts moving the other's
+// surface.
 const minimumPhaseInsightCycles = 3
 
 var phaseInsightOrder = []string{"menstrual", "follicular", "ovulation", "luteal"}
@@ -48,8 +61,11 @@ type completedCyclePhaseContext struct {
 	OvulationDay int
 }
 
-func buildCompletedCyclePhaseContexts(logs []models.DailyLog, location *time.Location) []completedCyclePhaseContext {
-	starts := DetectCycleStarts(logs)
+func buildCompletedCyclePhaseContexts(logs []models.DailyLog, location *time.Location, ctx BoundaryContext) []completedCyclePhaseContext {
+	// CycleBoundaries, the same rule buildCompletedCycleSpans reads: two readings
+	// of the boundaries used to run side by side in a single render — the ribbon
+	// reporting one merged cycle where the phase cards counted two.
+	starts := CycleBoundaries(logs, ctx)
 	if len(starts) < 2 {
 		return nil
 	}
@@ -116,12 +132,12 @@ func findCompletedCycleForDay(day time.Time, cycles []completedCyclePhaseContext
 	return completedCyclePhaseContext{}, false
 }
 
-func (service *StatsService) BuildPhaseMoodInsights(user *models.User, logs []models.DailyLog, location *time.Location) ([]StatsPhaseMoodInsight, bool) {
+func (service *StatsService) BuildPhaseMoodInsights(user *models.User, logs []models.DailyLog, location *time.Location, ctx BoundaryContext) ([]StatsPhaseMoodInsight, bool) {
 	if !IsOwnerUser(user) {
 		return nil, false
 	}
 
-	cycles := buildCompletedCyclePhaseContexts(logs, location)
+	cycles := buildCompletedCyclePhaseContexts(logs, location, ctx)
 	if len(cycles) < minimumPhaseInsightCycles {
 		return nil, false
 	}
@@ -173,26 +189,8 @@ func (service *StatsService) BuildPhaseMoodInsights(user *models.User, logs []mo
 	return insights, hasData
 }
 
-func (service *StatsService) BuildPhaseSymptomInsights(ctx context.Context, user *models.User, logs []models.DailyLog, location *time.Location) ([]StatsPhaseSymptomInsight, bool, error) {
-	if !canBuildPhaseSymptomInsights(service, user) {
-		return nil, false, nil
-	}
-
-	symptomByID, err := service.phaseInsightSymptomMap(ctx, user.ID)
-	if err != nil {
-		return nil, false, err
-	}
-
-	insights, hasData := buildPhaseSymptomInsightsWithMap(logs, location, symptomByID)
-	return insights, hasData, nil
-}
-
-func canBuildPhaseSymptomInsights(service *StatsService, user *models.User) bool {
-	return IsOwnerUser(user) && service != nil && service.symptoms != nil
-}
-
-func buildPhaseSymptomInsightsWithMap(logs []models.DailyLog, location *time.Location, symptomByID map[uint]models.SymptomType) ([]StatsPhaseSymptomInsight, bool) {
-	cycles := buildCompletedCyclePhaseContexts(logs, location)
+func buildPhaseSymptomInsightsWithMap(logs []models.DailyLog, location *time.Location, symptomByID map[uint]models.SymptomType, ctx BoundaryContext) ([]StatsPhaseSymptomInsight, bool) {
+	cycles := buildCompletedCyclePhaseContexts(logs, location, ctx)
 	if len(cycles) < minimumPhaseInsightCycles || len(symptomByID) == 0 {
 		return nil, false
 	}
@@ -248,10 +246,7 @@ func phaseForCompletedLogEntry(day time.Time, cycles []completedCyclePhaseContex
 }
 
 func appendPhaseSymptomCounts(counter *phaseSymptomCounter, symptomIDs []uint, symptomByID map[uint]models.SymptomType) {
-	for _, symptomID := range symptomIDs {
-		if _, exists := symptomByID[symptomID]; !exists {
-			continue
-		}
+	for _, symptomID := range uniqueKnownSymptomIDs(symptomIDs, symptomByID) {
 		counter.counts[symptomID]++
 	}
 }

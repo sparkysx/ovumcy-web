@@ -51,34 +51,53 @@ type Handler struct {
 	onboardingSvc        *services.OnboardingService
 	setupService         *services.SetupService
 	totpService          *services.TOTPService
+	readinessService     *services.ReadinessService
 	registerPickupTokens RegisterPickupTokenStore
 	auditLogEnabled      bool
 	assetVersion         string
+	// sessionIssuanceFault is nil in production. A test sets it to fail session
+	// minting the way no request can (a crypto or codec failure), to prove a
+	// recovery-code rotation rolls back when its delivery cannot be sealed.
+	sessionIssuanceFault func() error
+	// recoveryCodeIssuanceFault is nil in production. A test sets it to fail
+	// sealing the recovery-code reveal cookie the way no request can (a crypto
+	// or codec failure), the reveal-side twin of sessionIssuanceFault above —
+	// used to prove the register-pickup seal-order fix (WEB-64) leaves the
+	// pickup token retryable when the reveal itself is what fails to seal.
+	recoveryCodeIssuanceFault func() error
+	// now is nil in production, which reads time.Now (clockNow). A test sets it
+	// to meet a today the real clock cannot reach, such as the last accepted day.
+	now func() time.Time
 }
 
+func (handler *Handler) clockNow() time.Time {
+	if handler.now == nil {
+		return time.Now()
+	}
+	return handler.now()
+}
+
+// CalendarDay is one cell of the calendar grid. Every field on it is one the
+// calendar template interpolates: the day's own state is carried as the three
+// rendered forms (CellClass, TextClass, StateKey) rather than as the flags they
+// were derived from, so there is one place to read for what a cell looks like.
+// Re-exposing a raw predicate here means a template or a handler is about to
+// re-decide something buildCalendarDays already decided; the barrier in
+// declaration_reachability_barrier_test.go refuses a field nothing reads.
 type CalendarDay struct {
 	Date                   time.Time
 	DateString             string
 	Day                    int
-	InMonth                bool
 	IsToday                bool
 	OpenEditDirectly       bool
-	IsPeriod               bool
-	IsPredicted            bool
-	IsPreFertile           bool
-	IsFertility            bool
-	IsFertilityPeak        bool
-	IsFertilityEdge        bool
-	IsOvulation            bool
-	IsTentativeOvulation   bool
 	HasData                bool
 	HasSex                 bool
 	CellClass              string
 	TextClass              string
-	BadgeClass             string
 	StateKey               string
 	OvulationDot           bool
 	TentativeOvulationMark bool
+	Selectable             bool
 }
 
 type FlashPayload struct {
@@ -92,6 +111,12 @@ type FlashPayload struct {
 	// Login/register error prefill deliberately does NOT round-trip the email
 	// to keep PII out of the cookie on the common failure paths.
 	ForgotEmail string `json:"forgot_password_email,omitempty"`
+	// ExpiresAt is the server-side bound on the flash: setFlashCookie stamps
+	// it, popFlashCookie refuses a payload with none or one in the past. The
+	// cookie's own Expires is a browser hint; a client that kept the sealed
+	// value would otherwise replay the message (and a ForgotEmail prefill)
+	// until the key rotates.
+	ExpiresAt time.Time `json:"expires_at"`
 }
 
 const (

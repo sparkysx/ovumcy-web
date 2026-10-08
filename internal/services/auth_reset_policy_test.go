@@ -18,7 +18,7 @@ func TestBuildAndParsePasswordResetToken(t *testing.T) {
 	now := time.Date(2026, time.March, 1, 10, 0, 0, 0, time.UTC)
 	passwordHash := "$2a$10$testhashvaluefortokenclaims"
 
-	token, err := BuildPasswordResetToken(secret, 42, passwordHash, 30*time.Minute, now)
+	token, err := BuildPasswordResetToken(secret, 42, passwordHash, 1, PasswordResetTokenPurposeRecovery, 30*time.Minute, now)
 	if err != nil {
 		t.Fatalf("BuildPasswordResetToken() unexpected error: %v", err)
 	}
@@ -30,8 +30,8 @@ func TestBuildAndParsePasswordResetToken(t *testing.T) {
 	if claims.UserID != 42 {
 		t.Fatalf("expected UserID=42, got %d", claims.UserID)
 	}
-	if claims.Purpose != passwordResetTokenPurpose {
-		t.Fatalf("expected purpose %q, got %q", passwordResetTokenPurpose, claims.Purpose)
+	if claims.Purpose != PasswordResetTokenPurposeRecovery {
+		t.Fatalf("expected purpose %q, got %q", PasswordResetTokenPurposeRecovery, claims.Purpose)
 	}
 	if claims.PasswordState == "" {
 		t.Fatalf("expected non-empty password state")
@@ -43,7 +43,7 @@ func TestParsePasswordResetTokenRejectsExpired(t *testing.T) {
 	now := time.Date(2026, time.March, 1, 10, 0, 0, 0, time.UTC)
 	passwordHash := "$2a$10$testhashvaluefortokenclaims"
 
-	token, err := BuildPasswordResetToken(secret, 42, passwordHash, 1*time.Minute, now)
+	token, err := BuildPasswordResetToken(secret, 42, passwordHash, 1, PasswordResetTokenPurposeRecovery, 1*time.Minute, now)
 	if err != nil {
 		t.Fatalf("BuildPasswordResetToken() unexpected error: %v", err)
 	}
@@ -68,8 +68,7 @@ func TestParsePasswordResetTokenRejectsWrongPurpose(t *testing.T) {
 			IssuedAt:  jwt.NewNumericDate(now),
 		},
 	}
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	signed, err := token.SignedString(secret)
+	signed, err := signPasswordResetClaims(secret, &claims)
 	if err != nil {
 		t.Fatalf("sign token: %v", err)
 	}
@@ -77,6 +76,28 @@ func TestParsePasswordResetTokenRejectsWrongPurpose(t *testing.T) {
 	_, err = ParsePasswordResetToken(secret, signed, now.Add(1*time.Minute))
 	if !errors.Is(err, ErrPasswordResetTokenInvalidPurpose) {
 		t.Fatalf("expected ErrPasswordResetTokenInvalidPurpose, got %v", err)
+	}
+}
+
+// TestBuildPasswordResetTokenRejectsUnlistedPurpose pins the MINT-side half
+// of the allow-list: BuildPasswordResetToken refuses to sign a token for any
+// purpose outside passwordResetTokenAllowedPurposes, not only the three
+// PasswordResetTokenPurpose* constants every production caller passes today.
+// A future call site passing a typo'd or unlisted purpose is exactly the
+// mistake this guards against — catching it at mint time means no token ever
+// gets signed for it, rather than relying solely on the redeem-time parse
+// (TestParsePasswordResetTokenRejectsWrongPurpose above) to refuse it later.
+func TestBuildPasswordResetTokenRejectsUnlistedPurpose(t *testing.T) {
+	secret := []byte("test-secret")
+	now := time.Date(2026, time.March, 1, 10, 0, 0, 0, time.UTC)
+	passwordHash := "$2a$10$testhashvaluefortokenclaims"
+
+	token, err := BuildPasswordResetToken(secret, 42, passwordHash, 1, "not-a-real-purpose", 30*time.Minute, now)
+	if !errors.Is(err, ErrPasswordResetTokenInvalidPurpose) {
+		t.Fatalf("expected ErrPasswordResetTokenInvalidPurpose, got %v", err)
+	}
+	if token != "" {
+		t.Fatalf("expected no token to be minted for an unlisted purpose, got %q", token)
 	}
 }
 
@@ -91,15 +112,14 @@ func TestParsePasswordResetTokenRejectsMissingExpiry(t *testing.T) {
 
 	claims := PasswordResetClaims{
 		UserID:        7,
-		Purpose:       passwordResetTokenPurpose,
+		Purpose:       PasswordResetTokenPurposeRecovery,
 		PasswordState: "state",
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:  strconv.FormatUint(7, 10),
 			IssuedAt: jwt.NewNumericDate(now),
 		},
 	}
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	signed, err := token.SignedString(secret)
+	signed, err := signPasswordResetClaims(secret, &claims)
 	if err != nil {
 		t.Fatalf("sign token: %v", err)
 	}
@@ -107,6 +127,38 @@ func TestParsePasswordResetTokenRejectsMissingExpiry(t *testing.T) {
 	_, err = ParsePasswordResetToken(secret, signed, now)
 	if !errors.Is(err, ErrPasswordResetTokenExpired) {
 		t.Fatalf("expected ErrPasswordResetTokenExpired for token with no exp claim, got %v", err)
+	}
+}
+
+// TestParsePasswordResetTokenRejectsMissingSessionEpoch pins the SessionVersion
+// < 1 refusal (auth_reset_policy.go): BuildPasswordResetToken always normalizes
+// the epoch to at least 1 (NormalizeAuthSessionVersion), so this branch only
+// guards a hand-crafted or legacy token that never carried an `sv` claim. Such
+// a token must be refused, never treated as version 1 — that would bind it to
+// every account still at its first version.
+func TestParsePasswordResetTokenRejectsMissingSessionEpoch(t *testing.T) {
+	secret := []byte("test-secret")
+	now := time.Date(2026, time.March, 1, 10, 0, 0, 0, time.UTC)
+
+	claims := PasswordResetClaims{
+		UserID:        7,
+		Purpose:       PasswordResetTokenPurposeRecovery,
+		PasswordState: PasswordStateFingerprint("$2a$10$testhashvaluefortokenclaims"),
+		// SessionVersion left at its zero value on purpose.
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   strconv.FormatUint(7, 10),
+			ExpiresAt: jwt.NewNumericDate(now.Add(10 * time.Minute)),
+			IssuedAt:  jwt.NewNumericDate(now),
+		},
+	}
+	signed, err := signPasswordResetClaims(secret, &claims)
+	if err != nil {
+		t.Fatalf("sign token: %v", err)
+	}
+
+	_, err = ParsePasswordResetToken(secret, signed, now.Add(1*time.Minute))
+	if !errors.Is(err, ErrPasswordResetTokenInvalidSessionEpoch) {
+		t.Fatalf("expected ErrPasswordResetTokenInvalidSessionEpoch, got %v", err)
 	}
 }
 
@@ -173,7 +225,7 @@ func TestBuildPasswordResetTokenDefaultsNonPositiveTTL(t *testing.T) {
 	// boundary: the token is valid just before 30m and expired just after. The
 	// ttl=0 case also kills a `<= 0` → `< 0` boundary mutation.
 	for _, ttl := range []time.Duration{0, -time.Minute} {
-		token, err := BuildPasswordResetToken(secret, 42, passwordHash, ttl, now)
+		token, err := BuildPasswordResetToken(secret, 42, passwordHash, 1, PasswordResetTokenPurposeRecovery, ttl, now)
 		if err != nil {
 			t.Fatalf("BuildPasswordResetToken(ttl=%v) unexpected error: %v", ttl, err)
 		}

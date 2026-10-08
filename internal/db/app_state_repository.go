@@ -13,9 +13,12 @@ import (
 
 // AppStateRepository persists the process-level key/value markers in app_state
 // (migration 028). It holds runtime bookkeeping only — never per-owner health
-// data — so its operations are unscoped by user_id. Its sole consumer today is
-// the built-in reminder scheduler (issue #125), which reads and writes
-// last_reminder_run_date for restart safety and current-day catch-up.
+// data — so its operations are unscoped by user_id. Its consumers are the
+// built-in reminder scheduler (issue #125), which reads and writes
+// last_reminder_run_date for restart safety and current-day catch-up, and the
+// boot-time key-rotation sentinel, which keeps the calendar-feed key epoch
+// under calendar_feed_key_epoch, and the calendar-feed restore fence, which
+// keeps both its own token and the unanchored marker it erases again.
 type AppStateRepository struct {
 	database *gorm.DB
 }
@@ -44,9 +47,9 @@ func (repo *AppStateRepository) Get(ctx context.Context, key string) (string, bo
 }
 
 // Set upserts value for key, stamping updated_at. The ON CONFLICT (key) update
-// makes a repeated write for the same key overwrite in place, so the scheduler's
-// "ran today" marker is a single evolving row rather than an append. It is the
-// only writer of these rows.
+// makes a repeated write for the same key overwrite in place, so each marker is
+// a single evolving row rather than an append. Every key has exactly one
+// writer (scheduler goroutine or boot sentinel), never two concurrently.
 func (repo *AppStateRepository) Set(ctx context.Context, key string, value string) error {
 	trimmed := strings.TrimSpace(key)
 	if trimmed == "" {
@@ -62,4 +65,21 @@ func (repo *AppStateRepository) Set(ctx context.Context, key string, value strin
 		Columns:   []clause.Column{{Name: "key"}},
 		DoUpdates: clause.AssignmentColumns([]string{"value", "updated_at"}),
 	}).Create(row).Error
+}
+
+// Delete removes the row for key, if there is one. A key that was never written
+// is not an error: the only caller that deletes — the calendar-feed restore
+// fence, erasing its unanchored marker on the boot that answers for it and its
+// own token half on a boot that runs without a usable fence — runs the same
+// statement whether or not the row is there, so it never has to read before
+// writing and cannot turn an absent row into a failed boot.
+// A blank key deletes nothing rather than matching every row, the same
+// defensive shape Get gives it; Set is the one operation that refuses a blank
+// key outright, because there it would create a row nothing can address.
+func (repo *AppStateRepository) Delete(ctx context.Context, key string) error {
+	trimmed := strings.TrimSpace(key)
+	if trimmed == "" {
+		return nil
+	}
+	return repo.database.WithContext(ctx).Where("key = ?", trimmed).Delete(&models.AppState{}).Error
 }

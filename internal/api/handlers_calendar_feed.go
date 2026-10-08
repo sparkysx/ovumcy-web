@@ -1,9 +1,10 @@
 package api
 
 import (
-	"time"
+	"strings"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/ovumcy/ovumcy-web/internal/httpx"
 )
 
 // Calendar (.ics) feed endpoint (issue #126-replacement / .ics, slice 3).
@@ -26,47 +27,144 @@ import (
 //     resolves the owner by non-secret selector, constant-time-verifies the
 //     secret verifier, and scopes every read to the resolved user id.
 //   - 404-no-oracle: a malformed token, unknown selector, wrong verifier, and
-//     disabled feed ALL return an identical bare 404 with no body and no
-//     Set-Cookie, and are timing-equalized (a dummy bcrypt runs on the
-//     selector-miss path inside the service).
+//     disabled feed ALL return an identical bare 404 and no Set-Cookie, and are
+//     timing-equalized (a dummy bcrypt runs on the selector-miss path inside the
+//     service). Bare here means what c.SendStatus actually sends: Fiber's fixed
+//     status text under text/plain, the same bytes whatever the cause was — not
+//     an empty body.
 //   - Rate-limited per-IP by the edge /api-style limiter wired in main.go for
 //     this exact path; a 429 returns the limiter's own response (no UI needed).
 //   - Response headers pin text/calendar, a private 1-hour cache, and
 //     X-Robots-Tag: noindex.
 
 const (
-	// calendarFeedRoutePath is the registered page route. Fiber treats '.' as a
-	// parameter delimiter, so ":token.ics" binds param "token" (without ".ics")
-	// and ".ics" is a literal constant suffix.
-	calendarFeedRoutePath = "/calendar/feed/:token.ics"
-
 	// CalendarFeedRateLimitPrefix is the path prefix the composition root
 	// (cmd/ovumcy/main.go) mounts the per-IP feed rate limiter on. It is
 	// exported so the limiter wiring and the route share one source of truth;
 	// every concrete feed URL (…/calendar/feed/<token>.ics) sits under it.
 	CalendarFeedRateLimitPrefix = "/calendar/feed"
+
+	// calendarFeedRouteSuffix is the literal fiber binds after the ":token"
+	// parameter. Shared by the route pattern below, the predicate's route-form
+	// check, and the settings page's subscribe-URL builder
+	// (calendarFeedSubscribeURL) so the three can never drift apart.
+	calendarFeedRouteSuffix = ".ics"
+
+	// calendarFeedRoutePath is the registered page route. Fiber treats '.' as a
+	// parameter delimiter, so ":token.ics" binds param "token" (without ".ics")
+	// and ".ics" is a literal constant suffix.
+	calendarFeedRoutePath = CalendarFeedRateLimitPrefix + "/:token" + calendarFeedRouteSuffix
 )
+
+// IsCalendarFeedRequest reports whether method and path together select
+// fiber's dispatch of the cookieless feed's own route — GET or HEAD (app.Get
+// registers both) at a concrete feed URL — as opposed to a neighbour that
+// merely shares its leading characters, a nested or empty-token path under the
+// same prefix, or a mutating verb. The two app-wide middlewares that skip this
+// route (csrfMiddlewareConfig.Next in cmd/ovumcy/server.go, the early return
+// in LanguageMiddleware) and the feed's own rate limiter (server.go) all key on
+// this one predicate, so the three can never disagree about which requests are
+// "the feed".
+//
+// path is compared against fiber's OWN routing normalization
+// (httpx.RoutingNormalizedPath), not the raw wire path c.Path() returns: the
+// shipped fiberConfig (cmd/ovumcy/server.go) leaves CaseSensitive and
+// StrictRouting both off, so the router folds ASCII case and trailing slashes
+// away before matching a route, and a predicate comparing the untouched path
+// claims fewer spellings than the router actually dispatches here.
+//
+// The token/suffix boundary mirrors fiber's own left-to-right param scan
+// (path.go's findParamLen: strings.Index, never strings.LastIndex) rather than
+// a HasSuffix(".ics")-and-slice reading of the same string: fiber finds the
+// FIRST ".ics" in whatever follows the prefix and requires that occurrence to
+// consume the rest of the path outright (path.go's getMatch refuses a
+// leftover detection path on this non-Use route), so a second ".ics" further
+// right — "a.ics.ics" — is refused even though the string still ends in
+// ".ics". Verified experimentally against a probe registering this exact
+// route pattern under the shipped fiberConfig, not assumed from fiber's docs
+// (see cmd/ovumcy's route-shape definition test for calendarFeedRoutePath):
+// the token may contain any character but "/", must be non-empty, and the
+// prefix/suffix match case-insensitively.
+func IsCalendarFeedRequest(method, path string) bool {
+	return (method == fiber.MethodGet || method == fiber.MethodHead) && isCalendarFeedRequestPath(path)
+}
+
+// isCalendarFeedRequestPath is IsCalendarFeedRequest's route-form half, kept
+// separate (and unexported) because the mutating-verb refusal above is a
+// property of the METHOD, not the path.
+func isCalendarFeedRequestPath(path string) bool {
+	prefixWithSeparator := CalendarFeedRateLimitPrefix + "/"
+
+	// Cheap, allocation-free rejection first: this predicate runs in two
+	// app-wide middlewares, so it sees every request the instance serves, and
+	// most of them share no prefix with the feed at all. httpx.HasRoutingPrefix
+	// folds only 'A'-'Z', the same range the full normalization below folds,
+	// so a path that fails it would fail the prefix check after normalizing
+	// too — without paying for httpx.RoutingNormalizedPath's []byte allocation
+	// to find out. strings.EqualFold is the wrong primitive here: it performs
+	// Unicode simple case folding, which equates code points such as U+212A
+	// KELVIN SIGN with 'k' and U+017F LATIN SMALL LETTER LONG S with 's' — a
+	// fold fiber's router never performs.
+	if !httpx.HasRoutingPrefix(path, prefixWithSeparator) {
+		return false
+	}
+
+	normalized := httpx.RoutingNormalizedPath(path)
+	// Re-checked on the NORMALIZED path, not assumed from the cheap check
+	// above: trailing-slash trimming can eat into the separator itself (a
+	// bare "/calendar/feed/" normalizes to "/calendar/feed", which no longer
+	// has one), and that is exactly the empty-token path this must refuse.
+	if !strings.HasPrefix(normalized, prefixWithSeparator) {
+		return false
+	}
+	rest := normalized[len(prefixWithSeparator):]
+
+	// idx is the FIRST occurrence of ".ics" in rest, matching fiber's own scan.
+	// A match requires idx > 0 (a non-empty token; the router refuses a
+	// zero-length parameter outright) and that the occurrence consumes
+	// everything after it (idx+len(suffix) == len(rest); a non-Use route
+	// leaves no leftover detection path). The slash check mirrors the
+	// router's own refusal of a parameter spanning "/": "a/b.ics" finds
+	// ".ics" at idx=3 and idx+4==len(rest), but rest[:3] == "a/b" contains a
+	// "/", so it stays refused.
+	idx := strings.Index(rest, calendarFeedRouteSuffix)
+	return idx > 0 && idx+len(calendarFeedRouteSuffix) == len(rest) && !strings.Contains(rest[:idx], "/")
+}
 
 // ServeCalendarFeed serves an owner's read-only .ics feed, authenticated by the
 // path token alone. It never sets a cookie and never renders an HTML error: the
 // only outcomes are 200 + calendar body, a bare 404 (every not-found/invalid
-// case, no oracle), or a generic 500 on an infrastructure failure.
+// case, answered with the same status text, so no oracle), or a generic 500 on
+// an infrastructure failure. That promise also holds one layer up: CSRF and
+// LanguageMiddleware both key on IsCalendarFeedRequest to skip the cookie
+// either would otherwise mint for this route (see IsCalendarFeedRequest;
+// csrfMiddlewareConfig.Next lives in cmd/ovumcy/server.go). One consequence is
+// deliberate: with LanguageMiddleware skipped, requestLocation below is the
+// instance zone, never a zone the polling request named. The owner's stored
+// users.timezone decides the calendar day regardless
+// (CalendarFeedService.ResolveFeed); only an owner who never had one captured
+// is affected, and for them the capability URL now renders the same day
+// whoever polls it instead of following the poller's cookie.
 func (handler *Handler) ServeCalendarFeed(c fiber.Ctx) error {
 	token := c.Params("token")
 	location := handler.requestLocation(c)
-	now := time.Now().In(location)
+	now := handler.clockNow().In(location)
 
 	body, ok, err := handler.calendarFeedService.ResolveFeed(c.Context(), token, now, location)
 	if err != nil {
 		// Infrastructure failure (DB / log read). Return a generic 500 via the
 		// top-level error handler — never the raw error, and never a body that
-		// distinguishes this from the 404 path in a token-revealing way.
+		// distinguishes this from the 404 path in a token-revealing way. The
+		// handler answers it through the app-wide mapped envelope (stable key
+		// "internal_error"), which is a constant: it is derived from the status
+		// alone and says nothing about the token, the owner, or the failure.
 		return fiber.ErrInternalServerError
 	}
 	if !ok {
 		// Uniform bare 404 for malformed token / unknown selector / wrong
-		// verifier / disabled feed. No body, no Set-Cookie, timing-equalized in
-		// the service.
+		// verifier / disabled feed: SendStatus answers with Fiber's fixed status
+		// text, identical in every case. No Set-Cookie, timing-equalized in the
+		// service.
 		return c.SendStatus(fiber.StatusNotFound)
 	}
 

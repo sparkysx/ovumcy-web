@@ -5,15 +5,21 @@ independent, self-hosted channels: an in-app dashboard banner, an outbound
 webhook (for example a self-hosted [ntfy](https://ntfy.sh/) or
 [Gotify](https://gotify.net/) instance), and a private, read-only calendar
 (`.ics`) subscription. All three read the same underlying prediction and the
-same per-owner lead-time setting. There is no third-party notification service
-involved in any of them: this is a zero-cost, fully self-hosted notification
-model, consistent with Ovumcy's single-tenant, operator-controlled design.
+same per-owner lead-time setting; the calendar feed also carries the current
+cycle's ovulation day once the owner's temperature readings confirm it. No third-party notification service is
+required or built in: this is a zero-cost, self-hosted notification model,
+consistent with Ovumcy's single-tenant, operator-controlled design. The endpoints and calendar clients an
+owner chooses may themselves be third-party services — a hosted webhook target,
+or a calendar account at Google or Apple subscribed to the feed — and those then
+receive the reminder data. Which third party, if any, sees it is the owner's
+choice, not something Ovumcy arranges.
 
 > [!IMPORTANT]
 > Every reminder is an estimate, never a fact. The in-app banner, every
 > webhook payload, and the calendar feed all carry the same medical-safety
 > framing shown elsewhere in the app:
-> **"These are estimates, not medical advice or a method of contraception."**
+> **"Predictions are estimates, not medical advice or a method of contraception."**
+> Webhook reminders only ever announce a day that is still ahead.
 
 This document covers all three channels: what each one is, how an owner
 enables it, and — for the webhook channel, which needs a scheduled delivery
@@ -104,14 +110,23 @@ but harmless (delivery is idempotent — see
 #### The `ovumcy notify` CLI
 
 ```
-usage: ovumcy notify [--dry-run] [--fail-on-delivery-error]
+usage: ovumcy notify [--dry-run] [--show-health-details] [--fail-on-delivery-error]
 ```
 
 - `--dry-run` computes what **would** be sent — owners scanned, reminders due,
-  and a preview line per due reminder (type, estimated date, destination
-  **host only**) — but makes no outbound HTTP request and writes no watermark.
-  Use it to verify a schedule or a fresh deployment before it starts actually
-  delivering.
+  and a preview line per owner endpoint (owner id, how many reminders are
+  pending, destination **host only**) — but makes no outbound HTTP request and
+  writes no watermark. Use it to verify a schedule or a fresh deployment before
+  it starts actually delivering. The preview deliberately leaves out each
+  reminder's type and estimated date; see `--show-health-details` below.
+- `--show-health-details` adds the per-reminder specifics back to the
+  `--dry-run` preview: one line per reminder with its type (`period-soon` /
+  `ovulation-soon`) and estimated date. **That output is health data about an
+  identified owner** — a predicted period or ovulation date — so it is off by
+  default and must be treated like the database itself: read it on the terminal,
+  do not redirect it into a shared log, a cron mailer, or an install-script
+  transcript. The flag has no effect without `--dry-run` (a delivery pass
+  produces no preview at all).
 - `--fail-on-delivery-error` makes the process exit non-zero if **any**
   individual delivery failed during the pass. Without it (the default), a
   single unreachable owner endpoint is treated as an expected transient — the
@@ -123,9 +138,11 @@ usage: ovumcy notify [--dry-run] [--fail-on-delivery-error]
   `OnFailure=`, etc.) to surface delivery failures.
 - A pass-level failure (cannot open the database, invalid `SECRET_KEY`, bad
   arguments) always exits non-zero, regardless of the flag.
-- The command prints only aggregate counts and owner ids to stdout — never a
-  URL, token, or health specific — so its output is safe to capture in an
-  operator log or cron mailer.
+- By default the command prints only aggregate counts, owner ids, and
+  destination hosts to stdout — never a URL, token, reminder type, or estimated
+  date — so its output is safe to capture in an operator log or cron mailer.
+  `--show-health-details` is the single exception, and it is opt-in for exactly
+  that reason.
 
 Run it once daily at a fixed local hour that suits your household — for
 example, mid-morning, so a period-due reminder for today already reflects
@@ -149,6 +166,14 @@ example, with cron:
 Adjust `DB_DRIVER`/`DB_PATH` (or `DATABASE_URL` for Postgres) and the secret
 source to match your deployment's actual environment; the same environment
 variables apply regardless of which scheduler invokes the command.
+
+Redirecting the output into a log file, as above, is safe for the scheduled
+pass and for a plain `--dry-run`: neither prints a reminder type or an
+estimated date. Do **not** add `--show-health-details` to a scheduled or
+redirected invocation — that flag exists to put predictions on an operator's
+terminal on request, not into a log file that is likely to be world-readable,
+shipped to a log collector, or swept into a backup with weaker protection than
+the database.
 
 ##### Recommended cadence
 
@@ -191,6 +216,12 @@ Notes:
 - If the process was down when the scheduled hour passed, it catches up with
   **at most one pass for the current day** on the next start — it never
   backfills multiple missed days.
+- If a pass fails before it can send anything (the database was unreachable, so
+  the list of owners could not be read), the day is **not** counted as done: the
+  pass is retried a few minutes later, up to three attempts, and only then does
+  the scheduler give up until the next day's hour. A restart in between still
+  catches the day up, and the idempotency watermark below means a retry never
+  re-sends a reminder an earlier attempt already delivered.
 - On graceful shutdown (`SIGINT`/`SIGTERM`), the server waits briefly for an
   in-flight pass to finish before closing the database.
 - It reuses the exact same delivery path, idempotency watermark, and security
@@ -218,6 +249,14 @@ usage: ovumcy webhook <show|set> <email> [--enabled=<bool>] [--notify-period=<bo
   instead via the `OVUMCY_WEBHOOK_URL` environment variable for the single
   invocation, or interactively with `--url-stdin` (a no-echo terminal prompt,
   or the first line of piped stdin). It is never echoed back.
+- Those two sources are **mutually exclusive**: supplying both is refused with
+  an error naming each of them, and nothing is written. A left-over export — an
+  operator profile, an earlier invocation, a compose `env_file` inherited by
+  `docker compose run` — would otherwise silently outrank the URL you just
+  piped in and arm that owner's reminders at the wrong endpoint. Unset the
+  variable, or drop the flag. (`--clear-url` is unaffected: it removes any
+  stored endpoint, so it cannot arm the wrong one, and it still works with the
+  variable exported.)
 - `--clear-url` removes any stored endpoint; `--dry-run` validates and prints
   the result without writing anything.
 
@@ -230,18 +269,52 @@ webhook as part of an install script that also runs `ovumcy users create`).
 
 - Each reminder kind (period, ovulation) has its own **watermark**, storing
   the cycle-start anchor date the reminder was last successfully sent for.
-- The watermark advances **only after a successful (2xx) delivery**. A failed
-  delivery (timeout, non-2xx, refused redirect, connection error) leaves the
-  watermark untouched.
+- The watermark is **claimed before the request goes out** and given back when
+  the request fails, so a failed delivery (timeout, non-2xx, refused redirect,
+  connection error) leaves the watermark exactly where the pass found it. The
+  claim is what makes two passes running *at the same time* safe as well: it is
+  taken by a conditional write that only one of them can win, so the pass that
+  loses it skips the reminder instead of sending a second copy.
 - Consequence: re-running the pass is always safe.
   - A reminder already delivered this cycle is not sent again.
-  - A reminder whose delivery failed last time is retried automatically on the
-    next pass, with no separate retry mechanism to configure — the schedule
+  - A reminder whose delivery *returned* an error is retried automatically on
+    the next pass, with no separate retry mechanism to configure — the schedule
     itself **is** the retry loop.
+  - The one exception: because the claim is taken before the request, a pass that
+    is **killed outright** between the two — the host reboots, the container is
+    evicted or OOM-killed, an interactive `ovumcy notify` is interrupted — leaves
+    the reminder marked as handled although nothing was delivered, and that
+    cycle's reminder is then skipped for good. The trade is deliberate: a
+    reminder is a convenience, a duplicate reminder about health data sent to an
+    endpoint is not, so the pass prefers to miss one rather than send it twice.
+    If a reminder you expected never arrived and the logs show the pass dying
+    mid-run, that is this case; the next cycle is unaffected.
 - This means you can run the pass (or the built-in scheduler) on an ordinary
   daily schedule and never worry about double-notifying an owner because a
   previous run overlapped, was re-triggered, or ran twice due to a scheduler
   misconfiguration.
+- **Turning the webhook off takes effect immediately — including while a pass is
+  already running.** A pass reads every owner's settings once, at the start, and
+  sends each reminder some time later, so a change you make in between has to
+  reach it. Disabling delivery, replacing the endpoint, removing it, changing the
+  reminder lead time, and clearing all your data each mark the settings the
+  running pass is holding as superseded, and the claim it takes just before every
+  request is refused once that has happened. A pass still working through the
+  owner list therefore cannot deliver to an endpoint you have just removed.
+  - The one thing this cannot do is recall a request that has already left. If
+    the pass had already sent the POST at the moment you changed the setting,
+    that one request completes — nothing can unsend it. Every request after it is
+    refused. If the destination matters for a secret you are rotating, treat the
+    old endpoint as having possibly received one final reminder.
+  - Saving the **webhook** settings counts as a change even when you edited
+    nothing, so a save landing while the pass runs costs you that pass's
+    remaining reminders; they arrive on the next run. (The lead-time form is
+    different: it skips the write when what you submit matches the value the page
+    was rendered with, so re-submitting it unchanged normally costs nothing.) The
+    exception is a lead time of **0 days**, where a reminder is due on one
+    calendar day only — no later run still covers it, so that cycle's reminder is
+    skipped rather than delayed. On a zero-day lead time, change settings at an
+    hour the pass is not running.
 - A pass never fails all owners because of one bad owner: a decrypt failure, a
   load failure, or a delivery failure for one owner is logged (owner id and
   host only) and the pass continues to the next owner.
@@ -263,6 +336,11 @@ scheduler) once daily at a server-local hour and most or all of your owners
 have not yet had their timezone captured, that hour is effectively "09:00
 server time" for everyone until each owner's browser records its timezone.
 
+The [calendar feed](#3-calendar-ics-subscription) resolves "today" by the same
+two rules, so a prediction never lands on different days in the two channels;
+its fallback is the timezone of the request that fetched it, which for a
+calendar client (it sends no browser timezone) is the server's local timezone.
+
 ### Security notes
 
 Operator-relevant summary (the full, test-backed claim list lives in
@@ -277,7 +355,10 @@ Operator-relevant summary (the full, test-backed claim list lives in
   hardened: a 10-second hard timeout, no connection keep-alive/pooling, zero
   redirects, a capped response read, and `http`/`https` schemes only.
 - **Optional hardening.** Set `WEBHOOK_BLOCK_PRIVATE_ADDRESSES=true` (default:
-  `false`) to refuse delivery to loopback/private/link-local targets. Leave it
+  `false`) to refuse delivery to loopback/private/link-local targets, and to any
+  other address the IANA special-purpose registries record as not globally
+  reachable (benchmarking, documentation, reserved and multicast space among
+  them). Leave it
   unset/`false` for the common self-hosted-on-LAN case (a webhook URL like
   `http://ntfy.local` or `http://192.168.1.20:8080/...`). Turn it on only if
   your threat model specifically requires blocking private-network egress from
@@ -290,9 +371,18 @@ Operator-relevant summary (the full, test-backed claim list lives in
   that exact validated IP (so a hostname cannot rebind to a private address
   after the check); a lookup failure fails closed. "Private" here spans RFC 1918,
   ULA, loopback, link-local, the unspecified address, RFC 6598 CGNAT
-  (`100.64.0.0/10`), and the RFC 6052 NAT64 well-known prefix (`64:ff9b::/96`)
-  when it wraps a private IPv4 — a NAT64 address wrapping a public IPv4 stays
-  allowed. This same flag applies to both the CLI pass and the built-in
+  (`100.64.0.0/10`), RFC 1122 "this network" (`0.0.0.0/8`), the deprecated IPv6
+  site-local range (`fec0::/10`), and the RFC 8215 local-use NAT64 block
+  (`64:ff9b:1::/48`).
+
+  It also spans the IPv6 forms that carry an IPv4 address *inside* them. On a
+  network that routes such a form the packet ends up at the embedded IPv4, so the
+  embedded address decides the verdict, not the IPv6 wrapper: `[2002:7f00:1::]`
+  is `127.0.0.1` written differently, and it is refused. The decoded forms are
+  RFC 6052 NAT64 (`64:ff9b::/96`), 6to4 (`2002::/16`), Teredo (`2001::/32`),
+  IPv4-compatible (`::/96`) and IPv4-translated (`::ffff:0:0:0/96`). A form
+  wrapping a **public** IPv4 stays allowed, since that is where it really
+  routes. This same flag applies to both the CLI pass and the built-in
   scheduler. The server also logs a startup warning when `REGISTRATION_MODE=open`
   is combined with `WEBHOOK_BLOCK_PRIVATE_ADDRESSES=false`, surfacing exactly this
   multi-owner / publicly-reachable exposure at boot.
@@ -301,7 +391,8 @@ Operator-relevant summary (the full, test-backed claim list lives in
   (AWS/GCP/Azure/etc.) the link-local range also reaches the instance **metadata
   service** (`169.254.169.254`), which — like any other private target — an
   owner-controlled webhook URL would let the notify pass POST to. Delivery only
-  sends a fixed JSON body and discards the (size-capped) response, so there is no
+  sends a fixed body (JSON, or ntfy plain text) and discards the (size-capped)
+  response, so there is no
   response-body exfiltration path; the residual risk is a semi-trusted owner using
   status/timing differences to probe the instance's own internal network (a
   *blind* SSRF). If you deploy Ovumcy to any cloud or otherwise non-LAN host, set
@@ -313,8 +404,10 @@ Operator-relevant summary (the full, test-backed claim list lives in
   full URL, path, query string, or userinfo.
 - **Disclaimer in every payload.** Every delivered JSON body includes a
   `disclaimer` field carrying the exact medical-safety string shown elsewhere
-  in the app: *"These are estimates, not medical advice or a method of
-  contraception."*
+  in the app: *"Predictions are estimates, not medical advice or a method of
+  contraception."* — in the owner's own interface language, the same one the
+  title and message are written in. An ntfy-format body (`?format=ntfy`, below)
+  ends with the same string, after the message and a blank line.
 - **URL encrypted at rest.** The stored webhook URL is AES-256-GCM ciphertext,
   bound to the owning user's id, exactly like a TOTP secret. If `SECRET_KEY`
   is rotated, existing stored URLs can no longer be decrypted; delivery fails
@@ -322,9 +415,14 @@ Operator-relevant summary (the full, test-backed claim list lives in
   re-saves their URL under the new key. See the *SECRET_KEY Usage Map* in
   [`SECURITY.md`](../SECURITY.md) for the full rotation impact table.
 - **No secrets in the payload or CLI output.** The JSON payload carries only a
-  title, message, the disclaimer, the reminder type, the estimated event date,
-  and the lead-day count — never the webhook URL, never `SECRET_KEY`, never a
-  health specific beyond the single estimated date.
+  title, message, the disclaimer, the reminder type, the estimated event date
+  (and its last day, when the estimate is a range), and the lead-day count (the
+  ntfy format sends a subset: title, message, disclaimer and a tag for the
+  type) — never the webhook URL, never `SECRET_KEY`, never a health specific
+  beyond the estimated date or range. The CLI never prints the URL
+  or the token at all, and by default prints no reminder type or estimated date
+  either; `ovumcy notify --dry-run --show-health-details` is the one way to ask
+  for those, and it is opt-in precisely because the answer is health data.
 
 #### Payload shape
 
@@ -332,7 +430,7 @@ Operator-relevant summary (the full, test-backed claim list lives in
 {
   "title": "Period reminder",
   "message": "Estimated next period around 2026-07-14.",
-  "disclaimer": "These are estimates, not medical advice or a method of contraception.",
+  "disclaimer": "Predictions are estimates, not medical advice or a method of contraception.",
   "type": "period-soon",
   "event_date": "2026-07-14",
   "lead_days": 3
@@ -344,13 +442,83 @@ consumer (an ntfy topic rule, a Gotify filter, a home-automation flow) can
 route on it without parsing `message`. `disclaimer` is present on every
 payload, unconditionally.
 
+When the app shows the estimate as a range rather than one day, the payload
+adds `event_date_end`, the range's last day, and `event_date` is its first
+day; `message` then names both (*"Next period estimated to start between
+2026-07-11 and 2026-07-17."*). A single-date reminder has no `event_date_end`.
+A range reminder is sent once, when the range comes within the lead window.
+
+#### ntfy-native delivery (`?format=ntfy`)
+
+ntfy renders a plain-body `POST` to a topic URL **verbatim as the
+notification text**, so the JSON envelope above arrives on an ntfy topic as a
+raw JSON blob. If your webhook URL is an ntfy topic, opt that one URL into
+ntfy-native formatting by appending `format=ntfy` to it:
+
+```
+https://ntfy.example.com/my-topic?format=ntfy
+```
+
+Delivery then sends what ntfy expects natively:
+
+- `X-Title` — the reminder title (the same localized `title` as the JSON field;
+  a non-ASCII title travels as an RFC 2047 encoded word, which ntfy decodes),
+- `X-Tags` — an emoji tag per kind (`drop_of_blood` 🩸 for a period reminder,
+  `sparkles` ✨ for ovulation),
+- a `text/plain` body of the localized `message`, a blank line, then the
+  `disclaimer` — the disclaimer is delivered on every notification in this
+  format too, unconditionally.
+
+Everything else about the URL passes through untouched: an access token in
+the query (`?auth=...`) or userinfo still applies (ntfy ignores the unknown
+`format` parameter), and all delivery hardening (timeouts, no redirects,
+host-only logging) is identical in both formats. URLs without `format=ntfy`
+keep the generic JSON envelope byte-for-byte, so Gotify, Apprise, and
+home-automation consumers are unaffected. Re-saving the URL in Settings (or
+`ovumcy webhook set`) is all it takes to switch a given endpoint between the
+two formats. ntfy parameters you add to the URL yourself are yours to answer
+for: `filename=`, `attach=` or `template=` can make ntfy render the body as an
+attachment or through a template, where the disclaimer line may not be shown.
+
+The three text fields — `title`, `message` and `disclaimer` — are written in the
+**interface language the owner chose in settings**, all three in the same one
+(the example above is an owner on English). A pass runs without a browser, so
+the stored language is the only thing that knows which one to use, exactly as
+the stored timezone is the only thing that knows which calendar day the owner is
+on. An owner who never picked a language gets the server default
+(`DEFAULT_LANGUAGE`). `type`, `event_date` and `lead_days` never change with the
+language — route on those, not on the prose.
+
 ## 3. Calendar (.ics) subscription
 
 An owner can generate a private, read-only calendar feed URL and subscribe to
 it from any standard calendar app (Google Calendar, Apple Calendar,
 Thunderbird, or any client that supports "subscribe by URL"). The feed shows
-predicted period and ovulation days and updates automatically each time the
+estimated period and ovulation days and updates automatically each time the
 calendar app refreshes it — there is nothing to schedule or run.
+
+Besides the projected days, the feed carries the current cycle's
+temperature-confirmed ovulation day: once a basal body temperature shift
+confirms ovulation, that day appears in the feed exactly when the dashboard and
+the calendar show it, including after a cycle has run so long that projected
+dates are paused. It is still an estimate and carries the same disclaimer. If
+the feed had already projected ovulation for that same day, the calendar app
+updates that event rather than adding a second one; a projected day the
+confirmation replaces is dropped. The confirmed day is withheld in irregular
+(unpredictable) cycle mode, during a pregnancy pause and before the first
+completed cycle, as it is in the app, and earlier cycles are never included.
+Webhook reminders stay future-only and never send a confirmed day.
+
+The feed and the webhook reminders name dates the way the dashboard does.
+Where the dashboard shows a next-period start window (three or more completed
+cycles that vary in length) or, in irregular cycle mode, an ovulation range, the
+feed carries that window as one multi-day event and the reminder names its first
+and last day — never the single middle day the window was built around. With
+irregular cycle mode on and fewer than three completed cycles, the dashboard
+says more cycles are needed instead of naming a date, and the feed and the
+reminders send no projected date at all. A regular account with fewer than
+three completed cycles gets no ovulation event and no ovulation reminder
+either; its next-period estimate is still sent.
 
 ### How to enable it
 
@@ -369,6 +537,11 @@ The feed is **read-only**: nothing a calendar app does can write back into
 Ovumcy through it. It is scoped to the single owner who generated it, exactly
 like every other per-day and per-account resource in Ovumcy.
 
+Turning the feed off, rotating the link or clearing your data stops the
+calendar app from fetching anything new, but the app keeps the last copy it
+fetched. That copy can include a past, temperature-confirmed ovulation day. To
+remove those events, also delete the subscription in the calendar app itself.
+
 ### Security rationale (brief)
 
 The subscribe URL itself is the credential — a calendar client sends no
@@ -376,7 +549,14 @@ session cookie — so it is treated as a bearer capability token, not a normal
 authenticated resource: it is generated with cryptographic randomness, stored
 only as a hashed verifier (never recoverable from the database), shown to the
 owner exactly once, and revocable at any time by rotating or turning the feed
-off. The full rationale and test-backed invariants live in
+off. The stored verifier is keyed by `SECRET_KEY`, so **rotating that secret
+disarms every armed feed**: current rows refuse outright (their keyed MAC no
+longer matches), rows armed before migration 032 are disarmed by a boot-time
+rotation check, and subscribed calendar clients start receiving `404` until
+each owner generates a fresh subscribe URL from Settings. Plan a secret
+rotation accordingly — it is the same class of consequence rotation already has
+for 2FA secrets and stored webhook URLs. The full rationale and test-backed
+invariants live in
 [`docs/SECURITY_INVARIANTS.md`](SECURITY_INVARIANTS.md) under **Calendar feed
 subscription** — see that section for the complete, current detail rather than
 this summary.

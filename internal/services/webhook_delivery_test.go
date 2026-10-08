@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +18,16 @@ import (
 	"testing"
 	"time"
 )
+
+// webhookExternalSentinelIP is this suite's stand-in for "a destination out on
+// the public internet", used by every over-block guard. It has to satisfy two
+// things at once: globally reachable per the IANA special-purpose registry, so
+// the private-address gate must let it through, and no TCP listener anywhere, so
+// a test that really dials reaches nobody. RFC 5737 documentation space used to
+// serve this role; the gate refuses it now, so the sentinel is the RFC 7723 port
+// control protocol anycast address — registered globally reachable, reserved for
+// a UDP protocol, and not announced by ordinary networks.
+const webhookExternalSentinelIP = "2001:1::1"
 
 // fakeResolver is the injected ipResolver seam: it maps hostnames to fixed
 // answers so the resolve-and-check dialer can be tested without live DNS.
@@ -56,7 +68,7 @@ func samplePayload() WebhookPayload {
 	return WebhookPayload{
 		Title:      "Period reminder",
 		Message:    "Estimated next period around 2026-03-12.",
-		Disclaimer: "These are estimates, not medical advice or a method of contraception.",
+		Disclaimer: "Predictions are estimates, not medical advice or a method of contraception.",
 		Type:       DueReminderTypePeriod,
 		EventDate:  "2026-03-12",
 		LeadDays:   3,
@@ -174,6 +186,64 @@ func TestWebhookDeliveryRejectsNonHTTPScheme(t *testing.T) {
 	}
 }
 
+// TestWebhookDeliveryRejectsHostlessAuthority pins the authority check at the
+// DELIVERY boundary specifically. Save-time validation never revisits a row
+// already in the database, so an endpoint stored before that check existed — or
+// written straight to the column — reaches delivery unvalidated. A port-only
+// authority is the case that matters: url.Parse gives "http://:8080/" a non-empty
+// Host, so the pre-existing Host != "" test accepts it, and Go's dialer then reads
+// the empty hostname as the unspecified address and connects to the local machine.
+//
+// The gate is deliberately OFF here: with it on the guarded resolver refuses an
+// empty hostname anyway, which would hide whether this check does anything.
+func TestWebhookDeliveryRejectsHostlessAuthority(t *testing.T) {
+	deliverer := NewWebhookDeliverer(false)
+	for _, target := range []string{
+		"http://:8080/hook",
+		"http://:0/hook",
+		"http://user:pass@/hook",
+		"http://example.test:99999/hook",
+		"http://example.test:0/hook",
+	} {
+		err := deliverer.Deliver(context.Background(), target, samplePayload())
+		if !errors.Is(err, ErrWebhookDeliveryURLScheme) {
+			t.Fatalf("expected authority %q refused with ErrWebhookDeliveryURLScheme, got %v", target, err)
+		}
+	}
+}
+
+// TestWebhookDeliveryRefusesOversizedResponseHeaders proves the envelope bounds the
+// response HEADER block, not only the body. Headers are read before the body limit
+// can apply and default to Go's 10 MiB, so an owner-controlled endpoint could make
+// the pass buffer three orders of magnitude more than a webhook acknowledgement
+// needs. The positive anchor is the second half: an ordinary small header set on
+// the same server still succeeds, so the test cannot pass by refusing everything.
+func TestWebhookDeliveryRefusesOversizedResponseHeaders(t *testing.T) {
+	oversized := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		padding := strings.Repeat("x", 4096)
+		for index := range 16 { // 64 KiB of headers, past the 16 KiB cap
+			writer.Header().Set(fmt.Sprintf("X-Pad-%d", index), padding)
+		}
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer oversized.Close()
+
+	deliverer := NewWebhookDeliverer(false)
+	if err := deliverer.Deliver(context.Background(), oversized.URL, samplePayload()); err == nil {
+		t.Fatal("expected an oversized response header block to fail delivery")
+	}
+
+	modest := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("X-Small", "ok")
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer modest.Close()
+
+	if err := deliverer.Deliver(context.Background(), modest.URL, samplePayload()); err != nil {
+		t.Fatalf("an ordinary header set must still succeed, got %v", err)
+	}
+}
+
 // TestWebhookDeliveryHandlesOversizedBody proves an endpoint that returns a huge
 // body does not make us buffer it unbounded: we only need the status, and the
 // LimitReader caps the read. A 2xx with a large body still succeeds.
@@ -188,6 +258,164 @@ func TestWebhookDeliveryHandlesOversizedBody(t *testing.T) {
 	deliverer := NewWebhookDeliverer(false)
 	if err := deliverer.Deliver(context.Background(), server.URL, samplePayload()); err != nil {
 		t.Fatalf("expected success on 2xx with oversized body, got %v", err)
+	}
+}
+
+// countingReadCloser counts every byte a Read call returns, so a test can
+// observe exactly how many bytes the deliverer pulled from a body — not how
+// many bytes the source had available, and not how the transport or the OS
+// buffered the rest.
+type countingReadCloser struct {
+	source io.ReadCloser
+	read   *int64
+}
+
+func (c *countingReadCloser) Read(p []byte) (int, error) {
+	n, err := c.source.Read(p)
+	atomic.AddInt64(c.read, int64(n))
+	return n, err
+}
+
+func (c *countingReadCloser) Close() error {
+	return c.source.Close()
+}
+
+// bodyCountingTransport wraps a real http.RoundTripper and substitutes the
+// response body with a countingReadCloser, so a test can see exactly how many
+// bytes the deliverer's own `io.Copy(io.Discard, io.LimitReader(response.Body,
+// webhookResponseReadLimit))` reads. io.LimitReader bounds the TOTAL read
+// across every call to exactly its limit as long as the underlying source
+// never runs dry before that limit, so this assertion is exact and does not
+// depend on how much the network or the OS actually buffered.
+type bodyCountingTransport struct {
+	base http.RoundTripper
+	read *int64
+}
+
+func (t *bodyCountingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err != nil || resp == nil {
+		return resp, err
+	}
+	resp.Body = &countingReadCloser{source: resp.Body, read: t.read}
+	return resp, nil
+}
+
+// TestWebhookDeliveryResponseBodyReadIsCappedAtTheConstant proves the
+// response-body cap by COUNTING bytes actually consumed, not merely by
+// asserting success on an oversized body (that is
+// TestWebhookDeliveryHandlesOversizedBody, above). A server that serves far
+// more than webhookResponseReadLimit still results in the deliverer reading
+// EXACTLY webhookResponseReadLimit bytes from the response body: io.LimitReader
+// bounds the total across every Read call, so the count is exact regardless of
+// how much extra data the OS or the transport buffered underneath it.
+//
+// This path is identical for both delivery formats — it runs after
+// client.httpClient.Do returns and depends only on the response, never on
+// whether the outbound body was the JSON envelope or ntfy's plain text — so
+// one test covers both.
+func TestWebhookDeliveryResponseBodyReadIsCappedAtTheConstant(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusOK)
+		blob := bytes.Repeat([]byte("x"), 1<<20) // 1 MiB, far beyond the read cap
+		_, _ = writer.Write(blob)
+	}))
+	defer server.Close()
+
+	var bytesRead int64
+	client := &webhookDeliveryClient{
+		httpClient: &http.Client{
+			Timeout:       webhookDeliveryTimeout,
+			Transport:     &bodyCountingTransport{base: http.DefaultTransport, read: &bytesRead},
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return errWebhookRedirect },
+		},
+	}
+
+	if err := client.Deliver(context.Background(), server.URL, samplePayload()); err != nil {
+		t.Fatalf("expected success on 2xx with oversized body, got %v", err)
+	}
+
+	if got := atomic.LoadInt64(&bytesRead); got != webhookResponseReadLimit {
+		t.Fatalf("expected the deliverer to read exactly the capped %d bytes, read %d", webhookResponseReadLimit, got)
+	}
+}
+
+// blockingTransport is a RoundTripper double that never completes on its own:
+// it blocks until the REQUEST's own context is done, so a test can prove
+// delivery is released by context cancellation alone. started signals once
+// RoundTrip is actually in flight and blocked, so a test cancelling
+// afterwards knows it interrupted a blocked call rather than racing a call
+// that had not begun yet. observedCtxErr carries the context error
+// blockingTransport itself saw on the request context, proving the transport
+// — not just the caller — observed the cancellation.
+type blockingTransport struct {
+	started        chan struct{}
+	observedCtxErr chan error
+}
+
+func (bt *blockingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	close(bt.started)
+	<-req.Context().Done()
+	err := req.Context().Err()
+	bt.observedCtxErr <- err
+	return nil, err
+}
+
+// TestWebhookDeliveryReleasedByCallerContextCancellationNotClientTimeout
+// proves delivery is unblocked by the CALLER's context being cancelled, not by
+// any client-side timeout. The transport double blocks forever except on its
+// request context being done, and the client's own http.Client.Timeout is set
+// far larger than this test's own deadline, so a pass here cannot be
+// explained by that timeout firing instead — only cancelling ctx can release
+// it. This path is identical for both delivery formats: the request is built
+// from the same context.WithTimeout(ctx, ...) derivation and goes through the
+// same client.httpClient.Do call regardless of ?format=ntfy, so one test
+// covers both.
+func TestWebhookDeliveryReleasedByCallerContextCancellationNotClientTimeout(t *testing.T) {
+	transport := &blockingTransport{
+		started:        make(chan struct{}),
+		observedCtxErr: make(chan error, 1),
+	}
+	client := &webhookDeliveryClient{
+		httpClient: &http.Client{
+			Timeout:       time.Hour, // far larger than this test's own deadline: irrelevant to the result
+			Transport:     transport,
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return errWebhookRedirect },
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	result := make(chan error, 1)
+	go func() {
+		result <- client.Deliver(ctx, "http://example.test/hook", samplePayload())
+	}()
+
+	select {
+	case <-transport.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("transport never entered RoundTrip")
+	}
+
+	cancel() // the only signal this test relies on: the CALLER's own context
+
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("expected an error after the caller context was cancelled, got nil")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("delivery did not return promptly after the caller context was cancelled")
+	}
+
+	select {
+	case observed := <-transport.observedCtxErr:
+		if !errors.Is(observed, context.Canceled) {
+			t.Fatalf("expected the blocking transport to observe context.Canceled, got %v", observed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocking transport never reported its observed context error")
 	}
 }
 
@@ -313,7 +541,8 @@ func TestIsPrivateHost(t *testing.T) {
 		"ntfy.example.io": false,
 		"100.64.0.1":      true,  // RFC 6598 CGNAT literal (net.IP.IsPrivate omits it)
 		"64:ff9b::a00:1":  true,  // RFC 6052 NAT64 literal wrapping 10.0.0.1
-		"203.0.113.10":    false, // TEST-NET-3 stays external (over-block guard)
+		"203.0.113.10":    true,  // TEST-NET-3: documentation space is not globally reachable
+		"192.31.196.1":    false, // AS112-v4 anycast: special-purpose but globally reachable (over-block guard)
 	}
 	for host, want := range cases {
 		if got := isPrivateHost(host); got != want {
@@ -360,26 +589,31 @@ func TestWebhookDeliveryBlocksHostnameResolvingToPrivate(t *testing.T) {
 }
 
 // TestWebhookDeliveryAllowsHostnameResolvingToPublic proves the gate does not
-// over-block: with the gate ON, a hostname resolving to a PUBLIC address passes
-// the private-address guard (it fails later only because the documentation-range
-// IP is unroutable). The failure must NOT be the private-address sentinel.
+// over-block: with the gate ON, a hostname resolving to a globally reachable
+// address passes the private-address guard and fails later only on the dial
+// itself (nothing listens on the sentinel).
+//
+// The verdict is read from the LOG, not from errors.Is: Deliver deliberately
+// returns a host-only, non-wrapping error so the URL cannot leak through an error
+// chain, so errors.Is(err, errWebhookPrivateAddress) is false for a blocked
+// target too — this assertion used to be unable to fail.
 func TestWebhookDeliveryAllowsHostnameResolvingToPublic(t *testing.T) {
 	const hostname = "ntfy.example.io"
-	// 192.0.2.1 is TEST-NET-1 (RFC 5737): classified public, guaranteed unroutable.
-	deliverer := newWebhookDelivererWithResolver(true, resolverFor(hostname, "192.0.2.1"))
+	deliverer := newWebhookDelivererWithResolver(true, resolverFor(hostname, webhookExternalSentinelIP))
 	target := "http://" + hostname + "/hook"
 
-	// A short deadline so the unroutable dial aborts quickly instead of waiting the
-	// full 10s envelope.
+	// A short deadline so the dial to the unanswered sentinel aborts quickly
+	// instead of waiting the full 10s envelope.
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
-	err := deliverer.Deliver(ctx, target, samplePayload())
-	if err == nil {
-		t.Fatal("expected the unroutable public target to fail the dial")
-	}
-	if errors.Is(err, errWebhookPrivateAddress) {
-		t.Fatalf("public-resolving hostname was wrongly blocked as private: %v", err)
+	output := captureLogOutput(t, func() {
+		if err := deliverer.Deliver(ctx, target, samplePayload()); err == nil {
+			t.Fatal("expected the unanswered public target to fail the dial")
+		}
+	})
+	if strings.Contains(output, "reason=private_address_blocked") {
+		t.Fatalf("public-resolving hostname was wrongly blocked as private: %q", output)
 	}
 }
 
@@ -398,7 +632,7 @@ func TestWebhookDeliveryBlocksMixedPublicPrivateAnswer(t *testing.T) {
 	target := hostnameTargetFor(t, server.URL, hostname)
 	// Public first, then the loopback server IP: the guard must reject on the private
 	// record regardless of order and never reach the server.
-	deliverer := newWebhookDelivererWithResolver(true, resolverFor(hostname, "192.0.2.1", "127.0.0.1"))
+	deliverer := newWebhookDelivererWithResolver(true, resolverFor(hostname, webhookExternalSentinelIP, "127.0.0.1"))
 
 	err := deliverer.Deliver(context.Background(), target, samplePayload())
 	if err == nil {
@@ -454,27 +688,46 @@ func TestWebhookDeliveryBlocksHostnameResolvingToCarrierRanges(t *testing.T) {
 	}
 }
 
-// TestWebhookDeliveryAllowsHostnameResolvingToTestNet3 is the over-block guard
-// for the exact sentinel the suite treats as external: 203.0.113.10 (TEST-NET-3)
-// must stay allowed even with the gate ON. It passes the private-address guard
-// and fails later only because the documentation-range IP is unroutable — so the
-// logged reason must NOT be private_address_blocked (which is what a wrongful
-// over-block would record).
-func TestWebhookDeliveryAllowsHostnameResolvingToTestNet3(t *testing.T) {
-	const hostname = "public.example"
-	deliverer := newWebhookDelivererWithResolver(true, resolverFor(hostname, "203.0.113.10"))
-	target := "http://" + hostname + "/hook"
+// TestWebhookDeliveryBlocksHostnameResolvingToSpecialPurposeRanges is the
+// delivery-level half of the registry widening: the ranges below used to reach
+// the dialer with the gate ON, because the classifier only knew the ranges
+// somebody had reported. reason=private_address_blocked is logged ONLY when the
+// guarded dialer refuses before dialing, so that reason proves no packet left;
+// against the old classifier each case fell through to a real dial and logged
+// transport_error instead.
+//
+// TestIsPrivateIPWalksTheSpecialPurposeRegistries covers the whole registry at
+// the classifier; these four are the ones an operator can actually be pointed at.
+func TestWebhookDeliveryBlocksHostnameResolvingToSpecialPurposeRanges(t *testing.T) {
+	cases := map[string]string{
+		"benchmarking_rfc2544":         "198.18.0.1",
+		"protocol_assignments_rfc6890": "192.0.0.1",
+		"reserved_rfc1112":             "240.0.0.1",
+		"documentation_rfc5737":        "203.0.113.10",
+	}
+	for name, resolvedIP := range cases {
+		t.Run(name, func(t *testing.T) {
+			const hostname = "special.example"
+			target := "http://" + hostname + "/hook"
+			deliverer := newWebhookDelivererWithResolver(true, resolverFor(hostname, resolvedIP))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
+			// A short deadline bounds the regression path only: a classifier missing
+			// the range would fall through to a real dial. The fixed one never dials.
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
 
-	output := captureLogOutput(t, func() {
-		if err := deliverer.Deliver(ctx, target, samplePayload()); err == nil {
-			t.Fatal("expected the unroutable TEST-NET-3 target to fail the dial")
-		}
-	})
-	if strings.Contains(output, "reason=private_address_blocked") {
-		t.Fatalf("TEST-NET-3 (203.0.113.10) was wrongly blocked as private: %q", output)
+			output := captureLogOutput(t, func() {
+				if err := deliverer.Deliver(ctx, target, samplePayload()); err == nil {
+					t.Fatalf("expected hostname resolving to %s to be refused when gated on", resolvedIP)
+				}
+			})
+			if !strings.Contains(output, "reason=private_address_blocked") {
+				t.Fatalf("expected private_address_blocked (guard fired before any dial), got: %q", output)
+			}
+			if strings.Contains(output, resolvedIP) {
+				t.Fatalf("log leaked the resolved IP %q: %q", resolvedIP, output)
+			}
+		})
 	}
 }
 
@@ -487,15 +740,28 @@ func TestIsPrivateIP(t *testing.T) {
 		"192.168.1.10": true,
 		"172.16.0.1":   true,
 		"169.254.0.1":  true, // link-local unicast
-		"224.0.0.1":    true, // link-local multicast
-		"::1":          true,
-		"fe80::1":      true, // IPv6 link-local
-		"fc00::1":      true, // IPv6 ULA (private)
-		"0.0.0.0":      true, // unspecified
-		"::":           true, // IPv6 unspecified
-		"8.8.8.8":      false,
-		"192.0.2.1":    false, // TEST-NET-1, public-classified
-		"2606:4700::1": false, // public IPv6
+		// The cloud instance-metadata address, the single most valuable target an
+		// SSRF reaches for. Covered by IsLinkLocalUnicast() above, pinned by name so
+		// a future narrowing of that check is named rather than merely counted.
+		"169.254.169.254": true,
+		"224.0.0.1":       true, // link-local multicast
+		// IPv4-mapped IPv6 loopback: the control for embeddedIPv4s' To4() != nil
+		// early return, which leaves this form to the terminal checks rather than
+		// decoding it (its prefix ::ffff:0:0/96 is NOT the IPv4-translated one).
+		"::ffff:127.0.0.1": true,
+		"::1":              true,
+		"fe80::1":          true, // IPv6 link-local
+		"fc00::1":          true, // IPv6 ULA (private)
+		"0.0.0.0":          true, // unspecified
+		"::":               true, // IPv6 unspecified
+		"8.8.8.8":          false,
+		"2606:4700::1":     false, // public IPv6
+		// The IANA special-purpose registries decide the rest; the walk over every
+		// entry is TestIsPrivateIPWalksTheSpecialPurposeRegistries. Two samples stay
+		// here so this map's own picture is not misleading: documentation space is
+		// refused, globally reachable special-purpose space is not.
+		"192.0.2.1":    true,  // TEST-NET-1 (RFC 5737), not globally reachable
+		"192.31.196.1": false, // AS112-v4 anycast (RFC 7535), globally reachable
 		// RFC 6598 CGNAT (100.64.0.0/10): internal/carrier space that Go's
 		// net.IP.IsPrivate() omits, so the gate must still block it — with the /10
 		// boundaries staying public to guard against over-block.
@@ -509,8 +775,42 @@ func TestIsPrivateIP(t *testing.T) {
 		"64:ff9b::a00:1":   true,  // wraps 10.0.0.1
 		"64:ff9b::6440:1":  true,  // wraps 100.64.0.1 (CGNAT)
 		"64:ff9b::808:808": false, // wraps 8.8.8.8 (public)
-		// TEST-NET-3 must stay external — the positive delivery path relies on it.
-		"203.0.113.10": false,
+		// The remaining IPv6-embeds-IPv4 transition forms, each classified by what it
+		// wraps exactly as NAT64 is (GHSA-hg2x-v5cc-m384 reported the first two; the
+		// rest were found while measuring that report). A wrapper around a PUBLIC v4
+		// stays allowed in every form, so these are not blanket prefix blocks.
+		"2002:7f00:1::":      true,  // 6to4 (RFC 3056) wrapping 127.0.0.1
+		"2002:a00:1::":       true,  // 6to4 wrapping 10.0.0.1
+		"2002:a9fe:a9fe::":   true,  // 6to4 wrapping 169.254.169.254 (link-local metadata)
+		"2002:808:808::":     false, // 6to4 wrapping 8.8.8.8 stays allowed
+		"::10.0.0.1":         true,  // IPv4-compatible (RFC 4291, deprecated)
+		"::127.0.0.1":        true,  // IPv4-compatible wrapping loopback
+		"::8.8.8.8":          false, // IPv4-compatible wrapping a public v4
+		"::ffff:0:127.0.0.1": true,  // IPv4-translated (RFC 2765 SIIT, ::ffff:0:0:0/96)
+		"::ffff:0:8.8.8.8":   false, // same form, public v4
+		// Teredo (RFC 4380) embeds TWO v4 addresses. Each half is pinned alone, or a
+		// classifier that decoded only one of them would still pass this map.
+		"2001:0:a00:1:0:0:f5ff:fffe":   true, // server v4 = 10.0.0.1
+		"2001:0:808:808:0:0:f5ff:fffe": true, // public server, client ^0x0afffffe = 10.0.0.1
+		// Server 65.54.227.120, client 8.8.8.8 (stored inverted as f7f7:f7f7). The
+		// textbook example ends 3fff:fdd2 — client 192.0.2.45, documentation space —
+		// which is now refused, so it can no longer stand for "both halves public".
+		"2001:0:4136:e378:8000:63bf:f7f7:f7f7": false, // both halves public
+		// Ranges that are internal without wrapping anything, each with the boundary
+		// just outside it pinned so the fix cannot widen into an over-block.
+		"fec0::1":            true,  // deprecated IPv6 site-local (RFC 3879)
+		"feff:ffff::1":       true,  // top of fec0::/10
+		"fe7f:ffff::1":       false, // just below fec0::/10, and not link-local
+		"0.1.2.3":            true,  // RFC 1122 "this network", beyond the unspecified address
+		"0.255.255.255":      true,  // top of 0.0.0.0/8
+		"1.0.0.1":            false, // just above 0.0.0.0/8
+		"64:ff9b:1::a00:1":   true,  // RFC 8215 local-use NAT64, private wholesale
+		"64:ff9b:1::808:808": true,  // ... including a public-looking wrap: the BLOCK is local-use
+		"64:ff9b:2::808:808": false, // just outside the /48
+		// TEST-NET-3 is refused with the other documentation prefixes; the suite's
+		// external sentinel is now a globally reachable address (see
+		// webhookExternalSentinelIP).
+		"203.0.113.10": true,
 	}
 	for literal, want := range cases {
 		ip := net.ParseIP(literal)
@@ -553,14 +853,14 @@ func TestGuardedDialContext(t *testing.T) {
 		stub := &stubDial{conn: client}
 		dialFn := guardedDialContext(stub.dial, fakeResolver{})
 
-		conn, err := dialFn(ctx, "tcp", "192.0.2.1:443")
+		conn, err := dialFn(ctx, "tcp", "8.8.8.8:443")
 		if err != nil {
 			t.Fatalf("expected a public literal to dial, got %v", err)
 		}
 		if conn != client {
 			t.Fatal("guarded dialer did not return the dialed conn")
 		}
-		if stub.lastAddr != "192.0.2.1:443" {
+		if stub.lastAddr != "8.8.8.8:443" {
 			t.Fatalf("dialed the wrong address: %q", stub.lastAddr)
 		}
 	})
@@ -583,12 +883,12 @@ func TestGuardedDialContext(t *testing.T) {
 		defer func() { _ = client.Close() }()
 		defer func() { _ = server.Close() }()
 		stub := &stubDial{conn: client}
-		dialFn := guardedDialContext(stub.dial, resolverFor("ntfy.example.io", "192.0.2.1"))
+		dialFn := guardedDialContext(stub.dial, resolverFor("ntfy.example.io", "8.8.8.8"))
 
 		if _, err := dialFn(ctx, "tcp", "ntfy.example.io:443"); err != nil {
 			t.Fatalf("expected resolved public host to dial, got %v", err)
 		}
-		if stub.lastAddr != "192.0.2.1:443" {
+		if stub.lastAddr != "8.8.8.8:443" {
 			t.Fatalf("expected the resolved IP to be dialed, got %q", stub.lastAddr)
 		}
 	})
@@ -622,7 +922,7 @@ func TestGuardedDialContext(t *testing.T) {
 		stub := &stubDial{err: wantErr}
 		dialFn := guardedDialContext(stub.dial, fakeResolver{})
 
-		if _, err := dialFn(ctx, "tcp", "192.0.2.1:443"); !errors.Is(err, wantErr) {
+		if _, err := dialFn(ctx, "tcp", "8.8.8.8:443"); !errors.Is(err, wantErr) {
 			t.Fatalf("expected the dial error to surface, got %v", err)
 		}
 	})
@@ -640,6 +940,39 @@ func TestGuardedDialContext(t *testing.T) {
 	})
 }
 
+// TestWebhookDeliveryGateOffLeavesStockPathForHostname pins the default path: with
+// WEBHOOK_BLOCK_PRIVATE_ADDRESSES off, the resolve-and-check dialer is never
+// installed, so a hostname target dials straight through the stock dialer and the
+// private-address guard never runs. Non-vacuous: the deliverer is handed a resolver
+// that knows no hosts at all, so if the gate-off path ever started consulting it,
+// the lookup would fail and the delivery would never reach the server.
+func TestWebhookDeliveryGateOffLeavesStockPathForHostname(t *testing.T) {
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	// "localhost" resolves through the real stack to the loopback address the test
+	// server listens on, which is exactly the private target the gate would refuse
+	// when on — that contrast is the point of this regression.
+	target := hostnameTargetFor(t, server.URL, "localhost")
+	deliverer := newWebhookDelivererWithResolver(false, fakeResolver{})
+
+	output := captureLogOutput(t, func() {
+		if err := deliverer.Deliver(context.Background(), target, samplePayload()); err != nil {
+			t.Fatalf("gate-off delivery to a hostname must succeed through the stock dialer, got %v", err)
+		}
+	})
+	if hits.Load() != 1 {
+		t.Fatalf("expected exactly one delivery through the stock dialer, got %d", hits.Load())
+	}
+	if strings.Contains(output, "private_address_blocked") {
+		t.Fatalf("gate-off path must not run the private-address guard: %q", output)
+	}
+}
+
 // TestWebhookDeliveryURLParseFailure covers the unparseable-URL branch: a control
 // character in the URL makes url.Parse fail, and the error must not echo the URL.
 func TestWebhookDeliveryURLParseFailure(t *testing.T) {
@@ -651,5 +984,181 @@ func TestWebhookDeliveryURLParseFailure(t *testing.T) {
 	})
 	if strings.Contains(output, "secret") {
 		t.Fatalf("parse-failure log leaked URL content: %q", output)
+	}
+}
+
+// captureDelivery is the shared recorder for the ntfy-format tests: one
+// request's method, path, headers, and body, snapshotted under the handler.
+type captureDelivery struct {
+	method string
+	path   string
+	title  string
+	tags   string
+	ctype  string
+	body   string
+}
+
+// TestWebhookDeliveryNtfyFormatSendsNativeEnvelope pins the ?format=ntfy
+// opt-in: the request must carry the title and tag as ntfy headers, a
+// text/plain body of message + blank line + disclaimer, and still POST to the
+// exact URL the owner configured (query param riding along untouched).
+func TestWebhookDeliveryNtfyFormatSendsNativeEnvelope(t *testing.T) {
+	payload := samplePayload()
+	var captured captureDelivery
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		bodyBytes, _ := io.ReadAll(request.Body)
+		captured = captureDelivery{
+			method: request.Method,
+			path:   request.URL.RequestURI(),
+			title:  request.Header.Get("X-Title"),
+			tags:   request.Header.Get("X-Tags"),
+			ctype:  request.Header.Get("Content-Type"),
+			body:   string(bodyBytes),
+		}
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	deliverer := NewWebhookDeliverer(false)
+	if err := deliverer.Deliver(context.Background(), server.URL+"/ovumcy?auth=tok&format=ntfy", payload); err != nil {
+		t.Fatalf("ntfy-format delivery must succeed on 2xx, got %v", err)
+	}
+	if captured.method != http.MethodPost {
+		t.Fatalf("expected POST, got %s", captured.method)
+	}
+	if captured.path != "/ovumcy?auth=tok&format=ntfy" {
+		t.Fatalf("ntfy-format must keep the owner URL (params and order) untouched, got %q", captured.path)
+	}
+	if captured.title != payload.Title {
+		t.Fatalf("X-Title must carry the payload title %q, got %q", payload.Title, captured.title)
+	}
+	if captured.tags != "drop_of_blood" {
+		t.Fatalf("period reminder must tag drop_of_blood, got %q", captured.tags)
+	}
+	if captured.ctype != "text/plain" {
+		t.Fatalf("ntfy-format body must be text/plain, got %q", captured.ctype)
+	}
+	expectedBody := payload.Message + "\n\n" + payload.Disclaimer
+	if captured.body != expectedBody {
+		t.Fatalf("ntfy-format body must be message + blank line + disclaimer:\n want %q\n got  %q", expectedBody, captured.body)
+	}
+}
+
+// TestWebhookDeliveryNtfyFormatEncodesNonASCIITitle pins that a localized
+// title leaves as an RFC 2047 encoded word rather than raw UTF-8 header bytes,
+// and that it decodes back to the exact title ntfy should display.
+func TestWebhookDeliveryNtfyFormatEncodesNonASCIITitle(t *testing.T) {
+	payload := samplePayload()
+	payload.Title = "Напоминание о менструации"
+	var rawTitle string
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		rawTitle = request.Header.Get("X-Title")
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	if err := NewWebhookDeliverer(false).Deliver(context.Background(), server.URL+"/t?format=ntfy", payload); err != nil {
+		t.Fatalf("ntfy-format delivery must succeed on 2xx, got %v", err)
+	}
+	for index := range len(rawTitle) {
+		if rawTitle[index] >= 0x80 {
+			t.Fatalf("X-Title must be ASCII on the wire, got %q", rawTitle)
+		}
+	}
+	decoded, err := new(mime.WordDecoder).DecodeHeader(rawTitle)
+	if err != nil {
+		t.Fatalf("X-Title %q is not a decodable RFC 2047 header: %v", rawTitle, err)
+	}
+	if decoded != payload.Title {
+		t.Fatalf("X-Title must decode to %q, got %q", payload.Title, decoded)
+	}
+}
+
+// TestWebhookDeliveryNtfyFormatOvulationTag pins the ovulation-kind tag branch
+// of ntfyTagsForReminderType (and, through the table's default row, that an
+// unknown kind falls back to the period tag rather than an empty header).
+func TestWebhookDeliveryNtfyFormatOvulationTag(t *testing.T) {
+	cases := []struct {
+		name         string
+		reminderType string
+		expectedTag  string
+	}{
+		{"ovulation maps to sparkles", DueReminderTypeOvulation, "sparkles"},
+		{"period maps to drop_of_blood", DueReminderTypePeriod, "drop_of_blood"},
+		{"unknown kind falls back to drop_of_blood", "fertility-window", "drop_of_blood"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := ntfyTagsForReminderType(testCase.reminderType); got != testCase.expectedTag {
+				t.Fatalf("ntfyTagsForReminderType(%q) = %q, want %q", testCase.reminderType, got, testCase.expectedTag)
+			}
+		})
+	}
+}
+
+// TestWebhookDeliveryUnrelatedQueryParamsKeepJSONEnvelope pins the default:
+// query parameters that are NOT format=ntfy (a token param, or an explicit
+// format=json) must leave the generic JSON envelope — and its Content-Type —
+// byte-for-byte in place, so no existing consumer changes behavior.
+func TestWebhookDeliveryUnrelatedQueryParamsKeepJSONEnvelope(t *testing.T) {
+	for _, target := range []string{
+		"/hook?auth=tok",
+		"/hook?format=json",
+		"/hook?format=ntfyish",
+	} {
+		var gotTitle, gotTags, gotCtype string
+		var gotBody []byte
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			gotTitle = request.Header.Get("X-Title")
+			gotTags = request.Header.Get("X-Tags")
+			gotCtype = request.Header.Get("Content-Type")
+			gotBody, _ = io.ReadAll(request.Body)
+			writer.WriteHeader(http.StatusOK)
+		}))
+		deliverer := NewWebhookDeliverer(false)
+		if err := deliverer.Deliver(context.Background(), server.URL+target, samplePayload()); err != nil {
+			t.Fatalf("default-format delivery to %q must succeed, got %v", target, err)
+		}
+		server.Close()
+		if gotTitle != "" || gotTags != "" {
+			t.Fatalf("%q must not set ntfy headers, got title=%q tags=%q", target, gotTitle, gotTags)
+		}
+		if gotCtype != "application/json" {
+			t.Fatalf("%q must stay application/json, got %q", target, gotCtype)
+		}
+		var decoded WebhookPayload
+		if err := json.Unmarshal(gotBody, &decoded); err != nil {
+			t.Fatalf("%q body must remain the JSON envelope: %v", target, err)
+		}
+		if decoded.Disclaimer == "" {
+			t.Fatalf("%q JSON envelope lost the mandatory disclaimer", target)
+		}
+	}
+}
+
+// TestWebhookDeliveryNtfyFormatSkipsUnsafeTitleHeader pins headerSafeValue's
+// degradation: a title carrying a control character must be dropped from
+// X-Title (the request would otherwise fail to write at the transport layer)
+// while the delivery itself still succeeds with the plain-text body.
+func TestWebhookDeliveryNtfyFormatSkipsUnsafeTitleHeader(t *testing.T) {
+	payload := samplePayload()
+	payload.Title = "Broken\n title"
+	var gotTitle, gotContentType string
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		gotTitle = request.Header.Get("X-Title")
+		gotContentType = request.Header.Get("Content-Type")
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	deliverer := NewWebhookDeliverer(false)
+	if err := deliverer.Deliver(context.Background(), server.URL+"/t?format=ntfy", payload); err != nil {
+		t.Fatalf("delivery must succeed without the unsafe title header, got %v", err)
+	}
+	if gotContentType != "text/plain" {
+		t.Fatalf("expected the ntfy plain-text delivery, got Content-Type %q", gotContentType)
+	}
+	if gotTitle != "" {
+		t.Fatalf("unsafe title must be dropped from X-Title, got %q", gotTitle)
 	}
 }

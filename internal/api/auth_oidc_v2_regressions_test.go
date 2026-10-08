@@ -12,6 +12,7 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/ovumcy/ovumcy-web/internal/db"
+	"github.com/ovumcy/ovumcy-web/internal/security"
 	"github.com/ovumcy/ovumcy-web/internal/services"
 	"gorm.io/gorm"
 )
@@ -33,8 +34,9 @@ func TestLoginPageInOIDCOnlyModeHidesLocalAuthUI(t *testing.T) {
 
 	rendered := mustReadBodyString(t, response.Body)
 	assertBodyContainsAll(t, rendered,
+		// Structural hook only — the rendered SSO caption is Playwright's
+		// subject (e2e/auth-oidc.spec.ts), sourced from the catalogue.
 		bodyStringMatch{fragment: "data-auth-sso-cta", message: "expected SSO CTA in oidc_only mode"},
-		bodyStringMatch{fragment: "Sign in with SSO", message: "expected localized SSO CTA copy"},
 	)
 	assertBodyNotContainsAll(t, rendered,
 		bodyStringMatch{fragment: `id="login-form"`, message: "did not expect local login form in oidc_only mode"},
@@ -205,7 +207,8 @@ func TestOIDCLogoutBridgeRedirectsToProviderEndSessionEndpoint(t *testing.T) {
 		IDTokenHint:           "raw-id-token",
 		PostLogoutRedirectURL: "https://ovumcy.example.com/login",
 	})
-	bridgeCookie := mustBuildOIDCLogoutBridgeCookieHeader(t, mustExtractAuthSessionIDFromCookieHeader(t, authCookie))
+	bridgeClaims := mustExtractAuthSessionClaimsFromCookieHeader(t, authCookie)
+	bridgeCookie := mustBuildOIDCLogoutBridgeCookieHeader(t, bridgeClaims.SessionID, bridgeClaims.UserID)
 
 	request := httptest.NewRequest(http.MethodGet, oidcLogoutBridgeRedirectPath, nil)
 	request.Header.Set("Cookie", bridgeCookie)
@@ -238,7 +241,8 @@ func TestOIDCLogoutBridgeRedirectConsumesServerSideState(t *testing.T) {
 		IDTokenHint:           "raw-id-token",
 		PostLogoutRedirectURL: "https://ovumcy.example.com/login",
 	})
-	bridgeCookie := mustBuildOIDCLogoutBridgeCookieHeader(t, mustExtractAuthSessionIDFromCookieHeader(t, authCookie))
+	bridgeClaims := mustExtractAuthSessionClaimsFromCookieHeader(t, authCookie)
+	bridgeCookie := mustBuildOIDCLogoutBridgeCookieHeader(t, bridgeClaims.SessionID, bridgeClaims.UserID)
 
 	firstRequest := httptest.NewRequest(http.MethodGet, oidcLogoutBridgeRedirectPath, nil)
 	firstRequest.Header.Set("Cookie", bridgeCookie)
@@ -262,7 +266,8 @@ func TestOIDCLogoutBridgePageRefreshesToInternalRedirectEndpoint(t *testing.T) {
 		IDTokenHint:           "raw-id-token",
 		PostLogoutRedirectURL: "https://ovumcy.example.com/login",
 	})
-	bridgeCookie := mustBuildOIDCLogoutBridgeCookieHeader(t, mustExtractAuthSessionIDFromCookieHeader(t, authCookie))
+	bridgeClaims := mustExtractAuthSessionClaimsFromCookieHeader(t, authCookie)
+	bridgeCookie := mustBuildOIDCLogoutBridgeCookieHeader(t, bridgeClaims.SessionID, bridgeClaims.UserID)
 
 	request := httptest.NewRequest(http.MethodGet, oidcLogoutBridgePath, nil)
 	request.Header.Set("Cookie", bridgeCookie)
@@ -323,12 +328,182 @@ func TestAuthLogoutJSONWithOIDCProviderReturnsBridgePathWithoutTokenLeak(t *test
 	}
 }
 
+// TestOIDCLogoutBridgeRedirectRefusesAnotherOwnersSessionID is the privacy
+// boundary on the one route that runs with no session at all. The bridge
+// redirect resolves the stored end-session material — the raw id_token_hint
+// among it — from the sealed bridge cookie alone, so if that lookup were keyed
+// on the session id by itself, a cookie naming owner A and owner B's session
+// would hand A a redirect carrying B's id_token_hint and consume B's row in
+// passing. The pair (session id, owner) is what resolves the row.
+//
+// The refusal is negative twice over — no provider redirect, no consumed row —
+// so the same test carries its positive anchor: owner B's own bridge cookie,
+// against the same app and the same row, does redirect to the provider and
+// does consume it.
+func TestOIDCLogoutBridgeRedirectRefusesAnotherOwnersSessionID(t *testing.T) {
+	t.Parallel()
+
+	app, database := newOnboardingTestAppWithOptions(t, providerLogoutTestAppOptions())
+	ownerA := createOnboardingTestUser(t, database, "bridge-owner-a@example.com", "StrongPass1", true)
+	ownerB := createOnboardingTestUser(t, database, "bridge-owner-b@example.com", "StrongPass1", true)
+
+	authA := loginAndExtractAuthCookieWithCSRF(t, app, ownerA.Email, "StrongPass1")
+	authB := loginAndExtractAuthCookieWithCSRF(t, app, ownerB.Email, "StrongPass1")
+	claimsA := mustExtractAuthSessionClaimsFromCookieHeader(t, authA)
+	claimsB := mustExtractAuthSessionClaimsFromCookieHeader(t, authB)
+
+	persistOIDCLogoutStateForAuthCookie(t, database, authA, services.OIDCLogoutState{
+		UserID:                ownerA.ID,
+		EndSessionEndpoint:    "https://id.example.com/oidc/logout",
+		IDTokenHint:           "owner-a-id-token",
+		PostLogoutRedirectURL: "https://ovumcy.example.com/login",
+	})
+	persistOIDCLogoutStateForAuthCookie(t, database, authB, services.OIDCLogoutState{
+		UserID:                ownerB.ID,
+		EndSessionEndpoint:    "https://id.example.com/oidc/logout",
+		IDTokenHint:           "owner-b-id-token",
+		PostLogoutRedirectURL: "https://ovumcy.example.com/login",
+	})
+
+	// Owner A's cookie, owner B's session id: the swap the guard exists for.
+	swapped := mustBuildOIDCLogoutBridgeCookieHeader(t, claimsB.SessionID, claimsA.UserID)
+	request := httptest.NewRequest(http.MethodGet, oidcLogoutBridgeRedirectPath, nil)
+	request.Header.Set("Cookie", swapped)
+
+	response := mustAppResponse(t, app, request)
+	assertStatusCode(t, response, http.StatusSeeOther)
+	if location := response.Header.Get("Location"); location != "/login" {
+		t.Fatalf("owner %d presented owner %d's session id and was redirected to %q; the bridge resolves the logout state by session id alone", ownerA.ID, ownerB.ID, location)
+	}
+	body := mustReadBodyString(t, response.Body)
+	for _, header := range response.Header.Values("Set-Cookie") {
+		if strings.Contains(header, "owner-b-id-token") {
+			t.Fatal("owner B's id_token_hint reached a response to owner A")
+		}
+	}
+	if strings.Contains(body, "owner-b-id-token") {
+		t.Fatal("owner B's id_token_hint reached a response body served to owner A")
+	}
+
+	// Owner B's row must still be there: a cross-owner attempt may not consume
+	// what it could not read. Owner A's own row is untouched too — the request
+	// named A but B's session, so it matched nothing and consumed nothing.
+	logoutRepo := db.NewRepositories(database).OIDCLogout
+	if _, found, err := logoutRepo.FindBySessionID(context.Background(), claimsB.SessionID, ownerB.ID); err != nil || !found {
+		t.Fatalf("owner %d's provider-logout state was consumed by owner %d's request (found=%t, err=%v)", ownerB.ID, ownerA.ID, found, err)
+	}
+	if _, found, err := logoutRepo.FindBySessionID(context.Background(), claimsA.SessionID, ownerA.ID); err != nil || !found {
+		t.Fatalf("owner %d's own provider-logout state was consumed by a request that named another owner's session (found=%t, err=%v)", ownerA.ID, found, err)
+	}
+
+	// Positive anchor: the same row, reached by the owner it belongs to.
+	ownCookie := mustBuildOIDCLogoutBridgeCookieHeader(t, claimsB.SessionID, claimsB.UserID)
+	ownRequest := httptest.NewRequest(http.MethodGet, oidcLogoutBridgeRedirectPath, nil)
+	ownRequest.Header.Set("Cookie", ownCookie)
+
+	ownResponse := mustAppResponse(t, app, ownRequest)
+	assertStatusCode(t, ownResponse, http.StatusSeeOther)
+	location := mustParseLocationHeader(t, ownResponse)
+	if location.Host != "id.example.com" {
+		t.Fatalf("owner %d must reach the provider end-session endpoint with their own bridge cookie, got %q", ownerB.ID, location.String())
+	}
+	if got := location.Query().Get("id_token_hint"); got != "owner-b-id-token" {
+		t.Fatalf("expected owner %d's own id_token_hint in their provider logout redirect, got %q", ownerB.ID, got)
+	}
+	if _, found, err := logoutRepo.FindBySessionID(context.Background(), claimsB.SessionID, ownerB.ID); err != nil || found {
+		t.Fatalf("owner %d's own bridge redirect must consume the row (found=%t, err=%v)", ownerB.ID, found, err)
+	}
+}
+
+// TestOIDCLogoutBridgeRedirectDegradesALegacyBridgeCookieToLocalSignOut pins
+// the accepted failure mode of adding the owner to this payload. A bridge
+// cookie minted by the previous build names a session and no account; a zero
+// owner is refused rather than read as "any owner", so that browser gets a
+// local sign-out at /login instead of a provider end-session. The window is
+// bounded by the payload's own one-minute TTL, so it covers only cookies
+// minted in the minute before the deploy — and the row it could not consume is
+// left standing for the server-side TTL sweep rather than erroring or being
+// deleted by session id alone.
+//
+// Deliberately narrower than its subject: three layers refuse a zero owner
+// (validAt here, the service pre-check, the repository predicate), so removing
+// any one of them leaves this case green — the neighbours rescue it. It fails
+// only when the resolution goes back to the session id alone, which is the
+// widening it exists to catch. The rule that validAt itself refuses an
+// unattributed payload is pinned by
+// TestOIDCLogoutBridgeCookieRefusesAnUnattributedPayloadAndRetractsIt.
+func TestOIDCLogoutBridgeRedirectDegradesALegacyBridgeCookieToLocalSignOut(t *testing.T) {
+	t.Parallel()
+
+	app, authCookie, _, _ := prepareAuthenticatedOIDCLogoutContext(t, services.OIDCLogoutState{
+		EndSessionEndpoint:    "https://id.example.com/oidc/logout",
+		IDTokenHint:           "raw-id-token",
+		PostLogoutRedirectURL: "https://ovumcy.example.com/login",
+	})
+	claims := mustExtractAuthSessionClaimsFromCookieHeader(t, authCookie)
+
+	// Marshalled from the previous version's payload shape — no user_id key at
+	// all — rather than from a zero field this build would write.
+	serialized, err := json.Marshal(struct {
+		SessionID     string `json:"session_id"`
+		ExpiresAtUnix int64  `json:"expires_at_unix"`
+	}{SessionID: claims.SessionID, ExpiresAtUnix: 4102444800})
+	if err != nil {
+		t.Fatalf("marshal legacy bridge payload: %v", err)
+	}
+	legacyCookie := oidcLogoutBridgeCookieName + "=" + mustSealOIDCLogoutBridgePayload(t, serialized)
+
+	request := httptest.NewRequest(http.MethodGet, oidcLogoutBridgeRedirectPath, nil)
+	request.Header.Set("Cookie", legacyCookie)
+
+	response := mustAppResponse(t, app, request)
+	assertStatusCode(t, response, http.StatusSeeOther)
+	if location := response.Header.Get("Location"); location != "/login" {
+		t.Fatalf("a bridge cookie naming no owner must degrade to a local sign-out, got %q", location)
+	}
+	bridgeCookieAfter := responseCookie(response.Cookies(), oidcLogoutBridgeCookieName)
+	if bridgeCookieAfter == nil || bridgeCookieAfter.Value != "" {
+		t.Fatalf("expected the refused bridge cookie to be retracted, got %#v", bridgeCookieAfter)
+	}
+
+	// Positive anchor: the same session, the same row, a payload that names the
+	// owner — otherwise a bridge that redirected everything to /login would pass.
+	ownCookie := mustBuildOIDCLogoutBridgeCookieHeader(t, claims.SessionID, claims.UserID)
+	ownRequest := httptest.NewRequest(http.MethodGet, oidcLogoutBridgeRedirectPath, nil)
+	ownRequest.Header.Set("Cookie", ownCookie)
+
+	ownResponse := mustAppResponse(t, app, ownRequest)
+	assertStatusCode(t, ownResponse, http.StatusSeeOther)
+	location := mustParseLocationHeader(t, ownResponse)
+	if location.Host != "id.example.com" {
+		t.Fatalf("the same session with an attributed bridge cookie must still reach the provider, got %q", location.String())
+	}
+}
+
+// providerLogoutTestAppOptions is the configuration under which a stored
+// provider-logout row may still produce a hop to the IdP: OIDC on, logout mode
+// `provider`. The sign-out path re-reads both at logout time, so a test that
+// expects the bridge has to run on an app that names them — the package
+// default leaves OIDC off and the mode at `local`, where every stored row is
+// carrier data for a hop this instance no longer makes.
+func providerLogoutTestAppOptions() onboardingTestAppOptions {
+	return onboardingTestAppOptions{
+		enableCSRF:     true,
+		oidcEnabled:    true,
+		oidcLogoutMode: security.OIDCLogoutModeProvider,
+	}
+}
+
 func prepareAuthenticatedOIDCLogoutContext(t *testing.T, logoutState services.OIDCLogoutState) (*fiber.App, string, *http.Cookie, string) {
 	t.Helper()
 
-	app, database := newOnboardingTestAppWithCSRF(t)
+	app, database := newOnboardingTestAppWithOptions(t, providerLogoutTestAppOptions())
 	user := createOnboardingTestUser(t, database, "oidc-logout@example.com", "StrongPass1", true)
 	authCookie := loginAndExtractAuthCookieWithCSRF(t, app, user.Email, "StrongPass1")
+	// The state belongs to the account whose session it is keyed on — the
+	// store refuses a row no owner can be reached by, and every read of it is
+	// scoped to that owner.
+	logoutState.UserID = user.ID
 	persistOIDCLogoutStateForAuthCookie(t, database, authCookie, logoutState)
 
 	csrfRequest := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
@@ -359,6 +534,17 @@ func persistOIDCLogoutStateForAuthCookie(t *testing.T, database *gorm.DB, authCo
 func mustExtractAuthSessionIDFromCookieHeader(t *testing.T, authCookie string) string {
 	t.Helper()
 
+	return mustExtractAuthSessionClaimsFromCookieHeader(t, authCookie).SessionID
+}
+
+// mustExtractAuthSessionClaimsFromCookieHeader opens the sealed auth cookie and
+// returns the session token's claims. Callers that build a provider-logout
+// bridge cookie need both halves of what that payload names — the session id
+// and the owner — and taking them from the same token keeps the pair
+// consistent with the session under test.
+func mustExtractAuthSessionClaimsFromCookieHeader(t *testing.T, authCookie string) *services.AuthSessionClaims {
+	t.Helper()
+
 	_, sealedValue, ok := strings.Cut(strings.TrimSpace(authCookie), "=")
 	if !ok || strings.TrimSpace(sealedValue) == "" {
 		t.Fatalf("expected auth cookie header, got %q", authCookie)
@@ -380,19 +566,28 @@ func mustExtractAuthSessionIDFromCookieHeader(t *testing.T, authCookie string) s
 	if strings.TrimSpace(claims.SessionID) == "" {
 		t.Fatal("expected auth session token to carry a session id")
 	}
-	return claims.SessionID
+	if claims.UserID == 0 {
+		t.Fatal("expected auth session token to name the account it was issued for")
+	}
+	return claims
 }
 
-func mustBuildOIDCLogoutBridgeCookieHeader(t *testing.T, sessionID string) string {
+func mustBuildOIDCLogoutBridgeCookieHeader(t *testing.T, sessionID string, userID uint) string {
 	t.Helper()
 
 	serialized, err := json.Marshal(oidcLogoutBridgeCookiePayload{
 		SessionID:     sessionID,
+		UserID:        userID,
 		ExpiresAtUnix: 4102444800,
 	})
 	if err != nil {
 		t.Fatalf("marshal oidc logout bridge cookie payload: %v", err)
 	}
+	return oidcLogoutBridgeCookieName + "=" + mustSealOIDCLogoutBridgePayload(t, serialized)
+}
+
+func mustSealOIDCLogoutBridgePayload(t *testing.T, serialized []byte) string {
+	t.Helper()
 
 	codec, err := newSecureCookieCodec([]byte("test-secret-key"))
 	if err != nil {
@@ -402,5 +597,5 @@ func mustBuildOIDCLogoutBridgeCookieHeader(t *testing.T, sessionID string) strin
 	if err != nil {
 		t.Fatalf("seal oidc logout bridge cookie payload: %v", err)
 	}
-	return oidcLogoutBridgeCookieName + "=" + sealed
+	return sealed
 }

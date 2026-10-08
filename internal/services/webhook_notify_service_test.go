@@ -61,10 +61,61 @@ func (stub stubDecryptor) DecryptWebhookURL(userID uint, encryptedURL string) (s
 	return encryptedURL, nil
 }
 
-// stubDisclaimer returns a fixed disclaimer, standing in for the i18n adapter.
+// stubDisclaimer stands in for the i18n adapter: a fixed disclaimer plus the
+// English reminder copy for the four catalogue keys the payload names. Language
+// is ignored on purpose — that the pass resolves at the OWNER's language is
+// guarded against the real catalogue in egress_owner_language_test.go, which
+// keeps every other test of the pass free of the locale files.
 type stubDisclaimer struct{ text string }
 
 func (stub stubDisclaimer) Disclaimer(string) string { return stub.text }
+
+func (stub stubDisclaimer) Message(_ string, key string) string {
+	switch key {
+	case reminderPeriodTitleKey:
+		return "Period reminder"
+	case reminderPeriodMessageKey:
+		return "Estimated next period around %s."
+	case reminderOvulationTitleKey:
+		return "Ovulation reminder"
+	case reminderOvulationMessageKey:
+		return "Estimated ovulation around %s."
+	default:
+		return ""
+	}
+}
+
+// TestBuildPayloadWithAnEmptyDisclaimerSendsItEmptyAndKeepsTheRest records the
+// current behaviour when the localized disclaimer resolves to "": buildPayload has
+// no runtime guard, so the reminder still goes out with Disclaimer "" beside an
+// intact title, message and date. This CONTRADICTS the documented invariant that
+// every payload carries the disclaimer: the invariant currently rests on the
+// catalogue never resolving to "" (TestMedicalDisclaimerIsNonEmptyInEveryShippedLocale),
+// not on this builder. The test pins the gap so closing it is a deliberate change.
+func TestBuildPayloadWithAnEmptyDisclaimerSendsItEmptyAndKeepsTheRest(t *testing.T) {
+	service := &WebhookNotifyService{localized: stubDisclaimer{text: ""}}
+	reminder := DueReminder{
+		Type:      DueReminderTypePeriod,
+		EventDate: time.Date(2026, time.April, 9, 0, 0, 0, 0, time.UTC),
+		LeadDays:  2,
+	}
+
+	payload := service.buildPayload(reminder, "")
+	if payload.Disclaimer != "" {
+		t.Fatalf("pinned: an empty disclaimer is currently sent as-is (got %q); closing the gap should update this test", payload.Disclaimer)
+	}
+	if payload.Title != "Period reminder" || payload.Message != "Estimated next period around 2026-04-09." {
+		t.Fatalf("title and message are unaffected by the disclaimer: %q / %q", payload.Title, payload.Message)
+	}
+	if payload.Type != DueReminderTypePeriod || payload.EventDate != "2026-04-09" || payload.LeadDays != 2 {
+		t.Fatalf("type, date and lead days are unaffected: %+v", payload)
+	}
+
+	control := (&WebhookNotifyService{localized: stubDisclaimer{text: "estimate only"}}).buildPayload(reminder, "")
+	if control.Disclaimer != "estimate only" {
+		t.Fatalf("control: a non-empty disclaimer is carried verbatim, got %q", control.Disclaimer)
+	}
+}
 
 // watermarkWrite records one watermark advance.
 type watermarkWrite struct {
@@ -73,14 +124,54 @@ type watermarkWrite struct {
 	anchor       time.Time
 }
 
-// stubNotifyRepo serves a fixed record set and records every watermark write, so
-// a test can assert watermarks advance ONLY on success.
+// stubNotifyRepo serves a fixed record set and tracks the watermark column the
+// pass leaves behind. A claim appends a write; a release removes the matching one
+// again, because a released claim leaves the column exactly where the pass found
+// it — so writes() reports the NET watermark writes of a pass and a test can
+// still assert that a watermark stands only for a delivered reminder.
+//
+// claimErr makes the claim itself fail (a storage error before any request);
+// claimLost makes it return false, standing in for a concurrent pass that won the
+// same anchor.
+// claimExpected and releaseRestored record the prior-value argument of each call,
+// so a test can assert the claim is compared against — and the release restores —
+// the watermark the pass's snapshot actually carried.
+// claimEpochs records the revocation epoch each claim was handed, so a test can
+// assert the pass pins the epoch its OWN snapshot carried — the value the
+// repository compares a revocation against — rather than a constant or a fresher
+// re-read that would agree with whatever the revocation just wrote.
+//
+// marked models the webhook_last_delivered_at COLUMN (migration 039) rather than
+// just recording calls, so a test can read the row mid-pass and see NULL where
+// the real column would be NULL. deliveryMarks records every call including the
+// ones the modelled compare-and-set refuses, which is how a test tells "not
+// called" apart from "called and correctly discarded". epochs, when set, is the
+// stored revocation epoch per owner: a mark whose configVersion no longer
+// matches it is discarded exactly as the repository would discard it. markErr
+// makes the mark write fail after the delivery already succeeded.
 type stubNotifyRepo struct {
-	records      []models.WebhookNotifyRecord
-	listErr      error
-	watermarkErr error
-	mu           sync.Mutex
-	watermarks   []watermarkWrite
+	records         []models.WebhookNotifyRecord
+	listErr         error
+	claimErr        error
+	claimLost       bool
+	releaseErr      error
+	markErr         error
+	epochs          map[uint]int
+	mu              sync.Mutex
+	watermarks      []watermarkWrite
+	releases        []watermarkWrite
+	claimExpected   []*time.Time
+	claimEpochs     []int
+	releaseRestored []*time.Time
+	deliveryMarks   []deliveryMark
+	marked          map[uint]time.Time
+}
+
+// deliveryMark records one MarkWebhookDelivered call, refused or not.
+type deliveryMark struct {
+	userID        uint
+	at            time.Time
+	configVersion int
 }
 
 func (stub *stubNotifyRepo) ListAllForNotify(context.Context) ([]models.WebhookNotifyRecord, error) {
@@ -90,11 +181,75 @@ func (stub *stubNotifyRepo) ListAllForNotify(context.Context) ([]models.WebhookN
 	return stub.records, nil
 }
 
-func (stub *stubNotifyRepo) UpdateWebhookWatermark(_ context.Context, userID uint, reminderType string, anchor time.Time) error {
+func (stub *stubNotifyRepo) ClaimWebhookWatermark(_ context.Context, userID uint, reminderType string, anchor time.Time, previous *time.Time, configVersion int) (bool, error) {
 	stub.mu.Lock()
 	defer stub.mu.Unlock()
+	stub.claimExpected = append(stub.claimExpected, previous)
+	stub.claimEpochs = append(stub.claimEpochs, configVersion)
+	if stub.claimErr != nil {
+		return false, stub.claimErr
+	}
+	if stub.claimLost {
+		return false, nil
+	}
 	stub.watermarks = append(stub.watermarks, watermarkWrite{userID: userID, reminderType: reminderType, anchor: anchor})
-	return stub.watermarkErr
+	return true, nil
+}
+
+func (stub *stubNotifyRepo) ReleaseWebhookWatermark(_ context.Context, userID uint, reminderType string, anchor time.Time, previous *time.Time) error {
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	stub.releaseRestored = append(stub.releaseRestored, previous)
+	stub.releases = append(stub.releases, watermarkWrite{userID: userID, reminderType: reminderType, anchor: anchor})
+	for i := len(stub.watermarks) - 1; i >= 0; i-- {
+		claim := stub.watermarks[i]
+		if claim.userID == userID && claim.reminderType == reminderType && claim.anchor.Equal(anchor) {
+			stub.watermarks = append(stub.watermarks[:i], stub.watermarks[i+1:]...)
+			break
+		}
+	}
+	return stub.releaseErr
+}
+
+func (stub *stubNotifyRepo) MarkWebhookDelivered(_ context.Context, userID uint, deliveredAt time.Time, configVersion int) error {
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	stub.deliveryMarks = append(stub.deliveryMarks, deliveryMark{userID: userID, at: deliveredAt, configVersion: configVersion})
+	if stub.markErr != nil {
+		return stub.markErr
+	}
+	// The modelled column carries the repository's own compare-and-set: the
+	// pinned epoch must still be the stored one, and the stamp must move forward.
+	if stub.epochs != nil {
+		if stored, known := stub.epochs[userID]; known && stored != configVersion {
+			return nil
+		}
+	}
+	if stub.marked == nil {
+		stub.marked = map[uint]time.Time{}
+	}
+	if existing, ok := stub.marked[userID]; ok && !deliveredAt.After(existing) {
+		return nil
+	}
+	stub.marked[userID] = deliveredAt
+	return nil
+}
+
+// markedAt reports the modelled webhook_last_delivered_at of one owner; the
+// second return is false while the column would still be NULL.
+func (stub *stubNotifyRepo) markedAt(userID uint) (time.Time, bool) {
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	at, ok := stub.marked[userID]
+	return at, ok
+}
+
+func (stub *stubNotifyRepo) marks() []deliveryMark {
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	out := make([]deliveryMark, len(stub.deliveryMarks))
+	copy(out, stub.deliveryMarks)
+	return out
 }
 
 func (stub *stubNotifyRepo) writes() []watermarkWrite {
@@ -102,6 +257,14 @@ func (stub *stubNotifyRepo) writes() []watermarkWrite {
 	defer stub.mu.Unlock()
 	out := make([]watermarkWrite, len(stub.watermarks))
 	copy(out, stub.watermarks)
+	return out
+}
+
+func (stub *stubNotifyRepo) released() []watermarkWrite {
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	out := make([]watermarkWrite, len(stub.releases))
+	copy(out, stub.releases)
 	return out
 }
 
@@ -131,6 +294,20 @@ func periodStartLog(userID uint, day time.Time) models.DailyLog {
 	}
 }
 
+// completedCycleStartLogs returns the owner's current cycle start plus the
+// three previous starts, each one 28-day cycle earlier. The ovulation reminder
+// is withheld until three cycles have been observed (FertilityProjectionSuppressed),
+// and starts a full cycle apart observe the same 28 days the record carries, so
+// every projected date stays where the case pins it.
+func completedCycleStartLogs(userID uint, day time.Time) []models.DailyLog {
+	return []models.DailyLog{
+		periodStartLog(userID, day.AddDate(0, 0, -84)),
+		periodStartLog(userID, day.AddDate(0, 0, -56)),
+		periodStartLog(userID, day.AddDate(0, 0, -28)),
+		periodStartLog(userID, day),
+	}
+}
+
 // dueRecord returns a notify record for a regular 28-day owner whose last period
 // started lastPeriodDaysAgo before now, with webhook delivery on and the given
 // ciphertext-of-record URL token. With a 28-day cycle and lastPeriodDaysAgo=26,
@@ -153,7 +330,7 @@ func dueRecord(id uint, urlToken string, now time.Time, lastPeriodDaysAgo int) m
 }
 
 func newTestNotifyService(repo *stubNotifyRepo, logs stubLogReader, decryptor stubDecryptor, deliverer WebhookDeliverer) *WebhookNotifyService {
-	return NewWebhookNotifyService(repo, logs, decryptor, deliverer, stubDisclaimer{text: "These are estimates, not medical advice or a method of contraception."})
+	return NewWebhookNotifyService(repo, logs, decryptor, deliverer, stubDisclaimer{text: "Predictions are estimates, not medical advice or a method of contraception."})
 }
 
 // --- tests ------------------------------------------------------------------
@@ -258,12 +435,26 @@ func TestNotifyCrossOwnerHealthDataStaysScoped(t *testing.T) {
 }
 
 // TestNotifyDisclaimerPresentInEveryPayload proves the mandatory medical-safety
-// disclaimer rides in every delivered payload.
+// disclaimer rides in every delivered payload. It is the invariant's only
+// carrier — buildPayload sets Disclaimer unconditionally, and there is no
+// per-reminder flag a producer could forget — so it drives BOTH reminder kinds:
+// one owner whose next period is inside the lead window and one whose ovulation
+// is, with the kinds asserted present so the sweep cannot go quiet by delivering
+// only one of them.
 func TestNotifyDisclaimerPresentInEveryPayload(t *testing.T) {
 	now := time.Date(2026, 3, 12, 9, 0, 0, 0, time.UTC)
-	record := dueRecord(1, "https://a.example/hook", now, 26)
-	repo := &stubNotifyRepo{records: []models.WebhookNotifyRecord{record}}
-	logs := stubLogReader{byUser: map[uint][]models.DailyLog{1: {periodStartLog(1, *record.LastPeriodStart)}}}
+	periodOwner := dueRecord(1, "https://a.example/hook", now, 26)
+	periodOwner.WebhookNotifyOvulation = true
+	ovulationOwner := dueRecord(2, "https://b.example/hook", now, 12)
+	ovulationOwner.WebhookNotifyOvulation = true
+
+	repo := &stubNotifyRepo{records: []models.WebhookNotifyRecord{periodOwner, ovulationOwner}}
+	logs := stubLogReader{byUser: map[uint][]models.DailyLog{
+		1: {periodStartLog(1, *periodOwner.LastPeriodStart)},
+		// The ovulation reminder is withheld until one cycle has been observed
+		// (FertilityProjectionSuppressed), so this owner carries a completed one.
+		2: completedCycleStartLogs(2, *ovulationOwner.LastPeriodStart),
+	}}
 	deliverer := &stubDeliverer{}
 	service := newTestNotifyService(repo, logs, stubDecryptor{}, deliverer)
 
@@ -271,12 +462,16 @@ func TestNotifyDisclaimerPresentInEveryPayload(t *testing.T) {
 		t.Fatalf("RunOnce: %v", err)
 	}
 	deliveries := deliverer.deliveries()
-	if len(deliveries) == 0 {
-		t.Fatal("expected at least one delivery")
-	}
+	seenKinds := map[string]bool{}
 	for _, delivery := range deliveries {
+		seenKinds[delivery.payload.Type] = true
 		if !strings.Contains(delivery.payload.Disclaimer, "not medical advice or a method of contraception") {
-			t.Fatalf("payload missing disclaimer: %q", delivery.payload.Disclaimer)
+			t.Fatalf("payload of type %q missing disclaimer: %q", delivery.payload.Type, delivery.payload.Disclaimer)
+		}
+	}
+	for _, kind := range []string{DueReminderTypePeriod, DueReminderTypeOvulation} {
+		if !seenKinds[kind] {
+			t.Fatalf("anchor: expected a %q delivery, got kinds %v", kind, seenKinds)
 		}
 	}
 }
@@ -399,6 +594,141 @@ func TestNotifyRetriesAfterFailure(t *testing.T) {
 	}
 	if report2.Sent != 1 {
 		t.Fatalf("retry pass expected sent=1, got %d", report2.Sent)
+	}
+}
+
+// notifyDay builds a UTC calendar day for the resume timeline below.
+func notifyDay(year int, month time.Month, day int) time.Time {
+	return time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
+}
+
+// overdueResumeRecord is the owner of the resume timeline: a regular 28-day
+// account with period reminders on and a 3-day lead, anchored at the given last
+// period start and carrying the watermark a previous pass would have written.
+func overdueResumeRecord(lastPeriodStart time.Time, periodWatermark *time.Time) models.WebhookNotifyRecord {
+	anchor := lastPeriodStart
+	return models.WebhookNotifyRecord{
+		ID:                              1,
+		CycleLength:                     28,
+		PeriodLength:                    5,
+		LutealPhase:                     14,
+		LastPeriodStart:                 &anchor,
+		WebhookEnabled:                  true,
+		WebhookURL:                      "https://a.example/hook",
+		WebhookNotifyPeriod:             true,
+		WebhookNotifyOvulation:          false,
+		ReminderLeadDays:                3,
+		WebhookPeriodLastSentCycleStart: periodWatermark,
+	}
+}
+
+// runOverdueResumePass runs one notify pass over a single owner and returns the
+// report together with the stubs, so the caller can assert on deliveries and
+// watermark writes.
+func runOverdueResumePass(t *testing.T, record models.WebhookNotifyRecord, dayLogs []models.DailyLog, now time.Time) (NotifyReport, *stubNotifyRepo, *stubDeliverer) {
+	t.Helper()
+	repo := &stubNotifyRepo{records: []models.WebhookNotifyRecord{record}}
+	deliverer := &stubDeliverer{}
+	service := newTestNotifyService(repo, stubLogReader{byUser: map[uint][]models.DailyLog{1: dayLogs}}, stubDecryptor{}, deliverer)
+	report, err := service.RunOnce(context.Background(), now, time.UTC, false)
+	if err != nil {
+		t.Fatalf("RunOnce at %s: %v", now.Format("2006-01-02"), err)
+	}
+	return report, repo, deliverer
+}
+
+// TestNotifyOverdueCycleLeavesNoWatermarkAndResumesOnce walks the whole idempotency
+// story an overdue cycle used to break, as four passes over one owner.
+//
+// The watermark is keyed on the PREDICTED next-period date, which is also the
+// reminder's cycle anchor. While a cycle ran past its reference length the
+// projection used to roll forward one whole cycle at a time, and before the
+// overdue gate every roll produced an anchor no watermark covered and re-armed a
+// fresh "period soon" send — once per invented cycle, for as long as the cycle
+// stayed open. The period now stays on the running cycle; the gate still owns
+// what an overdue pass may compute and write.
+//
+//   - 2026-03-23, cycle day 26: the honest reminder for 2026-03-26 is sent and its
+//     watermark written.
+//   - 2026-04-20, cycle day 54: the account is overdue — nothing is computed,
+//     nothing is sent, AND nothing is written, so the watermark still points at
+//     2026-03-26. That is the resume path: an overdue pass that wrote a watermark
+//     would have consumed the next real cycle's key.
+//   - 2026-05-27, after the owner logs the real cycle start on 2026-05-02: the
+//     reminder for the start window around 2026-05-30 fires exactly once past
+//     the stale 2026-03-26 watermark, and advances it to the window's first day.
+//   - Same day, with the advanced watermark: nothing again.
+func TestNotifyOverdueCycleLeavesNoWatermarkAndResumesOnce(t *testing.T) {
+	anchor := notifyDay(2026, time.February, 26)
+	history := []models.DailyLog{
+		periodStartLog(1, notifyDay(2025, time.December, 4)),
+		periodStartLog(1, notifyDay(2026, time.January, 1)),
+		periodStartLog(1, notifyDay(2026, time.January, 29)),
+		periodStartLog(1, anchor),
+	}
+
+	// Pass 1 — inside the reference length: the estimate is honest and is sent.
+	report1, repo1, deliverer1 := runOverdueResumePass(t, overdueResumeRecord(anchor, nil), history, notifyDay(2026, time.March, 23))
+	if report1.Sent != 1 {
+		t.Fatalf("pass 1 expected one honest reminder sent, got sent=%d due=%d", report1.Sent, report1.Due)
+	}
+	writes1 := repo1.writes()
+	if len(writes1) != 1 {
+		t.Fatalf("pass 1 expected one watermark write, got %d", len(writes1))
+	}
+	firstWatermark := writes1[0].anchor
+	if got := firstWatermark.Format("2006-01-02"); got != "2026-03-26" {
+		t.Fatalf("pass 1 watermark = %s, want the predicted 2026-03-26", got)
+	}
+	if got := deliverer1.deliveries()[0].payload.EventDate; got != "2026-03-26" {
+		t.Fatalf("pass 1 delivered event date = %s, want 2026-03-26", got)
+	}
+
+	// Pass 2 — the period never came and the cycle is overdue: no candidate at all.
+	report2, repo2, deliverer2 := runOverdueResumePass(t, overdueResumeRecord(anchor, &firstWatermark), history, notifyDay(2026, time.April, 20))
+	if report2.Due != 0 || report2.Sent != 0 {
+		t.Fatalf("pass 2 must compute nothing for an overdue cycle, got due=%d sent=%d", report2.Due, report2.Sent)
+	}
+	if len(deliverer2.deliveries()) != 0 {
+		t.Fatalf("pass 2 delivered a phantom reminder: %#v", deliverer2.deliveries())
+	}
+	if len(repo2.writes()) != 0 {
+		t.Fatalf("pass 2 wrote a watermark for a reminder it never sent: %#v", repo2.writes())
+	}
+	if report2.SkippedIdempotent != 0 {
+		t.Fatalf("pass 2 should have no candidate at all, not one hidden by a watermark (skipped=%d)", report2.SkippedIdempotent)
+	}
+
+	// Pass 3 — the owner logs the real cycle start. The stale watermark still
+	// names 2026-03-26, so the new cycle's reminder is free to fire once.
+	resumed := notifyDay(2026, time.May, 2)
+	resumedLogs := append(append([]models.DailyLog{}, history...), periodStartLog(1, resumed))
+	report3, repo3, deliverer3 := runOverdueResumePass(t, overdueResumeRecord(resumed, &firstWatermark), resumedLogs, notifyDay(2026, time.May, 27))
+	if report3.Sent != 1 {
+		t.Fatalf("pass 3 expected exactly one reminder after the real cycle start, got sent=%d due=%d", report3.Sent, report3.Due)
+	}
+	writes3 := repo3.writes()
+	if len(writes3) != 1 {
+		t.Fatalf("pass 3 expected one watermark write, got %d", len(writes3))
+	}
+	// The 65-day cycle now in the history gives the new cycle a start window
+	// around its 2026-05-30 median, so the reminder carries the window the
+	// dashboard prints, keyed on the window's first day.
+	resumedWatermark := writes3[0].anchor
+	if got := resumedWatermark.Format("2006-01-02"); got != "2026-05-25" {
+		t.Fatalf("pass 3 watermark = %s, want the new cycle's window start 2026-05-25", got)
+	}
+	if got := deliverer3.deliveries()[0].payload; got.EventDate != "2026-05-25" || got.EventDateEnd != "2026-06-04" {
+		t.Fatalf("pass 3 delivered %s..%s, want the window 2026-05-25..2026-06-04", got.EventDate, got.EventDateEnd)
+	}
+
+	// Pass 4 — the same day again: exactly once means once.
+	report4, repo4, deliverer4 := runOverdueResumePass(t, overdueResumeRecord(resumed, &resumedWatermark), resumedLogs, notifyDay(2026, time.May, 27))
+	if report4.Sent != 0 || len(deliverer4.deliveries()) != 0 {
+		t.Fatalf("pass 4 must send nothing, got sent=%d deliveries=%d", report4.Sent, len(deliverer4.deliveries()))
+	}
+	if len(repo4.writes()) != 0 {
+		t.Fatalf("pass 4 wrote a watermark despite sending nothing: %#v", repo4.writes())
 	}
 }
 
@@ -558,14 +888,151 @@ func TestNotifySkipsOwnerWhenLogReadFails(t *testing.T) {
 	}
 }
 
-// TestNotifyWatermarkWriteFailureStillCountsSent proves the delivery-vs-watermark
-// split: a watermark write that fails AFTER a successful 2xx is logged but does
-// NOT turn the send into a failure — the reminder was delivered, so it counts as
-// sent (a stuck watermark would at worst re-send next pass, never lose data).
-func TestNotifyWatermarkWriteFailureStillCountsSent(t *testing.T) {
+// TestNotifyClaimFailureDeliversNothing proves the claim is a precondition of the
+// request, not bookkeeping around it: when the claim cannot be taken (a storage
+// error), NOTHING is delivered. Counting it as failed is what an operator needs —
+// the reminder is still pending and the next pass retries it.
+func TestNotifyClaimFailureDeliversNothing(t *testing.T) {
 	now := time.Date(2026, 3, 12, 9, 0, 0, 0, time.UTC)
 	record := dueRecord(1, "https://a.example/hook", now, 26)
-	repo := &stubNotifyRepo{records: []models.WebhookNotifyRecord{record}, watermarkErr: errors.New("watermark write failed")}
+	repo := &stubNotifyRepo{records: []models.WebhookNotifyRecord{record}, claimErr: errors.New("watermark claim failed")}
+	logs := stubLogReader{byUser: map[uint][]models.DailyLog{1: {periodStartLog(1, *record.LastPeriodStart)}}}
+	deliverer := &stubDeliverer{}
+	service := newTestNotifyService(repo, logs, stubDecryptor{}, deliverer)
+
+	report, err := service.RunOnce(context.Background(), now, time.UTC, false)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if len(deliverer.deliveries()) != 0 {
+		t.Fatalf("an unclaimed reminder must never be delivered, deliveries=%d", len(deliverer.deliveries()))
+	}
+	if report.Sent != 0 || report.Failed != 1 {
+		t.Fatalf("expected sent=0 failed=1 for an unclaimable reminder, got sent=%d failed=%d", report.Sent, report.Failed)
+	}
+	if len(report.OwnerIDsFailed) != 1 || report.OwnerIDsFailed[0] != 1 {
+		t.Fatalf("expected owner 1 flagged as failed, got %v", report.OwnerIDsFailed)
+	}
+}
+
+// TestNotifyLostClaimSkipsWithoutDelivering proves the losing side of the race:
+// when a concurrent pass already owns the (owner, kind, anchor), this pass makes
+// NO outbound request and accounts the reminder as skipped-idempotent — the
+// reminder is being delivered, just not by this pass, so it is not a failure.
+func TestNotifyLostClaimSkipsWithoutDelivering(t *testing.T) {
+	now := time.Date(2026, 3, 12, 9, 0, 0, 0, time.UTC)
+	record := dueRecord(1, "https://a.example/hook", now, 26)
+	repo := &stubNotifyRepo{records: []models.WebhookNotifyRecord{record}, claimLost: true}
+	logs := stubLogReader{byUser: map[uint][]models.DailyLog{1: {periodStartLog(1, *record.LastPeriodStart)}}}
+	deliverer := &stubDeliverer{}
+	service := newTestNotifyService(repo, logs, stubDecryptor{}, deliverer)
+
+	report, err := service.RunOnce(context.Background(), now, time.UTC, false)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if report.Due != 1 {
+		t.Fatalf("the decision still computes the reminder as due, due=%d", report.Due)
+	}
+	if len(deliverer.deliveries()) != 0 {
+		t.Fatalf("a lost claim must not deliver, deliveries=%d", len(deliverer.deliveries()))
+	}
+	if report.Sent != 0 || report.Failed != 0 {
+		t.Fatalf("a lost claim is neither a send nor a failure, sent=%d failed=%d", report.Sent, report.Failed)
+	}
+	if report.SkippedIdempotent != 1 {
+		t.Fatalf("a lost claim must be accounted skipped-idempotent, skipped=%d", report.SkippedIdempotent)
+	}
+}
+
+// TestNotifyFailedDeliveryReleasesTheClaim proves the retry semantics survive the
+// claim: a failed POST hands the claim back, keyed on the same (owner, kind,
+// anchor), so the watermark is left where the pass found it and the reminder
+// stays retryable instead of turning into a permanent skip.
+func TestNotifyFailedDeliveryReleasesTheClaim(t *testing.T) {
+	now := time.Date(2026, 3, 12, 9, 0, 0, 0, time.UTC)
+	record := dueRecord(1, "https://a.example/hook", now, 26)
+	repo := &stubNotifyRepo{records: []models.WebhookNotifyRecord{record}}
+	logs := stubLogReader{byUser: map[uint][]models.DailyLog{1: {periodStartLog(1, *record.LastPeriodStart)}}}
+	deliverer := &stubDeliverer{failEvery: true}
+	service := newTestNotifyService(repo, logs, stubDecryptor{}, deliverer)
+
+	report, err := service.RunOnce(context.Background(), now, time.UTC, false)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if report.Failed != 1 || report.Sent != 0 {
+		t.Fatalf("expected failed=1 sent=0, got failed=%d sent=%d", report.Failed, report.Sent)
+	}
+	releases := repo.released()
+	if len(releases) != 1 {
+		t.Fatalf("a failed delivery must release its claim exactly once, got %d releases", len(releases))
+	}
+	if releases[0].userID != 1 || releases[0].reminderType != DueReminderTypePeriod {
+		t.Fatalf("release must name the claimed owner and kind, got %+v", releases[0])
+	}
+	if len(repo.writes()) != 0 {
+		t.Fatal("after the release the watermark must stand exactly where the pass found it")
+	}
+}
+
+// TestNotifyClaimsAgainstTheWatermarkItsSnapshotCarried proves the pass hands the
+// compare-and-set the value it actually read, not nil and not the anchor. That
+// argument is what makes a stale pass lose instead of writing the watermark
+// backwards, and it is what a release restores — so the release must be given the
+// SAME value, which is exactly what the claim replaced.
+func TestNotifyClaimsAgainstTheWatermarkItsSnapshotCarried(t *testing.T) {
+	// An owner whose previous cycle's reminder was already sent: the snapshot
+	// carries a watermark, and the reminder now due belongs to a later cycle.
+	anchor := notifyDay(2026, time.February, 26)
+	stale := notifyDay(2026, time.January, 29)
+	history := []models.DailyLog{
+		periodStartLog(1, notifyDay(2026, time.January, 1)),
+		periodStartLog(1, stale),
+		periodStartLog(1, anchor),
+	}
+	record := overdueResumeRecord(anchor, &stale)
+
+	repo := &stubNotifyRepo{records: []models.WebhookNotifyRecord{record}}
+	deliverer := &stubDeliverer{failEvery: true}
+	service := newTestNotifyService(repo, stubLogReader{byUser: map[uint][]models.DailyLog{1: history}}, stubDecryptor{}, deliverer)
+
+	report, err := service.RunOnce(context.Background(), notifyDay(2026, time.March, 23), time.UTC, false)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if report.Due != 1 {
+		t.Fatalf("expected one due reminder for this timeline, got due=%d", report.Due)
+	}
+
+	if len(repo.claimExpected) != 1 {
+		t.Fatalf("expected exactly one claim, got %d", len(repo.claimExpected))
+	}
+	if repo.claimExpected[0] == nil || !repo.claimExpected[0].Equal(stale) {
+		t.Fatalf("the claim must compare against the snapshot's watermark %s, got %v", stale, repo.claimExpected[0])
+	}
+	if len(repo.releaseRestored) != 1 {
+		t.Fatalf("the failed delivery must release its claim exactly once, got %d", len(repo.releaseRestored))
+	}
+	if repo.releaseRestored[0] == nil || !repo.releaseRestored[0].Equal(stale) {
+		t.Fatalf("the release must restore what the claim replaced (%s), got %v", stale, repo.releaseRestored[0])
+	}
+}
+
+// TestNotifyClaimsAgainstTheRevocationEpochItsSnapshotCarried is the wiring half
+// of the revocation guard (finding PRIV-1 / SEC-01). The repository refuses a
+// claim whose epoch has been overtaken, but that refusal is only reachable if the
+// pass hands it the epoch from the SAME snapshot everything else about this send
+// came from — the enabled flag, the per-kind opt-in, and the URL it is about to
+// POST to. A pass passing a constant, or re-reading a fresher value at claim
+// time, would agree with whatever a revocation had just written: the check would
+// still be present in the SQL and inert in practice.
+func TestNotifyClaimsAgainstTheRevocationEpochItsSnapshotCarried(t *testing.T) {
+	now := time.Date(2026, 3, 12, 9, 0, 0, 0, time.UTC)
+	record := dueRecord(1, "https://a.example/hook", now, 26)
+	// A value no zero-valued field and no counter starting at one could produce.
+	record.WebhookConfigVersion = 7
+	repo := &stubNotifyRepo{records: []models.WebhookNotifyRecord{record}}
 	logs := stubLogReader{byUser: map[uint][]models.DailyLog{1: {periodStartLog(1, *record.LastPeriodStart)}}}
 	deliverer := &stubDeliverer{}
 	service := newTestNotifyService(repo, logs, stubDecryptor{}, deliverer)
@@ -575,10 +1042,36 @@ func TestNotifyWatermarkWriteFailureStillCountsSent(t *testing.T) {
 		t.Fatalf("RunOnce: %v", err)
 	}
 	if report.Sent != 1 {
-		t.Fatalf("a delivered reminder counts as sent even when the watermark write fails, sent=%d", report.Sent)
+		t.Fatalf("expected the reminder to be delivered, got sent=%d", report.Sent)
 	}
-	if report.Failed != 0 {
-		t.Fatalf("a watermark write failure is not a delivery failure, failed=%d", report.Failed)
+	if len(repo.claimEpochs) != 1 {
+		t.Fatalf("expected exactly one claim, got %d", len(repo.claimEpochs))
+	}
+	if repo.claimEpochs[0] != record.WebhookConfigVersion {
+		t.Fatalf("the claim must pin the snapshot's revocation epoch %d, got %d", record.WebhookConfigVersion, repo.claimEpochs[0])
+	}
+}
+
+// TestNotifyReleaseFailureStillReportsTheFailedDelivery proves a release that
+// itself errors does not change the pass's accounting: the delivery failed and is
+// reported as failed, nothing is delivered twice, and the pass continues.
+func TestNotifyReleaseFailureStillReportsTheFailedDelivery(t *testing.T) {
+	now := time.Date(2026, 3, 12, 9, 0, 0, 0, time.UTC)
+	record := dueRecord(1, "https://a.example/hook", now, 26)
+	repo := &stubNotifyRepo{records: []models.WebhookNotifyRecord{record}, releaseErr: errors.New("release failed")}
+	logs := stubLogReader{byUser: map[uint][]models.DailyLog{1: {periodStartLog(1, *record.LastPeriodStart)}}}
+	deliverer := &stubDeliverer{failEvery: true}
+	service := newTestNotifyService(repo, logs, stubDecryptor{}, deliverer)
+
+	report, err := service.RunOnce(context.Background(), now, time.UTC, false)
+	if err != nil {
+		t.Fatalf("a release failure must not fail the pass: %v", err)
+	}
+	if report.Failed != 1 || report.Sent != 0 {
+		t.Fatalf("expected failed=1 sent=0, got failed=%d sent=%d", report.Failed, report.Sent)
+	}
+	if len(deliverer.deliveries()) != 1 {
+		t.Fatalf("expected exactly one attempted delivery, got %d", len(deliverer.deliveries()))
 	}
 }
 
@@ -610,7 +1103,7 @@ func TestNotifyDeliversOvulationReminderCopy(t *testing.T) {
 	now := time.Date(2026, 3, 12, 9, 0, 0, 0, time.UTC)
 	record := ovulationDueRecord(1, "https://a.example/hook", now)
 	repo := &stubNotifyRepo{records: []models.WebhookNotifyRecord{record}}
-	logs := stubLogReader{byUser: map[uint][]models.DailyLog{1: {periodStartLog(1, *record.LastPeriodStart)}}}
+	logs := stubLogReader{byUser: map[uint][]models.DailyLog{1: completedCycleStartLogs(1, *record.LastPeriodStart)}}
 	deliverer := &stubDeliverer{}
 	service := newTestNotifyService(repo, logs, stubDecryptor{}, deliverer)
 
@@ -663,8 +1156,15 @@ func TestAppendUniqueID(t *testing.T) {
 }
 
 // TestResolveOwnerLocationPrefersPersistedTimezone proves the per-owner timezone
-// resolution: a valid persisted IANA zone is used; an invalid one falls back to
-// the server location; an empty one falls back too.
+// resolution shared by both request-free egress passes (the webhook notify pass
+// and the .ics calendar feed): a valid persisted IANA zone is used; an invalid
+// one falls back to the injected location; an empty one falls back too.
+//
+// "Local" is a separate arm because it is the one bad value that does NOT fail to
+// load: time.LoadLocation("Local") returns time.Local with no error, so without an
+// input-side rejection a stored "Local" would pin the owner to the server's zone
+// instead of falling back. Identity with the fallback is asserted rather than a
+// name, since time.Local stringifies to the host's real zone name when TZ is set.
 func TestResolveOwnerLocationPrefersPersistedTimezone(t *testing.T) {
 	fallback := time.UTC
 
@@ -681,6 +1181,11 @@ func TestResolveOwnerLocationPrefersPersistedTimezone(t *testing.T) {
 	}
 	if got := resolveOwnerLocation("   ", fallback); got != fallback {
 		t.Fatalf("empty persisted zone should fall back to server location, got %q", got.String())
+	}
+	for _, localToken := range []string{"Local", "local", " LOCAL "} {
+		if got := resolveOwnerLocation(localToken, fallback); got != fallback {
+			t.Fatalf("the %q token must fall back to the injected location, got %q", localToken, got.String())
+		}
 	}
 }
 
@@ -750,40 +1255,44 @@ func TestNotifyDecisionMatchesDashboardWithInferredLutealPhase(t *testing.T) {
 	// placed so each completed cycle's observed luteal length is 11 days (rise
 	// starts 11 days before the next cycle's start), inferring luteal=11 overall.
 	// The current (third) cycle has no BBT yet, matching a real in-progress cycle.
+	// A fourth, earlier start without BBT makes three completed cycles — the
+	// history the ovulation reminder needs — and leaves the inference to the two
+	// cycles that carry a rise.
 	logs := []models.DailyLog{
-		{Date: day("2025-01-01"), IsPeriod: true, Flow: models.FlowMedium},
-		{Date: day("2025-01-29"), IsPeriod: true, Flow: models.FlowMedium},
-		{Date: day("2025-02-26"), IsPeriod: true, Flow: models.FlowMedium},
+		{Date: day("2024-12-04"), IsPeriod: true, CycleStart: true, Flow: models.FlowMedium},
+		{Date: day("2025-01-01"), IsPeriod: true, CycleStart: true, Flow: models.FlowMedium},
+		{Date: day("2025-01-29"), IsPeriod: true, CycleStart: true, Flow: models.FlowMedium},
+		{Date: day("2025-02-26"), IsPeriod: true, CycleStart: true, Flow: models.FlowMedium},
 
-		// Cycle 1 (Jan1→Jan29): coverline window Jan1-6, rise Jan19-21 →
-		// ovulation Jan18 (day before first high), luteal = Jan29-Jan18 = 11.
-		{Date: day("2025-01-01"), BBT: models.NewBBT(36.20)},
-		{Date: day("2025-01-02"), BBT: models.NewBBT(36.20)},
-		{Date: day("2025-01-03"), BBT: models.NewBBT(36.20)},
-		{Date: day("2025-01-04"), BBT: models.NewBBT(36.20)},
-		{Date: day("2025-01-05"), BBT: models.NewBBT(36.20)},
-		{Date: day("2025-01-06"), BBT: models.NewBBT(36.20)},
-		{Date: day("2025-01-19"), BBT: models.NewBBT(36.50)},
-		{Date: day("2025-01-20"), BBT: models.NewBBT(36.50)},
-		{Date: day("2025-01-21"), BBT: models.NewBBT(36.50)},
+		// Cycle 1 (Jan1→Jan29, 28 days): coverline window Jan1-6, rise Jan19-21 →
+		// ovulation Jan18 (day before first high) = cycle day 18, luteal = 28-18 = 10.
+		{Date: day("2025-01-01"), BBT: new(36.20)},
+		{Date: day("2025-01-02"), BBT: new(36.20)},
+		{Date: day("2025-01-03"), BBT: new(36.20)},
+		{Date: day("2025-01-04"), BBT: new(36.20)},
+		{Date: day("2025-01-05"), BBT: new(36.20)},
+		{Date: day("2025-01-06"), BBT: new(36.20)},
+		{Date: day("2025-01-19"), BBT: new(36.50)},
+		{Date: day("2025-01-20"), BBT: new(36.50)},
+		{Date: day("2025-01-21"), BBT: new(36.50)},
 
-		// Cycle 2 (Jan29→Feb26): coverline window Jan29-Feb3, rise Feb16-18 →
-		// ovulation Feb15, luteal = Feb26-Feb15 = 11.
-		{Date: day("2025-01-29"), BBT: models.NewBBT(36.20)},
-		{Date: day("2025-01-30"), BBT: models.NewBBT(36.20)},
-		{Date: day("2025-01-31"), BBT: models.NewBBT(36.20)},
-		{Date: day("2025-02-01"), BBT: models.NewBBT(36.20)},
-		{Date: day("2025-02-02"), BBT: models.NewBBT(36.20)},
-		{Date: day("2025-02-03"), BBT: models.NewBBT(36.20)},
-		{Date: day("2025-02-16"), BBT: models.NewBBT(36.50)},
-		{Date: day("2025-02-17"), BBT: models.NewBBT(36.50)},
-		{Date: day("2025-02-18"), BBT: models.NewBBT(36.50)},
+		// Cycle 2 (Jan29→Feb26, 28 days): coverline window Jan29-Feb3, rise Feb16-18 →
+		// ovulation Feb15 = cycle day 18, luteal = 28-18 = 10.
+		{Date: day("2025-01-29"), BBT: new(36.20)},
+		{Date: day("2025-01-30"), BBT: new(36.20)},
+		{Date: day("2025-01-31"), BBT: new(36.20)},
+		{Date: day("2025-02-01"), BBT: new(36.20)},
+		{Date: day("2025-02-02"), BBT: new(36.20)},
+		{Date: day("2025-02-03"), BBT: new(36.20)},
+		{Date: day("2025-02-16"), BBT: new(36.50)},
+		{Date: day("2025-02-17"), BBT: new(36.50)},
+		{Date: day("2025-02-18"), BBT: new(36.50)},
 	}
 
-	// now = Feb26 + 15 days: with a 28-day cycle and the inferred 11-day luteal
-	// phase, ovulation is projected at Feb26+17 = Mar15 — 2 days out, inside a
-	// 3-day lead window. The record's own stored LutealPhase (14) is
-	// deliberately different from the inferred value (11), so the assertion
+	// now = Feb26 + 15 days: with a 28-day cycle and the inferred 10-day luteal
+	// phase, ovulation is projected on cycle day 18 = Feb26+17 = Mar15 — 2 days
+	// out, inside a 3-day lead window. The record's own stored LutealPhase (14)
+	// is deliberately different from the inferred value (10), so the assertion
 	// only passes if the inference actually ran.
 	now := day("2025-02-26").AddDate(0, 0, 15)
 	last := day("2025-02-26")
@@ -815,8 +1324,8 @@ func TestNotifyDecisionMatchesDashboardWithInferredLutealPhase(t *testing.T) {
 		LastPeriodStart: record.LastPeriodStart,
 	}
 	stats := NewStatsService(nil, nil).BuildCycleStatsFromLogs(&fullUser, logs, now, time.UTC)
-	if stats.LutealPhase != 11 {
-		t.Fatalf("test setup: expected dashboard path to infer luteal phase 11, got %d", stats.LutealPhase)
+	if stats.LutealPhase != 10 {
+		t.Fatalf("test setup: expected dashboard path to infer luteal phase 10, got %d", stats.LutealPhase)
 	}
 	today := DateAtLocation(now, time.UTC)
 	cycleLength := DashboardCycleReferenceLength(&fullUser, stats)
@@ -849,5 +1358,71 @@ func TestNotifyUsesOwnerPersistedTimezone(t *testing.T) {
 	}
 	if report.OwnersScanned != 1 {
 		t.Fatalf("expected 1 owner scanned, got %d", report.OwnersScanned)
+	}
+}
+
+// TestNotifyKeepsThePregnancyPauseWhenTomorrowsCycleStartIsLogged pins the one
+// surface that speaks outside the instance to the timeline the owner sees. The
+// notify pass loads the owner's WHOLE stored history, while the dashboard and
+// the .ics feed pass a set already bounded at today; ResolvePregnancyPause lifts
+// a pause on any cycle start later than the positive test and has no today of
+// its own, and manual entry permits a start up to two days ahead. So a positive
+// test today plus a start recorded for tomorrow left the owner reading "paused"
+// on every screen while this pass decided the pregnancy was over and sent
+// period-soon to their endpoint. Nothing may leave, and no watermark may be
+// claimed for what did not leave.
+func TestNotifyKeepsThePregnancyPauseWhenTomorrowsCycleStartIsLogged(t *testing.T) {
+	now := time.Date(2026, 3, 12, 9, 0, 0, 0, time.UTC)
+	today := notifyDay(2026, time.March, 12)
+	record := dueRecord(1, "https://a.example/hook", now, 26)
+
+	history := []models.DailyLog{
+		periodStartLog(1, *record.LastPeriodStart),
+		{UserID: 1, Date: today, PregnancyTest: models.PregnancyTestPositive},
+		// Permitted by manualCycleStartFutureDays (up to two days ahead), and not
+		// part of any timeline that has happened yet.
+		periodStartLog(1, today.AddDate(0, 0, 1)),
+	}
+
+	repo := &stubNotifyRepo{records: []models.WebhookNotifyRecord{record}}
+	deliverer := &stubDeliverer{}
+	service := newTestNotifyService(repo, stubLogReader{byUser: map[uint][]models.DailyLog{1: history}}, stubDecryptor{}, deliverer)
+
+	report, err := service.RunOnce(context.Background(), now, time.UTC, false)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if report.Due != 0 || report.Sent != 0 {
+		t.Fatalf("a paused owner must produce no reminder at all, got due=%d sent=%d", report.Due, report.Sent)
+	}
+	if len(deliverer.deliveries()) != 0 {
+		t.Fatalf("delivered a reminder for a paused owner: %#v", deliverer.deliveries())
+	}
+	if len(repo.writes()) != 0 {
+		t.Fatalf("claimed a watermark for a reminder that never left: %#v", repo.writes())
+	}
+	if report.SkippedIdempotent != 0 {
+		t.Fatalf("the pause is a suppression, not a watermark skip (skipped=%d)", report.SkippedIdempotent)
+	}
+
+	// Control: the same owner, the same instant, with the positive test BEFORE
+	// the recorded cycle start. That is a real resumption, so the pass must speak
+	// — otherwise this case would be green against a pass that had simply
+	// stopped sending anything, or against a fixture that was never due.
+	resumedRecord := dueRecord(1, "https://a.example/hook", now, 26)
+	resumedHistory := []models.DailyLog{
+		{UserID: 1, Date: today.AddDate(0, 0, -30), PregnancyTest: models.PregnancyTestPositive},
+		periodStartLog(1, *resumedRecord.LastPeriodStart),
+	}
+	resumedRepo := &stubNotifyRepo{records: []models.WebhookNotifyRecord{resumedRecord}}
+	resumedDeliverer := &stubDeliverer{}
+	resumedService := newTestNotifyService(resumedRepo, stubLogReader{byUser: map[uint][]models.DailyLog{1: resumedHistory}}, stubDecryptor{}, resumedDeliverer)
+
+	resumedReport, err := resumedService.RunOnce(context.Background(), now, time.UTC, false)
+	if err != nil {
+		t.Fatalf("RunOnce after a real resumption: %v", err)
+	}
+	if resumedReport.Sent == 0 {
+		t.Fatalf("a cycle start already in the past lifts the pause, expected a reminder, got due=%d sent=%d", resumedReport.Due, resumedReport.Sent)
 	}
 }

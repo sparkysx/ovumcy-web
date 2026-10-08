@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"path"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"
@@ -70,7 +72,8 @@ type OIDCClaims struct {
 	Subject       string
 	Email         string
 	EmailVerified bool
-	// IssuedAt is the ID token "iat" claim (always present per RFC).
+	// IssuedAt is the ID token "iat" claim (always present per RFC). It dates
+	// the token, not the sign-in: never use it as step-up freshness proof.
 	IssuedAt time.Time
 	// AuthTime is the ID token "auth_time" claim. Zero when the provider did
 	// not include the claim (it is REQUIRED only when max_age was requested).
@@ -229,7 +232,28 @@ func validateOIDCHTTPSURL(rawURL string, envName string) (*url.URL, error) {
 	if parsedURL.RawQuery != "" || parsedURL.Fragment != "" {
 		return nil, fmt.Errorf("%s must not include query or fragment", envName)
 	}
+	// A non-ASCII host is one HostDialsThisMachine refuses too, but naming it
+	// separately tells the operator the actual fix: spell the host in its ASCII
+	// `xn--` form.
+	if hostHasNonASCII(parsedURL.Hostname()) {
+		return nil, fmt.Errorf("%s host must be ASCII: write an internationalized domain in its xn-- (punycode) form", envName)
+	}
+	if HostDialsThisMachine(parsedURL.Hostname()) {
+		return nil, fmt.Errorf("%s must name a remote host", envName)
+	}
 	return parsedURL, nil
+}
+
+// hostHasNonASCII reports whether host holds any byte outside ASCII — the
+// spelling HostDialsThisMachine refuses because IDNA mapping decides what it
+// dials.
+func hostHasNonASCII(host string) bool {
+	for index := range len(host) {
+		if host[index] >= utf8.RuneSelf {
+			return true
+		}
+	}
+	return false
 }
 
 func (client *OIDCClient) Enabled() bool {
@@ -363,6 +387,13 @@ func (client *OIDCClient) ExchangeCode(ctx context.Context, code string, codeVer
 	if strings.TrimSpace(idToken.Nonce) != strings.TrimSpace(expectedNonce) {
 		return OIDCExchangeResult{}, errors.New("oidc nonce mismatch")
 	}
+	// The (issuer, subject) pair is the whole identity: every lookup and every
+	// link keys on it. A blank subject is not "some user" — it is no user, and a
+	// token carrying one is refused here, before any caller can resolve or bind
+	// an identity by it.
+	if strings.TrimSpace(idToken.Subject) == "" || strings.TrimSpace(idToken.Issuer) == "" {
+		return OIDCExchangeResult{}, errors.New("oidc id_token is missing sub or iss")
+	}
 
 	var claims struct {
 		Email         string `json:"email"`
@@ -422,10 +453,15 @@ func (client *OIDCClient) loadProvider(ctx context.Context) (*oauth2.Config, *oi
 		return nil, nil, fmt.Errorf("discover oidc provider: %w", err)
 	}
 
+	// The sanitizer runs whether or not Claims reports a decode error:
+	// encoding/json keeps filling the remaining fields after a type error, and a
+	// field that already decoded keeps the value it decoded — a document
+	// repeating end_session_endpoint as a cross-origin string and then as a
+	// number errors while leaving that string in place. So a decode error is not
+	// a reason to skip the pins; it is the case that most needs them.
 	metadata := oidcProviderMetadata{}
-	if claimsErr := provider.Claims(&metadata); claimsErr == nil {
-		metadata.EndSessionEndpoint = sanitizeOIDCEndSessionEndpoint(metadata.EndSessionEndpoint, client.config.IssuerURL)
-	}
+	_ = provider.Claims(&metadata)
+	metadata.EndSessionEndpoint = sanitizeOIDCEndSessionEndpoint(metadata.EndSessionEndpoint, client.config.IssuerURL)
 
 	// Pin the discovery-supplied jwks_uri to the issuer origin, mirroring the
 	// end_session_endpoint host-pin above. go-oidc fetches the verification keys
@@ -444,6 +480,16 @@ func (client *OIDCClient) loadProvider(ctx context.Context) (*oauth2.Config, *oi
 	// otherwise exfiltrate both to an attacker host or steer the request at
 	// internal infrastructure (SSRF).
 	if err := validateDiscoveredTokenEndpoint(provider.Endpoint().TokenURL, client.config.IssuerURL); err != nil {
+		return nil, nil, err
+	}
+
+	// Pin the discovery-supplied authorization_endpoint the same way. It is the
+	// browser hop rather than a server-side fetch, and it carries state, nonce,
+	// client_id and redirect_uri: a discovery document naming a foreign origin
+	// here would send the owner to a look-alike sign-in page the issuer never
+	// served, and one naming a host that dials this machine would send the
+	// owner's browser to whatever listens locally on that port.
+	if err := validateDiscoveredAuthorizationEndpoint(provider.Endpoint().AuthURL, client.config.IssuerURL); err != nil {
 		return nil, nil, err
 	}
 
@@ -558,8 +604,9 @@ func isValidProvisioningDomain(rawDomain string) bool {
 // from the same authority that issued the ID token.
 //
 // When issuerURL is empty (constant-time discovery / tests / legacy callers
-// that have no issuer to pin against), the function only enforces the
-// HTTPS-and-no-fragment shape and returns the endpoint unchanged.
+// that have no issuer to pin against), the function enforces the shape alone —
+// HTTPS, no fragment, and a host that does not dial this machine — and returns
+// the endpoint unchanged.
 func sanitizeOIDCEndSessionEndpoint(rawEndpoint string, issuerURL string) string {
 	endpoint := strings.TrimSpace(rawEndpoint)
 	if endpoint == "" {
@@ -570,7 +617,7 @@ func sanitizeOIDCEndSessionEndpoint(rawEndpoint string, issuerURL string) string
 	if err != nil || !parsed.IsAbs() {
 		return ""
 	}
-	if !strings.EqualFold(parsed.Scheme, "https") || parsed.Fragment != "" {
+	if !strings.EqualFold(parsed.Scheme, "https") || parsed.Fragment != "" || HostDialsThisMachine(parsed.Hostname()) {
 		return ""
 	}
 
@@ -638,6 +685,48 @@ func validateDiscoveredTokenEndpoint(tokenEndpoint string, issuerURL string) err
 	return nil
 }
 
+// validateDiscoveredAuthorizationEndpoint pins the discovery-supplied
+// authorization_endpoint to the issuer origin, exactly as jwks_uri and
+// token_endpoint are pinned: an absolute https URL on the same origin (scheme +
+// host + effective port) as the configured issuer, whose host does not dial
+// this machine. An empty endpoint is refused here rather than deferred to the
+// flow, unlike the siblings above: oauth2.Config.AuthCodeURL never validates
+// Endpoint.AuthURL, so an empty one composes the relative
+// "?client_id=…&state=…" and sends the owner back into ovumcy carrying state
+// and nonce instead of failing the sign-in.
+func validateDiscoveredAuthorizationEndpoint(authorizationEndpoint string, issuerURL string) error {
+	endpoint := strings.TrimSpace(authorizationEndpoint)
+	parsed, err := url.Parse(endpoint)
+	if err != nil || !parsed.IsAbs() || !strings.EqualFold(parsed.Scheme, "https") {
+		return errors.New("oidc authorization_endpoint must be an absolute https URL")
+	}
+	if HostDialsThisMachine(parsed.Hostname()) {
+		return errors.New("oidc authorization_endpoint must name a remote host")
+	}
+	parsedIssuer, err := url.Parse(strings.TrimSpace(issuerURL))
+	if err != nil || !parsedIssuer.IsAbs() {
+		return errors.New("oidc issuer URL is invalid")
+	}
+	if !sameOriginURL(parsed, parsedIssuer) {
+		return errors.New("oidc authorization_endpoint origin must match the issuer origin")
+	}
+	return nil
+}
+
+// OnIssuerOrigin reports whether endpoint sits on the configured issuer's
+// origin (scheme + host + effective port) — the same comparison every
+// discovered endpoint is pinned with. It exists for state read back from
+// storage after discovery has already run, such as the provider-logout
+// end-session URL. An issuer that does not parse as an absolute URL pins
+// nothing, so no endpoint is on its origin.
+func OnIssuerOrigin(endpoint *url.URL, issuerURL string) bool {
+	parsedIssuer, err := url.Parse(strings.TrimSpace(issuerURL))
+	if err != nil || !parsedIssuer.IsAbs() {
+		return false
+	}
+	return sameOriginURL(endpoint, parsedIssuer)
+}
+
 func validateOIDCCABundle(path string) error {
 	content, err := readOIDCCABundle(path)
 	if err != nil {
@@ -673,10 +762,11 @@ func newOIDCHTTPClient(config OIDCConfig) *http.Client {
 			}
 		}
 	}
+	transport.MaxResponseHeaderBytes = oidcResponseHeaderLimit
 
 	return &http.Client{
 		Timeout:       defaultOIDCHTTPTimeout,
-		Transport:     transport,
+		Transport:     &oidcBoundedBodyTransport{base: transport, limit: oidcResponseBodyLimit},
 		CheckRedirect: oidcRedirectPolicy(config.IssuerURL),
 	}
 }
@@ -708,13 +798,111 @@ func oidcRedirectPolicy(issuerURL string) func(req *http.Request, via []*http.Re
 	}
 }
 
+// HostDialsThisMachine reports whether a URL host resolves to the machine doing
+// the dialing rather than to a named peer: an empty host (`https://:8443`) and
+// the unspecified addresses `0.0.0.0` / `[::]` all do. An OIDC endpoint of that
+// shape parses as a valid absolute https URL, so nothing but this check stops
+// the client secret and authorization code from being posted to whatever
+// listens locally on that port. Loopback literals are deliberately not included:
+// a self-hosted issuer on 127.0.0.1 is a supported deployment, as is one on a
+// LAN address — so this is NOT an SSRF egress gate and must not be reused as
+// one. The gate that refuses private and link-local destinations outright is
+// `internal/services/webhook_delivery.go`.
+//
+// A host holding any non-ASCII byte is refused as well, because what it dials
+// is decided by a mapping this check does not run: Go's HTTP transport passes
+// the host through IDNA lookup mapping before dialing, and so does a browser, so
+// the full-width `０.０.０.０` is dialed as `0.0.0.0`. An internationalized
+// deployment spells its host in the ASCII (`xn--`) form, which is what those
+// mappings produce anyway.
+func HostDialsThisMachine(host string) bool {
+	if host == "" {
+		return true
+	}
+	if hostHasNonASCII(host) {
+		return true
+	}
+	address, err := netip.ParseAddr(host)
+	if err != nil {
+		// Go parses only canonical dotted-quad literals, but a resolver with
+		// inet_aton semantics reads `0`, `0.1`, `00.0.0.0` and `0x0` as addresses
+		// in 0.0.0.0/8 — the very block below. No registered hostname is written
+		// that way (a top-level label is never a number), so refusing every
+		// numeric spelling Go cannot parse costs no deployment and leaves no
+		// spelling of this block for a platform resolver to accept behind the
+		// check.
+		return isNumericAddressSpelling(host)
+	}
+	// A zone identifier (`https://[::%25eth0]`) is not part of the address the
+	// dialer resolves, and an IPv4-mapped form is the same address wearing a v6
+	// shape: strip both before classifying, or either spelling walks past this.
+	address = address.WithZone("").Unmap()
+	if address.IsUnspecified() {
+		return true
+	}
+	// Every IPv4 address whose first octet is zero — RFC 1122 "this network",
+	// 0.0.0.0/8 — is refused, not only the 0.0.0.0 that IsUnspecified matches.
+	// Only 0.0.0.0 itself is the address a connect() is known to map to the
+	// local host; the rest of the block is refused because it is not a valid
+	// destination for any peer, so no working issuer names one and no spelling
+	// of the block is left to a platform stack's handling of it. The webhook
+	// egress gate refuses the same prefix (`internal/services/webhook_delivery.go`).
+	return address.Is4() && address.As4()[0] == 0
+}
+
+// isNumericAddressSpelling reports whether every dot-separated label of a host
+// is a number in one of the bases inet_aton accepts — decimal, octal (a leading
+// zero) or hex (`0x`) — so the host is an address in some spelling, canonical
+// or not, and never a hostname. `192.168.001.010` lands here too: its
+// octal-looking labels name a different address under inet_aton than they
+// appear to, and an ambiguous numeric spelling is refused rather than guessed.
+// The caller has already classified the empty host.
+func isNumericAddressSpelling(host string) bool {
+	for _, label := range strings.Split(host, ".") {
+		digits, base := label, "0123456789"
+		if len(label) >= 2 && label[0] == '0' && (label[1] == 'x' || label[1] == 'X') {
+			digits, base = label[2:], "0123456789abcdefABCDEF"
+		}
+		for _, char := range digits {
+			if !strings.ContainsRune(base, char) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func sameOriginURL(left *url.URL, right *url.URL) bool {
 	if left == nil || right == nil {
+		return false
+	}
+	// Two hosts that both dial this machine are not the same origin: an issuer
+	// and an endpoint that both name no host would otherwise pin to each other.
+	if HostDialsThisMachine(left.Hostname()) || HostDialsThisMachine(right.Hostname()) {
 		return false
 	}
 	return strings.EqualFold(left.Scheme, right.Scheme) &&
 		strings.EqualFold(left.Hostname(), right.Hostname()) &&
 		effectivePort(left) == effectivePort(right)
+}
+
+// SameOriginURLString reports whether two absolute URLs share scheme, host and
+// effective port. Unlike sameOriginURL it does not refuse loopback hosts: it
+// answers "is this address first-party to that one", which holds for an
+// instance served on localhost exactly as for one on a public name. A blank or
+// relative operand is never the same origin as anything.
+func SameOriginURLString(left string, right string) bool {
+	leftURL, err := url.Parse(strings.TrimSpace(left))
+	if err != nil || !leftURL.IsAbs() || leftURL.Hostname() == "" {
+		return false
+	}
+	rightURL, err := url.Parse(strings.TrimSpace(right))
+	if err != nil || !rightURL.IsAbs() || rightURL.Hostname() == "" {
+		return false
+	}
+	return strings.EqualFold(leftURL.Scheme, rightURL.Scheme) &&
+		strings.EqualFold(leftURL.Hostname(), rightURL.Hostname()) &&
+		effectivePort(leftURL) == effectivePort(rightURL)
 }
 
 func effectivePort(value *url.URL) string {

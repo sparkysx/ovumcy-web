@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/ovumcy/ovumcy-web/internal/models"
@@ -37,6 +38,27 @@ type DashboardViewService struct {
 	days   DashboardDayStateProvider
 }
 
+// DashboardViewData is everything the dashboard page renders.
+//
+// ShowFertilityStatus gates the fertility half of the status header — the
+// fertile-window item and the status the header declares — on the decision the
+// cycle context already resolved (DashboardCycleContext.FertilitySuppressed,
+// which is FertilityProjectionSuppressed). It used to name the first-cycle
+// floor alone, one disjunct of the four, so unpredictable-cycle mode, a
+// pregnancy pause and an overdue cycle all rendered "Fertile window" — the last
+// two beside the very notice saying the account's predictions are off.
+//
+// Stats is the PUBLISHED copy, cleared by PublishedStats: the gate and
+// the data behind it move together, so a partial that forgets the gate renders
+// nothing rather than the raw classification. Every builder in
+// BuildDashboardViewData still reads the uncleared stats, because each applies
+// its own suppression rule to them.
+//
+// TodayEntry is what the owner's Today form shows: TodayLog with the period
+// ticked on a row-less stored onboarding start (withOnboardingStartTicked), and
+// TodayPeriodFromStoredStart says that tick came from the stored start, so the
+// form posts it back. TodayHasData, TodayEntryExists and every other reader
+// keep the stored row, TodayLog.
 type DashboardViewData struct {
 	Stats                             CycleStats
 	CycleContext                      DashboardCycleContext
@@ -47,6 +69,8 @@ type DashboardViewData struct {
 	YesterdayMonth                    string
 	FormattedDate                     string
 	TodayLog                          models.DailyLog
+	TodayEntry                        models.DailyLog
+	TodayPeriodFromStoredStart        bool
 	TodayHasData                      bool
 	TodayEntryExists                  bool
 	Symptoms                          []models.SymptomType
@@ -60,12 +84,19 @@ type DashboardViewData struct {
 	ShowCervicalMucus                 bool
 	ShowCycleFactors                  bool
 	ShowNotesField                    bool
+	MoreFieldsOpen                    bool
+	ShowOvulationEstimate             bool
+	ShowFirstCycleBridge              bool
+	ShowMoreCyclesBridge              bool
+	ShowFertilityStatus               bool
+	ShowBBTInVisibleTier              bool
 	AllowManualCycleStart             bool
 	ManualCycleStartPolicy            ManualCycleStartPolicy
 	ShowHighFertilityBadge            bool
 	ShowMissedDaysLink                bool
 	MissedDay                         time.Time
 	ShowCycleStartSuggestion          bool
+	ShowCycleStartQuestion            bool
 	ShowSpottingCycleWarning          bool
 	PredictionExplanationPrimaryKey   string
 	PredictionExplanationSecondaryKey string
@@ -76,12 +107,17 @@ type DashboardViewData struct {
 	IsOwner                           bool
 }
 
+// DayEditorViewData is everything the day editor renders. PeriodFromStoredStart
+// says Log.IsPeriod is ticked only because the date is the stored onboarding
+// start without a row (withOnboardingStartTicked); the editor form posts it
+// back, so un-ticking the period withdraws that start.
 type DayEditorViewData struct {
 	Date                       time.Time
 	DateString                 string
 	DateLabel                  string
 	IsFutureDate               bool
 	Log                        models.DailyLog
+	PeriodFromStoredStart      bool
 	Symptoms                   []models.SymptomType
 	PrimarySymptoms            []models.SymptomType
 	ExtraSymptoms              []models.SymptomType
@@ -97,6 +133,7 @@ type DayEditorViewData struct {
 	ManualCycleStartPolicy     ManualCycleStartPolicy
 	ShowFutureCycleStartNotice bool
 	ShowCycleStartSuggestion   bool
+	ShowCycleStartQuestion     bool
 	ShowSpottingCycleWarning   bool
 	IsOwner                    bool
 }
@@ -116,15 +153,21 @@ func (service *DashboardViewService) BuildDashboardViewData(ctx context.Context,
 	if err != nil {
 		return DashboardViewData{}, fmt.Errorf("%w: %v", ErrDashboardViewLoadTodayLog, err)
 	}
+	// Only the owner's Today form shows the stored start's tick; the
+	// read-only summary and every computation below read the stored row.
+	todayEntry, todayPeriodFromStoredStart := todayLog, false
+	if IsOwnerUser(user) {
+		todayEntry, todayPeriodFromStoredStart = withOnboardingStartTicked(user, todayLog, today, now, location)
+	}
 
 	stats, logs, err := service.buildDashboardStats(ctx, user, symptoms, today, now, location)
 	if err != nil {
 		return DashboardViewData{}, err
 	}
 
-	cycleContext := BuildDashboardCycleContext(user, stats, today, location)
+	cycleContext := BuildDashboardCycleContext(user, logs, stats, today, location)
 	cycleFactorExplanation, hasCycleFactorExplanation := buildStatsCycleFactorExplanation(user, logs, stats, now, location)
-	selectedSymptomID, rankedSymptoms, primarySymptoms, extraSymptoms, cycleStartPolicy, showCycleStartSuggestion, err := service.buildPickerViewState(
+	selectedSymptomID, rankedSymptoms, primarySymptoms, extraSymptoms, cycleStart, err := service.buildPickerViewState(
 		user,
 		today,
 		now,
@@ -136,7 +179,7 @@ func (service *DashboardViewService) BuildDashboardViewData(ctx context.Context,
 	if err != nil {
 		return DashboardViewData{}, err
 	}
-	yesterday := today.AddDate(0, 0, -1)
+	yesterday := AddCalendarDays(today, -1, location)
 	yesterdayHasData, err := service.days.DayHasDataForDate(ctx, user.ID, yesterday, location)
 	if err != nil {
 		return DashboardViewData{}, fmt.Errorf("%w: %v", ErrDashboardViewLoadDayState, err)
@@ -149,23 +192,38 @@ func (service *DashboardViewService) BuildDashboardViewData(ctx context.Context,
 		hasCycleFactorExplanation,
 	)
 	visibility := dashboardOwnerVisibilityState(user, today, now, location)
-	showHighFertilityBadge := dashboardHighFertilityBadge(user, todayLog)
+	timingFrame := resolveDashboardTimingFrame(user, cycleContext, visibility)
+	showHighFertilityBadge := dashboardHighFertilityBadge(user, cycleContext, todayLog)
 	showSpottingCycleWarning := dashboardSpottingCycleWarning(logs, todayLog, today, location)
 	reminderBanner := DashboardReminderBanner{}
 	if IsOwnerUser(user) {
 		reminderBanner = BuildDashboardReminderBanner(cycleContext, today, user.ReminderLeadDays)
 	}
 
+	// A confirmed thermal shift outranks the projection on the whole triple —
+	// day, window, status — before either the published copy or the hero ribbon
+	// reads it, so the header, the ring and the JSON API cannot name one day and
+	// shade another. The resolver carries the same medical gate the ovulation
+	// line above already resolves through, so this changes WHICH window is shown
+	// and never whether one is shown at all.
+	//
+	// The same helper the stats page and the day-save message go through, so the
+	// surfaces cannot drift apart on what a suppressed tier is allowed to carry.
+	// Every builder above still reads the uncleared stats.
+	confirmedStats, publishedStats, _ := ConfirmedAndPublishedStats(user, logs, stats, today, location)
+
 	return DashboardViewData{
-		Stats:                             stats,
+		Stats:                             publishedStats,
 		CycleContext:                      cycleContext,
-		CycleHero:                         BuildDashboardCycleHero(user, stats, cycleContext),
+		CycleHero:                         BuildDashboardCycleHero(user, confirmedStats, cycleContext, dashboardCycleHeroInput{Logs: logs, Today: today, Location: location}),
 		ReminderBanner:                    reminderBanner,
 		Today:                             today,
 		Yesterday:                         yesterday,
 		YesterdayMonth:                    yesterday.Format("2006-01"),
 		FormattedDate:                     LocalizedDashboardDate(language, today),
 		TodayLog:                          todayLog,
+		TodayEntry:                        todayEntry,
+		TodayPeriodFromStoredStart:        todayPeriodFromStoredStart,
 		TodayHasData:                      DayHasData(todayLog),
 		TodayEntryExists:                  todayLog.ID != 0,
 		Symptoms:                          rankedSymptoms,
@@ -179,12 +237,19 @@ func (service *DashboardViewService) BuildDashboardViewData(ctx context.Context,
 		ShowCervicalMucus:                 visibility.ShowCervicalMucus,
 		ShowCycleFactors:                  visibility.ShowCycleFactors,
 		ShowNotesField:                    visibility.ShowNotesField,
+		MoreFieldsOpen:                    dashboardMoreFieldsHoldData(todayLog, visibility, timingFrame.BBTInVisibleTier),
+		ShowOvulationEstimate:             timingFrame.ShowOvulationEstimate,
+		ShowFirstCycleBridge:              timingFrame.ShowFirstCycleBridge,
+		ShowMoreCyclesBridge:              timingFrame.ShowMoreCyclesBridge,
+		ShowFertilityStatus:               !cycleContext.FertilitySuppressed,
+		ShowBBTInVisibleTier:              timingFrame.BBTInVisibleTier,
 		AllowManualCycleStart:             visibility.AllowManualCycleStart,
-		ManualCycleStartPolicy:            cycleStartPolicy,
+		ManualCycleStartPolicy:            cycleStart.Policy,
 		ShowHighFertilityBadge:            showHighFertilityBadge,
 		ShowMissedDaysLink:                showMissedDaysLink,
 		MissedDay:                         missedDay,
-		ShowCycleStartSuggestion:          showCycleStartSuggestion,
+		ShowCycleStartSuggestion:          cycleStart.ShowSuggestion,
+		ShowCycleStartQuestion:            cycleStart.AskQuestion,
 		ShowSpottingCycleWarning:          showSpottingCycleWarning,
 		PredictionExplanationPrimaryKey:   predictionExplanation.PrimaryKey,
 		PredictionExplanationSecondaryKey: predictionExplanation.SecondaryKey,
@@ -212,20 +277,133 @@ type dashboardOwnerVisibility struct {
 	AllowManualCycleStart bool
 }
 
+// dashboardTimingFrame is the goal-aware half of the dashboard. An account
+// tracking to conceive is on the page for timing, so the status header carries
+// the ovulation estimate beside the next-period one and the morning temperature
+// such an account records daily sits in the journal's visible tier instead of
+// behind the "More" disclosure. Every other goal reads the page unchanged.
+//
+// ShowFirstCycleBridge is the one state where the timing item is replaced
+// rather than dropped: an account with no completed cycle yet gets a single line
+// naming when its fertile window arrives, so the goal it chose still answers it.
+//
+// ShowMoreCyclesBridge is the same replacement one tier up: a regular account
+// with one or two completed cycles has a date the policy still withholds, so the
+// slot says the window arrives after the third cycle instead of staying empty.
+type dashboardTimingFrame struct {
+	ShowOvulationEstimate bool
+	ShowFirstCycleBridge  bool
+	ShowMoreCyclesBridge  bool
+	BBTInVisibleTier      bool
+}
+
+// resolveDashboardTimingFrame decides that frame from the resolved usage goal.
+// The ovulation estimate is withheld wherever the next-period window is: an
+// unpredictable cycle, a pregnancy pause, and a cycle overdue past its own
+// cycle length — it is derived from the same projection, so an account
+// trying to conceive would otherwise be the one cohort still reading a
+// placeholder where the window used to be. Before the first completed cycle
+// (AwaitingFirstCycle) the projection has nothing but the onboarding slider to
+// project from, so the estimate is manufactured rather than measured; that state
+// gets the bridge line in place of the estimate — a promise about data, not a
+// date. BBT keeps existing only where the tracking settings grant it, and its
+// placement is a property of the goal alone: a late cycle is when a morning
+// reading matters most, so nothing about the cycle demotes the field.
+//
+// The two items read DIFFERENT gates, and the difference is about what each one
+// SAYS, not about which signals happen to be at hand.
+//
+// The ovulation estimate names a date, so it is a fertility claim and reads the
+// decision the context already resolved (FertilitySuppressed =
+// FertilityProjectionSuppressed) rather than rebuilding it from the disjuncts.
+// A day the owner's temperatures CONFIRMED is the one date that outlives it,
+// and the context says so too: DisplayOvulationConfirmed is set only where
+// ConfirmedOvulationWithheld let the day through, which past the fertility gate
+// means the overdue signal alone — the projection is paused, the observation
+// is not.
+//
+// The bridge line names NO date — it says the fertile window arrives once the
+// first cycle closes. Suppression exists to withhold a claim, and there is no
+// claim here to withhold, so the bridge asks only whether the account has
+// predictions at all: PredictionDisabled (unpredictable-cycle mode, pregnancy
+// pause), where a line promising a future window would contradict the page. It
+// deliberately does NOT read NextPeriodEstimatePaused. That flag means "this
+// projection is paused", which is a fact about a date the bridge does not name;
+// reading it withdrew the line for an account whose FIRST cycle had run past its
+// own cycle length — the moment the owner most needs to be told when the window
+// arrives — and left the status slot empty instead. Nor does it read
+// FertilitySuppressed: the bridge is the line shown IN the first-cycle floor, so
+// a gate carrying that floor would gate the bridge on its own state.
+func resolveDashboardTimingFrame(user *models.User, cycleContext DashboardCycleContext, visibility dashboardOwnerVisibility) dashboardTimingFrame {
+	if !IsOwnerUser(user) || NormalizeUsageGoal(user.UsageGoal) != models.UsageGoalTrying {
+		return dashboardTimingFrame{}
+	}
+	return dashboardTimingFrame{
+		ShowOvulationEstimate: !cycleContext.FertilitySuppressed || cycleContext.DisplayOvulationConfirmed,
+		ShowFirstCycleBridge:  !cycleContext.PredictionDisabled && cycleContext.AwaitingFirstCycle,
+		ShowMoreCyclesBridge:  resolveDashboardMoreCyclesBridge(cycleContext),
+		BBTInVisibleTier:      visibility.ShowBBTField,
+	}
+}
+
+// resolveDashboardMoreCyclesBridge is the one-or-two-completed-cycles twin of the
+// first-cycle bridge, and it reads the same single question for the same reason:
+// the line names no date, so it asks only whether the account has predictions at
+// all (PredictionDisabled covers unpredictable-cycle mode and a pregnancy pause)
+// and never the fertility gate, which carries the very floor this line is shown
+// in. It is its own function so the sweep's sanctioned residual for it names it.
+func resolveDashboardMoreCyclesBridge(cycleContext DashboardCycleContext) bool {
+	return !cycleContext.PredictionDisabled && cycleContext.AwaitingMoreCycles
+}
+
+// dashboardMoreFieldsHoldData answers whether the journal's "More" disclosure
+// must render open: it does exactly when today already holds one of the values
+// that live behind it. A field the owner's tracking settings hide is not
+// rendered at all, so a value left behind in its column cannot open the
+// disclosure over a control that does not exist — the visibility flags gate
+// every clause. The pregnancy test has no tracking toggle and is always there.
+// BBT is counted only while it is behind the disclosure: for a goal that lifts
+// it into the visible tier a recorded temperature is already in the open, and
+// opening the disclosure over it would fold nothing.
+func dashboardMoreFieldsHoldData(entry models.DailyLog, visibility dashboardOwnerVisibility, bbtInVisibleTier bool) bool {
+	if visibility.ShowSexChip && NormalizeDaySexActivity(entry.SexActivity) != models.SexActivityNone {
+		return true
+	}
+	if visibility.ShowCervicalMucus && NormalizeDayCervicalMucus(entry.CervicalMucus) != models.CervicalMucusNone {
+		return true
+	}
+	if NormalizeDayPregnancyTest(entry.PregnancyTest) != models.PregnancyTestNone {
+		return true
+	}
+	if visibility.ShowBBTField && !bbtInVisibleTier && entry.BBT != nil && IsValidDayBBT(entry.BBT) {
+		return true
+	}
+	if visibility.ShowCycleFactors && len(DayCycleFactorKeySet(entry.CycleFactorKeys)) > 0 {
+		return true
+	}
+	return visibility.ShowNotesField && strings.TrimSpace(entry.Notes) != ""
+}
+
 func dashboardOwnerVisibilityState(user *models.User, today time.Time, now time.Time, location *time.Location) dashboardOwnerVisibility {
 	isOwner := IsOwnerUser(user)
+	visibility := TrackingVisibilityForUser(user)
 	return dashboardOwnerVisibility{
-		ShowSexChip:           isOwner && !user.HideSexChip,
-		ShowBBTField:          isOwner && user.TrackBBT,
-		ShowCervicalMucus:     isOwner && user.TrackCervicalMucus,
-		ShowCycleFactors:      isOwner && !user.HideCycleFactors,
-		ShowNotesField:        isOwner && !user.HideNotesField,
+		ShowSexChip:           isOwner && visibility.ShowSexChip,
+		ShowBBTField:          isOwner && visibility.ShowBBTField,
+		ShowCervicalMucus:     isOwner && visibility.ShowCervicalMucus,
+		ShowCycleFactors:      isOwner && visibility.ShowCycleFactors,
+		ShowNotesField:        isOwner && visibility.ShowNotesField,
 		AllowManualCycleStart: isOwner && IsAllowedManualCycleStartDate(today, now, location),
 	}
 }
 
-func dashboardHighFertilityBadge(user *models.User, todayLog models.DailyLog) bool {
-	return IsOwnerUser(user) && NormalizeDayCervicalMucus(todayLog.CervicalMucus) == models.CervicalMucusEggWhite
+// dashboardHighFertilityBadge is a fertility claim, so it waits for the verdict
+// the cycle context already resolved: while the fertility half is withheld the
+// header says "held back", and today's mucus alone must not contradict it.
+func dashboardHighFertilityBadge(user *models.User, cycleContext DashboardCycleContext, todayLog models.DailyLog) bool {
+	return IsOwnerUser(user) &&
+		!cycleContext.FertilitySuppressed &&
+		NormalizeDayCervicalMucus(todayLog.CervicalMucus) == models.CervicalMucusEggWhite
 }
 
 func dashboardSpottingCycleWarning(logs []models.DailyLog, todayLog models.DailyLog, today time.Time, location *time.Location) bool {
@@ -242,11 +420,12 @@ func (service *DashboardViewService) BuildDayEditorViewData(ctx context.Context,
 	if err != nil {
 		return DayEditorViewData{}, fmt.Errorf("%w: %v", ErrDashboardViewLoadDayLog, err)
 	}
+	logEntry, periodFromStoredStart := withOnboardingStartTicked(user, logEntry, day, now, location)
 	logs, err := service.entryContextLogs(ctx, user, symptoms)
 	if err != nil {
 		return DayEditorViewData{}, err
 	}
-	selectedSymptomID, rankedSymptoms, primarySymptoms, extraSymptoms, cycleStartPolicy, showCycleStartSuggestion, err := service.buildPickerViewState(
+	selectedSymptomID, rankedSymptoms, primarySymptoms, extraSymptoms, cycleStart, err := service.buildPickerViewState(
 		user,
 		day,
 		now,
@@ -266,6 +445,7 @@ func (service *DashboardViewService) BuildDayEditorViewData(ctx context.Context,
 		DateLabel:                  LocalizedDateLabel(language, day),
 		IsFutureDate:               isFutureDate,
 		Log:                        logEntry,
+		PeriodFromStoredStart:      periodFromStoredStart,
 		Symptoms:                   rankedSymptoms,
 		PrimarySymptoms:            primarySymptoms,
 		ExtraSymptoms:              extraSymptoms,
@@ -278,12 +458,35 @@ func (service *DashboardViewService) BuildDayEditorViewData(ctx context.Context,
 		ShowCycleFactors:           visibility.ShowCycleFactors,
 		ShowNotesField:             visibility.ShowNotesField,
 		AllowManualCycleStart:      visibility.AllowManualCycleStart,
-		ManualCycleStartPolicy:     cycleStartPolicy,
+		ManualCycleStartPolicy:     cycleStart.Policy,
 		ShowFutureCycleStartNotice: isFutureDate && visibility.AllowManualCycleStart,
-		ShowCycleStartSuggestion:   showCycleStartSuggestion,
+		ShowCycleStartSuggestion:   cycleStart.ShowSuggestion,
+		ShowCycleStartQuestion:     cycleStart.AskQuestion,
 		ShowSpottingCycleWarning:   shouldShowSpottingCycleWarning(logs, logEntry, day, location),
 		IsOwner:                    IsOwnerUser(user),
 	}, nil
+}
+
+// withOnboardingStartTicked shows the period ticked on the stored onboarding
+// start when the day has no row: onboarding with auto-fill off records the
+// start without writing a day, and the calendar paints that day as a period
+// day (BuildCalendarDayStates). A form showing it unticked would leave the
+// owner nothing to un-tick. The second result reports that the tick came from
+// the stored start: the day editor and the dashboard's Today form post it back
+// as a hidden field (DayEntryInput.PeriodFromStoredStart), and only a save
+// carrying it that un-ticks the period withdraws the start
+// (DayService.applyDayWriteAndAutoFill) — a save that keeps the tick, or a
+// write that never showed it, leaves the start in place.
+func withOnboardingStartTicked(user *models.User, logEntry models.DailyLog, day time.Time, now time.Time, location *time.Location) (models.DailyLog, bool) {
+	if logEntry.ID != 0 {
+		return logEntry, false
+	}
+	onboardingDay := OnboardingBoundaryDay(BoundaryContextFor(user, DateAtLocation(now, location)))
+	if onboardingDay.IsZero() || CalendarDayKey(onboardingDay) != CalendarDayKey(day) {
+		return logEntry, false
+	}
+	logEntry.IsPeriod = true
+	return logEntry, true
 }
 
 func requiresEntryContextLogs(user *models.User, symptoms []models.SymptomType) bool {
@@ -309,9 +512,9 @@ func (service *DashboardViewService) entryContextLogs(ctx context.Context, user 
 // second, near-duplicate daily_logs query for a range that mostly overlaps
 // the full history. Otherwise it falls back to the single ranged query.
 func (service *DashboardViewService) buildDashboardStats(ctx context.Context, user *models.User, symptoms []models.SymptomType, today time.Time, now time.Time, location *time.Location) (CycleStats, []models.DailyLog, error) {
-	statsFrom := today.AddDate(-2, 0, 0)
 	if !requiresEntryContextLogs(user, symptoms) {
-		stats, _, err := service.stats.BuildCycleStatsForRange(ctx, user, statsFrom, today, now, location)
+		statsFrom, statsTo := StatsOverviewRange(today)
+		stats, _, err := service.stats.BuildCycleStatsForRange(ctx, user, statsFrom, statsTo, now, location)
 		if err != nil {
 			return CycleStats{}, nil, fmt.Errorf("%w: %v", ErrDashboardViewLoadStats, err)
 		}
@@ -322,33 +525,44 @@ func (service *DashboardViewService) buildDashboardStats(ctx context.Context, us
 	if err != nil {
 		return CycleStats{}, nil, err
 	}
-	rangeLogs := FilterLogsByDateRange(logs, statsFrom, today, location)
+	rangeLogs := FilterLogsToStatsHistory(logs, today, location)
 	stats := service.stats.BuildCycleStatsFromLogs(user, rangeLogs, now, location)
 	return stats, logs, nil
 }
 
-func (service *DashboardViewService) buildPickerViewState(user *models.User, day time.Time, now time.Time, logEntry models.DailyLog, symptoms []models.SymptomType, logs []models.DailyLog, location *time.Location) (map[uint]bool, []models.SymptomType, []models.SymptomType, []models.SymptomType, ManualCycleStartPolicy, bool, error) {
+// dayFormCycleStartState groups the cycle-start flags one day form needs: the
+// manual control's policy, the plain suggestion hint, and whether the form asks
+// the inline "does a new cycle begin here?" question beside the period toggle.
+type dayFormCycleStartState struct {
+	Policy         ManualCycleStartPolicy
+	ShowSuggestion bool
+	AskQuestion    bool
+}
+
+func (service *DashboardViewService) buildPickerViewState(user *models.User, day time.Time, now time.Time, logEntry models.DailyLog, symptoms []models.SymptomType, logs []models.DailyLog, location *time.Location) (map[uint]bool, []models.SymptomType, []models.SymptomType, []models.SymptomType, dayFormCycleStartState, error) {
 	selectedSymptomID := SymptomIDSet(logEntry.SymptomIDs)
 	rankedSymptoms := symptoms
 	if len(logs) == 0 {
 		primarySymptoms, extraSymptoms := SplitSymptomsForCollapsedPicker(rankedSymptoms, selectedSymptomID, 8)
-		return selectedSymptomID, rankedSymptoms, primarySymptoms, extraSymptoms, ManualCycleStartPolicy{}, false, nil
+		return selectedSymptomID, rankedSymptoms, primarySymptoms, extraSymptoms, dayFormCycleStartState{}, nil
 	}
-	if len(symptoms) >= 2 && completedCycleCountFromLogs(logs) >= 2 {
+	if len(symptoms) >= 2 && completedCycleCountFromLogs(logs, BoundaryContextFor(user, DateAtLocation(now, location))) >= 2 {
 		rankedSymptoms = RankSymptomsForEntryPicker(symptoms, logs)
 	}
 
 	primarySymptoms, extraSymptoms := SplitSymptomsForCollapsedPicker(rankedSymptoms, selectedSymptomID, 8)
-	showCycleStartSuggestion := ShouldSuggestManualCycleStart(user, logs, logEntry, day, now, location)
-	cycleStartPolicy := ManualCycleStartPolicy{}
-	if IsOwnerUser(user) {
-		cycleStartPolicy = ResolveManualCycleStartPolicy(user, logs, day, now, location)
+	cycleStart := dayFormCycleStartState{
+		ShowSuggestion: ShouldSuggestManualCycleStart(user, logs, logEntry, day, now, location),
 	}
-	return selectedSymptomID, rankedSymptoms, primarySymptoms, extraSymptoms, cycleStartPolicy, showCycleStartSuggestion, nil
+	if IsOwnerUser(user) {
+		cycleStart.Policy = ResolveManualCycleStartPolicy(user, logs, day, now, location)
+		cycleStart.AskQuestion = ShouldAskCycleStartQuestion(user, logs, logEntry, day, now, location)
+	}
+	return selectedSymptomID, rankedSymptoms, primarySymptoms, extraSymptoms, cycleStart, nil
 }
 
-func completedCycleCountFromLogs(logs []models.DailyLog) int {
-	starts := ObservedCycleStarts(logs)
+func completedCycleCountFromLogs(logs []models.DailyLog, ctx BoundaryContext) int {
+	starts := CycleBoundaries(logs, ctx)
 	if len(starts) < 2 {
 		return 0
 	}
@@ -364,7 +578,7 @@ func firstMissingTrackedDay(logs []models.DailyLog, today time.Time, lookbackDay
 		logByDay[CalendarDay(logEntry.Date, location).Format("2006-01-02")] = true
 	}
 
-	startDay := today.AddDate(0, 0, -lookbackDays)
+	startDay := AddCalendarDays(today, -lookbackDays, location)
 	if !trackingStart.IsZero() {
 		trackingStartDay := DateAtLocation(trackingStart, location)
 		if trackingStartDay.After(startDay) {
@@ -376,7 +590,7 @@ func firstMissingTrackedDay(logs []models.DailyLog, today time.Time, lookbackDay
 	}
 	missedCount := 0
 	firstMissing := time.Time{}
-	for day := startDay; day.Before(today); day = day.AddDate(0, 0, 1) {
+	for day := startDay; day.Before(today); day = AddCalendarDays(day, 1, location) {
 		if logByDay[day.Format("2006-01-02")] {
 			continue
 		}

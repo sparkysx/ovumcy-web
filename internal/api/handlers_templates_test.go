@@ -3,11 +3,13 @@ package api
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/ovumcy/ovumcy-web/internal/i18n"
 	"github.com/ovumcy/ovumcy-web/internal/models"
+	"golang.org/x/net/html"
 )
 
 // withTemplateDefaultsForTest drives withTemplateDefaults inside a real Fiber
@@ -72,19 +74,34 @@ func TestWithTemplateDefaultsPreservesSeededValues(t *testing.T) {
 func TestWithTemplateDefaultsFillsMissingDefaults(t *testing.T) {
 	t.Parallel()
 
-	data := withTemplateDefaultsForTest(t, "/stats?window=90", fiber.Map{})
+	data := withTemplateDefaultsForTest(t, "/calendar?month=2026-02", fiber.Map{})
 
 	if data["Lang"] != "en" {
 		t.Fatalf("expected default language en, got %v", data["Lang"])
 	}
-	if data["CurrentPath"] != "/stats?window=90" {
-		t.Fatalf("expected request path captured, got %v", data["CurrentPath"])
+	if data["CurrentPath"] != "/calendar?month=2026-02" {
+		t.Fatalf("expected request path captured with its allowlisted query, got %v", data["CurrentPath"])
 	}
 	if data["AssetVersion"] != "testver" {
 		t.Fatalf("expected asset version threaded, got %v", data["AssetVersion"])
 	}
 	if data["NoDataLabel"] != "-" {
 		t.Fatalf("expected NoDataLabel to fall back to '-', got %v", data["NoDataLabel"])
+	}
+}
+
+// TestWithTemplateDefaultsTruncatesANonAllowlistedQuery pins, at the seam that
+// actually feeds the templates, that a parameter no page reads does not reach
+// CurrentPath. `window` is such a parameter: nothing calls c.Query("window"), so
+// /stats renders identically without it, and the address the layout echoes into
+// every page must not carry it.
+func TestWithTemplateDefaultsTruncatesANonAllowlistedQuery(t *testing.T) {
+	t.Parallel()
+
+	data := withTemplateDefaultsForTest(t, "/stats?window=90", fiber.Map{})
+
+	if data["CurrentPath"] != "/stats" {
+		t.Fatalf("expected the non-allowlisted query truncated to /stats, got %v", data["CurrentPath"])
 	}
 }
 
@@ -271,36 +288,75 @@ func TestBaseLayoutVersionsStaticAssets(t *testing.T) {
 	)
 }
 
-// TestSetAssetVersionNormalizesToken locks the normalization applied to the raw
-// build revision before it reaches an asset URL: a dirty git SHA is truncated
-// and kept URL-safe, while an empty or fully invalid revision falls back to the
-// static default rather than emitting a bare ?v=.
-func TestSetAssetVersionNormalizesToken(t *testing.T) {
+// TestBaseLayoutAppliesThemeBeforeStylesheet pins the no-flash contract the
+// client-side theme rests on. The bootstrap script resolves the stored
+// preference onto html[data-theme]; the first paint is blocked by the
+// stylesheet in <head>, so as long as the script is render-blocking *and*
+// precedes that stylesheet, the very first frame is already themed. Move the
+// script after the link, or add defer/async to it, and a cold start with a
+// saved dark theme flashes the light default. Browser proof of the same
+// invariant, measured against the recorded first paint:
+// e2e/theme-dark-mode.spec.ts.
+func TestBaseLayoutAppliesThemeBeforeStylesheet(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name     string
-		revision string
-		want     string
-	}{
-		{name: "short revision preserved", revision: "abc123", want: "abc123"},
-		{name: "dirty suffix kept and truncated", revision: "0123456789abcdef0123-dirty", want: "0123456789abcdef"},
-		{name: "surrounding space trimmed", revision: "  fe9c1a  ", want: "fe9c1a"},
-		{name: "unsafe characters dropped", revision: "v1.2.3/../x", want: "v1.2.3..x"},
-		{name: "empty falls back to default", revision: "", want: defaultAssetVersion},
-		{name: "all-invalid falls back to default", revision: "///", want: defaultAssetVersion},
+	app, _ := newOnboardingTestAppWithOptions(t, onboardingTestAppOptions{assetVersion: "testrev1"})
+
+	request := httptest.NewRequest(http.MethodGet, "/login", nil)
+	request.Header.Set("Accept-Language", "en")
+	response := mustAppResponse(t, app, request)
+	assertStatusCode(t, response, http.StatusOK)
+
+	document := mustParseHTMLDocument(t, mustReadBodyString(t, response.Body))
+	head := htmlFindElement(document, func(node *html.Node) bool {
+		return node.Type == html.ElementNode && node.Data == "head"
+	})
+	if head == nil {
+		t.Fatal("expected a head element in the base layout")
 	}
 
-	for _, tt := range tests {
+	ordered := htmlFindElements(head, func(node *html.Node) bool {
+		if node.Type != html.ElementNode {
+			return false
+		}
+		if node.Data == "script" {
+			return strings.Contains(htmlAttr(node, "src"), "/static/js/theme-bootstrap.js")
+		}
+		return node.Data == "link" && strings.Contains(htmlAttr(node, "href"), "/static/css/tailwind.css")
+	})
+	if len(ordered) != 2 {
+		t.Fatalf("expected exactly the theme bootstrap script and the stylesheet in head, got %d elements", len(ordered))
+	}
+	if ordered[0].Data != "script" {
+		t.Fatal("expected the theme bootstrap script to precede the stylesheet in head")
+	}
+	if htmlHasAttr(ordered[0], "defer") || htmlHasAttr(ordered[0], "async") {
+		t.Fatal("expected the theme bootstrap script to stay render-blocking (no defer/async)")
+	}
+}
 
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			handler := &Handler{}
-			handler.SetAssetVersion(tt.revision)
-			if handler.assetVersion != tt.want {
-				t.Fatalf("SetAssetVersion(%q) => %q, want %q", tt.revision, handler.assetVersion, tt.want)
-			}
-		})
+// TestSetAssetVersionDelegatesToNormalizeAssetVersion pins the one thing the
+// exported setter owes beyond storing a string: the composition root hands it a
+// raw build revision, and what reaches the asset URL is normalizeAssetVersion's
+// verdict on it. What that verdict is — the allow-list, the 16-rune cap, the
+// fallback to the static default — belongs to
+// TestNormalizeAssetVersionCharacterClasses below; restating its rows here made
+// two tables that had to move together on every change to the allow-list, while
+// the delegation itself was the only row this test uniquely earned.
+func TestSetAssetVersionDelegatesToNormalizeAssetVersion(t *testing.T) {
+	t.Parallel()
+
+	// A revision that normalization must visibly change, so storing the raw
+	// input cannot pass for delegation.
+	const revision = "  0123456789abcdef0123-dirty  "
+
+	handler := &Handler{}
+	handler.SetAssetVersion(revision)
+	if handler.assetVersion == revision {
+		t.Fatalf("SetAssetVersion stored the raw revision %q", revision)
+	}
+	if want := normalizeAssetVersion(revision); handler.assetVersion != want {
+		t.Fatalf("SetAssetVersion(%q) => %q, want normalizeAssetVersion's %q", revision, handler.assetVersion, want)
 	}
 }
 
@@ -334,6 +390,9 @@ func TestNormalizeAssetVersionCharacterClasses(t *testing.T) {
 		{name: "sixteen valid chars kept whole", revision: "0123456789abcdef", want: "0123456789abcdef"},
 		{name: "seventeenth char truncated", revision: "0123456789abcdefX", want: "0123456789abcdef"},
 		{name: "invalid chars do not count toward cap", revision: "////0123456789abcdef", want: "0123456789abcdef"},
+		{name: "surrounding space trimmed", revision: "  fe9c1a  ", want: "fe9c1a"},
+		{name: "empty falls back to default", revision: "", want: defaultAssetVersion},
+		{name: "all-invalid falls back to default", revision: "///", want: defaultAssetVersion},
 	}
 
 	for _, tt := range tests {
@@ -346,12 +405,15 @@ func TestNormalizeAssetVersionCharacterClasses(t *testing.T) {
 	}
 }
 
-// TestParsePartialTemplatesIncludesBaseHelpers pins that parsePartialTemplates
-// parses the embedded base.html alongside each partial, so a partial that
-// delegates to a define declared in base.html (for example the
-// current_user_identity_oob partial invoking nav_user_identity_chip) resolves.
-// Asserting the parsed template set contains both defines keeps the contract
-// without coupling to page copy.
+// TestParsePartialTemplatesIncludesBaseHelpers pins the whole parse list
+// parsePartialTemplates hands each partial: the partial itself, the shared
+// components (nav_user_identity_chip, which the current_user_identity_oob
+// partial delegates to, is declared in components/nav.html), and base.html.
+//
+// "base" is the only define base.html declares, so it is also the only lookup
+// that can tell whether base.html is still in the list — asserting the chip
+// alone leaves the test green with base.html dropped, because the chip resolves
+// out of components/*.html on its own.
 func TestParsePartialTemplatesIncludesBaseHelpers(t *testing.T) {
 	t.Parallel()
 
@@ -364,9 +426,16 @@ func TestParsePartialTemplatesIncludesBaseHelpers(t *testing.T) {
 	if !ok {
 		t.Fatal("expected current_user_identity_oob partial to be parsed")
 	}
-	for _, name := range []string{"current_user_identity_oob", "nav_user_identity_chip"} {
-		if parsed.Lookup(name) == nil {
-			t.Fatalf("expected parsed partial set to include %q define (base.html helpers must be parsed in)", name)
+	for _, source := range []struct {
+		define string
+		from   string
+	}{
+		{define: "current_user_identity_oob", from: "the partial itself"},
+		{define: "nav_user_identity_chip", from: "components/nav.html"},
+		{define: "base", from: "base.html"},
+	} {
+		if parsed.Lookup(source.define) == nil {
+			t.Fatalf("expected the parsed partial set to include the %q define from %s", source.define, source.from)
 		}
 	}
 }

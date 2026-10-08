@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"strconv"
@@ -24,7 +25,7 @@ func getEnvInt(key string, fallback int) int {
 
 	parsed, err := strconv.Atoi(value)
 	if err != nil || parsed < 1 {
-		log.Printf("invalid %s=%q, using fallback %d", key, value, fallback)
+		log.Printf("invalid %s=%q, using fallback %d", key, value, fallback) // #nosec G706 -- key is a compile-time literal and value is os.Getenv(key), read once at boot (main.go's mustLoadRuntimeConfig) from the operator's own deployment env; same operator-managed-startup-configuration boundary as the G304 exception on internal/security/local_file.go, never reachable from a request.
 		return fallback
 	}
 	return parsed
@@ -42,24 +43,50 @@ func getEnvIntInRange(key string, fallback, minValue, maxValue int) int {
 
 	parsed, err := strconv.Atoi(value)
 	if err != nil || parsed < minValue || parsed > maxValue {
-		log.Printf("invalid %s=%q, using fallback %d", key, value, fallback)
+		log.Printf("invalid %s=%q, using fallback %d", key, value, fallback) // #nosec G706 -- same operator-managed-startup-configuration boundary as getEnvInt above: value is read once at boot from the operator's own env, never from a request.
 		return fallback
 	}
 	return parsed
 }
 
-func getEnvDuration(key string, fallback time.Duration) time.Duration {
+// getEnvDurationInRange parses a duration env var and accepts it only within the
+// inclusive [min, max] range, falling back otherwise — the duration twin of
+// getEnvIntInRange. Every duration setting has an upper bound that is part of
+// its contract, so there is no unbounded variant.
+func getEnvDurationInRange(key string, fallback, minValue, maxValue time.Duration) time.Duration {
+	value, _ := lookupEnvDurationInRange(key, fallback, minValue, maxValue)
+	return value
+}
+
+// lookupEnvDurationInRange is getEnvDurationInRange that also says whether the
+// value was usable: false means the variable was set and refused (logged), so
+// a caller that pairs it with another setting can fall back on both.
+func lookupEnvDurationInRange(key string, fallback, minValue, maxValue time.Duration) (time.Duration, bool) {
 	value := strings.TrimSpace(os.Getenv(key))
 	if value == "" {
-		return fallback
+		return fallback, true
 	}
 
 	parsed, err := time.ParseDuration(value)
-	if err != nil || parsed < time.Second {
-		log.Printf("invalid %s=%q, using fallback %s", key, value, fallback)
-		return fallback
+	if err != nil || parsed < minValue || parsed > maxValue {
+		log.Printf("invalid %s=%q, using fallback %s", key, value, fallback) // #nosec G706 -- same operator-managed-startup-configuration boundary as getEnvInt above: value is read once at boot from the operator's own env, never from a request.
+		return fallback, false
 	}
-	return parsed
+	return parsed, true
+}
+
+// parseBoolEnvValue holds the accepted vocabulary for every boolean env var. Both
+// getEnvBool and getEnvBoolStrict route through it so the lenient and the
+// refusing getter can never accept different spellings of the same value.
+func parseBoolEnvValue(value string) (bool, bool) {
+	switch strings.ToLower(value) {
+	case "1", "true", "yes", "on":
+		return true, true
+	case "0", "false", "no", "off":
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 func getEnvBool(key string, fallback bool) bool {
@@ -68,15 +95,36 @@ func getEnvBool(key string, fallback bool) bool {
 		return fallback
 	}
 
-	switch strings.ToLower(value) {
-	case "1", "true", "yes", "on":
-		return true
-	case "0", "false", "no", "off":
-		return false
-	default:
-		log.Printf("invalid %s=%q, using fallback %t", key, value, fallback)
+	parsed, ok := parseBoolEnvValue(value)
+	if !ok {
+		log.Printf("invalid %s=%q, using fallback %t", key, value, fallback) // #nosec G706 -- same operator-managed-startup-configuration boundary as getEnvInt above: value is read once at boot from the operator's own env, never from a request.
 		return fallback
 	}
+	return parsed
+}
+
+// getEnvBoolStrict reads a boolean env var like getEnvBool but refuses an
+// unparseable value instead of falling back to the default.
+//
+// It is used for the security-relevant toggles, where a typo silently lands
+// the instance on a posture the operator did not choose — COOKIE_SECURE,
+// HSTS_ENABLED, TRUST_PROXY_ENABLED, WEBHOOK_BLOCK_PRIVATE_ADDRESSES,
+// AUDIT_LOG_ENABLED, OIDC_ENABLED. There a typo (COOKIE_SECURE=ture) used to
+// start the process on the default, so what the instance ran with could not be
+// answered from the operator's env file, only from the boot log. An unset
+// value is still the documented default; only a value the operator wrote and
+// this process cannot read stops the boot, naming the key and the value.
+func getEnvBoolStrict(key string, fallback bool) (bool, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback, nil
+	}
+
+	parsed, ok := parseBoolEnvValue(value)
+	if !ok {
+		return false, fmt.Errorf("invalid %s=%q: expected one of 1/true/yes/on or 0/false/no/off", key, value)
+	}
+	return parsed, nil
 }
 
 func parseCSV(value string) []string {

@@ -1,0 +1,56 @@
+-- Webhook revocation epoch (finding PRIV-1 / SEC-01): a monotonic per-owner
+-- counter that moves on every write to an owner's delivery configuration, so a
+-- notify pass holding a stale snapshot can be told apart from one holding the
+-- configuration that is current at the moment it tries to send.
+--
+-- The notify pass takes its whole decision from one snapshot read at the start
+-- of the pass and claims each send only later, so between the two the owner can
+-- disable delivery, replace the endpoint, remove it, narrow how far ahead
+-- reminders arrive, or clear all data. The per-kind watermark alone cannot see
+-- any of that: a settings save deliberately leaves the watermarks where they
+-- are, and a clear-data wipe NULLs them, which re-opens the first-ever-claim
+-- branch of the claim predicate. Either way the stale snapshot could still win
+-- its claim and POST health data to an endpoint the owner had already been told
+-- was revoked.
+--
+-- webhook_config_version closes that window. Four writers advance it, each in
+-- the same statement that performs its own write, and that is the COMPLETE set
+-- of DELIVERY CONFIGURATION writers rather than an illustration -- a later one
+-- owes the same advance:
+--
+--   * SaveWebhookSettings -- a save, a disable, an endpoint replacement, a
+--     removal.
+--   * RemoveWebhookDestination -- withdrawing the endpoint on its own, which the
+--     save above cannot express without also writing reminder_lead_days and both
+--     per-kind opt-ins.
+--   * UpdateReminderLeadDays -- the shared banner-and-webhook lead window, which
+--     ListAllForNotify projects and the notify decision places the reminder from.
+--   * ClearAllDataAndResetSettings.
+--
+-- What obliges a writer is what it CHANGES, never that it touched the users row.
+-- MarkWebhookDelivered (migration 039) writes that row after a 2xx and must NOT
+-- advance this column: it records that delivery happened, changing neither
+-- WHETHER, WHERE nor HOW EARLY it happens. Advancing there would also break the
+-- pass doing the delivering -- the epoch is pinned once per owner OUTSIDE the
+-- reminder loop, so a bump after a period delivery loses the ovulation claim of
+-- that same pass.
+--
+-- The claim pins the value the claiming pass's snapshot carried. Monotonic on
+-- purpose: clear-data ADVANCES the counter rather than resetting it, because a
+-- reset would hand a revoked snapshot its own value back. The scope is WHETHER,
+-- WHERE and HOW EARLY delivery happens, and deliberately not what the reminder
+-- would say -- a cycle-data edit or a timezone capture moves the prediction,
+-- which is the watermark compare-and-set's own subject.
+--
+-- Existing rows start at 0, and nothing is owed to them. Migrations run at boot
+-- before the listener, so no pass spans the upgrade and the first pass after it
+-- reads a fresh snapshot. The claim additionally pins webhook_enabled and the
+-- per-kind opt-in, but as the persistence layer's own floor rather than for
+-- those rows: the pass already returns before the claim when its own snapshot
+-- says delivery is off. ClaimWebhookWatermark carries the whole predicate.
+--
+-- The migration runner skips any ADD COLUMN whose column already exists, so
+-- this file is idempotent across clean installs and rolling deploys. Rollback
+-- (forward-only repo) is documented in the commit body, not here.
+
+ALTER TABLE users ADD COLUMN webhook_config_version INTEGER NOT NULL DEFAULT 0;

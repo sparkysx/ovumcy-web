@@ -39,6 +39,15 @@ func TestValidateOIDCHTTPSURLRejectsUnsafeInputs(t *testing.T) {
 		{name: "http", rawURL: "http://id.example.com"},
 		{name: "query", rawURL: "https://id.example.com/callback?foo=bar"},
 		{name: "fragment", rawURL: "https://id.example.com/callback#frag"},
+		// A host that names no peer parses as absolute and dials this machine.
+		{name: "empty host with port", rawURL: "https://:8443"},
+		{name: "empty host with path", rawURL: "https:///.well-known"},
+		{name: "empty host callback", rawURL: "https://:8443/auth/oidc/callback"},
+		{name: "unspecified ipv4", rawURL: "https://0.0.0.0:8443"},
+		{name: "unspecified ipv6", rawURL: "https://[::]:8443/auth/oidc/callback"},
+		{name: "this network ipv4", rawURL: "https://0.1.2.3:8443"},
+		{name: "short numeric spelling", rawURL: "https://0:8443"},
+		{name: "hex numeric spelling", rawURL: "https://0x0:8443"},
 	}
 
 	for _, testCase := range tests {
@@ -129,6 +138,35 @@ func TestSameOriginURLAndEffectivePort(t *testing.T) {
 	}
 	if sameOriginURL(nil, rightDefault) {
 		t.Fatal("did not expect sameOriginURL to accept nil URLs")
+	}
+}
+
+// SameOriginURLString validates each operand independently before comparing:
+// a blank or relative URL on either side names no origin, and must be refused
+// rather than compared against whatever the other side happens to parse to.
+func TestSameOriginURLStringRefusesBlankOrRelativeOperands(t *testing.T) {
+	t.Parallel()
+
+	const valid = "https://ovumcy.example.com/login"
+	cases := map[string]struct {
+		left  string
+		right string
+	}{
+		"blank left":     {left: "", right: valid},
+		"relative left":  {left: "/login", right: valid},
+		"blank right":    {left: valid, right: ""},
+		"relative right": {left: valid, right: "/login"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if SameOriginURLString(tc.left, tc.right) {
+				t.Fatalf("expected SameOriginURLString(%q, %q) to refuse", tc.left, tc.right)
+			}
+		})
+	}
+
+	if !SameOriginURLString(valid, "https://ovumcy.example.com:443/logout") {
+		t.Fatal("expected SameOriginURLString to accept the same https origin with an explicit default port")
 	}
 }
 

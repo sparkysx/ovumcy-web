@@ -10,7 +10,44 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/ovumcy/ovumcy-web/internal/db"
+	"github.com/ovumcy/ovumcy-web/internal/security"
 )
+
+// TestRateLimitScopeClassifiesEveryRoutableSpelling pins the security-event
+// scope label to the path the router matched: a variant spelling reaches the
+// same auth or settings handler, and its rate-limit event must not be filed
+// under the generic api scope. The lowercase rows are the positive controls.
+func TestRateLimitScopeClassifiesEveryRoutableSpelling(t *testing.T) {
+	app := fiber.New()
+	app.Use(func(c fiber.Ctx) error {
+		return c.SendString(rateLimitScope(c))
+	})
+
+	cases := map[string]string{
+		"/api/v1/sessions":               "auth",
+		"/API/v1/sessions":               "auth",
+		"/api/v1/sessions/":              "auth",
+		"/auth/oidc/start":               "auth",
+		"/AUTH/OIDC/start":               "auth",
+		"/api/v1/users/current/profile":  "settings",
+		"/API/V1/USERS/CURRENT/profile":  "settings",
+		"/api/v1/users/current/profile/": "settings",
+	}
+	for path, want := range cases {
+		response, err := app.Test(httptest.NewRequest(http.MethodGet, path, nil))
+		if err != nil {
+			t.Fatalf("probe %s failed: %v", path, err)
+		}
+		body, err := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if err != nil {
+			t.Fatalf("read %s response body: %v", path, err)
+		}
+		if got := string(body); got != want {
+			t.Errorf("rateLimitScope(%s) = %q, want %q", path, got, want)
+		}
+	}
+}
 
 // setValidBootEnv installs a minimal, valid runtime environment so a
 // loadRuntimeConfig call succeeds; individual tests then break one variable to
@@ -26,6 +63,11 @@ func setValidBootEnv(t *testing.T) {
 	t.Setenv("TRUST_PROXY_ENABLED", "false")
 	t.Setenv("REGISTRATION_MODE", "closed")
 	t.Setenv("OIDC_ENABLED", "false")
+	// Cleared like SECRET_KEY_FILE and DATABASE_URL above: a relative
+	// CALENDAR_FEED_FENCE_PATH now refuses the boot, so one left in the shell
+	// running the suite would fail every caller of this helper on a value none
+	// of them set.
+	t.Setenv("CALENDAR_FEED_FENCE_PATH", "")
 }
 
 func TestGetEnvFallbacksOnInvalidValue(t *testing.T) {
@@ -35,8 +77,8 @@ func TestGetEnvFallbacksOnInvalidValue(t *testing.T) {
 	}
 
 	t.Setenv("OVUMCY_TEST_DURATION", "not-a-duration")
-	if got := getEnvDuration("OVUMCY_TEST_DURATION", 30*time.Second); got != 30*time.Second {
-		t.Fatalf("getEnvDuration: expected fallback 30s, got %s", got)
+	if got := getEnvDurationInRange("OVUMCY_TEST_DURATION", 30*time.Second, time.Second, time.Hour); got != 30*time.Second {
+		t.Fatalf("getEnvDurationInRange: expected fallback 30s, got %s", got)
 	}
 
 	t.Setenv("OVUMCY_TEST_BOOL", "maybe")
@@ -116,7 +158,7 @@ func TestTryRunCLICommandWithHandlersReturnsUnhandledForNoOrUnknownArgs(t *testi
 }
 
 func TestTryRunCLICommandWithHandlersResetPassword(t *testing.T) {
-	t.Run("rejects wrong argument count", func(t *testing.T) {
+	t.Run("requires a handler with no address", func(t *testing.T) {
 		handled, err := tryRunCLICommandWithHandlers([]string{"reset-password"}, cliCommandHandlers{})
 		if !handled || err == nil {
 			t.Fatalf("expected handled error, got (%t, %v)", handled, err)
@@ -134,7 +176,7 @@ func TestTryRunCLICommandWithHandlersResetPassword(t *testing.T) {
 		setValidBootEnv(t)
 		t.Setenv("DB_DRIVER", "bogus")
 		handled, err := tryRunCLICommandWithHandlers([]string{"reset-password", "owner@example.com"}, cliCommandHandlers{
-			runResetPassword: func(db.Config, string) error { return nil },
+			runResetPassword: func(db.Config, []string) error { return nil },
 		})
 		if !handled || err == nil {
 			t.Fatalf("expected handled db-config error, got (%t, %v)", handled, err)
@@ -145,10 +187,10 @@ func TestTryRunCLICommandWithHandlersResetPassword(t *testing.T) {
 		setValidBootEnv(t)
 		called := false
 		handled, err := tryRunCLICommandWithHandlers([]string{"reset-password", "owner@example.com"}, cliCommandHandlers{
-			runResetPassword: func(_ db.Config, email string) error {
+			runResetPassword: func(_ db.Config, args []string) error {
 				called = true
-				if email != "owner@example.com" {
-					t.Fatalf("unexpected email %q", email)
+				if len(args) != 1 || args[0] != "owner@example.com" {
+					t.Fatalf("unexpected reset-password args: %#v", args)
 				}
 				return nil
 			},
@@ -158,6 +200,117 @@ func TestTryRunCLICommandWithHandlersResetPassword(t *testing.T) {
 		}
 		if !called {
 			t.Fatal("expected the reset-password handler to be invoked")
+		}
+	})
+
+	// TestTryRunCLICommandWithHandlersResetPassword/dispatches_the_--id_form
+	// pins that the id-addressing affordance (finding DB-2) reaches the
+	// handler as an ordinary argument, exactly like the users subcommands'
+	// own --id flag.
+	t.Run("dispatches the --id form", func(t *testing.T) {
+		setValidBootEnv(t)
+		called := false
+		handled, err := tryRunCLICommandWithHandlers([]string{"reset-password", "--id", "7"}, cliCommandHandlers{
+			runResetPassword: func(_ db.Config, args []string) error {
+				called = true
+				if len(args) != 2 || args[0] != "--id" || args[1] != "7" {
+					t.Fatalf("unexpected reset-password args: %#v", args)
+				}
+				return nil
+			},
+		})
+		if !handled || err != nil {
+			t.Fatalf("expected clean dispatch, got (%t, %v)", handled, err)
+		}
+		if !called {
+			t.Fatal("expected the reset-password handler to be invoked")
+		}
+	})
+}
+
+func TestTryRunCLICommandWithHandlersLinkOIDCIdentity(t *testing.T) {
+	baseArgs := []string{"link-oidc-identity", "owner@example.com", "--issuer", "https://idp.example", "--subject", "sub-1"}
+
+	t.Run("requires a handler", func(t *testing.T) {
+		setValidBootEnv(t)
+		handled, err := tryRunCLICommandWithHandlers(baseArgs, cliCommandHandlers{})
+		if !handled || err == nil {
+			t.Fatalf("expected handled error, got (%t, %v)", handled, err)
+		}
+	})
+
+	t.Run("reports invalid database config", func(t *testing.T) {
+		setValidBootEnv(t)
+		t.Setenv("DB_DRIVER", "bogus")
+		handled, err := tryRunCLICommandWithHandlers(baseArgs, cliCommandHandlers{
+			runLinkOIDCIdentity: func(db.Config, security.OIDCConfig, []string) error { return nil },
+		})
+		if !handled || err == nil {
+			t.Fatalf("expected handled db-config error, got (%t, %v)", handled, err)
+		}
+	})
+
+	t.Run("reports invalid oidc config", func(t *testing.T) {
+		setValidBootEnv(t)
+		t.Setenv("OIDC_ENABLED", "true")
+		t.Setenv("OIDC_ISSUER_URL", "")
+		t.Setenv("OIDC_CLIENT_ID", "")
+		handled, err := tryRunCLICommandWithHandlers(baseArgs, cliCommandHandlers{
+			runLinkOIDCIdentity: func(db.Config, security.OIDCConfig, []string) error { return nil },
+		})
+		if !handled || err == nil {
+			t.Fatalf("expected handled oidc-config error, got (%t, %v)", handled, err)
+		}
+	})
+
+	t.Run("reports an invalid COOKIE_SECURE value", func(t *testing.T) {
+		setValidBootEnv(t)
+		t.Setenv("COOKIE_SECURE", "not-a-bool")
+		handled, err := tryRunCLICommandWithHandlers(baseArgs, cliCommandHandlers{
+			runLinkOIDCIdentity: func(db.Config, security.OIDCConfig, []string) error { return nil },
+		})
+		if !handled || err == nil {
+			t.Fatalf("expected handled COOKIE_SECURE error, got (%t, %v)", handled, err)
+		}
+	})
+
+	t.Run("reports an invalid REGISTRATION_MODE value", func(t *testing.T) {
+		setValidBootEnv(t)
+		t.Setenv("REGISTRATION_MODE", "bogus")
+		handled, err := tryRunCLICommandWithHandlers(baseArgs, cliCommandHandlers{
+			runLinkOIDCIdentity: func(db.Config, security.OIDCConfig, []string) error { return nil },
+		})
+		if !handled || err == nil {
+			t.Fatalf("expected handled REGISTRATION_MODE error, got (%t, %v)", handled, err)
+		}
+	})
+
+	t.Run("dispatches to the handler with the resolved oidc config", func(t *testing.T) {
+		setValidBootEnv(t)
+		t.Setenv("OIDC_ENABLED", "true")
+		t.Setenv("OIDC_ISSUER_URL", "https://idp.example")
+		t.Setenv("OIDC_CLIENT_ID", "client-id")
+		t.Setenv("OIDC_CLIENT_SECRET", "client-secret")
+		t.Setenv("OIDC_REDIRECT_URL", "https://app.example/auth/oidc/callback")
+		t.Setenv("COOKIE_SECURE", "true")
+		called := false
+		handled, err := tryRunCLICommandWithHandlers(baseArgs, cliCommandHandlers{
+			runLinkOIDCIdentity: func(_ db.Config, oidcConfig security.OIDCConfig, args []string) error {
+				called = true
+				if !oidcConfig.Enabled {
+					t.Fatal("expected the resolved OIDC config to be enabled")
+				}
+				if len(args) != 5 {
+					t.Fatalf("unexpected link-oidc-identity args: %#v", args)
+				}
+				return nil
+			},
+		})
+		if !handled || err != nil {
+			t.Fatalf("expected clean dispatch, got (%t, %v)", handled, err)
+		}
+		if !called {
+			t.Fatal("expected the link-oidc-identity handler to be invoked")
 		}
 	})
 }

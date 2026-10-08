@@ -4,17 +4,9 @@
     }
 
     var input = toggle.querySelector("[data-binary-toggle-input]");
-    var state = toggle.querySelector("[data-binary-toggle-state]");
     var active = !!(input && input.checked);
 
     toggle.setAttribute("data-active", active ? "true" : "false");
-    if (!state) {
-      return;
-    }
-
-    state.textContent = active
-      ? String(state.getAttribute("data-state-on") || "")
-      : String(state.getAttribute("data-state-off") || "");
   }
 
   function bindBinaryToggles(root) {
@@ -38,6 +30,46 @@
       }
 
       syncBinaryToggleState(toggle);
+    }
+  }
+
+  // The avoid-pregnancy warning follows the checked usage_goal radio of its
+  // scope. The server already renders it shown or hidden for the saved goal, so
+  // the page is right without this script; this keeps it in step while the
+  // choice changes before a save, after a draft reset, and when a skip clears it.
+  function syncUsageGoalWarning(scope) {
+    if (!scope || !scope.querySelector) {
+      return;
+    }
+
+    var warning = scope.querySelector("[data-usage-goal-avoid-warning]");
+    var checked = scope.querySelector("input[name='usage_goal']:checked");
+    setNodeHidden(warning, !checked || checked.value !== "avoid_pregnancy");
+  }
+
+  function bindUsageGoalWarnings(root) {
+    var scope = root && root.querySelectorAll ? root : document;
+    var scopes = [];
+    if (scope.matches && scope.matches("[data-usage-goal-warning-scope]")) {
+      scopes.push(scope);
+    }
+    var nested = scope.querySelectorAll("[data-usage-goal-warning-scope]");
+    for (var nestedIndex = 0; nestedIndex < nested.length; nestedIndex++) {
+      scopes.push(nested[nestedIndex]);
+    }
+
+    for (var index = 0; index < scopes.length; index++) {
+      var current = scopes[index];
+      if (current.dataset.usageGoalWarningBound !== "1") {
+        current.dataset.usageGoalWarningBound = "1";
+        current.addEventListener("change", function (event) {
+          if (event.target && event.target.matches && event.target.matches("input[name='usage_goal']")) {
+            syncUsageGoalWarning(this);
+          }
+        });
+      }
+
+      syncUsageGoalWarning(current);
     }
   }
 
@@ -87,6 +119,78 @@
       }
 
       syncSymptomNameCounter(field);
+    }
+  }
+
+  // Removing a saved pregnancy-test result is a button after the radiogroup,
+  // not a third radio: the group keeps exactly two results and announces them
+  // as two. The button does what the radio used to do — move the hidden "none"
+  // carrier — and then fires one change event from that carrier, which is the
+  // single signal both day forms already listen to: the dashboard marks itself
+  // dirty and autosaves, the calendar editor simply carries the new value into
+  // its explicit Save. Nothing here is keyed on which form it sits in.
+  function syncPregnancyTestField(field, recorded) {
+    var remove = field.querySelector("[data-pregnancy-test-remove]");
+    field.setAttribute("data-pregnancy-test-state", recorded ? "recorded" : "absent");
+    var empty = field.querySelector("[data-pregnancy-test-empty]");
+    if (remove) {
+      setNodeHidden(remove, !recorded);
+    }
+    if (empty) {
+      setNodeHidden(empty, recorded);
+    }
+  }
+
+  function clearPregnancyTestResult(field) {
+    var radios = field.querySelectorAll("input[name='pregnancy_test']");
+    var carrier = field.querySelector("[data-pregnancy-test-unset]");
+
+    for (var index = 0; index < radios.length; index++) {
+      radios[index].checked = false;
+    }
+    if (!carrier) {
+      return;
+    }
+    carrier.checked = true;
+    syncPregnancyTestField(field, false);
+    // The button the owner just pressed is now hidden, and focus on a hidden
+    // control falls back to the page body. It lands on the first result: the
+    // control the removal hands the field back to.
+    if (radios.length > 0 && typeof radios[0].focus === "function") {
+      radios[0].focus();
+    }
+    carrier.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  function bindPregnancyTestFields(root) {
+    var scope = root && root.querySelectorAll ? root : document;
+    var fields = scope.querySelectorAll("[data-pregnancy-test]");
+
+    for (var index = 0; index < fields.length; index++) {
+      var field = fields[index];
+      if (field.dataset.pregnancyTestBound === "1") {
+        continue;
+      }
+      field.dataset.pregnancyTestBound = "1";
+
+      field.addEventListener("click", function (event) {
+        var button = closestFromEvent(event, "[data-pregnancy-test-remove]");
+        if (!button || !this.contains(button)) {
+          return;
+        }
+        clearPregnancyTestResult(this);
+      });
+
+      // Picking a result again after a removal must offer the way back out
+      // once more, or the removal turns the control into a one-way door until
+      // the next page load.
+      field.addEventListener("change", function (event) {
+        var radio = event.target;
+        if (!radio || radio.name !== "pregnancy_test" || !radio.checked) {
+          return;
+        }
+        syncPregnancyTestField(this, radio.value !== "none");
+      });
     }
   }
 

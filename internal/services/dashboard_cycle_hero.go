@@ -1,30 +1,46 @@
 package services
 
 import (
-	"math"
-	"strconv"
+	"time"
 
 	"github.com/ovumcy/ovumcy-web/internal/models"
 )
 
-const (
-	dashboardCycleHeroCenterX = 110.0
-	dashboardCycleHeroCenterY = 110.0
-	dashboardCycleHeroRadius  = 78.0
-)
+// dashboardCycleHeroMaxAxisDays bounds the day cells the ribbon renders. The
+// axis normally ends at the reference cycle length, but an irregular account's
+// predicted start window runs to MaxCycleLength, and a cycle merged by a missed
+// period log makes that number arbitrarily large. Past this bound the window is
+// drawn as far as the axis reaches — the status line still states its exact
+// dates — rather than growing the DOM without limit.
+const dashboardCycleHeroMaxAxisDays = 60
 
-var dashboardCycleHeroCircumference = 2 * math.Pi * dashboardCycleHeroRadius
+// phaseBeyondProjectedCycle labels the axis days past the projected cycle
+// length: they carry no phase (the projection ended) and exist only because the
+// predicted start window reaches them.
+const phaseBeyondProjectedCycle = "beyond"
+
+// phaseFertilityWithheld labels the axis days a suppressed tier still HAS —
+// the cycle is running — but whose phase is defined in terms of the ovulation
+// day the shared fertility gate withholds. It is deliberately not
+// phaseBeyondProjectedCycle: "beyond" means the projection ENDED and the
+// ribbon paints nothing there, so letting these days fall through to it told a
+// mid-cycle owner that tracking had stopped rather than that the fertile
+// details were held back.
+const phaseFertilityWithheld = "withheld"
 
 type DashboardCycleHero struct {
-	Visible              bool
-	Approximate          bool
-	CurrentDay           int
-	CycleLength          int
-	CurrentPhase         string
-	PhaseCards           []DashboardCycleHeroPhaseCard
-	Segments             []DashboardCycleHeroSegment
-	CurrentDayMarker     DashboardCycleHeroMarker
-	ShowCurrentDayMarker bool
+	Visible      bool
+	Approximate  bool
+	CurrentDay   int
+	CycleLength  int
+	AxisDays     int
+	CurrentPhase string
+	PhaseCards   []DashboardCycleHeroPhaseCard
+	// Days is the ribbon itself: one cell per day of the axis, in order, each
+	// carrying every encoding that day is under. The presentation is a row of
+	// equal-width cells rather than SVG geometry so that no coordinate is
+	// computed twice and no inline style is needed (strict CSP).
+	Days []DashboardCycleHeroDay
 }
 
 type DashboardCycleHeroPhaseCard struct {
@@ -34,18 +50,32 @@ type DashboardCycleHeroPhaseCard struct {
 	IsCurrent bool
 }
 
-type DashboardCycleHeroSegment struct {
-	Phase      string
-	DashArray  string
-	DashOffset string
+// DashboardCycleHeroDay is one day column of the ribbon. Phase and fertility
+// are two orthogonal axes (#416), so a day carries both independently, and the
+// recorded/projected distinction is a third: it is what separates a fact from
+// an estimate on a surface that shows them side by side.
+type DashboardCycleHeroDay struct {
+	Day             int
+	Phase           string
+	IsToday         bool
+	IsProjected     bool
+	IsLogged        bool
+	IsFertile       bool
+	IsFertilePeak   bool
+	IsStartWindow   bool
+	IsPredictedFlow bool
 }
 
-type DashboardCycleHeroMarker struct {
-	X string
-	Y string
+// dashboardCycleHeroInput is everything the ribbon needs beyond the cycle
+// context: the account's own logs decide which days carry a recorded entry, and
+// the location resolves them to calendar days.
+type dashboardCycleHeroInput struct {
+	Logs     []models.DailyLog
+	Today    time.Time
+	Location *time.Location
 }
 
-func BuildDashboardCycleHero(user *models.User, stats CycleStats, cycleContext DashboardCycleContext) DashboardCycleHero {
+func BuildDashboardCycleHero(user *models.User, stats CycleStats, cycleContext DashboardCycleContext, input dashboardCycleHeroInput) DashboardCycleHero {
 	cycleLength := DashboardCycleReferenceLength(user, stats)
 	if !canRenderDashboardCycleHero(cycleLength, stats, cycleContext) {
 		return DashboardCycleHero{}
@@ -56,33 +86,163 @@ func BuildDashboardCycleHero(user *models.User, stats CycleStats, cycleContext D
 		return DashboardCycleHero{}
 	}
 
-	ovulationDay, _ := CalcOvulationDay(cycleLength, stats.LutealPhase)
-	if ovulationDay <= periodLength+1 || ovulationDay > cycleLength {
+	location := input.Location
+	if location == nil {
+		location = time.UTC
+	}
+	cycleStart := CalendarDay(stats.LastPeriodStart, location)
+
+	// FertilitySuppressed is FertilityProjectionSuppressed(user, stats) resolved
+	// once on the context — the same predicate the fertile-span peak below
+	// already deferred to (dashboardCycleHeroFertileSpan) and the one
+	// PublishedStats clears the fertility fields against. It, not
+	// AwaitingFirstCycle alone, is the gate here: AwaitingFirstCycle is only ONE
+	// of the reasons this predicate suppresses (unpredictable-cycle mode and a
+	// pregnancy pause are the others), and the hero is built from
+	// confirmedStats — the pre-publication copy — so it must defer to the same
+	// floor PublishedStats applies rather than a narrower one of its own.
+	fertilitySuppressed := cycleContext.FertilitySuppressed
+
+	ovulationDay, confirmedAnchor := dashboardCycleHeroOvulationDay(stats, cycleContext, cycleLength, cycleStart, location)
+	// A window running past the published ovulation (the range mode's) makes
+	// that day the band's left edge for the header (ovulationTimingUndetermined),
+	// so the cards take it too; the average-based projection would open the band
+	// on another day and the cells would answer differently from the header.
+	undeterminedEnd := dashboardCycleHeroUndeterminedEnd(stats, cycleStart, location, fertilitySuppressed)
+	if undeterminedEnd > 0 && !confirmedAnchor {
+		ovulationDay = CalendarDaysBetween(cycleStart, CalendarDay(stats.OvulationDate, location)) + 1
+	}
+	if confirmedAnchor {
+		// A confirmed day is an OBSERVATION; the projected periodLength above it
+		// is a projection of the average. When they disagree the observation
+		// narrows the menstrual/follicular split (and every card and cell that
+		// reads periodLength below), rather than the projection hiding the whole
+		// ribbon out from under the cohort that tracks its temperatures most
+		// closely. The only refusal left here is geometric impossibility —
+		// see the comment on dashboardCycleHeroOvulationDay for why the confirmed
+		// branch drops the periodLength+1 floor the projected branch still needs.
+		if ovulationDay < 2 || ovulationDay > cycleLength {
+			return DashboardCycleHero{}
+		}
+		periodLength = min(periodLength, ovulationDay-1)
+	} else if ovulationDay <= periodLength+1 || ovulationDay > cycleLength {
 		return DashboardCycleHero{}
 	}
 
 	currentDay := stats.CurrentCycleDay
-	currentPhase := dashboardCycleHeroCurrentPhase(stats.CurrentPhase, currentDay, periodLength, ovulationDay, cycleLength)
-	phaseCards := dashboardCycleHeroPhaseCards(currentPhase, periodLength, ovulationDay, cycleLength)
-	segments := dashboardCycleHeroSegments(phaseCards, cycleLength)
+	// The ribbon geometry (axis, day cells, the "today" marker) stays visible
+	// under FERTILITY suppression — the owner rejected hiding the whole hero for
+	// that tier; the overdue gate is refused earlier, in
+	// canRenderDashboardCycleHero, for the reason stated there — but the parts
+	// that NAME the ovulation day go quiet: the current-phase
+	// label and the phase-card breakdown both stop revealing anything past the
+	// menstrual card, which is read off recorded bleeding rather than the
+	// suppressed ovulation projection.
+	currentPhase := dashboardCycleHeroCurrentPhase(stats.CurrentPhase, currentDay, periodLength, ovulationDay, cycleLength, fertilitySuppressed)
+	// The fallback above resolves "unknown" off the ribbon's own geometry, so a
+	// day resolveCyclePhase left unnamed because the window still calls it
+	// fertile past the published ovulation day would come back "luteal" here —
+	// on the header the dashboard prints in place of the published phase. The
+	// same rule decides it on both. It overrides only what that fallback
+	// invented: a phase resolveCyclePhase named is already its answer, and a
+	// bleeding day logged inside the band is "menstrual" there before the rule
+	// is asked. A suppressed tier keeps its own answer.
+	if !fertilitySuppressed && stats.CurrentPhase == "unknown" && ovulationTimingUndetermined(stats, input.Today) {
+		currentPhase = "unknown"
+	}
+	phaseCards := dashboardCycleHeroPhaseCards(currentPhase, periodLength, ovulationDay, cycleLength, fertilitySuppressed, undeterminedEnd)
+
+	startWindow := dashboardCycleHeroStartWindow(cycleContext, cycleStart)
+	axisDays := dashboardCycleHeroAxisDays(cycleLength, startWindow)
 
 	return DashboardCycleHero{
-		Visible:              true,
-		Approximate:          dashboardCycleHeroApproximate(cycleContext),
-		CurrentDay:           currentDay,
-		CycleLength:          cycleLength,
-		CurrentPhase:         currentPhase,
-		PhaseCards:           phaseCards,
-		Segments:             segments,
-		CurrentDayMarker:     dashboardCycleHeroMarkerAtDay(float64(currentDay)-0.5, cycleLength),
-		ShowCurrentDayMarker: true,
+		Visible:      true,
+		Approximate:  dashboardCycleHeroApproximate(cycleContext, startWindow),
+		CurrentDay:   currentDay,
+		CycleLength:  cycleLength,
+		AxisDays:     axisDays,
+		CurrentPhase: currentPhase,
+		PhaseCards:   phaseCards,
+		Days: dashboardCycleHeroDays(
+			axisDays,
+			currentDay,
+			phaseCards,
+			startWindow,
+			dashboardCycleHeroFertileSpan(stats, cycleContext, cycleStart, location),
+			dashboardCycleHeroLoggedDays(input.Logs, cycleStart, input.Today, location),
+			periodLength,
+		),
 	}
 }
 
+// dashboardCycleHeroOvulationDay anchors the phase-card geometry — and so the
+// "ovulation" card and dashboardCycleHeroCurrentPhase's own fallback — on the
+// same day dashboardCycleHeroFertileSpan already peaks on: the confirmed
+// OvulationDate, read as a cycle day off the same cycleStart, rather than a
+// second, independent CalcOvulationDay projection. Left unconditional, this
+// anchor also fires for an account with no confirmed shift, whose
+// stats.OvulationDate is a MEDIAN-driven projection (DashboardProjectionCycleLength)
+// while the ribbon's own geometry — cycleLength here — is the AVERAGE
+// (DashboardCycleReferenceLength); a median well above the average lands that
+// date's cycle day outside the ribbon and the bounds check below silently
+// hides the hero for an owner who never recorded a thermal shift. So the
+// confirmed date is only trusted when cycleContext.DisplayOvulationConfirmed
+// says a resolver actually substituted it; otherwise this falls back to the
+// same CalcOvulationDay(cycleLength, LutealPhase) projection used before
+// confirmed-shift anchoring existed.
+//
+// The two callers apply two DIFFERENT bounds, because the two returned days
+// carry different guarantees. The projected branch's caller still requires
+// ovulationDay > periodLength+1: CalcOvulationDay is itself a projection
+// built from the SAME AveragePeriodLength periodLength projects, so a day it
+// places inside or one after the projected period is that projection
+// disagreeing with itself, not a real cycle — a legitimate refusal to render.
+// The confirmed branch's caller drops that floor to the geometric minimum
+// (ovulationDay >= 2): the day is an OBSERVATION the detector read off
+// recorded temperatures, periodLength is still a projection of the average,
+// and when an observation lands inside or before the projected period the
+// observation narrows periodLength instead — the projection has no standing
+// to hide a ribbon an observation can place. Only ovulationDay > cycleLength
+// stays a refusal on both branches: that is a day past the ribbon's own axis,
+// which no clamp on periodLength can fix.
+// A suppressed tier never trusts the confirmed anchor: ResolveConfirmedCycleStats
+// and PublishedStats already withhold the confirmed OvulationDate for exactly
+// this cohort, and letting the hero substitute it anyway — even only to narrow
+// periodLength below — would place the observation's day one past the
+// menstrual card the ribbon still draws, naming it by construction.
+func dashboardCycleHeroOvulationDay(stats CycleStats, cycleContext DashboardCycleContext, cycleLength int, cycleStart time.Time, location *time.Location) (int, bool) {
+	if !cycleContext.FertilitySuppressed && cycleContext.DisplayOvulationConfirmed && !stats.OvulationDate.IsZero() && !cycleStart.IsZero() {
+		return CalendarDaysBetween(cycleStart, CalendarDay(stats.OvulationDate, location)) + 1, true
+	}
+	projected, _ := CalcOvulationDay(cycleLength, stats.LutealPhase)
+	return projected, false
+}
+
+// canRenderDashboardCycleHero decides whether the ribbon may be drawn at all.
+//
+// NextPeriodEstimatePaused is the decision the cycle context already resolved,
+// read rather than re-derived, and it is not the day-inside-the-length test above
+// it: cycleLength here is the average-first reference, which a merged cycle
+// inflates, while the gate is measured against the shorter length. Cycle day
+// 61 sat inside a 96-day reference, so the ribbon drew a 96-day projected cycle
+// map — projected days and a projected ovulation day among them — beside a header
+// saying the estimate is paused. A projected window the gate withheld may not be
+// drawn by any surface, this one included: a suppressed cycle map is not a cycle
+// map that stays honest.
+//
+// This is a stricter refusal than the fertility tier's, and deliberately so. That
+// tier keeps the ribbon and quiets only the parts that NAME the ovulation day
+// (see the comment on currentPhase in BuildDashboardCycleHero), because the axis
+// itself is still a length the account can be shown to be inside. Past the
+// overdue gate nothing on the ribbon survives that test: the axis length is the
+// inflated reference, the start window is a withheld date, and the "today" marker
+// sits outside the projection that produced them. Pinned from the outside by
+// TestLongCycleGateSuppressesEverySurfaceWhenAMergedCycleInflatesTheAverage.
 func canRenderDashboardCycleHero(cycleLength int, stats CycleStats, cycleContext DashboardCycleContext) bool {
 	return cycleLength > 0 &&
 		stats.CurrentCycleDay > 0 &&
 		stats.CurrentCycleDay <= cycleLength &&
+		!cycleContext.NextPeriodEstimatePaused &&
 		!cycleContext.PredictionDisabled &&
 		!cycleContext.CycleDataStale &&
 		!cycleContext.DisplayNextPeriodPrompt &&
@@ -91,92 +251,278 @@ func canRenderDashboardCycleHero(cycleLength int, stats CycleStats, cycleContext
 		!cycleContext.DisplayOvulationImpossible
 }
 
-func dashboardCycleHeroApproximate(cycleContext DashboardCycleContext) bool {
-	return cycleContext.DisplayNextPeriodUseRange ||
+// The next-period half is approximate only through the window the ribbon
+// actually draws: a header range the ribbon leaves out (it belongs to the next
+// cycle) has nothing on the ribbon to qualify.
+func dashboardCycleHeroApproximate(cycleContext DashboardCycleContext, startWindow dashboardCycleHeroDaySpan) bool {
+	return startWindow.Present ||
 		cycleContext.DisplayOvulationUseRange ||
 		!cycleContext.DisplayOvulationExact
 }
 
-func dashboardCycleHeroPhaseCards(currentPhase string, periodLength int, ovulationDay int, cycleLength int) []DashboardCycleHeroPhaseCard {
-	return []DashboardCycleHeroPhaseCard{
+// dashboardCycleHeroPhaseCards splits the cycle into cards for the ribbon's
+// phase breakdown. The menstrual card is the only NAMED phase that survives
+// suppression: it is read off recorded bleeding (periodLength), never off the
+// ovulation day, so it carries nothing the shared fertility gate withholds.
+// The follicular, ovulation and luteal cards all have a boundary defined IN
+// TERMS OF ovulationDay — cutting any one of them in would still spell the day
+// out through its StartDay/EndDay, so all three drop together rather than only
+// the "ovulation" card whose name is the obvious tell. What replaces them is
+// one card carrying no boundary of its own, so that the days keep a status
+// instead of falling through to "beyond".
+//
+// undeterminedEnd > ovulationDay inserts an "unknown" card over
+// (ovulationDay, undeterminedEnd] and starts luteal after it: the cells say
+// what the header says on those days (ovulationTimingUndetermined).
+func dashboardCycleHeroPhaseCards(currentPhase string, periodLength int, ovulationDay int, cycleLength int, fertilitySuppressed bool, undeterminedEnd int) []DashboardCycleHeroPhaseCard {
+	cards := []DashboardCycleHeroPhaseCard{
 		{
 			Phase:     "menstrual",
 			StartDay:  1,
 			EndDay:    periodLength,
 			IsCurrent: currentPhase == "menstrual",
 		},
-		{
+	}
+	if fertilitySuppressed {
+		// periodLength < cycleLength is the caller's invariant, not a case to
+		// re-test: BuildDashboardCycleHero returns an empty hero above when the
+		// projected period fills the cycle, and the confirmed branch only ever
+		// lowers periodLength. The three unsuppressed cards below rest on the
+		// same guarantee, and guarding only this one would have bought a test
+		// that exercises a state the ribbon cannot be built in.
+		cards = append(cards, DashboardCycleHeroPhaseCard{
+			Phase:     phaseFertilityWithheld,
+			StartDay:  periodLength + 1,
+			EndDay:    cycleLength,
+			IsCurrent: currentPhase == phaseFertilityWithheld,
+		})
+		return cards
+	}
+	cards = append(cards,
+		DashboardCycleHeroPhaseCard{
 			Phase:     "follicular",
 			StartDay:  periodLength + 1,
 			EndDay:    ovulationDay - 1,
 			IsCurrent: currentPhase == "follicular",
 		},
-		{
+		DashboardCycleHeroPhaseCard{
 			Phase:     "ovulation",
 			StartDay:  ovulationDay,
 			EndDay:    ovulationDay,
 			IsCurrent: currentPhase == "ovulation",
 		},
-		{
-			Phase:     "luteal",
+	)
+	lutealStart := ovulationDay + 1
+	if undeterminedEnd > ovulationDay {
+		cards = append(cards, DashboardCycleHeroPhaseCard{
+			Phase:     "unknown",
 			StartDay:  ovulationDay + 1,
-			EndDay:    cycleLength,
-			IsCurrent: currentPhase == "luteal",
-		},
-	}
-}
-
-func dashboardCycleHeroSegments(phaseCards []DashboardCycleHeroPhaseCard, cycleLength int) []DashboardCycleHeroSegment {
-	segments := make([]DashboardCycleHeroSegment, 0, len(phaseCards))
-	offset := 0.0
-	for _, card := range phaseCards {
-		dayCount := float64(card.EndDay - card.StartDay + 1)
-		dash := dashboardCycleHeroCircumference * (dayCount / float64(cycleLength))
-		segments = append(segments, DashboardCycleHeroSegment{
-			Phase:      card.Phase,
-			DashArray:  dashboardCycleHeroDashArray(dash),
-			DashOffset: dashboardCycleHeroFloat(-offset),
+			EndDay:    min(undeterminedEnd, cycleLength),
+			IsCurrent: currentPhase == "unknown",
 		})
-		offset += dash
+		lutealStart = undeterminedEnd + 1
 	}
-	return segments
+	return append(cards, DashboardCycleHeroPhaseCard{
+		Phase:     "luteal",
+		StartDay:  lutealStart,
+		EndDay:    cycleLength,
+		IsCurrent: currentPhase == "luteal",
+	})
 }
 
-func dashboardCycleHeroCurrentPhase(currentPhase string, currentDay int, periodLength int, ovulationDay int, cycleLength int) string {
+// dashboardCycleHeroUndeterminedEnd is the cycle day the fertile window ends on
+// when it runs past the published ovulation day — only the irregular range
+// mode's widened window does — and 0 otherwise, so every other ribbon keeps
+// its cards. A non-zero answer also moves the ribbon's projected ovulation card
+// onto the published day (BuildDashboardCycleHero). The suppressed tier never
+// gets one: its cards name no ovulation day at all.
+func dashboardCycleHeroUndeterminedEnd(stats CycleStats, cycleStart time.Time, location *time.Location, fertilitySuppressed bool) int {
+	if fertilitySuppressed || cycleStart.IsZero() || stats.OvulationImpossible || stats.OvulationDate.IsZero() || stats.FertilityWindowEnd.IsZero() {
+		return 0
+	}
+	windowEnd := CalendarDay(stats.FertilityWindowEnd, location)
+	if !windowEnd.After(CalendarDay(stats.OvulationDate, location)) {
+		return 0
+	}
+	return CalendarDaysBetween(cycleStart, windowEnd) + 1
+}
+
+// dashboardCycleHeroDaySpan is a closed [StartDay, EndDay] run of cycle days,
+// 1-based like the cycle day itself. A zero-value span covers nothing.
+type dashboardCycleHeroDaySpan struct {
+	StartDay int
+	EndDay   int
+	PeakDay  int
+	Present  bool
+}
+
+func (span dashboardCycleHeroDaySpan) covers(day int) bool {
+	return span.Present && day >= span.StartDay && day <= span.EndDay
+}
+
+// dashboardCycleHeroStartWindow is the run of days the NEXT period may start
+// on: the window the header prints, read from the context that resolved it
+// (ResolveProjectionRanges on the projection, plus the header's own
+// withholding), never a second derivation. That projection is the period that
+// closes the cycle opened at cycleStart (DashboardUpcomingPredictions keeps it
+// there until the overdue gate), so the window is always this ribbon's own.
+func dashboardCycleHeroStartWindow(cycleContext DashboardCycleContext, cycleStart time.Time) dashboardCycleHeroDaySpan {
+	if cycleStart.IsZero() || !cycleContext.DisplayNextPeriodUseRange {
+		return dashboardCycleHeroDaySpan{}
+	}
+	windowStart, windowEnd := cycleContext.DisplayNextPeriodRangeStart, cycleContext.DisplayNextPeriodRangeEnd
+	return dashboardCycleHeroSpanFromDates(cycleStart, windowStart, windowEnd, time.Time{})
+}
+
+// dashboardCycleHeroFertileSpan is the fertile window as the calendar shades
+// it, with the ovulation day as its peak. It gates on FertilitySuppressed —
+// FertilityProjectionSuppressed(user, stats) resolved once on the context —
+// rather than AwaitingFirstCycle alone: the first-cycle floor is only ONE of
+// the reasons that predicate withholds the fertile half (unpredictable-cycle
+// mode and a pregnancy pause are the other two), and this span must defer to
+// the same floor every other fertility surface — the calendar grid, the .ics
+// feed, the published stats copy — already defers to, or an account
+// suppressed for one of those other two reasons would still see the peak here.
+func dashboardCycleHeroFertileSpan(stats CycleStats, cycleContext DashboardCycleContext, cycleStart time.Time, location *time.Location) dashboardCycleHeroDaySpan {
+	if cycleContext.FertilitySuppressed || cycleStart.IsZero() {
+		return dashboardCycleHeroDaySpan{}
+	}
+	return dashboardCycleHeroSpanFromDates(
+		cycleStart,
+		CalendarDay(stats.FertilityWindowStart, location),
+		CalendarDay(stats.FertilityWindowEnd, location),
+		CalendarDay(stats.OvulationDate, location),
+	)
+}
+
+func dashboardCycleHeroSpanFromDates(cycleStart time.Time, start time.Time, end time.Time, peak time.Time) dashboardCycleHeroDaySpan {
+	if start.IsZero() || end.IsZero() || end.Before(start) {
+		return dashboardCycleHeroDaySpan{}
+	}
+
+	startDay := CalendarDaysBetween(cycleStart, start) + 1
+	endDay := CalendarDaysBetween(cycleStart, end) + 1
+	if endDay < 1 {
+		return dashboardCycleHeroDaySpan{}
+	}
+	if startDay < 1 {
+		startDay = 1
+	}
+
+	span := dashboardCycleHeroDaySpan{StartDay: startDay, EndDay: endDay, Present: true}
+	if !peak.IsZero() {
+		span.PeakDay = CalendarDaysBetween(cycleStart, peak) + 1
+	}
+	return span
+}
+
+// dashboardCycleHeroLoggedDays reports which cycle days carry a recorded entry.
+// Only days up to today can: a future day has nothing to record, and marking one
+// would put a fact on the estimate side of the ribbon.
+func dashboardCycleHeroLoggedDays(logs []models.DailyLog, cycleStart time.Time, today time.Time, location *time.Location) map[int]bool {
+	if cycleStart.IsZero() {
+		return nil
+	}
+
+	logged := make(map[int]bool, len(logs))
+	for _, logEntry := range logs {
+		if !DayHasData(logEntry) {
+			continue
+		}
+
+		localDay := CalendarDay(logEntry.Date, location)
+		if localDay.Before(cycleStart) || (!today.IsZero() && localDay.After(today)) {
+			continue
+		}
+
+		dayNumber := CalendarDaysBetween(cycleStart, localDay) + 1
+		if dayNumber >= 1 {
+			logged[dayNumber] = true
+		}
+	}
+	return logged
+}
+
+func dashboardCycleHeroAxisDays(cycleLength int, startWindow dashboardCycleHeroDaySpan) int {
+	axisDays := cycleLength
+	if startWindow.Present && startWindow.EndDay > axisDays {
+		axisDays = startWindow.EndDay
+	}
+	if axisDays > dashboardCycleHeroMaxAxisDays {
+		axisDays = dashboardCycleHeroMaxAxisDays
+	}
+	return axisDays
+}
+
+func dashboardCycleHeroDays(
+	axisDays int,
+	currentDay int,
+	phaseCards []DashboardCycleHeroPhaseCard,
+	startWindow dashboardCycleHeroDaySpan,
+	fertile dashboardCycleHeroDaySpan,
+	logged map[int]bool,
+	periodLength int,
+) []DashboardCycleHeroDay {
+	days := make([]DashboardCycleHeroDay, 0, axisDays)
+	for day := 1; day <= axisDays; day++ {
+		days = append(days, DashboardCycleHeroDay{
+			Day:         day,
+			Phase:       dashboardCycleHeroPhaseForDay(day, phaseCards),
+			IsToday:     day == currentDay,
+			IsProjected: day > currentDay,
+			IsLogged:    logged[day],
+			// A recorded day is never repainted as an estimate: the fertile
+			// shading and the projected-flow texture belong to what is still
+			// ahead, and the fertile window keeps its shading in the past
+			// because it is where the recorded temperatures were taken.
+			IsFertile:       fertile.covers(day),
+			IsFertilePeak:   fertile.Present && fertile.PeakDay == day,
+			IsStartWindow:   startWindow.covers(day),
+			IsPredictedFlow: day > currentDay && day <= periodLength,
+		})
+	}
+	return days
+}
+
+func dashboardCycleHeroPhaseForDay(day int, phaseCards []DashboardCycleHeroPhaseCard) string {
+	for _, card := range phaseCards {
+		if day >= card.StartDay && day <= card.EndDay {
+			return card.Phase
+		}
+	}
+	return phaseBeyondProjectedCycle
+}
+
+// dashboardCycleHeroCurrentPhase names today's phase. The resolution below is
+// unchanged from before suppression was a concern; fertilitySuppressed only
+// filters the RESULT, because "menstrual" is read off recorded bleeding
+// (periodLength) while every other branch is defined in terms of
+// ovulationDay — the follicular/ovulation/luteal split the fertility gate
+// withholds. A suppressed tier keeps "menstrual" and answers "withheld" for
+// anything else, rather than resolving a phase whose boundary names the day.
+// The status line and the ribbon cells below it are one widget answering about
+// one cycle, so the header says the same word the cells do; a second spelling
+// for the same suppression is a second answer.
+func dashboardCycleHeroCurrentPhase(currentPhase string, currentDay int, periodLength int, ovulationDay int, cycleLength int, fertilitySuppressed bool) string {
+	resolved := currentPhase
 	switch currentPhase {
-	case "menstrual", "ovulation", "luteal":
-		return currentPhase
-	case "follicular", "fertile":
-		return "follicular"
-	}
-
-	switch {
-	case currentDay >= 1 && currentDay <= periodLength:
-		return "menstrual"
-	case currentDay == ovulationDay:
-		return "ovulation"
-	case currentDay > ovulationDay && currentDay <= cycleLength:
-		return "luteal"
+	case "menstrual", "ovulation", "luteal", "follicular":
+		// Trust the caller's own classification as-is.
 	default:
-		return "follicular"
+		switch {
+		case currentDay >= 1 && currentDay <= periodLength:
+			resolved = "menstrual"
+		case currentDay == ovulationDay:
+			resolved = "ovulation"
+		case currentDay > ovulationDay && currentDay <= cycleLength:
+			resolved = "luteal"
+		default:
+			resolved = "follicular"
+		}
 	}
-}
 
-func dashboardCycleHeroMarkerAtDay(dayIndex float64, cycleLength int) DashboardCycleHeroMarker {
-	ratio := dayIndex / float64(cycleLength)
-	angle := (-math.Pi / 2) + (ratio * 2 * math.Pi)
-	x := dashboardCycleHeroCenterX + dashboardCycleHeroRadius*math.Cos(angle)
-	y := dashboardCycleHeroCenterY + dashboardCycleHeroRadius*math.Sin(angle)
-	return DashboardCycleHeroMarker{
-		X: dashboardCycleHeroFloat(x),
-		Y: dashboardCycleHeroFloat(y),
+	if fertilitySuppressed && resolved != "menstrual" {
+		return phaseFertilityWithheld
 	}
-}
-
-func dashboardCycleHeroDashArray(dash float64) string {
-	return dashboardCycleHeroFloat(dash) + " " + dashboardCycleHeroFloat(dashboardCycleHeroCircumference-dash)
-}
-
-func dashboardCycleHeroFloat(value float64) string {
-	return strconv.FormatFloat(value, 'f', 1, 64)
+	return resolved
 }

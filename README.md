@@ -1,24 +1,35 @@
-[![CI](https://github.com/ovumcy/ovumcy-web/actions/workflows/ci.yml/badge.svg)](https://github.com/ovumcy/ovumcy-web/actions/workflows/ci.yml)
-[![CodeQL](https://github.com/ovumcy/ovumcy-web/actions/workflows/codeql.yml/badge.svg)](https://github.com/ovumcy/ovumcy-web/actions/workflows/codeql.yml)
-[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/ovumcy/ovumcy-web/badge)](https://securityscorecards.dev/viewer/?uri=github.com/ovumcy/ovumcy-web)
-[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13130/badge)](https://www.bestpractices.dev/projects/13130)
-[![Coverage](https://codecov.io/gh/ovumcy/ovumcy-web/graph/badge.svg)](https://app.codecov.io/gh/ovumcy/ovumcy-web)
-[![Tested](https://img.shields.io/badge/tested-mutation%20%C2%B7%20fuzz%20%C2%B7%20property-2ea44f)](https://github.com/ovumcy/ovumcy-web/blob/main/TESTING.md)
-[![Release](https://img.shields.io/github/v/release/ovumcy/ovumcy-web?display_name=tag)](https://github.com/ovumcy/ovumcy-web/releases)
-[![Last Commit](https://img.shields.io/github/last-commit/ovumcy/ovumcy-web)](https://github.com/ovumcy/ovumcy-web/commits/main)
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![Go Reference](https://pkg.go.dev/badge/github.com/ovumcy/ovumcy-web.svg)](https://pkg.go.dev/github.com/ovumcy/ovumcy-web)
-[![Go Version](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go)](https://go.dev/)
-[![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker)](https://github.com/ovumcy/ovumcy-web/actions/workflows/docker-image.yml)
-[![Self-hosted](https://img.shields.io/badge/Self--hosted-yes-2ea44f)](https://github.com/ovumcy/ovumcy-web/blob/main/docs/self-hosted.md)
-[![No telemetry](https://img.shields.io/badge/Telemetry-none-2ea44f)](https://github.com/ovumcy/ovumcy-web#privacy-and-security)
-
 <p align="center">
   <img src="docs/screenshots/ovumcy-logo-horizontal.svg" alt="Ovumcy" width="640">
 </p>
 
 <p align="center">
   <strong>A menstrual cycle tracker you run yourself. Your data stays on your server.</strong>
+</p>
+
+<p align="center">
+  <!-- The CI badge reads the MERGE-QUEUE run, not the push that follows it: `main` is
+       written only through the queue, so that run is the last attempt to enter the branch
+       and it tests the exact commit that lands. The unfiltered badge read the push run,
+       where any cancellation renders as failing — a job that hits `timeout-minutes` is
+       reported `cancelled`, which took the badge red on 2026-08-17 with no failed job in
+       the run. Do not add `branch=main`: queue runs live on `gh-readonly-queue/...`, and
+       that pair returns "no status". -->
+  <a href="https://github.com/ovumcy/ovumcy-web/actions/workflows/ci.yml?query=event%3Amerge_group"><img src="https://github.com/ovumcy/ovumcy-web/actions/workflows/ci.yml/badge.svg?event=merge_group" alt="CI"></a>
+  <a href="https://github.com/ovumcy/ovumcy-web/actions/workflows/codeql.yml"><img src="https://github.com/ovumcy/ovumcy-web/actions/workflows/codeql.yml/badge.svg" alt="CodeQL"></a>
+  <a href="https://securityscorecards.dev/viewer/?uri=github.com/ovumcy/ovumcy-web"><img src="https://api.securityscorecards.dev/projects/github.com/ovumcy/ovumcy-web/badge" alt="OpenSSF Scorecard"></a>
+  <a href="https://www.bestpractices.dev/projects/13130"><img src="https://www.bestpractices.dev/projects/13130/badge" alt="OpenSSF Best Practices"></a>
+  <a href="https://app.codecov.io/gh/ovumcy/ovumcy-web"><img src="https://codecov.io/gh/ovumcy/ovumcy-web/graph/badge.svg" alt="Coverage"></a>
+  <a href="https://github.com/ovumcy/ovumcy-web/blob/main/TESTING.md"><img src="https://img.shields.io/badge/tested-mutation%20%C2%B7%20fuzz%20%C2%B7%20property-2ea44f" alt="Tested"></a>
+  <a href="https://github.com/ovumcy/ovumcy-web/releases"><img src="https://img.shields.io/github/v/release/ovumcy/ovumcy-web?display_name=tag" alt="Release"></a>
+  <a href="https://github.com/ovumcy/ovumcy-web/commits/main"><img src="https://img.shields.io/github/last-commit/ovumcy/ovumcy-web" alt="Last Commit"></a>
+  <a href="https://www.gnu.org/licenses/agpl-3.0"><img src="https://img.shields.io/badge/License-AGPL%20v3-blue.svg" alt="License: AGPL v3"></a>
+  <a href="https://pkg.go.dev/github.com/ovumcy/ovumcy-web"><img src="https://pkg.go.dev/badge/github.com/ovumcy/ovumcy-web.svg" alt="Go Reference"></a>
+  <a href="https://go.dev/"><img src="https://img.shields.io/badge/Go-1.27.1+-00ADD8?logo=go" alt="Go Version"></a>
+  <a href="https://github.com/ovumcy/ovumcy-web/actions/workflows/docker-image.yml"><img src="https://img.shields.io/badge/Docker-ready-2496ED?logo=docker" alt="Docker"></a>
+  <a href="https://github.com/ovumcy/ovumcy-web/pkgs/container/ovumcy-web"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fovumcy%2Fovumcy-web%2Fbadges%2Fpulls.json&logo=docker" alt="Docker pulls"></a>
+  <a href="https://hub.docker.com/r/ovumcy/ovumcy-web"><img src="https://img.shields.io/docker/pulls/ovumcy/ovumcy-web" alt="Docker Pulls"></a>
+  <a href="https://github.com/ovumcy/ovumcy-web/blob/main/docs/self-hosted.md"><img src="https://img.shields.io/badge/Self--hosted-yes-2ea44f" alt="Self-hosted"></a>
+  <a href="https://github.com/ovumcy/ovumcy-web#privacy-and-security"><img src="https://img.shields.io/badge/Telemetry-none-2ea44f" alt="No telemetry"></a>
 </p>
 
 Ovumcy is a menstrual cycle tracker you run on your own server. If the thought of your period dates, symptoms, and fertile-window estimates sitting on someone else's cloud makes you uneasy, this is for you: quick daily logging, cycle insights that are actually useful, and health data that stays on a machine you control.
@@ -43,6 +54,8 @@ The public project site is [ovumcy.com](https://ovumcy.com).
 - [Clients And Deployment Models](#clients-and-deployment-models)
 - [Architecture](#architecture) · [Tech Stack](#tech-stack)
 - [Quick Start](#quick-start) · [Configuration](#configuration)
+- [Operator CLI](#operator-cli) · [Development](#development)
+- [Contributing](#contributing) · [Releases](#releases) · [Roadmap](#roadmap) · [License](#license)
 
 ## Why Ovumcy Exists
 
@@ -107,7 +120,7 @@ No — you run it yourself, on your own server, with no vendor account in the mi
 
 ### Where is the data stored?
 
-On the server you deploy Ovumcy to, and nowhere else. SQLite is the default and works out of the box; PostgreSQL is there when you want it for a more involved setup.
+On the server you deploy Ovumcy to. SQLite is the default and works out of the box; PostgreSQL is there when you want it for a more involved setup. Nothing leaves that server unless you switch it on yourself: the optional webhook reminders POST the predicted dates to a URL you choose, and a calendar app you subscribe to the `.ics` feed fetches those dates wherever it runs — onto Google's or Apple's servers if that is where your calendar lives.
 
 ### Does Ovumcy use analytics or ad trackers?
 
@@ -138,7 +151,7 @@ Period and fertile-window predictions in particular are statistical estimates de
 - Predictions for your next period, ovulation, fertile window, and cycle phase.
 - Calendar and statistics views for spotting patterns over the longer term.
 - Reminders, three ways: an in-app dashboard banner, webhook reminders to your own self-hosted ntfy/Gotify endpoint, and a private, read-only calendar (`.ics`) subscription.
-- Install it to your phone's home screen (on the current `main` branch).
+- Install it to your phone's home screen — a web app manifest and install prompt, no service worker or offline cache.
 - CSV and JSON export — for backups, for moving your data, or just for looking back.
 - Optional OIDC sign-in in hybrid or SSO-only mode, with guarded owner auto-provision and provider logout.
 - Optional TOTP two-factor authentication for owner sign-in, working with any RFC 6238 authenticator app (Google Authenticator, 1Password, Aegis, and the like).
@@ -259,12 +272,20 @@ Uses the prebuilt image from GHCR pinned to the latest tagged release by default
 
 Tagged releases from `v0.7.1` onward publish under the GHCR namespace `ghcr.io/ovumcy/ovumcy-web`.
 
+The same image is mirrored to Docker Hub as `docker.io/ovumcy/ovumcy-web`, under the same tags and
+at the same digest: the mirror is a copy of the signed manifest, not a second build. Substitute that
+name into any command below to pull or verify what Docker Hub serves. The mirror is signed on Docker
+Hub itself, by the same workflow identity and over that same digest, and the build provenance is
+issued against the digest rather than against a registry — so both registries answer to the same
+checks, and the release workflow refuses to report a mirror published until it has run the signature
+check below against Docker Hub.
+
 **Verify the image before running (recommended).** Every published image is Cosign-signed (keyless, via GitHub Actions OIDC — no long-lived signing key), carries a SLSA build-provenance attestation, and ships an SBOM attached at build time. To verify a tagged release (needs [`cosign`](https://docs.sigstore.dev/cosign/installation/) and the [`gh`](https://cli.github.com/) CLI):
 
 ```bash
 # 1. Cosign signature — pins the signer identity (this workflow) and the OIDC issuer
 cosign verify \
-  --certificate-identity-regexp '^https://github.com/ovumcy/ovumcy-web/\.github/workflows/docker-image\.yml@refs/tags/v' \
+  --certificate-identity-regexp '^https://github\.com/ovumcy/ovumcy-web/\.github/workflows/docker-image\.yml@refs/tags/v' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   ghcr.io/ovumcy/ovumcy-web:v1.9.2
 
@@ -274,6 +295,8 @@ gh attestation verify oci://ghcr.io/ovumcy/ovumcy-web:v1.9.2 --repo ovumcy/ovumc
 # 3. SBOM attached at build time
 docker buildx imagetools inspect ghcr.io/ovumcy/ovumcy-web:v1.9.2 --format '{{ json .SBOM }}'
 ```
+
+**An untagged, unsigned digest can exist in the GHCR package, and it is safe to ignore.** The release workflow pushes the image by digest, scans every platform, and only then signs and tags it. When the scan refuses, or a step between the push and the signature fails, that digest stays in the public package: no tag, no signature, still pullable by digest, and printed in the failed run's log. Nothing you are told to run resolves to it — every command above names a tag, every tag the workflow writes points at a signed digest, and the Cosign check in step 1 fails on a digest that was never signed. It is kept rather than deleted on purpose: deleting it would need delete rights over the whole package inside the publish job — a `delete:packages` token, or the Admin role for this repository's `GITHUB_TOKEN` on the package — and either would let a compromised publish step delete signed releases too, a larger risk than an unsigned digest that verification already refuses.
 
 For public GHCR images, pull does not require GitHub login. `docker compose up -d` is enough because `pull_policy: always` is enabled.
 
@@ -301,7 +324,9 @@ docker buildx imagetools inspect ghcr.io/ovumcy/ovumcy-web:v1.9.2 --format '{{ .
 
 Then open `http://127.0.0.1:8080`.
 
-The base compose file now binds to loopback by default. For an intentional LAN/private-network bind, set `HOST_BIND_ADDRESS` in `.env` to a specific private IP you control before starting the stack.
+The base compose file now binds to loopback by default. For an intentional LAN/private-network bind, set `HOST_BIND_ADDRESS` in `.env` to a specific private IP you control before starting the stack. Only compose reads `HOST_BIND_ADDRESS`; the [Manual](#manual) path below ignores it.
+
+**Upgrading an existing install to v2.0.0 or later: take the new compose file first.** Changing only `OVUMCY_IMAGE` on a compose file from v1.9.2 or earlier starts the new image without the `ovumcy_fence` volume it expects at `/app/fence`. The container still reports healthy, but the calendar-feed restore fence has nowhere to keep its marker, so every armed calendar feed is disarmed on every start, and `ovumcy reset-password` and `ovumcy users delete` refuse. Download the new `docker-compose.yml` (or the compose file of the example stack you run), or add the volume by hand: `- ovumcy_fence:/app/fence` under the service's `volumes:` (a postgres example stack has no such key on the app service yet, so add it) and an `ovumcy_fence:` entry under the top-level `volumes:`. The example stacks also forward settings an older copy leaves out, `REGISTRATION_MODE` among them, so an old stack ignores those values in `.env` until its compose file is replaced, and a value `.env` already holds for one of them takes effect at the first start of the new file: `REGISTRATION_MODE`, `HSTS_ENABLED`, `AUDIT_LOG_ENABLED` and `WEBHOOK_BLOCK_PRIVATE_ADDRESSES` refuse to start the app on a value they cannot read, so review `.env` for these keys before upgrading. The full sequence is in the [Safe Upgrade Procedure](docs/self-hosted.md#safe-upgrade-procedure).
 
 For production-style setups:
 
@@ -311,9 +336,11 @@ For production-style setups:
 
 ### Manual
 
+A binary started this way listens on `PORT` (default `8080`) on every interface; `HOST_BIND_ADDRESS` has no effect outside compose. On a machine other hosts can reach, block the port with a firewall.
+
 Requirements:
 
-- Go 1.26+
+- Go 1.27.1+
 - Node.js 22+
 
 ```bash
@@ -370,17 +397,36 @@ TRUSTED_PROXIES=127.0.0.1,::1
 # Per-action audit logs to stderr. Default off. Enable only when investigating an incident.
 AUDIT_LOG_ENABLED=false
 
-# Rate limits (defaults shown); see SECURITY.md's Rate Limits section for the full policy
+# Rate limits (defaults shown); see SECURITY.md's Rate Limits section for the full policy.
+# Each *_MAX has a ceiling (100 for login/register/forgot-password, 600 logout, 200 logout
+# account, 3000 api, 120 calendar feed) and each *_WINDOW must be between 1s and 24h (1m and
+# 24h for the login, register, forgot-password, 2FA challenge and password-reset redeem
+# windows); a value outside its range is logged at boot and the default is used instead — a limiter cannot be
+# widened past its ceiling, let alone switched off. The login, register, forgot-password, 2FA
+# challenge and password-reset redeem pairs are also held to at most 30 requests per minute
+# (MAX over WINDOW, e.g. 100 with 200s); a pair above that, or an out-of-range window, is
+# logged and both halves fall back to the defaults.
 # RATE_LIMIT_LOGIN_MAX=8
 # RATE_LIMIT_LOGIN_WINDOW=15m
 # RATE_LIMIT_REGISTER_MAX=8
 # RATE_LIMIT_REGISTER_WINDOW=15m
 # RATE_LIMIT_FORGOT_PASSWORD_MAX=8
 # RATE_LIMIT_FORGOT_PASSWORD_WINDOW=1h
+# RATE_LIMIT_TOTP_CHALLENGE_MAX=8
+# RATE_LIMIT_TOTP_CHALLENGE_WINDOW=15m
+# RATE_LIMIT_PASSWORD_RESET_REDEEM_MAX=8
+# RATE_LIMIT_PASSWORD_RESET_REDEEM_WINDOW=15m
 # RATE_LIMIT_LOGOUT_MAX=60
 # RATE_LIMIT_LOGOUT_WINDOW=15m
+# Per-account (identity-keyed) logout budget, separate from the per-IP pair above
+# RATE_LIMIT_LOGOUT_ACCOUNT_MAX=20
+# RATE_LIMIT_LOGOUT_ACCOUNT_WINDOW=15m
 # RATE_LIMIT_API_MAX=300
 # RATE_LIMIT_API_WINDOW=1m
+# Calendar feed: kept well below the API budget on purpose — it is the only cap on
+# a cookieless, unauthenticated polling surface, not on cheap authorized reads.
+# RATE_LIMIT_CALENDAR_FEED_MAX=20
+# RATE_LIMIT_CALENDAR_FEED_WINDOW=1m
 
 # Optional OIDC sign-in / SSO
 # OIDC_ENABLED=true
@@ -404,12 +450,12 @@ Important notes:
 - `SECRET_KEY` takes precedence if both `SECRET_KEY` and `SECRET_KEY_FILE` are set.
 - `DEFAULT_LANGUAGE` supports `en`, `ru`, `es`, `fr`, `de`, and `it`.
 - `REGISTRATION_MODE` supports `open` and `closed`; use `closed` for pre-provisioned or otherwise operator-restricted internet-facing instances where self-service sign-up must stay disabled.
-- `HOST_BIND_ADDRESS=127.0.0.1` keeps the base compose path local/private by default. Only change it deliberately for a specific private-network bind.
+- `HOST_BIND_ADDRESS=127.0.0.1` keeps the base compose path local/private by default. Only change it deliberately for a specific private-network bind. It is a compose setting, not an app setting: the binary ignores it and listens on `PORT` on every interface.
 - Set `COOKIE_SECURE=true` when serving over HTTPS.
 - `AUDIT_LOG_ENABLED` is off by default. Per-action security-event lines are suppressed; Go panics, startup errors, and the Fiber request log stay enabled. Flip to `true` only when investigating a specific incident, and remember the resulting stream contains `user_id` and is as sensitive as the database. See [docs/security/logging.md](docs/security/logging.md#logging-policy).
 - OIDC sign-in is optional, supports `hybrid` and `oidc_only` login modes, and requires HTTPS plus `COOKIE_SECURE=true`.
 - `OIDC_CA_FILE` is optional and lets Ovumcy trust a readable PEM CA bundle for private or internal identity-provider certificates.
-- The first OIDC sign-in uses an existing `(issuer, subject)` link when present, otherwise it falls back to a verified email match.
+- The first OIDC sign-in uses an existing `(issuer, subject)` link when present; a verified email claim that matches an existing local account does **not** link automatically — the callback refuses and redirects to `/login`. Completing the link needs the account's current password to start a Settings step-up and a fresh re-authentication at the provider, or the operator CLI for an account with no working sign-in — see [docs/oidc.md](docs/oidc.md#current-contract).
 - `OIDC_AUTO_PROVISION=true` is supported only with `REGISTRATION_MODE=open`; it creates `owner` accounts and can be restricted with `OIDC_AUTO_PROVISION_ALLOWED_DOMAINS`.
 - Auto-provisioned users start without a local password. They can set one later in `Settings` to enable recovery codes and password-confirmed danger-zone actions.
 - `OIDC_LOGOUT_MODE` controls whether logout stays local or redirects to the provider when discovery metadata includes `end_session_endpoint`.
@@ -431,17 +477,27 @@ printf '%s' "$OWNER_PASSWORD" | go run ./cmd/ovumcy users create owner@example.c
 go run ./cmd/ovumcy users list
 go run ./cmd/ovumcy users delete owner@example.com
 go run ./cmd/ovumcy users delete owner@example.com --yes
+go run ./cmd/ovumcy users delete --id 7
+go run ./cmd/ovumcy users set-email --id 7 owner@example.com
 go run ./cmd/ovumcy reset-password owner@example.com
+go run ./cmd/ovumcy reset-password --id 7
+go run ./cmd/ovumcy repair symptom-names
 ```
 
 Notes:
 
-- `users create <email>` provisions an owner account so an instance can be set up declaratively (for example a YunoHost install script), instead of opening registration, signing up, then closing it again. An instance can host several independent owners (household self-hosting) — run it once per person; each owner's data stays isolated by `user_id`, and only a duplicate email is rejected — pass `--skip-if-exists` to make re-runs idempotent (an existing email is skipped with a success exit code, never overwritten; use `reset-password` to change a password). On an interactive terminal it prompts for the password twice with echo disabled; when stdin is piped or redirected it reads the password from the first line of stdin, so the secret never appears in the command line or the environment. Each owner completes onboarding (last period start, cycle defaults) on first sign-in — that health data is intentionally never passed through provisioning. No recovery code is printed by default (so it cannot leak into install logs); pass `--show-recovery-code` to print it for an interactive operator, or sign in and regenerate one from Settings.
+- `users create <email>` provisions an owner account so an instance can be set up declaratively — an install script, for example — instead of opening registration, signing up, then closing it again. Specifics worth knowing:
+  - *Several owners per instance.* Run it once per person (household self-hosting); each owner's data stays isolated by `user_id`, and only a duplicate email is rejected. `--skip-if-exists` makes re-runs idempotent: an existing email is skipped with a success exit code, never overwritten. To change a password, use `reset-password`.
+  - *The password never touches argv or the environment.* On an interactive terminal it prompts twice with echo disabled; when stdin is piped or redirected it reads the password from the first line of stdin.
+  - *No recovery code is printed by default*, so it cannot leak into install logs. Pass `--show-recovery-code` to print it for an interactive operator, or sign in and regenerate one from Settings.
+  - *No health data passes through provisioning.* Each owner completes onboarding — last period start, cycle defaults — on first sign-in.
 - `users list` prints a minimal account audit table: `id`, `email`, `role`, `display name`, onboarding state, and creation time.
-- `users delete <email>` removes the selected account together with related health data and prompts for an explicit `DELETE` confirmation unless `--yes` is provided.
-- `reset-password <email>` prompts for a new password interactively, validates it against the password policy, writes its bcrypt hash to the account, and atomically bumps `auth_session_version` so every existing session is invalidated. Use this when an owner has lost both their password and their recovery code.
+- `users delete <email>|--id <id>` removes the selected account together with related health data and prompts for an explicit `DELETE` confirmation — quoting the stored address, id and role — unless `--yes` is provided. An address matching more than one row is refused (naming the ids) instead of deleting whichever row a lookup returns first; retry with `--id`.
+- `users set-email --id <id> <email>` re-homes one account to a new address, addressed by the id `users list` prints. It is the repair for an account whose stored email predates strict sign-in normalization and can therefore no longer be signed in to or addressed by email at all; it validates the new address under the same rule sign-in uses, refuses one another account already answers to, leaves the health record untouched, and bumps `auth_session_version` because the address is the login identity. Runbook: [docs/self-hosted.md](docs/self-hosted.md#an-account-cannot-sign-in-after-upgrading-email-stored-in-a-legacy-form).
+- `reset-password <email>|--id <id>` prompts for a new password interactively, validates it against the password policy, writes its bcrypt hash to the account, and atomically bumps `auth_session_version` so every existing session is invalidated. Use this when an owner has lost both their password and their recovery code. Takes the same `--id` form as `users delete` and `users set-email`, for the same reason: a legacy row whose stored email predates strict sign-in normalization cannot be reached by address at all, and a bare address that matches more than one row is refused — naming the ids — rather than resetting whichever one the database happened to return first.
 - `notify` runs one webhook reminder pass — decides due period/ovulation reminders per owner and delivers them to each owner's configured webhook. It is meant to be scheduled (cron, systemd timer, a Docker one-shot, or Task Scheduler), not run continuously; an optional built-in daily scheduler (`REMINDER_SCHEDULER_ENABLED`) can run the same pass in-process instead. See [docs/notifications.md](docs/notifications.md) for all three reminder channels (in-app banner, webhook, calendar feed), scheduling recipes, and the idempotency/security contract.
-- `webhook show|set <email>` inspects or configures an owner's webhook notification settings (endpoint, enabled state, notify-period/notify-ovulation toggles) from the shell — the same settings the Settings-page form writes. See [docs/notifications.md](docs/notifications.md) for the full flag reference.
+- `webhook show|set <email>` inspects or configures an owner's webhook notification settings (endpoint, enabled state, notify-period/notify-ovulation toggles) from the shell — the same settings the Settings-page form writes. See [docs/notifications.md](docs/notifications.md) for the full flag reference. `webhook` has no `--id` form; an address matching more than one row is refused (naming the ids) rather than configuring whichever row a lookup returns first.
+- `repair` lists the offline data repairs the binary carries; each inspects and reports by default and changes nothing until `--apply`. Unlike every other subcommand it opens the database *without* applying migrations, because it exists for the case where a migration is refusing to run against data it cannot cover — which also stops the server, so there is no application to fix the data in. Today it carries one repair, `symptom-names`, for an account holding two symptoms under the same name. Runbook: [docs/self-hosted.md](docs/self-hosted.md#duplicate-rows-that-refuse-a-migration).
 - Treat CLI usage as operator-only access. It is intended for local shell access on the instance, not for browser or remote public administration.
 
 ## Development
@@ -449,8 +505,10 @@ Notes:
 Common commands from the repository root:
 
 ```bash
-# scoped past node_modules/, where a vendored JS dep ships a .go file
-go test ./cmd/... ./internal/... ./migrations/... ./scripts/... ./web/...
+# scoped past node_modules/, where a vendored JS dep ships a .go file;
+# -timeout 30m raises Go's 10-minute PER PACKAGE default, which internal/api
+# outruns on a dev host (see TESTING.md)
+go test ./cmd/... ./internal/... ./migrations/... ./scripts/... ./web/... -timeout 30m
 npm run build
 go run ./cmd/ovumcy
 ```
@@ -463,7 +521,8 @@ Project structure:
 - `internal/db` - persistence and migrations
 - `web/` - templates, JavaScript, and CSS assets
 
-CI runs staticcheck, `go vet`, tests, and frontend build on pushes and pull requests.
+CI runs staticcheck, `go vet`, tests, and the frontend build on pull requests and on the merge queue's validation of the commit that lands.
+The post-merge run on `main` deliberately skips that work — the queue already proved this exact commit — and executes only the work the queue does not: the cross-browser e2e, image-smoke and Postgres-smoke lanes, and the image publish.
 Dedicated security workflows run CodeQL plus `gosec`, `govulncheck`, Trivy filesystem/container scanning, and publish a CycloneDX image SBOM artifact for each scan run.
 
 Beyond plain unit and integration tests, the suite uses property-based tests,
@@ -490,8 +549,12 @@ This README intentionally focuses on functionality that exists today rather than
 
 ## License
 
-Ovumcy is licensed under AGPL v3.
-See [LICENSE](LICENSE).
+Copyright (C) 2026 Ovumcy Contributors.
+
+Ovumcy is licensed under AGPL v3. See [LICENSE](LICENSE) for the full text of the license.
+
+If you run a modified version of Ovumcy as a network service, section 13 of the license
+obliges you to make the complete source code of that version available to its users.
 
 Third-party software redistributed with the built application (e.g. htmx) is listed with its
 license in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).

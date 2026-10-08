@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -28,6 +29,14 @@ type runtimeConfig struct {
 	RateLimits       rateLimitSettings
 	Proxy            proxySettings
 	AuditLogEnabled  bool
+	// CalendarFeedFencePath is CALENDAR_FEED_FENCE_PATH: the file the boot-time
+	// restore fence keeps its non-rollbackable half in. It has to live OUTSIDE
+	// whatever a database backup captures — that is the whole mechanism — so it
+	// is an operator-supplied path rather than one the app derives: only the
+	// operator knows which of their mounts their backups skip. Empty (the
+	// default for a bare binary; the image sets it) means no fence, which fails
+	// closed: every armed calendar feed is disarmed on every boot.
+	CalendarFeedFencePath string
 	// WebhookBlockPrivate mirrors the off-by-default WEBHOOK_BLOCK_PRIVATE_ADDRESSES
 	// egress gate the notify CLI reads, so the built-in scheduler wires the same
 	// deliverer hardening.
@@ -47,6 +56,102 @@ type reminderSchedulerSettings struct {
 	Hour    int
 }
 
+// Every RATE_LIMIT_* setting has a ceiling as well as a floor: a value above it
+// falls back to the default (logged at boot) instead of widening the budget,
+// so an oversized max or a stray zero cannot switch a limiter off. A window is
+// held to [1s, 24h]: a unit slip there (15s for 15m) still widens a
+// non-credential budget. A credential window is held to [1m, 24h]: seconds
+// is not a budget worth the name on the endpoints that guard a password, a
+// recovery token or a TOTP code. A refused credential window takes its MAX
+// down to the default with it, as a pair above the rate does. On the
+// credential endpoints the pair is also held to a per-minute rate
+// (getCredentialRateLimit), which is what stops a unit slip from widening
+// them and the per-account login budget with them. The ceilings
+// are sized to what a self-hosted instance behind one address can need, not to
+// what the process could survive; the load-bearing cost on the credential
+// endpoints stays the bcrypt compare each request pays (cost 12, ~250 ms of
+// CPU), which these caps bound the rate of rather than replace.
+const (
+	rateLimitWindowFloor   = time.Second
+	rateLimitWindowCeiling = 24 * time.Hour
+	// The five credential windows (login, registration, forgot-password, the
+	// 2FA challenge, the password-reset redeem) start here instead of at
+	// rateLimitWindowFloor; every other window keeps the one-second floor.
+	rateLimitCredentialWindowFloor = time.Minute
+	// Login, registration and password-reset requests each cost a bcrypt
+	// compare or hash; the per-account login and recovery budgets read the
+	// same numbers. 100 in a window is already a dozen times the default.
+	rateLimitCredentialMaxCeiling = 100
+	// The count ceiling above does not bound the RATE: 100 over a one-second
+	// window is 6000 bcrypt compares a minute from one address. Each
+	// credential pair is therefore also held to this many requests per minute
+	// (max/window), about half a bcrypt a second. The credential window floor
+	// keeps the window from being that short; this check is what holds a count
+	// of 100 to a window of at least 200s.
+	rateLimitCredentialPerMinuteCeiling = 30
+	// Logout is one storage write per request; the per-IP row stays wide
+	// enough for a household behind one address, the per-account budget
+	// never needs more than a handful.
+	rateLimitLogoutMaxCeiling        = 600
+	rateLimitLogoutAccountMaxCeiling = 200
+	// Authenticated API reads are cheap; ten times the default covers an
+	// HTMX-heavy session without becoming no limit at all.
+	rateLimitAPIMaxCeiling = 3000
+	// The feed is the cookieless surface with no other cap; a calendar client
+	// polls every 15-60 minutes, so two requests a second is far beyond any
+	// fleet of devices behind one address.
+	rateLimitCalendarFeedMaxCeiling = 120
+	// GET /calendar builds the month grid plus its projected cycles
+	// (BuildCalendarDayStates / appendPredictedCycles); its own upper-bound
+	// clamp and iteration cap (services.CalendarMaximumNavigableMonth,
+	// maxProjectedCyclesInGrid — WEB-14 SEC-H5) already hold that cost to a
+	// small, request-size-independent constant, so this budget sits with the
+	// other authenticated reads rather than the cheap-request /api default: ten
+	// times the default covers an HTMX-heavy session without being no limit.
+	rateLimitCalendarMaxCeiling = 3000
+)
+
+func getRateLimitMax(key string, fallback int, ceiling int) int {
+	return getEnvIntInRange(key, fallback, 1, ceiling)
+}
+
+func getRateLimitWindow(key string, fallback time.Duration) time.Duration {
+	return getEnvDurationInRange(key, fallback, rateLimitWindowFloor, rateLimitWindowCeiling)
+}
+
+// credentialRateWithinCeiling holds a credential pair to
+// rateLimitCredentialPerMinuteCeiling, compared in integers so no rounding can
+// admit a pair a hair above it.
+func credentialRateWithinCeiling(maxRequests int, window time.Duration) bool {
+	return time.Duration(maxRequests)*time.Minute <= rateLimitCredentialPerMinuteCeiling*window
+}
+
+// getCredentialRateLimit reads the MAX/WINDOW pair of a credential endpoint
+// (login, registration, password reset, the 2FA challenge, the password-reset
+// redeem): each half is bounded on its own, then the pair is held to the
+// per-minute rate ceiling. A pair above it, or a refused window (below the
+// one-minute floor, above a day, unparseable), falls back to BOTH defaults,
+// logged — keeping either half would leave a rate the operator never chose. It
+// is the only reader of the credential count ceiling and the only place the
+// ten LOGIN, REGISTER, FORGOT_PASSWORD, TOTP_CHALLENGE and
+// PASSWORD_RESET_REDEEM keys are named as literals; a key assembled at run
+// time is not held to that.
+func getCredentialRateLimit(maxKey, windowKey string, fallbackMax int, fallbackWindow time.Duration) (int, time.Duration) {
+	maxRequests := getRateLimitMax(maxKey, fallbackMax, rateLimitCredentialMaxCeiling)
+	window, windowOK := lookupEnvDurationInRange(windowKey, fallbackWindow, rateLimitCredentialWindowFloor, rateLimitWindowCeiling)
+	if !windowOK {
+		log.Printf("%s is dropped with the refused %s, using fallbacks %d and %s",
+			maxKey, windowKey, fallbackMax, fallbackWindow) // #nosec G706 -- operator-managed startup configuration read once at boot, never from a request.
+		return fallbackMax, fallbackWindow
+	}
+	if credentialRateWithinCeiling(maxRequests, window) {
+		return maxRequests, window
+	}
+	log.Printf("invalid %s=%d with %s=%s: a credential endpoint allows at most %d requests per minute (for example %s=100 with %s=200s), using fallbacks %d and %s",
+		maxKey, maxRequests, windowKey, window, rateLimitCredentialPerMinuteCeiling, maxKey, windowKey, fallbackMax, fallbackWindow) // #nosec G706 -- operator-managed startup configuration read once at boot, never from a request.
+	return fallbackMax, fallbackWindow
+}
+
 type rateLimitSettings struct {
 	LoginMax             int
 	LoginWindow          time.Duration
@@ -54,10 +159,44 @@ type rateLimitSettings struct {
 	ForgotPasswordWindow time.Duration
 	RegisterMax          int
 	RegisterWindow       time.Duration
-	LogoutMax            int
-	LogoutWindow         time.Duration
-	APIMax               int
-	APIWindow            time.Duration
+	// TOTPChallengeMax/TOTPChallengeWindow and PasswordResetRedeemMax/Window
+	// (WEB-70) are the edge rows for the two credential-verifying routes that
+	// used to draw on the /api catch-all alone: the 2FA login challenge and the
+	// password-reset redeem. Read through getCredentialRateLimit like the three
+	// pairs above, so they share the same count ceiling and per-minute rate.
+	TOTPChallengeMax          int
+	TOTPChallengeWindow       time.Duration
+	PasswordResetRedeemMax    int
+	PasswordResetRedeemWindow time.Duration
+	// LogoutMax/LogoutWindow size the per-IP edge limiter in front of
+	// DELETE /api/v1/sessions/current. LogoutAccountMax/LogoutAccountWindow
+	// size the per-account, identity-keyed budget AuthService enforces behind
+	// it. They are deliberately separate pairs: one bounds requests from an
+	// address, the other bounds failures against one account, and a household
+	// instance behind one address needs the first wide while the second stays
+	// tight. Wiring both from one pair — which is what shipped until this split
+	// — silently ran the account budget at the per-IP number.
+	LogoutMax           int
+	LogoutWindow        time.Duration
+	LogoutAccountMax    int
+	LogoutAccountWindow time.Duration
+	APIMax              int
+	APIWindow           time.Duration
+	// CalendarFeed is deliberately NOT the API budget. The feed is a cookieless
+	// unauthenticated endpoint and this is the only cap on it; it was sized when
+	// every well-formed request cost a bcrypt compare, and since migration 032
+	// moved verification (and its timing equalization) to a keyed MAC it bounds
+	// only the residual bcrypt of a row minted before that. A calendar client
+	// polls once per refresh interval, so a small budget is generous. See
+	// docs/security/auth-policy-and-rate-limits.md.
+	CalendarFeedMax    int
+	CalendarFeedWindow time.Duration
+	// Calendar is the authenticated GET /calendar page's own budget — outside
+	// /api, so the APIMax limiter above never reaches it. Keyed the same way as
+	// the sibling authenticated routes (see the keyGen call at this limiter's
+	// mount point in server.go). See docs/security/auth-policy-and-rate-limits.md.
+	CalendarMax    int
+	CalendarWindow time.Duration
 }
 
 type proxySettings struct {
@@ -68,6 +207,15 @@ type proxySettings struct {
 
 // maxSecretKeyFileBytes caps the SECRET_KEY_FILE read (see resolveSecretKey).
 const maxSecretKeyFileBytes int64 = 8 << 10
+
+// maxDatabaseURLFileBytes caps the DATABASE_URL_FILE read (see
+// resolveDatabaseConfig). A Postgres DSN with a long password and several
+// query parameters comfortably fits well under this.
+const maxDatabaseURLFileBytes int64 = 8 << 10
+
+// maxOIDCClientSecretFileBytes caps the OIDC_CLIENT_SECRET_FILE read (see
+// resolveOIDCConfig).
+const maxOIDCClientSecretFileBytes int64 = 8 << 10
 
 // codecov:ignore:start -- main() composition-root wiring: fatal-exits on an
 // invalid runtime config at boot. loadRuntimeConfig (the resolution logic) is
@@ -108,43 +256,100 @@ func loadRuntimeConfig(location *time.Location) (runtimeConfig, error) {
 		return runtimeConfig{}, err
 	}
 
-	cookieSecure := getEnvBool("COOKIE_SECURE", false)
+	cookieSecure, err := getEnvBoolStrict("COOKIE_SECURE", false)
+	if err != nil {
+		return runtimeConfig{}, err
+	}
 	// HSTS defaults to COOKIE_SECURE (preserving the historical coupling where
 	// enabling secure cookies also pinned HTTPS) but is an independent switch:
 	// HSTS_ENABLED=false lets an operator run secure cookies without pinning
 	// browsers to HTTPS for a year, and HSTS_ENABLED=true opts in explicitly.
-	hstsEnabled := getEnvBool("HSTS_ENABLED", cookieSecure)
+	hstsEnabled, err := getEnvBoolStrict("HSTS_ENABLED", cookieSecure)
+	if err != nil {
+		return runtimeConfig{}, err
+	}
+	webhookBlockPrivate, err := getEnvBoolStrict("WEBHOOK_BLOCK_PRIVATE_ADDRESSES", false)
+	if err != nil {
+		return runtimeConfig{}, err
+	}
+	// Strict for the same reason as the toggles above: the fallback is the
+	// posture the operator was trying to leave. AUDIT_LOG_ENABLED=ture used to
+	// start without the audit stream an incident investigation had switched on,
+	// and the only trace of it was one line in the boot log.
+	auditLogEnabled, err := getEnvBoolStrict("AUDIT_LOG_ENABLED", false)
+	if err != nil {
+		return runtimeConfig{}, err
+	}
 	oidcConfig, err := resolveOIDCConfig(cookieSecure, registrationMode)
 	if err != nil {
 		return runtimeConfig{}, err
 	}
 
+	calendarFeedFencePath, err := resolveCalendarFeedFencePath()
+	if err != nil {
+		return runtimeConfig{}, err
+	}
+
+	loginMax, loginWindow := getCredentialRateLimit("RATE_LIMIT_LOGIN_MAX", "RATE_LIMIT_LOGIN_WINDOW", 8, 15*time.Minute)
+	registerMax, registerWindow := getCredentialRateLimit("RATE_LIMIT_REGISTER_MAX", "RATE_LIMIT_REGISTER_WINDOW", 8, 15*time.Minute)
+	forgotPasswordMax, forgotPasswordWindow := getCredentialRateLimit("RATE_LIMIT_FORGOT_PASSWORD_MAX", "RATE_LIMIT_FORGOT_PASSWORD_WINDOW", 8, time.Hour)
+	// WEB-70: the 2FA challenge and the password-reset redeem each verify a
+	// credential and sat under the /api catch-all alone, with no edge row of
+	// their own. Neither pays the login/register/forgot-password CPU-cost shape
+	// (a bcrypt compare on every well-formed request): the 2FA challenge checks
+	// a TOTP code and pays no bcrypt at all, and the redeem first runs
+	// ResolveUserByResetToken (an HMAC JWT parse plus fingerprint/session-version
+	// checks) — only a request carrying a valid token reaches
+	// ResetPasswordAndRotateRecoveryCodeCAS, where the new password is hashed.
+	// The ceiling here instead bounds credential guessing directly — TOTP codes
+	// on one route, reset tokens on the other. Only the 2FA challenge has a
+	// service-level attempt budget behind it (the per-account, per-client
+	// "totp" budget, checked in the handler); the redeem has none, so the edge
+	// ceiling is its only guess bound. Same mechanism, same ceiling as the three pairs
+	// above; sized like the login pair rather than forgot-password's 1-hour
+	// window, since both are a continuation of an already-started flow.
+	totpChallengeMax, totpChallengeWindow := getCredentialRateLimit("RATE_LIMIT_TOTP_CHALLENGE_MAX", "RATE_LIMIT_TOTP_CHALLENGE_WINDOW", 8, 15*time.Minute)
+	passwordResetRedeemMax, passwordResetRedeemWindow := getCredentialRateLimit("RATE_LIMIT_PASSWORD_RESET_REDEEM_MAX", "RATE_LIMIT_PASSWORD_RESET_REDEEM_WINDOW", 8, 15*time.Minute)
+
 	return runtimeConfig{
-		Location:         location,
-		SecretKey:        secretKey,
-		DatabaseConfig:   databaseConfig,
-		Port:             port,
-		DefaultLanguage:  getEnv("DEFAULT_LANGUAGE", "en"),
-		RegistrationMode: registrationMode,
-		CookieSecure:     cookieSecure,
-		HSTSEnabled:      hstsEnabled,
-		OIDC:             oidcConfig,
-		ReadBufferSize:   getEnvIntInRange("OVUMCY_READ_BUFFER_SIZE", 16384, 4096, 1024*1024),
+		Location:              location,
+		SecretKey:             secretKey,
+		DatabaseConfig:        databaseConfig,
+		Port:                  port,
+		DefaultLanguage:       getEnv("DEFAULT_LANGUAGE", "en"),
+		CalendarFeedFencePath: calendarFeedFencePath,
+		RegistrationMode:      registrationMode,
+		CookieSecure:          cookieSecure,
+		HSTSEnabled:           hstsEnabled,
+		OIDC:                  oidcConfig,
+		ReadBufferSize:        getEnvIntInRange("OVUMCY_READ_BUFFER_SIZE", 16384, 4096, 1024*1024),
 		RateLimits: rateLimitSettings{
-			LoginMax:             getEnvInt("RATE_LIMIT_LOGIN_MAX", 8),
-			LoginWindow:          getEnvDuration("RATE_LIMIT_LOGIN_WINDOW", 15*time.Minute),
-			RegisterMax:          getEnvInt("RATE_LIMIT_REGISTER_MAX", 8),
-			RegisterWindow:       getEnvDuration("RATE_LIMIT_REGISTER_WINDOW", 15*time.Minute),
-			ForgotPasswordMax:    getEnvInt("RATE_LIMIT_FORGOT_PASSWORD_MAX", 8),
-			ForgotPasswordWindow: getEnvDuration("RATE_LIMIT_FORGOT_PASSWORD_WINDOW", time.Hour),
-			LogoutMax:            getEnvInt("RATE_LIMIT_LOGOUT_MAX", 60),
-			LogoutWindow:         getEnvDuration("RATE_LIMIT_LOGOUT_WINDOW", 15*time.Minute),
-			APIMax:               getEnvInt("RATE_LIMIT_API_MAX", 300),
-			APIWindow:            getEnvDuration("RATE_LIMIT_API_WINDOW", time.Minute),
+			LoginMax:                  loginMax,
+			LoginWindow:               loginWindow,
+			RegisterMax:               registerMax,
+			RegisterWindow:            registerWindow,
+			ForgotPasswordMax:         forgotPasswordMax,
+			ForgotPasswordWindow:      forgotPasswordWindow,
+			TOTPChallengeMax:          totpChallengeMax,
+			TOTPChallengeWindow:       totpChallengeWindow,
+			PasswordResetRedeemMax:    passwordResetRedeemMax,
+			PasswordResetRedeemWindow: passwordResetRedeemWindow,
+			LogoutMax:                 getRateLimitMax("RATE_LIMIT_LOGOUT_MAX", 60, rateLimitLogoutMaxCeiling),
+			LogoutWindow:              getRateLimitWindow("RATE_LIMIT_LOGOUT_WINDOW", 15*time.Minute),
+			// Defaulted from the service constants so the documented account
+			// budget and the code cannot drift apart.
+			LogoutAccountMax:    getRateLimitMax("RATE_LIMIT_LOGOUT_ACCOUNT_MAX", services.DefaultLogoutAttemptsLimit, rateLimitLogoutAccountMaxCeiling),
+			LogoutAccountWindow: getRateLimitWindow("RATE_LIMIT_LOGOUT_ACCOUNT_WINDOW", services.DefaultLogoutAttemptsWindow),
+			APIMax:              getRateLimitMax("RATE_LIMIT_API_MAX", 300, rateLimitAPIMaxCeiling),
+			APIWindow:           getRateLimitWindow("RATE_LIMIT_API_WINDOW", time.Minute),
+			CalendarFeedMax:     getRateLimitMax("RATE_LIMIT_CALENDAR_FEED_MAX", 20, rateLimitCalendarFeedMaxCeiling),
+			CalendarFeedWindow:  getRateLimitWindow("RATE_LIMIT_CALENDAR_FEED_WINDOW", time.Minute),
+			CalendarMax:         getRateLimitMax("RATE_LIMIT_CALENDAR_MAX", 300, rateLimitCalendarMaxCeiling),
+			CalendarWindow:      getRateLimitWindow("RATE_LIMIT_CALENDAR_WINDOW", time.Minute),
 		},
 		Proxy:               proxy,
-		AuditLogEnabled:     getEnvBool("AUDIT_LOG_ENABLED", false),
-		WebhookBlockPrivate: getEnvBool("WEBHOOK_BLOCK_PRIVATE_ADDRESSES", false),
+		AuditLogEnabled:     auditLogEnabled,
+		WebhookBlockPrivate: webhookBlockPrivate,
 		ReminderScheduler: reminderSchedulerSettings{
 			Enabled: getEnvBool("REMINDER_SCHEDULER_ENABLED", false),
 			// getEnvInt rejects values <1, so hour 0 (valid) would be lost; use a
@@ -162,12 +367,60 @@ func resolveRegistrationMode() (services.RegistrationMode, error) {
 	return mode, nil
 }
 
+// resolveCalendarFeedFencePath reads CALENDAR_FEED_FENCE_PATH for the boot-time
+// restore fence.
+//
+// No default: an unset value must reach the fence as "not configured" so it
+// fails closed. A default path would guess at a mount the operator never made
+// and turn a loud refusal into a fence that silently vanishes.
+//
+// A relative path refuses the boot instead, because this server is not the only
+// process that opens that file: `ovumcy users delete` and a forced `ovumcy
+// reset-password` confirm and advance the SAME fence before removing an owner's
+// calendar feed, and each resolves a relative path against its own working
+// directory rather than this one's. Taken verbatim it would give the server a
+// fence that works and every operator removal a refusal whose documented remedy
+// — point the server at this path — is already satisfied. Refusing is deliberately
+// not "treat it as unconfigured": that would disarm every armed feed on each
+// start, which is worse than what a relative path does today.
+func resolveCalendarFeedFencePath() (string, error) {
+	fencePath := strings.TrimSpace(os.Getenv(security.CalendarFeedFencePathEnv))
+	if fencePath != "" && !security.CalendarFeedFencePathRooted(fencePath) {
+		return "", fmt.Errorf("invalid %s=%q: the operator CLI resolves a relative fence path against its own working directory, not the server's, and refuses it, so give an absolute path (for example /app/fence/calendar-feed.fence)",
+			security.CalendarFeedFencePathEnv, fencePath)
+	}
+	return fencePath, nil
+}
+
+// resolveOIDCConfig resolves the client secret only when OIDC is enabled. A
+// disabled instance never consumes it, so a stale or unreadable
+// OIDC_CLIENT_SECRET_FILE left in its env is not read and does not block the
+// boot — the same rule DATABASE_URL_FILE follows on a sqlite instance. Once
+// enabled, today's rule stands unchanged: OIDC_CLIENT_SECRET wins when both are
+// set, and a file that is the only source and cannot be read refuses the boot.
+//
+// OIDC_ENABLED is strict: it gates Validate, so a typo that fell back to off
+// would skip every OIDC check while OIDC_LOGIN_MODE=oidc_only stopped applying
+// — password sign-in and open registration would come back on, silently.
 func resolveOIDCConfig(cookieSecure bool, registrationMode services.RegistrationMode) (security.OIDCConfig, error) {
+	enabled, err := getEnvBoolStrict("OIDC_ENABLED", false)
+	if err != nil {
+		return security.OIDCConfig{}, err
+	}
+
+	clientSecret := ""
+	if enabled {
+		clientSecret, err = resolveSecretFromEnvOrFile("OIDC_CLIENT_SECRET", "OIDC_CLIENT_SECRET_FILE", maxOIDCClientSecretFileBytes)
+		if err != nil {
+			return security.OIDCConfig{}, err
+		}
+	}
+
 	config := security.OIDCConfig{
-		Enabled:                     getEnvBool("OIDC_ENABLED", false),
+		Enabled:                     enabled,
 		IssuerURL:                   getEnv("OIDC_ISSUER_URL", ""),
 		ClientID:                    getEnv("OIDC_CLIENT_ID", ""),
-		ClientSecret:                getEnv("OIDC_CLIENT_SECRET", ""),
+		ClientSecret:                clientSecret,
 		RedirectURL:                 getEnv("OIDC_REDIRECT_URL", ""),
 		CAFile:                      getEnv("OIDC_CA_FILE", ""),
 		AutoProvision:               getEnvBool("OIDC_AUTO_PROVISION", false),
@@ -184,8 +437,13 @@ func resolveOIDCConfig(cookieSecure bool, registrationMode services.Registration
 }
 
 func resolveProxySettings() (proxySettings, error) {
+	enabled, err := getEnvBoolStrict("TRUST_PROXY_ENABLED", false)
+	if err != nil {
+		return proxySettings{}, err
+	}
+
 	settings := proxySettings{
-		Enabled:        getEnvBool("TRUST_PROXY_ENABLED", false),
+		Enabled:        enabled,
 		Header:         strings.TrimSpace(getEnv("PROXY_HEADER", fiber.HeaderXForwardedFor)),
 		TrustedProxies: parseCSV(getEnv("TRUSTED_PROXIES", "127.0.0.1,::1")),
 	}
@@ -199,16 +457,78 @@ func resolveProxySettings() (proxySettings, error) {
 	if len(settings.TrustedProxies) == 0 {
 		return proxySettings{}, fmt.Errorf("TRUST_PROXY_ENABLED=true requires at least one TRUSTED_PROXIES entry")
 	}
+	if err := validateTrustedProxies(settings.TrustedProxies); err != nil {
+		return proxySettings{}, err
+	}
 	return settings, nil
+}
+
+// validateTrustedProxies refuses a TRUSTED_PROXIES entry the trust boundary
+// could never use, so the boot fails loudly instead of running on a smaller
+// trusted set than the operator wrote.
+//
+// The rules are the ones newTrustedProxyMatcher (and fiber's own
+// handleTrustedProxy) apply: an entry containing "/" is a CIDR range, anything
+// else is matched by exact net.IP string — hence the canonical-spelling check,
+// since "2001:DB8::1" parses fine yet never equals the "2001:db8::1" the
+// matcher looks up. An entry that fails either rule used to be dropped (bad
+// CIDR) or stored where nothing can match it (everything else): the proxy then
+// stayed untrusted, every client behind it fell back to the socket peer and
+// shared one rate-limit bucket, while the startup banner counted the raw CSV
+// and reported the typo as configured.
+//
+// A repeated IP is refused for the same reason though both spellings are well
+// formed: the matcher keys its exact set by the entry and collapses the pair
+// into one, so the banner would count a trusted proxy the matcher does not
+// hold — the same lie the typo told, minted by a copy-paste instead. A repeated
+// CIDR is left alone: ranges are appended to a slice, so both copies survive
+// and the two counts still agree.
+func validateTrustedProxies(entries []string) error {
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if strings.Contains(entry, "/") {
+			if _, _, err := net.ParseCIDR(entry); err != nil {
+				return fmt.Errorf("invalid TRUSTED_PROXIES entry %q: not a CIDR range (for example 10.0.0.0/8)", entry)
+			}
+			continue
+		}
+		parsed := net.ParseIP(entry)
+		if parsed == nil {
+			return fmt.Errorf("invalid TRUSTED_PROXIES entry %q: not an IP address or CIDR range", entry)
+		}
+		if canonical := parsed.String(); canonical != entry {
+			return fmt.Errorf("invalid TRUSTED_PROXIES entry %q: an IP is matched literally, so it must be written in canonical form (%q)", entry, canonical)
+		}
+		if _, duplicate := seen[entry]; duplicate {
+			return fmt.Errorf("invalid TRUSTED_PROXIES entry %q: listed more than once", entry)
+		}
+		seen[entry] = struct{}{}
+	}
+	return nil
 }
 
 func resolveDatabaseConfig() (db.Config, error) {
 	driver := db.Driver(strings.ToLower(strings.TrimSpace(getEnv("DB_DRIVER", string(db.DriverSQLite)))))
 	config := db.Config{
-		Driver:      driver,
-		SQLitePath:  getEnv("DB_PATH", filepath.Join("data", "ovumcy.db")),
-		PostgresURL: strings.TrimSpace(os.Getenv("DATABASE_URL")),
+		Driver:     driver,
+		SQLitePath: getEnv("DB_PATH", filepath.Join("data", "ovumcy.db")),
 	}
+
+	// Only resolve DATABASE_URL/DATABASE_URL_FILE when the driver actually
+	// consumes it. The old plain os.Getenv("DATABASE_URL") read could never
+	// fail; resolving through the bounded-file helper CAN fail (unreadable
+	// file, directory path, oversized file), and a sqlite instance carrying a
+	// stale DATABASE_URL_FILE — an old value left in .env, or a Swarm secret
+	// mount that vanished on redeploy — must not have that turn into a reason
+	// to refuse booting a database it never touches.
+	if driver == db.DriverPostgres {
+		databaseURL, err := resolveSecretFromEnvOrFile("DATABASE_URL", "DATABASE_URL_FILE", maxDatabaseURLFileBytes)
+		if err != nil {
+			return db.Config{}, err
+		}
+		config.PostgresURL = databaseURL
+	}
+
 	if err := config.Validate(); err != nil {
 		return db.Config{}, err
 	}
@@ -225,16 +545,9 @@ func mustLoadLocation(name string) *time.Location {
 }
 
 func resolveSecretKey() (string, error) {
-	secret := strings.TrimSpace(os.Getenv("SECRET_KEY"))
-	if secret == "" {
-		keyFilePath := strings.TrimSpace(os.Getenv("SECRET_KEY_FILE"))
-		if keyFilePath != "" {
-			content, err := readSecretKeyFile(keyFilePath)
-			if err != nil {
-				return "", fmt.Errorf("failed to read SECRET_KEY_FILE: %w", err)
-			}
-			secret = strings.TrimSpace(content)
-		}
+	secret, err := resolveSecretFromEnvOrFile("SECRET_KEY", "SECRET_KEY_FILE", maxSecretKeyFileBytes)
+	if err != nil {
+		return "", err
 	}
 
 	if secret == "" {
@@ -252,12 +565,55 @@ func resolveSecretKey() (string, error) {
 	return secret, nil
 }
 
-func readSecretKeyFile(path string) (string, error) {
-	content, err := security.ReadBoundedRegularFile(path, "SECRET_KEY_FILE", maxSecretKeyFileBytes)
-	if err != nil {
-		return "", err
+// resolveSecretFromEnvOrFile resolves one sensitive configuration value that
+// may be supplied either directly via envVar or, for Docker Swarm/Compose
+// secrets on the shell-free runtime image (distroless: no `sh -c 'export
+// X=$(cat …)'` workaround is possible), via fileEnvVar naming a local file to
+// read it from — generalizing the SECRET_KEY/SECRET_KEY_FILE pattern so every
+// sensitive value resolves the same way instead of drifting per variable.
+//
+// envVar wins silently over fileEnvVar when both are set, matching SECRET_KEY's
+// existing, tested precedence over SECRET_KEY_FILE — one behavior, reused
+// rather than re-decided per variable. Silent is only safe once the operator
+// can find out some other way: a wrong SECRET_KEY fails loudly at first use,
+// but a wrong DATABASE_URL or OIDC_CLIENT_SECRET does not fail at all — it
+// just points at the wrong database or provider — and there is no shell in
+// the distroless runtime image to go looking. So every resolution logs one
+// line at boot naming which variable supplied the value, and — when both were
+// set — naming the fileEnvVar that was ignored. The resolved value itself is
+// never included in any error or log line — only the variable names.
+//
+// The file is read through security.ReadBoundedRegularFile, which rejects
+// directories/special files and caps the read at maxBytes; its content is
+// trimmed the same way a plain env value already is, so a trailing newline
+// from `echo secret > file` never leaks into the resolved value. A file that
+// cannot be read aborts with an error naming fileEnvVar — callers that only
+// consume the value on some other condition (a particular DB_DRIVER, OIDC
+// enabled) must gate the call on that condition themselves, so a stale or
+// dangling fileEnvVar for a value nothing reads never blocks boot.
+func resolveSecretFromEnvOrFile(envVar, fileEnvVar string, maxBytes int64) (string, error) {
+	value := strings.TrimSpace(os.Getenv(envVar))
+	filePath := strings.TrimSpace(os.Getenv(fileEnvVar))
+
+	if value != "" {
+		if filePath != "" {
+			log.Printf("config: %s supplied via environment; %s is also set but ignored (%s takes precedence)", envVar, fileEnvVar, envVar)
+		} else {
+			log.Printf("config: %s supplied via environment", envVar)
+		}
+		return value, nil
 	}
-	return string(content), nil
+
+	if filePath == "" {
+		return "", nil
+	}
+
+	content, err := security.ReadBoundedRegularFile(filePath, fileEnvVar, maxBytes)
+	if err != nil {
+		return "", fmt.Errorf("failed to read %s: %w", fileEnvVar, err)
+	}
+	log.Printf("config: %s supplied via %s", envVar, fileEnvVar)
+	return strings.TrimSpace(string(content)), nil
 }
 
 func resolvePort() (string, error) {

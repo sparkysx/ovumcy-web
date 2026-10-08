@@ -1,13 +1,13 @@
 {{define "content"}}
 <section class="mx-auto max-w-3xl space-y-6 px-4 py-8">
   <div>
-    <h1 class="journal-title">{{t .Messages "settings.2fa.title"}}</h1>
+    <h1 class="journal-title" data-title-key="settings.2fa.title">{{t .Messages "settings.2fa.title"}}</h1>
     <p class="journal-muted mt-1 text-sm">{{t .Messages "settings.2fa.description"}}</p>
   </div>
 
   {{if .TOTPEnabled}}
 
-  <div class="journal-card p-5 sm:p-6 space-y-4">
+  <div class="card p-5 sm:p-6 space-y-4">
     <div>
       <h2 class="journal-subtitle">{{t .Messages "settings.2fa.status_enabled_label"}}</h2>
       <p class="journal-muted mt-1 text-sm">{{t .Messages "settings.2fa.status_enabled_hint"}}</p>
@@ -21,6 +21,7 @@
       hx-swap="innerHTML"
       class="space-y-4">
       <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+      <input type="hidden" name="_method" value="DELETE">
 
       <div class="space-y-2">
         <label class="field-label" for="settings-2fa-disable-password">
@@ -46,7 +47,7 @@
 
   {{else}}
 
-  <div class="journal-card p-5 sm:p-6 space-y-6">
+  <div class="card p-5 sm:p-6 space-y-6">
     <div>
       <h2 class="journal-subtitle">{{t .Messages "settings.2fa.setup_title"}}</h2>
       <p class="journal-muted mt-1 text-sm">{{t .Messages "settings.2fa.setup_instructions"}}</p>
@@ -76,6 +77,7 @@
       hx-swap="innerHTML"
       class="space-y-4">
       <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+      <input type="hidden" name="_method" value="PUT">
       {{template "password_username_context_field" (dict "Value" .CurrentUser.Email)}}
 
       <div class="space-y-2">
@@ -91,7 +93,7 @@
           maxlength="6"
           autocomplete="one-time-code"
           required
-          class="input-field tracking-widest text-center text-xl w-40"
+          class="input-field input-field-code tracking-widest text-center text-xl"
           placeholder="000000" />
       </div>
 
@@ -116,7 +118,7 @@
   {{end}}
 
   <div class="mt-2">
-    <a href="/settings" class="inline-link text-sm">← {{t .Messages "common.back_to_settings"}}</a>
+    <a href="/settings" class="inline-link text-sm"><span aria-hidden="true">←</span> {{t .Messages "common.back_to_settings"}}</a>
   </div>
 </section>
 {{end}}

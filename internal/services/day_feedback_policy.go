@@ -14,6 +14,37 @@ const (
 	daySaveMessagePregnancyPaused = "dashboard.save_message_pregnancy_paused"
 )
 
+// DaySaveMessageKind is what a day-save sentence is beyond its words, so the
+// surfaces that show it decide by the kind and never by matching translated
+// copy.
+type DaySaveMessageKind int
+
+const (
+	// DaySaveMessageRoutine is a line about the day (self-care, fertile): shown,
+	// and it clears itself.
+	DaySaveMessageRoutine DaySaveMessageKind = iota
+	// DaySaveMessageConfirmation says only that the day was saved. A surface
+	// with its own save indicator does not repeat it.
+	DaySaveMessageConfirmation
+	// DaySaveMessageSafety carries red-flag guidance (the pregnancy pause): it
+	// stays until the owner dismisses it.
+	DaySaveMessageSafety
+)
+
+// ClassifyDaySaveMessage names the kind of the sentence a day save answers
+// with. An empty key is a save for which no sentence was resolved: the caller
+// answers with the bare timestamped confirmation, so it is a confirmation too.
+func ClassifyDaySaveMessage(messageKey string) DaySaveMessageKind {
+	switch messageKey {
+	case daySaveMessagePregnancyPaused:
+		return DaySaveMessageSafety
+	case daySaveMessageNeutral, "":
+		return DaySaveMessageConfirmation
+	default:
+		return DaySaveMessageRoutine
+	}
+}
+
 type DayFeedbackState struct {
 	MessageKey               string
 	ShowSpottingCycleWarning bool
@@ -33,20 +64,24 @@ func (service *DayService) ResolveDayFeedback(ctx context.Context, user *models.
 
 	day = DateAtLocation(day, location)
 	today := DateAtLocation(now, location)
-	stats := BuildCycleStats(logs, today)
-	// BuildCycleStats does not resolve the pregnancy pause itself (mirrors
-	// StatsService.BuildCycleStatsFromLogs); resolve it here so the save
-	// message can explain the paused predictions.
-	if _, paused := ResolvePregnancyPause(logs); paused {
-		stats.PregnancyPaused = true
-	}
+	// The dashboard's own derivation, step for step: the stats come from the same
+	// two-year history window through BuildCycleStatsFromLogs (which bounds the
+	// timeline at today, the pregnancy pause included, and applies the owner's
+	// luteal baseline), and the window then goes through the same confirmed-shift
+	// and suppression gate. Plain BuildCycleStats fixed the luteal phase at its
+	// default of 14 and never saw a thermal shift, so the toast named days the
+	// dashboard did not shade and stayed silent on days it did. The two warnings
+	// below keep the full set on purpose — each asks about the day being edited,
+	// not about what the account's timeline supports today.
+	stats := BuildCycleStatsFromLogs(user, FilterLogsToStatsHistory(logs, today, location), now, location)
+	_, published, suppression := ConfirmedAndPublishedStats(user, logs, stats, today, location)
 	entry, err := service.FetchLogByDate(ctx, user.ID, day, location)
 	if err != nil {
 		return DayFeedbackState{}, err
 	}
 
 	state := DayFeedbackState{
-		MessageKey: resolveDaySaveMessageKey(user, day, stats),
+		MessageKey: resolveDaySaveMessageKey(user, day, today, published, suppression),
 	}
 
 	if shouldShowSpottingCycleWarning(logs, entry, day, location) {
@@ -54,7 +89,7 @@ func (service *DayService) ResolveDayFeedback(ctx context.Context, user *models.
 	}
 
 	streakLength, cycleStart, ok := currentPeriodStreakAtDay(logs, day, location)
-	if ok && streakLength > 8 && (user == nil || user.LongPeriodWarnedAt == nil || !sameCalendarDay(CalendarDay(*user.LongPeriodWarnedAt, location), cycleStart)) {
+	if ok && streakLength > 8 && (user.LongPeriodWarningCycleStart == nil || !sameCalendarDay(CalendarDay(*user.LongPeriodWarningCycleStart, location), cycleStart)) {
 		state.ShowLongPeriodWarning = true
 		state.LongPeriodCycleStart = cycleStart
 	}
@@ -79,20 +114,30 @@ func (service *DayService) AcknowledgeLongPeriodWarning(ctx context.Context, use
 	})
 }
 
-func resolveDaySaveMessageKey(user *models.User, day time.Time, stats CycleStats) string {
+// resolveDaySaveMessageKey requires a non-nil user: its only caller,
+// ResolveDayFeedback, dereferences user.ID before it gets here, so a nil user
+// panics there rather than reaching a guard in this package. It reads the
+// PUBLISHED stats and the verdict that came with them
+// (ConfirmedAndPublishedStats), never stats it derived itself: the fertile line
+// may only name a window the dashboard would show. `today` is the owner's
+// calendar day, in the same location-midnight shape as `day`.
+func resolveDaySaveMessageKey(user *models.User, day time.Time, today time.Time, stats CycleStats, suppression PredictionSuppression) string {
 	// A positive pregnancy test pauses predictions (ResolvePregnancyPause);
 	// explain the pause right at save time instead of a routine
 	// self-care/fertile message, and carry the red-flag guidance.
 	if stats.PregnancyPaused {
 		return daySaveMessagePregnancyPaused
 	}
-	if user != nil && user.UnpredictableCycle {
+	if user.UnpredictableCycle {
 		return daySaveMessageNeutral
 	}
-	// `day` arrives as a location-midnight working value while the stats
-	// fields carry UTC-midnight calendar days; re-anchor `day` to UTC-midnight
-	// of its calendar components so the instant comparisons below cannot
-	// shift a day across the UTC offset (issue #48 class).
+	// `day` arrives as a location-midnight working value, and so do the window
+	// bounds: they come from the owner's baseline and the confirmed-shift
+	// resolver, which anchor every date at the owner's local midnight. Each side
+	// is therefore re-anchored to UTC-midnight of its own calendar components
+	// before they are ordered, so the comparisons below read calendar days and
+	// never instants (issue #48 class). Anchoring only `day` would be right in
+	// UTC and one day off at an end of the window in every other zone.
 	day = dateOnly(day)
 	if !stats.LastPeriodStart.IsZero() {
 		cycleDay := cycleDayAt(stats.LastPeriodStart, day)
@@ -100,7 +145,42 @@ func resolveDaySaveMessageKey(user *models.User, day time.Time, stats CycleStats
 			return daySaveMessageSelfCare
 		}
 	}
-	if !stats.FertilityWindowStart.IsZero() && !day.Before(stats.FertilityWindowStart) && !day.After(stats.FertilityWindowEnd) {
+	// The fertile line is an estimate about the window, so it may only be made
+	// from one the other fertility surfaces would still publish — the verdict is
+	// the fertility half of PredictionSuppression, the gate the calendar grid, the
+	// .ics feed, the webhook reminder and the dashboard read (the window itself
+	// is the confirmed one when the owner's temperatures have confirmed a shift,
+	// and the personalised one when their luteal phase has been inferred). Two of
+	// its tiers matter here
+	// beyond the early returns above. Until the first cycle closes there are no
+	// observed cycle lengths, so the window is the default length projected
+	// forward with the default luteal phase: where the only source is
+	// configuration defaults, suppression is the floor and a qualifier is not
+	// enough (docs/SECURITY_INVARIANTS.md -> medical safety). And once the cycle
+	// has run more than a week past its own length (DashboardCycleOverdue), the
+	// window is a projection the account's data no longer supports: three 28-day
+	// cycles beside one 300-day gap still placed it on days 9-14 of a cycle on
+	// day 61, and saving one of those days called it fertile while every other
+	// surface withheld the window. The save falls back to the neutral message
+	// rather than softening the fertile one.
+	//
+	// The line speaks about the day being saved only when that day is today. A day
+	// already behind the owner is a backfill, recorded after the fact, and the
+	// line would read as a claim about a day that is over; a day still ahead is
+	// not what the owner is living in yet, so it gets no claim either.
+	//
+	// Out-of-date data is a third tier, and the one PublishedStats does not answer
+	// with a cleared window: it withholds the status and the phase and leaves the
+	// projected dates beside the out-of-date banner. This message reads the window,
+	// so it asks the same verdict (CycleDataStale on the published copy): a toast
+	// naming a window the cycle has already outrun would say what both owner
+	// pages, which print "unknown" there, do not.
+	if !suppression.FertilitySuppressed &&
+		!stats.CycleDataStale &&
+		day.Equal(dateOnly(today)) &&
+		!stats.FertilityWindowStart.IsZero() &&
+		!day.Before(dateOnly(stats.FertilityWindowStart)) &&
+		!day.After(dateOnly(stats.FertilityWindowEnd)) {
 		return daySaveMessageFertile
 	}
 	return daySaveMessageNeutral
@@ -124,13 +204,25 @@ func currentPeriodStreakAtDay(logs []models.DailyLog, day time.Time, location *t
 		return 0, time.Time{}, false
 	}
 
-	targetDay := DateAtLocation(day, location)
+	// The walk below is a run of CALENDAR days, so it is stepped as calendar
+	// days: the requested day is re-anchored to UTC midnight and the cursor
+	// moves there, the same convention BuildCalendarDayStates uses for the
+	// month grid. Stepping inside the request zone re-enters time.Date there,
+	// and in a UTC-minus zone whose DST jump lands on midnight
+	// (America/Santiago 2026-09-06) the missing wall clock normalizes BACKWARD
+	// into the previous calendar day: the step off 2026-09-07 landed on
+	// 2026-09-05 and 2026-09-06 was never queried, undercounting a continuous
+	// period by a day and jumping the gap that should have ended the walk. UTC
+	// has no transitions, so the same arithmetic there visits every calendar
+	// day exactly once for every request zone. Only the cursor's shape changes:
+	// the calendar day it names on any other date is the one it named before.
+	targetDay := CalendarDay(DateAtLocation(day, location), time.UTC)
 	logByDay := make(map[string]models.DailyLog, len(logs))
 	for _, logEntry := range sortDailyLogs(logs) {
-		logByDay[CalendarDay(logEntry.Date, location).Format("2006-01-02")] = logEntry
+		logByDay[CalendarDayKey(logEntry.Date)] = logEntry
 	}
 
-	current, ok := logByDay[targetDay.Format("2006-01-02")]
+	current, ok := logByDay[CalendarDayKey(targetDay)]
 	if !ok || !current.IsPeriod {
 		return 0, time.Time{}, false
 	}
@@ -138,7 +230,7 @@ func currentPeriodStreakAtDay(logs []models.DailyLog, day time.Time, location *t
 	streak := 0
 	cycleStart := targetDay
 	for cursor := targetDay; ; cursor = cursor.AddDate(0, 0, -1) {
-		logEntry, exists := logByDay[cursor.Format("2006-01-02")]
+		logEntry, exists := logByDay[CalendarDayKey(cursor)]
 		if !exists || !logEntry.IsPeriod {
 			break
 		}

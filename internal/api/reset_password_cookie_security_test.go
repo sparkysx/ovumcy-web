@@ -45,6 +45,7 @@ func TestResetPasswordCookieFlagsFollowCookieSecureConfig(t *testing.T) {
 			form := url.Values{
 				"email":         {user.Email},
 				"recovery_code": {recoveryCode},
+				"password":      {"StrongPass1"},
 			}
 			request := httptest.NewRequest(http.MethodPost, "/api/v1/password-resets", strings.NewReader(form.Encode()))
 			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -86,18 +87,15 @@ func TestResetPasswordCookieRoundTripPreservesPayload(t *testing.T) {
 
 	app := fiber.New()
 	app.Get("/seal", func(c fiber.Ctx) error {
-		if err := handler.setResetPasswordCookie(c, "reset-token-xyz", true); err != nil {
+		if err := handler.setResetPasswordCookie(c, "reset-token-xyz"); err != nil {
 			t.Fatalf("seal reset password cookie: %v", err)
 		}
 		return c.SendStatus(fiber.StatusNoContent)
 	})
 	app.Get("/open", func(c fiber.Ctx) error {
-		token, forced := handler.readResetPasswordCookie(c)
+		token := handler.readResetPasswordCookie(c)
 		if token != "reset-token-xyz" {
 			t.Fatalf("expected reset token to round-trip, got %q", token)
-		}
-		if !forced {
-			t.Fatalf("expected forced flag to round-trip as true")
 		}
 		return c.SendStatus(fiber.StatusNoContent)
 	})
@@ -120,6 +118,9 @@ func TestResetPasswordCookieRoundTripPreservesPayload(t *testing.T) {
 		t.Fatalf("open request: %v", err)
 	}
 	defer func() { _ = openResponse.Body.Close() }()
+	if openResponse.StatusCode != fiber.StatusNoContent {
+		t.Fatalf("expected /open to reach 204, got %d; the in-handler round-trip assertion may have been skipped", openResponse.StatusCode)
+	}
 }
 
 func TestResetPasswordCookieRejectsTamperedByte(t *testing.T) {
@@ -132,15 +133,15 @@ func TestResetPasswordCookieRejectsTamperedByte(t *testing.T) {
 
 	app := fiber.New()
 	app.Get("/seal", func(c fiber.Ctx) error {
-		if err := handler.setResetPasswordCookie(c, "reset-tamper", false); err != nil {
+		if err := handler.setResetPasswordCookie(c, "reset-tamper"); err != nil {
 			t.Fatalf("seal: %v", err)
 		}
 		return c.SendStatus(fiber.StatusNoContent)
 	})
 	app.Get("/open", func(c fiber.Ctx) error {
-		token, forced := handler.readResetPasswordCookie(c)
-		if token != "" || forced {
-			t.Fatalf("expected tampered reset password cookie to yield empty token, got %q forced=%t", token, forced)
+		token := handler.readResetPasswordCookie(c)
+		if token != "" {
+			t.Fatalf("expected tampered reset password cookie to yield empty token, got %q", token)
 		}
 		return c.SendStatus(fiber.StatusNoContent)
 	})
@@ -164,6 +165,10 @@ func TestResetPasswordCookieRejectsTamperedByte(t *testing.T) {
 		t.Fatalf("open tampered request: %v", err)
 	}
 	defer func() { _ = openResponse.Body.Close() }()
+	if openResponse.StatusCode != fiber.StatusNoContent {
+		t.Fatalf("expected /open to reach 204, got %d; the in-handler tampered-cookie assertion may have been skipped", openResponse.StatusCode)
+	}
+	assertSealedCookieCleared(t, openResponse.Cookies(), resetPasswordCookieName, resetPasswordCookieSpec.path)
 }
 
 func TestResetPasswordCookieRejectsForeignKey(t *testing.T) {
@@ -180,16 +185,16 @@ func TestResetPasswordCookieRejectsForeignKey(t *testing.T) {
 
 	sealingApp := fiber.New()
 	sealingApp.Get("/seal", func(c fiber.Ctx) error {
-		if err := sealingHandler.setResetPasswordCookie(c, "reset-foreign", true); err != nil {
+		if err := sealingHandler.setResetPasswordCookie(c, "reset-foreign"); err != nil {
 			t.Fatalf("seal: %v", err)
 		}
 		return c.SendStatus(fiber.StatusNoContent)
 	})
 	openingApp := fiber.New()
 	openingApp.Get("/open", func(c fiber.Ctx) error {
-		token, forced := openingHandler.readResetPasswordCookie(c)
-		if token != "" || forced {
-			t.Fatalf("expected rotated-key handler to reject sealed cookie, got %q forced=%t", token, forced)
+		token := openingHandler.readResetPasswordCookie(c)
+		if token != "" {
+			t.Fatalf("expected rotated-key handler to reject sealed cookie, got %q", token)
 		}
 		return c.SendStatus(fiber.StatusNoContent)
 	})
@@ -212,4 +217,123 @@ func TestResetPasswordCookieRejectsForeignKey(t *testing.T) {
 		t.Fatalf("open request: %v", err)
 	}
 	defer func() { _ = openResponse.Body.Close() }()
+	if openResponse.StatusCode != fiber.StatusNoContent {
+		t.Fatalf("expected /open to reach 204, got %d; the in-handler foreign-key assertion may have been skipped", openResponse.StatusCode)
+	}
+	assertSealedCookieCleared(t, openResponse.Cookies(), resetPasswordCookieName, resetPasswordCookieSpec.path)
+}
+
+// TestResetPasswordCookieReaderClearsWhenCodecUnavailable drives
+// readResetPasswordCookie's handler.cookieCodec() failure branch. A bare
+// Handler with no secretKey never gets past it: newSecureCookieCodec refuses
+// an empty key before any AEAD is built. NewHandler requires a non-empty
+// SECRET_KEY at boot, so a fully composed app can never reach this in
+// production — but the reader still has to fail closed rather than trust an
+// uninitialized codec's zero value if it is ever invoked before that
+// invariant holds, which is exactly what this drives directly.
+func TestResetPasswordCookieReaderClearsWhenCodecUnavailable(t *testing.T) {
+	t.Parallel()
+
+	handler := &Handler{}
+
+	app := fiber.New()
+	app.Get("/open", func(c fiber.Ctx) error {
+		token := handler.readResetPasswordCookie(c)
+		if token != "" {
+			t.Fatalf("expected no token when the cookie codec is unavailable, got %q", token)
+		}
+		return c.SendStatus(fiber.StatusNoContent)
+	})
+
+	request := httptest.NewRequest("GET", "/open", nil)
+	request.Header.Set("Cookie", resetPasswordCookieName+"=anything")
+	response, err := app.Test(request, testConfigNoTimeout)
+	if err != nil {
+		t.Fatalf("open request: %v", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != fiber.StatusNoContent {
+		t.Fatalf("expected /open to reach 204, got %d; the in-handler assertion may have been skipped", response.StatusCode)
+	}
+	assertSealedCookieCleared(t, response.Cookies(), resetPasswordCookieName, resetPasswordCookieSpec.path)
+}
+
+// TestResetPasswordCookieReaderClearsOnNonJSONPlaintext drives
+// readResetPasswordCookie's json.Unmarshal failure branch: a value that opens
+// under the AEAD (so it was minted with the right key and not tampered) but
+// whose plaintext is not the payload JSON at all. setResetPasswordCookie
+// itself can never produce this — it always marshals resetPasswordCookiePayload
+// — so this seals the malformed plaintext directly, the same technique the
+// tamper/foreign-key tests above use to reach the reader's other failure arms.
+func TestResetPasswordCookieReaderClearsOnNonJSONPlaintext(t *testing.T) {
+	t.Parallel()
+
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	handler := &Handler{secretKey: secret, cookieSecure: true}
+
+	codec, err := newSecureCookieCodec(secret)
+	if err != nil {
+		t.Fatalf("new secure cookie codec: %v", err)
+	}
+	sealed, err := codec.seal(resetPasswordCookieName, []byte("not-the-payload-json"))
+	if err != nil {
+		t.Fatalf("seal malformed plaintext: %v", err)
+	}
+
+	app := fiber.New()
+	app.Get("/open", func(c fiber.Ctx) error {
+		token := handler.readResetPasswordCookie(c)
+		if token != "" {
+			t.Fatalf("expected no token for a sealed value whose plaintext is not payload JSON, got %q", token)
+		}
+		return c.SendStatus(fiber.StatusNoContent)
+	})
+
+	request := httptest.NewRequest("GET", "/open", nil)
+	request.Header.Set("Cookie", resetPasswordCookieName+"="+sealed)
+	response, err := app.Test(request, testConfigNoTimeout)
+	if err != nil {
+		t.Fatalf("open request: %v", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != fiber.StatusNoContent {
+		t.Fatalf("expected /open to reach 204, got %d; the in-handler assertion may have been skipped", response.StatusCode)
+	}
+	assertSealedCookieCleared(t, response.Cookies(), resetPasswordCookieName, resetPasswordCookieSpec.path)
+}
+
+// TestResetPasswordCookieReaderClearsOnBlankToken drives readResetPasswordCookie's
+// blank-token branch: the payload decodes as valid JSON but its Token field is
+// empty (or all whitespace). setResetPasswordCookie's own guard refuses to
+// seal an empty token, so this reaches the branch the same way the tests
+// above reach the reader's other arms — sealing the payload directly rather
+// than through the setter.
+func TestResetPasswordCookieReaderClearsOnBlankToken(t *testing.T) {
+	t.Parallel()
+
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	handler := &Handler{secretKey: secret, cookieSecure: true}
+
+	cookieValue := mustSealResetCookieValueForTest(t, secret, "   ")
+
+	app := fiber.New()
+	app.Get("/open", func(c fiber.Ctx) error {
+		token := handler.readResetPasswordCookie(c)
+		if token != "" {
+			t.Fatalf("expected no token for a payload whose Token field is blank, got %q", token)
+		}
+		return c.SendStatus(fiber.StatusNoContent)
+	})
+
+	request := httptest.NewRequest("GET", "/open", nil)
+	request.Header.Set("Cookie", resetPasswordCookieName+"="+cookieValue)
+	response, err := app.Test(request, testConfigNoTimeout)
+	if err != nil {
+		t.Fatalf("open request: %v", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != fiber.StatusNoContent {
+		t.Fatalf("expected /open to reach 204, got %d; the in-handler assertion may have been skipped", response.StatusCode)
+	}
+	assertSealedCookieCleared(t, response.Cookies(), resetPasswordCookieName, resetPasswordCookieSpec.path)
 }

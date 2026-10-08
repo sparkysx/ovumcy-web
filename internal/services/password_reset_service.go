@@ -38,14 +38,37 @@ func (service *PasswordResetService) ConfigureRecoveryAttemptLimits(attempts int
 	service.recoveryPolicy.Configure(attempts, window)
 }
 
-func (service *PasswordResetService) IssueResetTokenForUser(secretKey []byte, user *models.User, ttl time.Duration, now time.Time) (string, error) {
+// IssueResetTokenForUser mints a token with the given purpose. Every caller
+// mints one of the two FORCED purposes — the plain login route reaches this
+// via LoginService, which always passes PasswordResetTokenPurposeForcedLocal
+// (WEB-77 removed the only other route that used to share this call, OIDC
+// link-confirm's password challenge); the OIDC callback's own
+// must-change-password branch passes PasswordResetTokenPurposeForcedOIDC
+// directly. StartRecovery below is the only recovery-purpose minter and does
+// not go through this method.
+func (service *PasswordResetService) IssueResetTokenForUser(secretKey []byte, user *models.User, purpose string, ttl time.Duration, now time.Time) (string, error) {
 	if user == nil {
 		return "", ErrAuthUserRequired
 	}
-	return service.auth.BuildPasswordResetToken(secretKey, user.ID, user.PasswordHash, ttl, now)
+	return service.auth.BuildPasswordResetToken(secretKey, user.ID, user.PasswordHash, user.AuthSessionVersion, purpose, ttl, now)
 }
 
-func (service *PasswordResetService) StartRecovery(ctx context.Context, secretKey []byte, limiterKey string, email string, rawRecoveryCode string, now time.Time, tokenTTL time.Duration) (string, error) {
+// StartRecovery mints a password-reset token for an owner who proves TWO
+// factors: the account's current password AND its recovery code. The recovery
+// code stands in for the second factor (TOTP), never for the password — an
+// owner whose TOTP secret stopped decrypting after a SECRET_KEY rotation still
+// knows the password, while an attacker who photographed the recovery code once
+// no longer holds a standing takeover credential.
+//
+// An address that does not normalize to a usable email is malformed input,
+// visible to the caller without any lookup, and answers
+// ErrPasswordRecoveryInputInvalid. Every failure past that point — unknown
+// address, local auth disabled, wrong recovery code, wrong or absent password,
+// unsupported role — returns the SAME ErrPasswordRecoveryCodeInvalid, so the
+// route reveals neither account existence nor which operand was wrong. Every
+// failure, the malformed one included, books its attempt under the same keys
+// the budget check above it reads.
+func (service *PasswordResetService) StartRecovery(ctx context.Context, secretKey []byte, limiterKey string, email string, rawRecoveryCode string, password string, now time.Time, tokenTTL time.Duration) (string, error) {
 	if service.auth == nil {
 		return "", errors.New("auth service is required")
 	}
@@ -54,39 +77,51 @@ func (service *PasswordResetService) StartRecovery(ctx context.Context, secretKe
 	}
 
 	normalizedEmail := NormalizeAuthEmail(email)
-	if service.recoveryPolicy.TooManyRecent(secretKey, limiterKey, normalizedEmail, now) {
+	// The attempt is reserved before any compare and stays booked on every
+	// refusal and every error below, a storage error included; only a request
+	// that verified both factors gives the slot back. See AttemptLimiter.Reserve.
+	reservation, admitted := service.recoveryPolicy.Reserve(secretKey, limiterKey, normalizedEmail, now)
+	if !admitted {
 		return "", ErrPasswordRecoveryRateLimited
 	}
 	if normalizedEmail == "" {
-		service.recoveryPolicy.AddFailure(secretKey, limiterKey, "", now)
 		return "", ErrPasswordRecoveryInputInvalid
 	}
 
 	code := NormalizeRecoveryCode(rawRecoveryCode)
 	if err := ValidateRecoveryCodeFormat(code); err != nil {
-		service.recoveryPolicy.AddFailure(secretKey, limiterKey, normalizedEmail, now)
 		return "", ErrPasswordRecoveryCodeInvalid
 	}
 
-	user, err := service.auth.FindUserByEmailAndRecoveryCode(ctx, normalizedEmail, code)
+	user, err := service.auth.FindUserByEmailRecoveryCodeAndPassword(ctx, normalizedEmail, code, password)
 	if err != nil {
 		if errors.Is(err, ErrRecoveryCodeNotFound) {
-			service.recoveryPolicy.AddFailure(secretKey, limiterKey, normalizedEmail, now)
 			return "", ErrPasswordRecoveryCodeInvalid
 		}
+		// A storage error is not a verdict on the operands, but the attempt stays
+		// booked all the same: failing closed keeps a flapping store from being
+		// a way to compare operands without drawing the budget, and it matches
+		// what the sign-in flow does with the same fault.
 		return "", err
 	}
+	// Both factors verified: the reservation was never a failure.
+	reservation.Refund()
 
-	token, err := service.auth.BuildPasswordResetToken(secretKey, user.ID, user.PasswordHash, tokenTTL, now)
+	token, err := service.auth.BuildPasswordResetToken(secretKey, user.ID, user.PasswordHash, user.AuthSessionVersion, PasswordResetTokenPurposeRecovery, tokenTTL, now)
 	if err != nil {
 		return "", err
 	}
 
-	service.recoveryPolicy.Reset(secretKey, limiterKey, normalizedEmail)
+	// Unauthenticated flow: forgive this client only (see ResetClient).
+	service.recoveryPolicy.ResetClient(limiterKey)
 	return token, nil
 }
 
-func (service *PasswordResetService) CompleteReset(ctx context.Context, secretKey []byte, rawToken string, password string, confirmPassword string, now time.Time) (*models.User, string, error) {
+// CompleteReset redeems a reset token: it rewrites the password and rotates
+// the recovery code in one compare-and-set write. deliver seals the new
+// session and the code's reveal before that write commits (see
+// RecoveryCodeDelivery); if it fails, the reset never happened.
+func (service *PasswordResetService) CompleteReset(ctx context.Context, secretKey []byte, rawToken string, password string, confirmPassword string, now time.Time, deliver RecoveryCodeDelivery) (*models.User, string, error) {
 	if service.auth == nil {
 		return nil, "", errors.New("auth service is required")
 	}
@@ -105,7 +140,7 @@ func (service *PasswordResetService) CompleteReset(ctx context.Context, secretKe
 	// win; the loser receives ErrResetTokenAlreadyConsumed.
 	oldPasswordHash := user.PasswordHash
 
-	recoveryCode, err := service.auth.ResetPasswordAndRotateRecoveryCodeCAS(ctx, user, oldPasswordHash, password)
+	recoveryCode, err := service.auth.ResetPasswordAndRotateRecoveryCodeCAS(ctx, user, oldPasswordHash, password, deliver)
 	if err != nil {
 		return nil, "", err
 	}

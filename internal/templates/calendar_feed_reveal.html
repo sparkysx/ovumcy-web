@@ -1,15 +1,15 @@
 {{define "content"}}
 <section class="mx-auto flex min-h-[72vh] max-w-3xl items-center justify-center px-4 py-8">
   <div
-    class="journal-card journal-hero w-full p-7 sm:p-10"
+    class="card card-hero w-full p-7 sm:p-10"
     data-calendar-feed-reveal
     data-recovery-code-tools
     data-copy-success-message="{{t .Messages "settings.calendar_feed.reveal.copied"}}"
     data-copy-failed-message="{{t .Messages "settings.calendar_feed.reveal.copy_failed"}}">
-    <p class="journal-kicker">🗓️ {{t .Messages "settings.calendar_feed.reveal.kicker"}}</p>
+    <p class="journal-kicker"><span aria-hidden="true">{{template "icon" "calendar"}}</span> {{t .Messages "settings.calendar_feed.reveal.kicker"}}</p>
 
     <div>
-      <h1 class="journal-title" data-calendar-feed-reveal-heading>
+      <h1 class="journal-title" data-calendar-feed-reveal-heading data-title-key="{{if .CalendarFeedRotated}}settings.calendar_feed.reveal.title_rotated{{else}}settings.calendar_feed.reveal.title{{end}}">
         {{if .CalendarFeedRotated}}{{t .Messages "settings.calendar_feed.reveal.title_rotated"}}{{else}}{{t .Messages "settings.calendar_feed.reveal.title"}}{{end}}
       </h1>
       <p class="journal-muted mt-2">{{t .Messages "settings.calendar_feed.reveal.subtitle"}}</p>
@@ -26,7 +26,7 @@
     <p class="status-ok mt-4" data-recovery-status="copied" hidden>{{t .Messages "settings.calendar_feed.reveal.copied"}}</p>
     <p class="status-error mt-4" data-recovery-status="copy-failed" hidden>{{t .Messages "settings.calendar_feed.reveal.copy_failed"}}</p>
 
-    <p class="journal-muted mt-5 text-sm" data-calendar-feed-disclaimer>{{t .Messages "settings.calendar_feed.disclaimer"}}</p>
+    <p class="journal-muted mt-5 text-sm" data-calendar-feed-disclaimer>{{t .Messages "medical.disclaimer"}}</p>
 
     <div class="mt-6">
       <a href="/settings" class="btn-primary w-full inline-flex justify-center" data-calendar-feed-reveal-continue>{{t .Messages "settings.calendar_feed.reveal.done"}}</a>

@@ -1,9 +1,13 @@
 {{define "settings_tracking_section_content"}}
-  <section class="journal-card p-5 sm:p-6 space-y-5" id="settings-tracking">
-    <div>
-      <h2 class="journal-subtitle">🧪 {{t .Messages "settings.tracking.title"}}</h2>
-      <p class="journal-muted mt-2 text-sm">{{t .Messages "settings.tracking.subtitle"}}</p>
-    </div>
+  {{/* A disclosure, rendered open. It is closed only by the phone-width script;
+       on every wider screen, and with no script at all, this is the section it
+       has always been. The subtitle sits inside, not in the summary: a closed
+       card is its title row, or the height is spent twice. */}}
+  <details class="card settings-section p-4 sm:p-5 space-y-4" id="settings-tracking" data-settings-section open>
+    <summary class="settings-section-summary">
+      <h2 class="journal-subtitle"><span aria-hidden="true">{{template "icon" "flask"}}</span> {{t .Messages "settings.tracking.title"}}</h2>
+    </summary>
+    <p class="journal-muted mt-1 text-sm">{{t .Messages "settings.tracking.subtitle"}}</p>
 
     <form
       action="/api/v1/users/current/tracking"
@@ -17,124 +21,101 @@
       data-settings-unsaved-accept="{{t .Messages "settings.draft.discard"}}"
       data-save-feedback>
       <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+      <input type="hidden" name="_method" value="PATCH">
 
+      {{/* No helper line under these five toggles. Each one used to carry two
+           sentences: the first restated its own label (under "Show BBT field",
+           the line "Adds a basal body temperature field..."), and the second
+           repeated, verbatim, what the section subtitle above already says
+           once for the whole group - that turning a field off never removes
+           what is already logged. The sixth toggle keeps its hint: past-cycle
+           phases are DERIVED, and where that shading comes from is not on its
+           label. Keep this comment free of pictographs: the glyph guard scans
+           template source without skipping {{ }} comments. */}}
       <div class="settings-toggle-list">
         <label
-          class="period-toggle settings-tracking-toggle"
+          class="period-toggle"
           data-binary-toggle
           data-active="{{if .TrackBBT}}true{{else}}false{{end}}"
           data-tracking-setting="track-bbt">
           <input type="checkbox" name="track_bbt" value="true" data-binary-toggle-input {{if .TrackBBT}}checked{{end}}>
           <span class="period-toggle-copy settings-tracking-toggle-copy">
-            <span class="period-toggle-main">🌡️ {{t .Messages "settings.tracking.track_bbt"}}</span>
-            <span class="journal-muted text-sm">{{t .Messages "settings.tracking.track_bbt_hint"}}</span>
-            <span
-              class="journal-muted text-xs"
-              data-binary-toggle-state
-              data-state-on="{{t .Messages "settings.tracking.track_bbt_state_on"}}"
-              data-state-off="{{t .Messages "settings.tracking.track_bbt_state_off"}}">{{if .TrackBBT}}{{t .Messages "settings.tracking.track_bbt_state_on"}}{{else}}{{t .Messages "settings.tracking.track_bbt_state_off"}}{{end}}</span>
+            <span class="period-toggle-main"><span aria-hidden="true">{{template "icon" "thermometer"}}</span> {{t .Messages "settings.tracking.track_bbt"}}</span>
           </span>
         </label>
 
         <label
-          class="period-toggle settings-tracking-toggle"
+          class="period-toggle"
           data-binary-toggle
           data-active="{{if .TrackCervicalMucus}}true{{else}}false{{end}}"
           data-tracking-setting="track-cervical-mucus">
           <input type="checkbox" name="track_cervical_mucus" value="true" data-binary-toggle-input {{if .TrackCervicalMucus}}checked{{end}}>
           <span class="period-toggle-copy settings-tracking-toggle-copy">
-            <span class="period-toggle-main">💧 {{t .Messages "settings.tracking.track_cervical_mucus"}}</span>
-            <span class="journal-muted text-sm">{{t .Messages "settings.tracking.track_cervical_mucus_hint"}}</span>
-            <span
-              class="journal-muted text-xs"
-              data-binary-toggle-state
-              data-state-on="{{t .Messages "settings.tracking.track_cervical_mucus_state_on"}}"
-              data-state-off="{{t .Messages "settings.tracking.track_cervical_mucus_state_off"}}">{{if .TrackCervicalMucus}}{{t .Messages "settings.tracking.track_cervical_mucus_state_on"}}{{else}}{{t .Messages "settings.tracking.track_cervical_mucus_state_off"}}{{end}}</span>
+            <span class="period-toggle-main"><span aria-hidden="true">{{template "icon" "droplets"}}</span> {{t .Messages "settings.tracking.track_cervical_mucus"}}</span>
           </span>
         </label>
 
         <label
-          class="period-toggle settings-tracking-toggle"
+          class="period-toggle"
           data-binary-toggle
-          data-active="{{if .HideSexChip}}true{{else}}false{{end}}"
-          data-tracking-setting="hide-sex-chip">
-          <input type="checkbox" name="hide_sex_chip" value="true" data-binary-toggle-input {{if .HideSexChip}}checked{{end}}>
+          data-active="{{if .ShowSexChip}}true{{else}}false{{end}}"
+          data-tracking-setting="show-sex-chip">
+          <input type="checkbox" name="show_sex_chip" value="true" data-binary-toggle-input {{if .ShowSexChip}}checked{{end}}>
           <span class="period-toggle-copy settings-tracking-toggle-copy">
-            <span class="period-toggle-main">◦ {{t .Messages "settings.tracking.hide_sex_chip"}}</span>
-            <span class="journal-muted text-sm">{{t .Messages "settings.tracking.hide_sex_chip_hint"}}</span>
-            <span
-              class="journal-muted text-xs"
-              data-binary-toggle-state
-              data-state-on="{{t .Messages "settings.tracking.hide_sex_chip_state_on"}}"
-              data-state-off="{{t .Messages "settings.tracking.hide_sex_chip_state_off"}}">{{if .HideSexChip}}{{t .Messages "settings.tracking.hide_sex_chip_state_on"}}{{else}}{{t .Messages "settings.tracking.hide_sex_chip_state_off"}}{{end}}</span>
+            <span class="period-toggle-main"><span aria-hidden="true">{{template "icon" "heart"}}</span> {{t .Messages "settings.tracking.show_sex_chip"}}</span>
           </span>
         </label>
 
         <label
-          class="period-toggle settings-tracking-toggle"
+          class="period-toggle"
           data-binary-toggle
-          data-active="{{if .HideCycleFactors}}true{{else}}false{{end}}"
-          data-tracking-setting="hide-cycle-factors">
-          <input type="checkbox" name="hide_cycle_factors" value="true" data-binary-toggle-input {{if .HideCycleFactors}}checked{{end}}>
+          data-active="{{if .ShowCycleFactors}}true{{else}}false{{end}}"
+          data-tracking-setting="show-cycle-factors">
+          <input type="checkbox" name="show_cycle_factors" value="true" data-binary-toggle-input {{if .ShowCycleFactors}}checked{{end}}>
           <span class="period-toggle-copy settings-tracking-toggle-copy">
-            <span class="period-toggle-main">🏷️ {{t .Messages "settings.tracking.hide_cycle_factors"}}</span>
-            <span class="journal-muted text-sm">{{t .Messages "settings.tracking.hide_cycle_factors_hint"}}</span>
-            <span
-              class="journal-muted text-xs"
-              data-binary-toggle-state
-              data-state-on="{{t .Messages "settings.tracking.hide_cycle_factors_state_on"}}"
-              data-state-off="{{t .Messages "settings.tracking.hide_cycle_factors_state_off"}}">{{if .HideCycleFactors}}{{t .Messages "settings.tracking.hide_cycle_factors_state_on"}}{{else}}{{t .Messages "settings.tracking.hide_cycle_factors_state_off"}}{{end}}</span>
+            <span class="period-toggle-main"><span aria-hidden="true">{{template "icon" "tag"}}</span> {{t .Messages "settings.tracking.show_cycle_factors"}}</span>
           </span>
         </label>
 
         <label
-          class="period-toggle settings-tracking-toggle"
+          class="period-toggle"
           data-binary-toggle
-          data-active="{{if .HideNotesField}}true{{else}}false{{end}}"
-          data-tracking-setting="hide-notes-field">
-          <input type="checkbox" name="hide_notes_field" value="true" data-binary-toggle-input {{if .HideNotesField}}checked{{end}}>
+          data-active="{{if .ShowNotesField}}true{{else}}false{{end}}"
+          data-tracking-setting="show-notes-field">
+          <input type="checkbox" name="show_notes_field" value="true" data-binary-toggle-input {{if .ShowNotesField}}checked{{end}}>
           <span class="period-toggle-copy settings-tracking-toggle-copy">
-            <span class="period-toggle-main">📝 {{t .Messages "settings.tracking.hide_notes_field"}}</span>
-            <span class="journal-muted text-sm">{{t .Messages "settings.tracking.hide_notes_field_hint"}}</span>
-            <span
-              class="journal-muted text-xs"
-              data-binary-toggle-state
-              data-state-on="{{t .Messages "settings.tracking.hide_notes_field_state_on"}}"
-              data-state-off="{{t .Messages "settings.tracking.hide_notes_field_state_off"}}">{{if .HideNotesField}}{{t .Messages "settings.tracking.hide_notes_field_state_on"}}{{else}}{{t .Messages "settings.tracking.hide_notes_field_state_off"}}{{end}}</span>
+            <span class="period-toggle-main"><span aria-hidden="true">{{template "icon" "pencil"}}</span> {{t .Messages "settings.tracking.show_notes_field"}}</span>
           </span>
         </label>
 
         <label
-          class="period-toggle settings-tracking-toggle"
+          class="period-toggle"
           data-binary-toggle
           data-active="{{if .ShowHistoricalPhases}}true{{else}}false{{end}}"
           data-tracking-setting="show-historical-phases">
           <input type="checkbox" name="show_historical_phases" value="true" data-binary-toggle-input {{if .ShowHistoricalPhases}}checked{{end}}>
           <span class="period-toggle-copy settings-tracking-toggle-copy">
-            <span class="period-toggle-main">📅 {{t .Messages "settings.tracking.show_historical_phases"}}</span>
+            <span class="period-toggle-main"><span aria-hidden="true">{{template "icon" "calendar"}}</span> {{t .Messages "settings.tracking.show_historical_phases"}}</span>
             <span class="journal-muted text-sm">{{t .Messages "settings.tracking.show_historical_phases_hint"}}</span>
-            <span
-              class="journal-muted text-xs"
-              data-binary-toggle-state
-              data-state-on="{{t .Messages "settings.tracking.show_historical_phases_state_on"}}"
-              data-state-off="{{t .Messages "settings.tracking.show_historical_phases_state_off"}}">{{if .ShowHistoricalPhases}}{{t .Messages "settings.tracking.show_historical_phases_state_on"}}{{else}}{{t .Messages "settings.tracking.show_historical_phases_state_off"}}{{end}}</span>
           </span>
         </label>
       </div>
 
+      {{/* Two two-option switches, so they share a row instead of stacking. */}}
+      <div class="grid gap-3 sm:grid-cols-2 sm:items-start">
       <div class="space-y-2">
         <p class="field-label">{{t .Messages "settings.tracking.temperature_unit"}}</p>
         <div class="settings-unit-switch" role="radiogroup" aria-label="{{t .Messages "settings.tracking.temperature_unit"}}">
           <label class="choice-option">
             <input type="radio" name="temperature_unit" value="c" class="choice-input" {{if eq .TemperatureUnit "c"}}checked{{end}}>
-            <span class="radio-tile radio-tile-inline">
+            <span class="chip chip-stack chip-inline">
               <span>°C</span>
               <span>{{t .Messages "settings.tracking.temperature_unit_celsius"}}</span>
             </span>
           </label>
           <label class="choice-option">
             <input type="radio" name="temperature_unit" value="f" class="choice-input" {{if eq .TemperatureUnit "f"}}checked{{end}}>
-            <span class="radio-tile radio-tile-inline">
+            <span class="chip chip-stack chip-inline">
               <span>°F</span>
               <span>{{t .Messages "settings.tracking.temperature_unit_fahrenheit"}}</span>
             </span>
@@ -148,18 +129,20 @@
         <div class="settings-unit-switch" role="radiogroup" aria-label="{{t .Messages "settings.tracking.week_starts_on"}}">
           <label class="choice-option">
             <input type="radio" name="week_starts_on" value="sunday" class="choice-input" {{if eq .WeekStartsOn "sunday"}}checked{{end}}>
-            <span class="radio-tile radio-tile-inline">
+            <span class="chip chip-stack chip-inline">
               <span>{{t .Messages "settings.tracking.week_starts_on_sunday"}}</span>
             </span>
           </label>
           <label class="choice-option">
             <input type="radio" name="week_starts_on" value="monday" class="choice-input" {{if eq .WeekStartsOn "monday"}}checked{{end}}>
-            <span class="radio-tile radio-tile-inline">
+            <span class="chip chip-stack chip-inline">
               <span>{{t .Messages "settings.tracking.week_starts_on_monday"}}</span>
             </span>
           </label>
         </div>
-        <p class="journal-muted text-sm">{{t .Messages "settings.tracking.week_starts_on_hint"}}</p>
+        {{/* No helper line: the hint that used to sit here said back what the
+             label above it already says. */}}
+      </div>
       </div>
 
       <div class="settings-form-actions">
@@ -173,5 +156,5 @@
         <div id="settings-tracking-status" class="save-status text-sm" aria-live="polite"></div>
       </div>
     </form>
-  </section>
+  </details>
 {{end}}

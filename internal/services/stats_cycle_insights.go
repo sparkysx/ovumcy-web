@@ -17,6 +17,69 @@ type StatsBBTChartViewData struct {
 	MarkerIndex    int
 	MarkerLabelKey string
 	HasMarker      bool
+	Points         []StatsBBTChartPointViewData
+	// TemperatureUnit is the unit every number above is expressed in. The zero
+	// value is storage's Celsius; inTemperatureUnit is the only way to another.
+	TemperatureUnit string
+}
+
+// UnitLabelKey names the catalogue entry for the unit the chart's numbers are
+// in, so the axis suffix, the table and the text summary print the unit the
+// values were converted to rather than a fixed one.
+func (chart StatsBBTChartViewData) UnitLabelKey() string {
+	if NormalizeTemperatureUnit(chart.TemperatureUnit) == TemperatureUnitFahrenheit {
+		return "stats.bbt_unit_fahrenheit"
+	}
+	return "stats.bbt_unit"
+}
+
+// inTemperatureUnit re-expresses a chart built from stored Celsius readings in
+// the owner's display unit. It runs after detection, which compares stored
+// units, so the shift, the coverline day and the marker cannot move with the
+// unit; only the numbers shown change. A reading converts exactly as the day
+// editor shows it (FormatDayBBTForInput) and its text is re-derived from the
+// converted value, so value, text, coverline and unit label stay one unit.
+// Stored data is never touched.
+func (chart StatsBBTChartViewData) inTemperatureUnit(unit string) StatsBBTChartViewData {
+	if NormalizeTemperatureUnit(unit) != TemperatureUnitFahrenheit {
+		return chart
+	}
+
+	values := make([]*float64, len(chart.Values))
+	for index, value := range chart.Values {
+		if value != nil {
+			converted := roundTemperatureValue(celsiusToFahrenheit(*value))
+			values[index] = &converted
+		}
+	}
+	points := make([]StatsBBTChartPointViewData, len(chart.Points))
+	copy(points, chart.Points)
+	for index := range points {
+		if points[index].HasValue && index < len(values) && values[index] != nil {
+			points[index].ValueText = formatBBTChartPointValue(*values[index])
+		}
+	}
+
+	chart.Values = values
+	chart.Points = points
+	if chart.HasBaseline {
+		chart.Baseline = roundTemperatureValue(celsiusToFahrenheit(chart.Baseline))
+	}
+	chart.TemperatureUnit = TemperatureUnitFahrenheit
+	return chart
+}
+
+// StatsBBTChartPointViewData is one plotted day, spelled out for the surfaces
+// that cannot read a canvas: the hover tooltip and the table twin under the
+// chart. It restates the series the chart already draws — the same labels and
+// the same values, in the same order — and adds only the calendar date the
+// cycle day falls on, which the chart's x axis has no room for.
+type StatsBBTChartPointViewData struct {
+	Day       int
+	DayLabel  string
+	Date      string
+	ValueText string
+	HasValue  bool
 }
 
 type StatsSymptomPatternViewData struct {
@@ -34,8 +97,8 @@ type completedCycleSpan struct {
 	PeriodLength int
 }
 
-func buildCompletedCycleSpans(logs []models.DailyLog, location *time.Location) []completedCycleSpan {
-	starts := ObservedCycleStarts(logs)
+func buildCompletedCycleSpans(logs []models.DailyLog, location *time.Location, ctx BoundaryContext) []completedCycleSpan {
+	starts := CycleBoundaries(logs, ctx)
 	if len(starts) < 2 {
 		return nil
 	}
@@ -178,7 +241,7 @@ func buildSymptomPatternInsights(logs []models.DailyLog, completedCycles []compl
 	return items
 }
 
-func buildCurrentCycleBBTChart(stats CycleStats, logs []models.DailyLog, now time.Time, location *time.Location) StatsBBTChartViewData {
+func buildCurrentCycleBBTChart(language string, stats CycleStats, logs []models.DailyLog, now time.Time, location *time.Location) StatsBBTChartViewData {
 	cycleStart, today, ok := resolveCurrentCycleBBTBounds(stats, now, location)
 	if !ok {
 		return StatsBBTChartViewData{}
@@ -190,10 +253,60 @@ func buildCurrentCycleBBTChart(stats CycleStats, logs []models.DailyLog, now tim
 		return StatsBBTChartViewData{}
 	}
 
-	detectionDays, detectionValues := bbtSeriesFromPoints(collectCycleBBTPoints(logs, cycleStart, today.AddDate(0, 0, 1), location))
+	detectionDays, detectionValues := bbtSeriesFromPoints(collectCycleBBTPoints(logs, cycleStart, currentCycleDetectionBound(today, location), location))
 	firstHighDay, coverline, hasShift := detectBBTShiftFirstHighDay(detectionDays, detectionValues)
 	markerIndex, hasMarker := probableOvulationMarkerIndex(firstHighDay, hasShift, len(labels))
-	return newCurrentCycleBBTChartViewData(labels, values, coverline, hasShift, markerIndex, hasMarker)
+	points := buildCurrentCycleBBTChartPoints(language, cycleStart, labels, values)
+	return newCurrentCycleBBTChartViewData(labels, values, coverline, hasShift, markerIndex, hasMarker, points)
+}
+
+// buildOwnerCurrentCycleBBTChart is the chart the stats page draws. The
+// probable-ovulation marker and the coverline are an interpretation of the
+// readings — the day the temperatures confirmed and the threshold that
+// confirmed it — so they appear only where the dashboard, the calendar and the
+// JSON API would name that day, and the verdict is read from the one owner of
+// it, ConfirmedCurrentCycleOvulation, rather than restated here: unpredictable
+// mode, a pregnancy pause and the first-cycle floor withhold it, an overdue
+// cycle does not. The readings themselves are recorded facts and stay on the
+// chart under every one of them.
+func buildOwnerCurrentCycleBBTChart(user *models.User, language string, stats CycleStats, logs []models.DailyLog, now time.Time, location *time.Location) StatsBBTChartViewData {
+	chart := buildCurrentCycleBBTChart(language, stats, logs, now, location)
+	if _, confirmed := ConfirmedCurrentCycleOvulation(user, logs, stats, DateAtLocation(now, location), location); !confirmed {
+		chart.Baseline, chart.HasBaseline = 0, false
+		chart.MarkerIndex, chart.HasMarker = 0, false
+	}
+	return chart
+}
+
+// buildCurrentCycleBBTChartPoints restates the drawn series as text. Cycle day
+// n is the nth day from the cycle start, which is how the labels were numbered
+// in the first place, so the date is a walk along the same axis rather than a
+// second derivation of it.
+func buildCurrentCycleBBTChartPoints(language string, cycleStart time.Time, labels []string, values []*float64) []StatsBBTChartPointViewData {
+	points := make([]StatsBBTChartPointViewData, 0, len(labels))
+	for index, label := range labels {
+		point := StatsBBTChartPointViewData{
+			Day:      index + 1,
+			DayLabel: label,
+			Date:     LocalizedDateShort(language, AddCalendarDays(cycleStart, index, cycleStart.Location())),
+		}
+		if index < len(values) && values[index] != nil {
+			point.ValueText = formatBBTChartPointValue(*values[index])
+			point.HasValue = true
+		}
+		points = append(points, point)
+	}
+	return points
+}
+
+// formatBBTChartPointValue renders one reading to the tenth of a degree the
+// chart labels its axis with. This is the only place a reading becomes text:
+// the table twin prints it and the crosshair readout is handed the same string
+// rather than re-rounding the float in the browser. Go rounds a tie to even and
+// JavaScript's toFixed rounds it up, so an exactly representable 36.25 would
+// otherwise read 36.2 in the table and 36.3 in the tooltip beside it.
+func formatBBTChartPointValue(value float64) string {
+	return strconv.FormatFloat(value, 'f', 1, 64)
 }
 
 func resolveCurrentCycleBBTBounds(stats CycleStats, now time.Time, location *time.Location) (time.Time, time.Time, bool) {
@@ -256,7 +369,7 @@ func buildCurrentCycleBBTSeries(recordedDays []int, dayValues map[int]float64) (
 	return labels, values, true
 }
 
-func newCurrentCycleBBTChartViewData(labels []string, values []*float64, coverline float64, hasCoverline bool, markerIndex int, hasMarker bool) StatsBBTChartViewData {
+func newCurrentCycleBBTChartViewData(labels []string, values []*float64, coverline float64, hasCoverline bool, markerIndex int, hasMarker bool, points []StatsBBTChartPointViewData) StatsBBTChartViewData {
 	return StatsBBTChartViewData{
 		Labels:         labels,
 		Values:         values,
@@ -266,6 +379,7 @@ func newCurrentCycleBBTChartViewData(labels []string, values []*float64, coverli
 		MarkerIndex:    markerIndex,
 		MarkerLabelKey: "stats.bbt_probable_ovulation",
 		HasMarker:      hasMarker,
+		Points:         points,
 	}
 }
 
@@ -299,21 +413,20 @@ func completedCycleDayNumber(day time.Time, completedCycles []completedCycleSpan
 	return 0, false
 }
 
+// uniqueKnownSymptomIDs narrows a day's symptom ids to the ones the caller's
+// symptom map knows, deduplicated by uniqueSymptomIDs first so the two helpers
+// cannot disagree about what "once per day" means.
 func uniqueKnownSymptomIDs(symptomIDs []uint, symptomByID map[uint]models.SymptomType) []uint {
 	if len(symptomIDs) == 0 || len(symptomByID) == 0 {
 		return nil
 	}
 
-	unique := make([]uint, 0, len(symptomIDs))
-	seen := make(map[uint]struct{}, len(symptomIDs))
-	for _, symptomID := range symptomIDs {
+	deduped := uniqueSymptomIDs(symptomIDs)
+	unique := make([]uint, 0, len(deduped))
+	for _, symptomID := range deduped {
 		if _, exists := symptomByID[symptomID]; !exists {
 			continue
 		}
-		if _, duplicate := seen[symptomID]; duplicate {
-			continue
-		}
-		seen[symptomID] = struct{}{}
 		unique = append(unique, symptomID)
 	}
 	return unique

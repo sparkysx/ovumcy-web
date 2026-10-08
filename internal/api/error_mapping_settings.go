@@ -23,6 +23,17 @@ func settingsInvalidPasswordErrorSpec() APIErrorSpec {
 	return settingsFormErrorSpec(fiber.StatusUnauthorized, APIErrorCategoryUnauthorized, "invalid password")
 }
 
+// settingsLocalPasswordRequiredErrorSpec is the business-rule refusal for
+// removing an account's LAST sign-in method (mapOIDCIdentityUnlinkError,
+// below): unlike a re-auth failure, it only fires after the caller has
+// already proved the current password, so telling the owner to set one up
+// first discloses nothing an authenticated caller does not already know.
+// WEB-54 removed every OTHER call site — the ones that answered "the account
+// being re-authenticated has no local password" before the password was even
+// checked, which was a caller-visible oracle for "wrong password" vs "no
+// password". settingsInvalidPasswordErrorSpec (and, on the password-change
+// form, SettingsPasswordChangeKeyInvalidCurrent) now stands in for that
+// answer instead. Do not add a new re-auth call site here.
 func settingsLocalPasswordRequiredErrorSpec() APIErrorSpec {
 	return settingsFormErrorSpec(fiber.StatusForbidden, APIErrorCategoryForbidden, "local password required")
 }
@@ -39,8 +50,86 @@ func settingsOIDCReauthStaleErrorSpec() APIErrorSpec {
 	return settingsFormErrorSpec(fiber.StatusUnauthorized, APIErrorCategoryUnauthorized, "oidc reauth stale")
 }
 
+// settingsOIDCReauthAuthTimeMissingErrorSpec is the refusal of a step-up whose
+// provider returned no auth_time at all, as distinct from one whose sign-in was
+// merely too old. Its own key is what makes the two tellable apart downstream:
+// the owner is told that trying again cannot help (the stale sentence asks for
+// exactly that, and on such a provider it is a loop with no exit), and the
+// audit line carries reason="oidc reauth auth_time missing", so an operator can
+// separate a non-conforming provider from a genuinely slow sign-in without
+// reading the owner's copy. The status stays 401 alongside the stale spec: both
+// are refusals of the caller's proof, which is the side of
+// securityEventOutcomeForSpec's split ("denied", never "failure") that they
+// share — nothing on this instance failed.
+func settingsOIDCReauthAuthTimeMissingErrorSpec() APIErrorSpec {
+	return settingsFormErrorSpec(fiber.StatusUnauthorized, APIErrorCategoryUnauthorized, "oidc reauth auth_time missing")
+}
+
 func settingsOIDCReauthMismatchErrorSpec() APIErrorSpec {
 	return settingsFormErrorSpec(fiber.StatusUnauthorized, APIErrorCategoryUnauthorized, "oidc reauth identity mismatch")
+}
+
+// settingsErasureNeedsAccountPasswordErrorSpec is the callback-side refusal of
+// an erasure step-up whose account enrolled a local password while the owner
+// was at the provider: the erasure gate moved back to that password, so the
+// step-up authorizes nothing. Distinct from the start handler's
+// settingsInvalidInputErrorSpec, which refuses the same condition observed
+// before the flow begins and answers an API caller rather than the settings
+// page.
+func settingsErasureNeedsAccountPasswordErrorSpec() APIErrorSpec {
+	return settingsFormErrorSpec(fiber.StatusForbidden, APIErrorCategoryForbidden, "erasure requires the account password")
+}
+
+// settingsOIDCIdentityLinkClaimedErrorSpec is returned when the (issuer,
+// subject) the step-up exchange resolved to is already linked to a DIFFERENT
+// account — ConfirmAndLinkIdentity's cross-user-claim guard. Distinct from the
+// reauth-mismatch spec above: that one means "not the same session that
+// started the flow"; this one means the identity itself belongs elsewhere.
+func settingsOIDCIdentityLinkClaimedErrorSpec() APIErrorSpec {
+	return settingsFormErrorSpec(fiber.StatusConflict, APIErrorCategoryValidation, "oidc identity already linked")
+}
+
+// mapOIDCIdentityLinkReauthError maps failures of CompleteIdentityLinkReauth
+// (the Settings step-up that links a NEW OIDC identity). Stale freshness and a
+// cross-user claim keep their own specs so the owner learns what to do next;
+// everything else collapses into the generic SSO failure so provider state
+// never leaks through error granularity.
+func mapOIDCIdentityLinkReauthError(err error) APIErrorSpec {
+	switch {
+	// Before the stale arm, always: ErrOIDCReauthAuthTimeMissing wraps
+	// ErrOIDCReauthStale, so the coarse match below would swallow it and tell
+	// the owner to retry something that cannot succeed. Pinned by
+	// TestEveryReauthStaleMatchIsPrecededByTheMissingAuthTimeMatch.
+	case errors.Is(err, services.ErrOIDCReauthAuthTimeMissing):
+		return settingsOIDCReauthAuthTimeMissingErrorSpec()
+	case errors.Is(err, services.ErrOIDCReauthStale):
+		return settingsOIDCReauthStaleErrorSpec()
+	case errors.Is(err, services.ErrOIDCLinkFailed):
+		return settingsOIDCIdentityLinkClaimedErrorSpec()
+	case errors.Is(err, services.ErrAuthSessionVersionChanged):
+		return authSessionCreateErrorSpec()
+	case errors.Is(err, services.ErrOIDCDisabled),
+		errors.Is(err, services.ErrOIDCUnavailable),
+		errors.Is(err, services.ErrOIDCIdentityResolveFailed):
+		return authOIDCUnavailableErrorSpec()
+	default:
+		return authOIDCAuthenticationFailedErrorSpec()
+	}
+}
+
+// mapOIDCIdentityUnlinkError maps failures of UnlinkIdentity. A foreign,
+// zero or missing id share one 404 so the answer is no oracle for other
+// owners' identity ids; refusing to remove the last way in reuses the
+// "local password required" key, which is what the owner has to set up first.
+func mapOIDCIdentityUnlinkError(err error) APIErrorSpec {
+	switch {
+	case errors.Is(err, services.ErrOIDCIdentityNotFound):
+		return notFoundErrorSpec()
+	case errors.Is(err, services.ErrOIDCUnlinkLastSignIn):
+		return settingsLocalPasswordRequiredErrorSpec()
+	default:
+		return authOIDCUnavailableErrorSpec()
+	}
 }
 
 func settingsCycleUpdateErrorSpec() APIErrorSpec {
@@ -59,6 +148,16 @@ func settingsWebhookInvalidURLErrorSpec() APIErrorSpec {
 	return settingsFormErrorSpec(fiber.StatusBadRequest, APIErrorCategoryValidation, "invalid webhook url")
 }
 
+// settingsWebhookUnreadableURLErrorSpec is the owner-fault spec for a save that
+// would have had to invent an endpoint: the stored ciphertext will not open (a
+// rotated SECRET_KEY) and the form left the field blank, which means "keep it".
+// It is separate from the invalid-URL spec because the owner's next action is
+// different -- enter a new endpoint, or withdraw the stored one -- and identical
+// copy for two different remedies is how a surface stops being actionable.
+func settingsWebhookUnreadableURLErrorSpec() APIErrorSpec {
+	return settingsFormErrorSpec(fiber.StatusBadRequest, APIErrorCategoryValidation, "webhook url unreadable")
+}
+
 func settingsWebhookUpdateErrorSpec() APIErrorSpec {
 	return globalErrorSpec(fiber.StatusInternalServerError, APIErrorCategoryInternal, "failed to update webhook settings")
 }
@@ -70,6 +169,9 @@ func settingsWebhookUpdateErrorSpec() APIErrorSpec {
 func mapSettingsWebhookSaveError(err error) APIErrorSpec {
 	if errors.Is(err, services.ErrWebhookURLInvalid) {
 		return settingsWebhookInvalidURLErrorSpec()
+	}
+	if errors.Is(err, services.ErrWebhookURLUnreadable) {
+		return settingsWebhookUnreadableURLErrorSpec()
 	}
 	return settingsWebhookUpdateErrorSpec()
 }
@@ -84,6 +186,15 @@ func settingsCalendarFeedUpdateErrorSpec() APIErrorSpec {
 	return globalErrorSpec(fiber.StatusInternalServerError, APIErrorCategoryInternal, "failed to update calendar feed")
 }
 
+// settingsInterfaceUpdateErrorSpec is the internal-failure spec for the
+// interface save's account-side half (users.interface_language). The save is
+// reported as failed rather than silently degraded to a cookie-only change:
+// an owner who picked a language in Settings and saw a success flash would
+// otherwise find the choice gone on the next device.
+func settingsInterfaceUpdateErrorSpec() APIErrorSpec {
+	return globalErrorSpec(fiber.StatusInternalServerError, APIErrorCategoryInternal, "failed to update interface settings")
+}
+
 func settingsTimezoneUpdateErrorSpec() APIErrorSpec {
 	return globalErrorSpec(fiber.StatusInternalServerError, APIErrorCategoryInternal, "failed to update timezone")
 }
@@ -94,6 +205,16 @@ func settingsRemindersUpdateErrorSpec() APIErrorSpec {
 
 func settingsClearDataErrorSpec() APIErrorSpec {
 	return globalErrorSpec(fiber.StatusInternalServerError, APIErrorCategoryInternal, "failed to clear data")
+}
+
+// settingsDataClearedSignInAgainErrorSpec answers a clear-data whose wipe and
+// AuthSessionVersion bump already committed but whose session could not be
+// re-issued afterward. Distinct from settingsClearDataErrorSpec, which means
+// nothing was erased: here the data is already gone, so telling the owner
+// "failed to clear data" would be false, and 401 (not 500) says the right next
+// step is signing in again, since the caller has already cleared the cookie.
+func settingsDataClearedSignInAgainErrorSpec() APIErrorSpec {
+	return settingsFormErrorSpec(fiber.StatusUnauthorized, APIErrorCategoryUnauthorized, "data cleared sign in again")
 }
 
 func settingsValidatePasswordErrorSpec() APIErrorSpec {
@@ -119,15 +240,52 @@ func mapSettingsProfileNormalizeError(err error) APIErrorSpec {
 	}
 }
 
+// mapSettingsDeleteAccountPasswordError maps VerifyReauthPassword's outcome
+// for every settings action gated by validateSettingsActionPassword
+// (clear-data validate/apply, delete account, the OIDC identity-link step-up
+// start, and OIDC identity unlink). WEB-54: an account
+// with no local password and a wrong password on one that has one answer
+// IDENTICALLY here — same 401, same key, same target — because both are
+// ErrSettingsPasswordInvalid and ErrSettingsLocalPasswordNotSet are the same
+// caller-visible refusal now; ValidateCurrentPassword already equalizes their
+// bcrypt cost (SEC-L3, WEB-13), so neither status/key nor timing tells the two
+// apart. The distinction survives only in the security log, via
+// logSecurityError's typed error. Regression:
+// TestSettingsReauthMergesNoLocalPasswordIntoInvalidPassword.
 func mapSettingsDeleteAccountPasswordError(err error) APIErrorSpec {
 	switch {
+	// Checked first: an exhausted re-auth budget refuses the request before the
+	// password is compared, so it must not be reported as an invalid password.
+	case errors.Is(err, services.ErrSettingsReauthRateLimited):
+		return settingsRateLimitErrorSpec()
 	case errors.Is(err, services.ErrSettingsPasswordMissing):
 		return settingsMissingPasswordErrorSpec()
-	case errors.Is(err, services.ErrSettingsPasswordInvalid):
+	case errors.Is(err, services.ErrSettingsPasswordInvalid), errors.Is(err, services.ErrSettingsLocalPasswordNotSet):
 		return settingsInvalidPasswordErrorSpec()
-	case errors.Is(err, services.ErrSettingsLocalPasswordNotSet):
-		return settingsLocalPasswordRequiredErrorSpec()
 	default:
 		return settingsValidatePasswordErrorSpec()
+	}
+}
+
+// settingsReauthCauseField recovers, for the server log only, which of the two
+// merged conditions actually happened before mapSettingsDeleteAccountPasswordError
+// or mapSettingsPasswordChangeError folded it into the caller-visible "invalid
+// password" answer (WEB-54): a wrong password against an account that has one,
+// or an account with no local password at all. Read from the raw service error
+// BEFORE mapping — the mapped APIErrorSpec no longer carries the distinction,
+// by design. Every call site that maps a VerifyReauthPassword or
+// ValidatePasswordChange error passes this alongside the mapped spec so an
+// operator reading the security log can still tell the two apart even though
+// the response cannot. Returns the zero SecurityEventField (silently dropped
+// by emitSecurityEvent) for any other error, including nil.
+func settingsReauthCauseField(err error) SecurityEventField {
+	switch {
+	case errors.Is(err, services.ErrSettingsLocalPasswordNotSet):
+		return securityEventField("reauth_cause", "no_local_password")
+	case errors.Is(err, services.ErrSettingsPasswordInvalid),
+		errors.Is(err, services.ErrSettingsInvalidCurrentPassword):
+		return securityEventField("reauth_cause", "invalid_password")
+	default:
+		return SecurityEventField{}
 	}
 }

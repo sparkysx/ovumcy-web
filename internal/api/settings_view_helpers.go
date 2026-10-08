@@ -21,7 +21,7 @@ func (handler *Handler) buildSettingsViewData(c fiber.Ctx, user *models.User, fl
 			FlashSuccess: flash.SettingsSuccess,
 			FlashError:   flash.SettingsError,
 		},
-		time.Now().In(location),
+		handler.clockNow().In(location),
 		location,
 	)
 	if err != nil {
@@ -31,8 +31,13 @@ func (handler *Handler) buildSettingsViewData(c fiber.Ctx, user *models.User, fl
 	*user = viewData.CurrentUser
 
 	data := fiber.Map{
-		"Title":                  localizedPageTitle(messages, "meta.title.settings", "Ovumcy | Settings"),
-		"CurrentUser":            user,
+		"Title":       localizedPageTitle(messages, "meta.title.settings", "Ovumcy | Settings"),
+		"CurrentUser": user,
+		// OIDCEnabled gates the "link an OIDC identity" card (issue #701): the
+		// step-up it starts (StartOIDCIdentityLinkStepup) refuses immediately
+		// when the provider is disabled, so hiding the control when it can only
+		// ever fail is a display decision, not a second copy of that check.
+		"OIDCEnabled":            handler.oidcService != nil && handler.oidcService.Enabled(),
 		"ErrorKey":               viewData.ErrorKey,
 		"ChangePasswordErrorKey": viewData.ChangePasswordErrorKey,
 		"SuccessKey":             viewData.SuccessKey,
@@ -43,25 +48,39 @@ func (handler *Handler) buildSettingsViewData(c fiber.Ctx, user *models.User, fl
 		"UnpredictableCycle":     viewData.UnpredictableCycle,
 		"AgeGroup":               viewData.AgeGroup,
 		"UsageGoal":              viewData.UsageGoal,
+		"UsageGoalLabelKey":      services.UsageGoalTranslationKey(viewData.UsageGoal),
+		"UsageGoalSummaryKey":    services.UsageGoalSummaryTranslationKey(viewData.UsageGoal),
 		"ShownPeriodTip":         viewData.ShownPeriodTip,
 		"TrackBBT":               viewData.TrackBBT,
 		"TemperatureUnit":        viewData.TemperatureUnit,
 		"TrackCervicalMucus":     viewData.TrackCervicalMucus,
-		"HideSexChip":            viewData.HideSexChip,
-		"HideCycleFactors":       viewData.HideCycleFactors,
-		"HideNotesField":         viewData.HideNotesField,
+		"ShowSexChip":            viewData.ShowSexChip,
+		"ShowCycleFactors":       viewData.ShowCycleFactors,
+		"ShowNotesField":         viewData.ShowNotesField,
 		"ShowHistoricalPhases":   viewData.ShowHistoricalPhases,
 		"WeekStartsOn":           viewData.WeekStartsOn,
 		"ReminderLeadDays":       viewData.ReminderLeadDays,
-		"WebhookEnabled":         viewData.WebhookEnabled,
-		"WebhookNotifyPeriod":    viewData.WebhookNotifyPeriod,
-		"WebhookNotifyOvulation": viewData.WebhookNotifyOvulation,
-		"WebhookURLConfigured":   viewData.WebhookURLConfigured,
-		"WebhookURLHost":         viewData.WebhookURLHost,
-		"CalendarFeedConfigured": viewData.CalendarFeedConfigured,
 		"LastPeriodStart":        viewData.LastPeriodStart,
 		"TodayISO":               viewData.TodayISO,
 		"CycleStartMinISO":       viewData.CycleStartMinISO,
+	}
+
+	// The egress account is projected only past the owner gate, and as ONE key.
+	// The six flat keys it replaced were set unconditionally: a session that was
+	// not this row's owner received the endpoint's configured flag, its host, and
+	// the feed's configured flag as FALSE values rather than as absent ones, and a
+	// false value is still an answer to a question that session may not ask.
+	// Regression: TestSettingsViewDataNamesNoEgressKeyForANonOwner.
+	if viewData.HasOwnerEgressLedger {
+		data["Egress"] = buildSettingsEgressView(c, viewData.Egress, location)
+	}
+
+	if oidcEnabled, _ := data["OIDCEnabled"].(bool); oidcEnabled {
+		linked, err := handler.oidcService.ListLinkedIdentities(c.Context(), user.ID)
+		if err != nil {
+			return nil, err
+		}
+		data["LinkedOIDCIdentities"] = buildSettingsLinkedIdentityRows(language, location, linked)
 	}
 
 	if viewData.HasOwnerExportViewState {
@@ -99,4 +118,30 @@ func (handler *Handler) buildSettingsViewData(c fiber.Ctx, user *models.User, fl
 	}
 
 	return data, nil
+}
+
+// settingsLinkedIdentityRow is one row of the "linked sign-in identities"
+// list: the id the unlink form addresses, the issuer the owner signed in at,
+// and when the link was made. The provider subject is deliberately absent — it
+// is an opaque key, not something the owner recognises.
+type settingsLinkedIdentityRow struct {
+	ID           uint
+	Issuer       string
+	LinkedAtISO  string
+	LinkedAtText string
+}
+
+func buildSettingsLinkedIdentityRows(language string, location *time.Location, linked []services.LinkedOIDCIdentity) []settingsLinkedIdentityRow {
+	rows := make([]settingsLinkedIdentityRow, 0, len(linked))
+	for _, identity := range linked {
+		linkedAt := identity.LinkedAt
+		iso, text := egressTimestampStrings(language, location, &linkedAt)
+		rows = append(rows, settingsLinkedIdentityRow{
+			ID:           identity.ID,
+			Issuer:       identity.Issuer,
+			LinkedAtISO:  iso,
+			LinkedAtText: text,
+		})
+	}
+	return rows
 }

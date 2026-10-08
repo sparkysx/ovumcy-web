@@ -1,6 +1,11 @@
-import { expect, test, type Locator, type Page } from '@playwright/test';
-import { dateFieldRoot, fillDateField } from './support/date-field-helpers';
-import { dashboardNextPeriodText } from './support/dashboard-helpers';
+import { expect, test, type Locator, type Page } from './support/fixtures';
+import { fillDateField } from './support/date-field-helpers';
+import {
+  dashboardNextPeriodText,
+  openDashboardMoreFields,
+  saveDashboardEntry,
+} from './support/dashboard-helpers';
+import { selectOnboardingStartDate } from './support/onboarding-helpers';
 import { checkStyledControl } from './support/form-helpers';
 import {
   completeOnboardingIfPresent,
@@ -12,6 +17,17 @@ import {
 } from './support/auth-helpers';
 import { assertNoHorizontalOverflow } from './support/mobile-layout-helpers';
 import { openCalendarDayEditor } from './support/stats-helpers';
+import {
+  cancelConfirmDialog,
+  expectConfirmDialogCaptions,
+  mutatingRequestsDuring,
+} from './support/confirm-dialog-helpers';
+import { localeText } from './support/locale-helpers';
+
+// The duplicate-name rejection is asserted on three surfaces in this file (the
+// create form twice, an archived row once). Source it once from the catalogue
+// so a copy edit lands in all three without a search-and-replace.
+const DUPLICATE_SYMPTOM_NAME_ERROR = localeText('en', 'settings.symptoms.error.duplicate_name');
 
 function toISODate(date: Date): string {
   const copy = new Date(date);
@@ -142,14 +158,11 @@ async function saveTodayWithSymptom(page: Page, symptomName: string): Promise<st
   await page.goto('/dashboard');
   await expect(page).toHaveURL(/\/dashboard$/);
 
-  await page.locator('input[name="is_period"]').check();
-  const customSymptom = await ensureSymptomInputVisible(
-    dashboardSaveForm(page),
-    symptomName
-  );
-  await checkStyledControl(customSymptom);
-  await page.locator('button[data-save-button]').first().click();
-  await expect(page.locator('#save-status .status-ok')).toBeVisible();
+  await saveDashboardEntry(page, async () => {
+    await page.locator('input[name="is_period"]').check();
+    const customSymptom = await ensureSymptomInputVisible(dashboardSaveForm(page), symptomName);
+    await checkStyledControl(customSymptom);
+  });
 
   const todayAction = await page
     .locator('[data-dashboard-save-form]')
@@ -160,22 +173,12 @@ async function saveTodayWithSymptom(page: Page, symptomName: string): Promise<st
 }
 
 async function completeOnboardingWithStartDate(page: Page, startDate: string): Promise<void> {
-  const startDateInput = page.locator('#last-period-start');
-  await expect(dateFieldRoot(startDateInput)).toBeVisible();
-
-  const startDateOption = page.locator(`[data-onboarding-day-option][data-onboarding-day-value="${startDate}"]`);
-  if ((await startDateOption.count()) > 0) {
-    await startDateOption.first().focus();
-    await page.keyboard.press('Enter');
-  } else {
-    await fillDateField(startDateInput, startDate);
-  }
-
+  await selectOnboardingStartDate(page, startDate);
   await page.locator('form[hx-post="/api/v1/onboarding/steps/1"] button[type="submit"]').click();
 
   const stepTwoForm = page.locator('form[hx-post="/api/v1/onboarding/steps/2"]');
   await expect(stepTwoForm).toBeVisible();
-  await stepTwoForm.locator('button[type="submit"]').click();
+  await stepTwoForm.locator('[data-onboarding-step2-submit]').click();
   await expect(page).toHaveURL(/\/dashboard(?:\?.*)?$/);
 }
 
@@ -185,10 +188,14 @@ test.describe('Settings: profile and cycle', () => {
   }) => {
     const creds = await registerOwnerAndOpenSettings(page, 'settings-profile');
 
+    // The email is displayed, never editable. Assert that structurally: the
+    // panel renders the address as static text and carries no editable control
+    // at all. The previous negated-copy checks ("Cannot be changed." and its ru
+    // variant) passed just as well when the copy was reworded or dropped —
+    // which is exactly what happened, the string no longer renders anywhere.
     const profileAccountPanel = page.locator('[data-profile-email-panel]');
     await expect(profileAccountPanel).toContainText(creds.email);
-    await expect(profileAccountPanel).not.toContainText('Cannot be changed.');
-    await expect(profileAccountPanel).not.toContainText('Эл. почту нельзя изменить.');
+    await expect(profileAccountPanel.locator('input, textarea, select, [contenteditable]')).toHaveCount(0);
     await expect(page.locator('#settings-account input#settings-profile-email')).toHaveCount(0);
 
     const displayNameInput = page.locator('#settings-display-name');
@@ -243,7 +250,13 @@ test.describe('Settings: profile and cycle', () => {
 
     await page.reload();
     await expect(displayNameInput).toHaveValue('');
-    await expect(navIdentityChip(page)).toHaveAttribute('title', 'Profile settings');
+    // With no display name the chip falls back to the profile-name hint. Pin
+    // the key's rendered value from the catalogue rather than an English
+    // literal — the chip is localized like everything else.
+    await expect(navIdentityChip(page)).toHaveAttribute(
+      'title',
+      localeText('en', 'nav.profile_name_hint')
+    );
     await expect(navIdentityChip(page)).not.toContainText(creds.email);
     await expect(navIdentityChip(page)).not.toContainText(creds.email.split('@')[0]);
   });
@@ -260,7 +273,7 @@ test.describe('Settings: profile and cycle', () => {
     await page.goto('/settings');
     await expect(page).toHaveURL(/\/settings$/);
 
-    const cycleForm = page.locator('section#settings-cycle form[action="/api/v1/users/current/cycle"]');
+    const cycleForm = page.locator('#settings-cycle form[action="/api/v1/users/current/cycle"]');
     await expect(cycleForm).toBeVisible();
 
     const cycleLength = cycleForm.locator('#settings-cycle-length');
@@ -286,7 +299,7 @@ test.describe('Settings: profile and cycle', () => {
     await expect(page.locator('#settings-cycle-length')).toHaveValue(String(targetCycleLength));
     await expect(page.locator('#settings-period-length')).toHaveValue(String(targetPeriodLength));
     await expect(page.locator('#settings-last-period-start')).toHaveValue(targetStart);
-    await expect(page.locator('section#settings-cycle input[name="auto_period_fill"]')).not.toBeChecked();
+    await expect(page.locator('#settings-cycle input[name="auto_period_fill"]')).not.toBeChecked();
 
     await page.goto('/dashboard');
     await expect(page).toHaveURL(/\/dashboard$/);
@@ -302,16 +315,16 @@ test.describe('Settings: profile and cycle', () => {
 
     await fillDateField(page.locator('#settings-last-period-start'), isoDaysFromNow(1));
     await page
-      .locator('section#settings-cycle form[action="/api/v1/users/current/cycle"] button[data-save-button]')
+      .locator('#settings-cycle form[action="/api/v1/users/current/cycle"] button[data-save-button]')
       .click();
 
     await expect(page.locator('#settings-cycle-status .status-error')).toBeVisible();
   });
 
-  test('irregular cycle toggle switches dashboard prediction to a date range', async ({ page }) => {
+  test('irregular cycle toggle switches dashboard prediction to a pending-cycles estimate', async ({ page }) => {
     await registerOwnerAndOpenSettings(page, 'settings-irregular-cycle');
 
-    const cycleForm = page.locator('section#settings-cycle form[action="/api/v1/users/current/cycle"]');
+    const cycleForm = page.locator('#settings-cycle form[action="/api/v1/users/current/cycle"]');
     await expect(cycleForm).toBeVisible();
 
     const irregularToggle = cycleForm.locator('input[name="irregular_cycle"]');
@@ -322,10 +335,17 @@ test.describe('Settings: profile and cycle', () => {
     await page.goto('/dashboard');
     await expect(page).toHaveURL(/\/dashboard$/);
 
+    // A freshly onboarded owner has fewer than 3 completed cycles, so irregular
+    // mode renders the needs-more-cycles note alone — no date, no range:
+    // dashboardNeedsNextPeriodData short-circuits before the range is applied.
     const nextPeriodText = await dashboardNextPeriodText(page);
-    expect(nextPeriodText).toContain('around');
-    expect(nextPeriodText).toContain('3 cycles are needed');
-    expect(nextPeriodText).not.toContain(' - ');
+    expect(nextPeriodText).toBe(localeText('en', 'dashboard.next_period_need_cycles'));
+    // Sparse irregular mode, asserted on the explainer key rather than by
+    // forbidding the exact-date separator this state must not render.
+    await expect(page.locator('[data-dashboard-prediction-explainer]')).toHaveAttribute(
+      'data-explainer-key',
+      'prediction.explainer.irregular_sparse'
+    );
   });
 
   test('tracking toggles and BBT unit persist and change the owner day form', async ({ page }) => {
@@ -336,50 +356,49 @@ test.describe('Settings: profile and cycle', () => {
 
     const trackBBT = trackingSection.locator('input[name="track_bbt"]');
     const trackCervicalMucus = trackingSection.locator('input[name="track_cervical_mucus"]');
-    const hideSexChip = trackingSection.locator('input[name="hide_sex_chip"]');
+    const showSexChip = trackingSection.locator('input[name="show_sex_chip"]');
     const trackBBTToggle = trackingSection.locator('[data-tracking-setting="track-bbt"]');
     const trackCervicalMucusToggle = trackingSection.locator('[data-tracking-setting="track-cervical-mucus"]');
-    const hideSexChipToggle = trackingSection.locator('[data-tracking-setting="hide-sex-chip"]');
-    const trackBBTState = trackBBTToggle.locator('[data-binary-toggle-state]');
-    const trackCervicalMucusState = trackCervicalMucusToggle.locator('[data-binary-toggle-state]');
-    const hideSexChipState = hideSexChipToggle.locator('[data-binary-toggle-state]');
+    const showSexChipToggle = trackingSection.locator('[data-tracking-setting="show-sex-chip"]');
     const temperatureUnitFahrenheit = trackingSection.locator('input[name="temperature_unit"][value="f"]');
     const saveTrackingButton = trackingSection.locator('button[data-save-button]');
 
+    // Every toggle in this section is phrased positively: checked means the
+    // field is shown. The intimacy section is visible by default, so its box
+    // starts checked while the two opt-in fields start unchecked.
+    //
+    // The state each toggle is in is read off `data-active`, which the same
+    // handler writes: the sentence that used to restate it under every toggle
+    // ("Currently visible in …") is no longer rendered — a switch showing its
+    // own state does not need a line saying so.
+    //
+    // Nor is the helper line that followed it: it opened by restating the
+    // toggle's own label and closed by repeating, word for word, the section
+    // subtitle's promise that turning a field off never removes what is
+    // already logged. What each toggle must still carry is its LABEL, and it
+    // is read from the catalogue — this block previously re-typed the helper
+    // sentences as English literals, so the copy could be deleted from all six
+    // catalogues with every key-based search coming back clean.
     await expect(trackBBT).not.toBeChecked();
     await expect(trackCervicalMucus).not.toBeChecked();
-    await expect(hideSexChip).not.toBeChecked();
+    await expect(showSexChip).toBeChecked();
     await expect(trackBBTToggle).toHaveAttribute('data-active', 'false');
-    await expect(trackBBTToggle).toContainText(
-      'Adds a basal body temperature field to dashboard and calendar day editing.'
-    );
+    await expect(trackCervicalMucusToggle).toHaveAttribute('data-active', 'false');
+    await expect(showSexChipToggle).toHaveAttribute('data-active', 'true');
+    await expect(trackBBTToggle).toContainText(localeText('en', 'settings.tracking.track_bbt'));
     await expect(trackCervicalMucusToggle).toContainText(
-      'Adds cervical mucus choices to dashboard and calendar day editing.'
+      localeText('en', 'settings.tracking.track_cervical_mucus')
     );
-    await expect(hideSexChipToggle).toContainText(
-      'Removes the intimacy section from new dashboard and calendar entries.'
-    );
-    await expect(trackBBTState).toHaveText('Currently hidden from new dashboard and calendar entries.');
-    await expect(trackCervicalMucusState).toHaveText(
-      'Currently hidden from new dashboard and calendar entries.'
-    );
-    await expect(hideSexChipState).toHaveText(
-      'Currently visible in dashboard and calendar day editor.'
+    await expect(showSexChipToggle).toContainText(
+      localeText('en', 'settings.tracking.show_sex_chip')
     );
 
     await trackBBT.check();
     await trackCervicalMucus.check();
-    await hideSexChip.check();
+    await showSexChip.uncheck();
     await expect(trackBBTToggle).toHaveAttribute('data-active', 'true');
     await expect(trackCervicalMucusToggle).toHaveAttribute('data-active', 'true');
-    await expect(hideSexChipToggle).toHaveAttribute('data-active', 'true');
-    await expect(trackBBTState).toHaveText('Currently visible in dashboard and calendar day editor.');
-    await expect(trackCervicalMucusState).toHaveText(
-      'Currently visible in dashboard and calendar day editor.'
-    );
-    await expect(hideSexChipState).toHaveText(
-      'Currently hidden in dashboard and calendar day editor.'
-    );
+    await expect(showSexChipToggle).toHaveAttribute('data-active', 'false');
     await checkStyledControl(temperatureUnitFahrenheit);
     await saveTrackingButton.click();
     await expect(page.locator('#settings-tracking-status .status-ok')).toBeVisible();
@@ -388,26 +407,24 @@ test.describe('Settings: profile and cycle', () => {
     await expect(page).toHaveURL(/\/settings$/);
     await expect(trackBBT).toBeChecked();
     await expect(trackCervicalMucus).toBeChecked();
-    await expect(hideSexChip).toBeChecked();
+    await expect(showSexChip).not.toBeChecked();
     await expect(trackBBTToggle).toHaveAttribute('data-active', 'true');
     await expect(trackCervicalMucusToggle).toHaveAttribute('data-active', 'true');
-    await expect(hideSexChipToggle).toHaveAttribute('data-active', 'true');
-    await expect(trackBBTState).toHaveText('Currently visible in dashboard and calendar day editor.');
-    await expect(trackCervicalMucusState).toHaveText(
-      'Currently visible in dashboard and calendar day editor.'
-    );
-    await expect(hideSexChipState).toHaveText(
-      'Currently hidden in dashboard and calendar day editor.'
-    );
+    await expect(showSexChipToggle).toHaveAttribute('data-active', 'false');
     await expect(temperatureUnitFahrenheit).toBeChecked();
 
     await page.goto('/dashboard');
     await expect(page).toHaveURL(/\/dashboard$/);
     const dashboardForm = page.locator('[data-dashboard-save-form]').first();
-    const bbtInput = dashboardForm.getByLabel('BBT');
+    // BBT, cervical mucus and intimacy sit behind the journal's "More"
+    // disclosure; a day with none of them recorded renders it closed.
+    await openDashboardMoreFields(page);
+    // Address the field by its stable id, not its localized label ("BBT" is
+    // «БТТ» in ru), the way every other field in this spec is addressed.
+    const bbtInput = dashboardForm.locator('#dashboard-bbt');
     await expect(bbtInput).toBeVisible();
     await expect(dashboardForm.locator('.measurement-field-unit')).toContainText('°F');
-    await expect(dashboardForm).toContainText('93.20-109.40 °F');
+    await expect(dashboardForm).toContainText('93.2-109.4 °F');
     await bbtInput.fill('150.0');
     await bbtInput.blur();
     const invalidState = await bbtInput.evaluate((node) => {
@@ -419,33 +436,29 @@ test.describe('Settings: profile and cycle', () => {
     });
     expect(invalidState.valid).toBe(false);
     expect(invalidState.validationMessage).not.toBe('');
-    await bbtInput.fill('98.6');
-    await bbtInput.blur();
-    await expect(bbtInput).toHaveValue('98.60');
     await expect(page.locator('[data-dashboard-save-form] input[name="cervical_mucus"][value="dry"]')).toBeVisible();
     await expect(page.locator('[data-dashboard-save-form] [data-sex-activity-details]')).toHaveCount(0);
-    await page.locator('button[data-save-button]').first().click();
-    await expect(page.locator('#save-status .status-ok')).toBeVisible();
+    await saveDashboardEntry(page, async () => {
+      await bbtInput.fill('98.6');
+      await bbtInput.blur();
+    });
+    await expect(bbtInput).toHaveValue('98.60');
 
     const todayAction = await dashboardForm.getAttribute('hx-put');
     expect(todayAction).toMatch(/^\/api\/v1\/days\/\d{4}-\d{2}-\d{2}$/);
     const todayISO = String(todayAction).replace('/api/v1/days/', '');
     const dayEditorForm = await openCalendarDayEditor(page, todayISO);
-    await expect(dayEditorForm.getByLabel('BBT')).toHaveValue('98.60');
+    await expect(dayEditorForm.locator('#calendar-bbt')).toHaveValue('98.60');
     await expect(dayEditorForm.locator('.measurement-field-unit')).toContainText('°F');
 
     await page.goto('/settings');
     await expect(page).toHaveURL(/\/settings$/);
     await trackBBT.uncheck();
     await trackCervicalMucus.uncheck();
-    await hideSexChip.uncheck();
-    await expect(trackBBTState).toHaveText('Currently hidden from new dashboard and calendar entries.');
-    await expect(trackCervicalMucusState).toHaveText(
-      'Currently hidden from new dashboard and calendar entries.'
-    );
-    await expect(hideSexChipState).toHaveText(
-      'Currently visible in dashboard and calendar day editor.'
-    );
+    await showSexChip.check();
+    await expect(trackBBTToggle).toHaveAttribute('data-active', 'false');
+    await expect(trackCervicalMucusToggle).toHaveAttribute('data-active', 'false');
+    await expect(showSexChipToggle).toHaveAttribute('data-active', 'true');
     await saveTrackingButton.click();
     await expect(page.locator('#settings-tracking-status .status-ok')).toBeVisible();
     await expect(trackBBTToggle).toHaveAttribute('data-active', 'false');
@@ -454,10 +467,11 @@ test.describe('Settings: profile and cycle', () => {
     await expect(page).toHaveURL(/\/dashboard$/);
     await expect(page.locator('[data-dashboard-save-form] input[name="bbt"]')).toHaveCount(0);
     await expect(page.locator('[data-dashboard-save-form] input[name="cervical_mucus"][value="dry"]')).toHaveCount(0);
+    await openDashboardMoreFields(page);
     await expect(page.locator('[data-dashboard-save-form] [data-sex-activity-details]')).toBeVisible();
   });
 
-  test('hide-cycle-factors, hide-notes-field, and show-historical-phases toggles persist and change the owner day form', async ({
+  test('show-cycle-factors, show-notes-field, and show-historical-phases toggles persist and change the owner day form', async ({
     page,
   }) => {
     await registerOwnerAndOpenSettings(page, 'settings-tracking-extra');
@@ -465,57 +479,48 @@ test.describe('Settings: profile and cycle', () => {
     const trackingSection = page.locator('#settings-tracking');
     await expect(trackingSection).toBeVisible();
 
-    const hideCycleFactors = trackingSection.locator('input[name="hide_cycle_factors"]');
-    const hideNotesField = trackingSection.locator('input[name="hide_notes_field"]');
+    const showCycleFactors = trackingSection.locator('input[name="show_cycle_factors"]');
+    const showNotesField = trackingSection.locator('input[name="show_notes_field"]');
     const showHistoricalPhases = trackingSection.locator('input[name="show_historical_phases"]');
-    const hideCycleFactorsToggle = trackingSection.locator('[data-tracking-setting="hide-cycle-factors"]');
-    const hideNotesFieldToggle = trackingSection.locator('[data-tracking-setting="hide-notes-field"]');
+    const showCycleFactorsToggle = trackingSection.locator('[data-tracking-setting="show-cycle-factors"]');
+    const showNotesFieldToggle = trackingSection.locator('[data-tracking-setting="show-notes-field"]');
     const showHistoricalPhasesToggle = trackingSection.locator('[data-tracking-setting="show-historical-phases"]');
-    const hideCycleFactorsState = hideCycleFactorsToggle.locator('[data-binary-toggle-state]');
-    const hideNotesFieldState = hideNotesFieldToggle.locator('[data-binary-toggle-state]');
-    const showHistoricalPhasesState = showHistoricalPhasesToggle.locator('[data-binary-toggle-state]');
     const saveTrackingButton = trackingSection.locator('button[data-save-button]');
 
-    await expect(hideCycleFactors).not.toBeChecked();
-    await expect(hideNotesField).not.toBeChecked();
+    // Cycle factors and notes are visible by default, so their positive
+    // toggles start checked; historical phases are opt-in.
+    await expect(showCycleFactors).toBeChecked();
+    await expect(showNotesField).toBeChecked();
     await expect(showHistoricalPhases).not.toBeChecked();
-    await expect(hideCycleFactorsToggle).toHaveAttribute('data-active', 'false');
-    await expect(hideNotesFieldToggle).toHaveAttribute('data-active', 'false');
+    await expect(showCycleFactorsToggle).toHaveAttribute('data-active', 'true');
+    await expect(showNotesFieldToggle).toHaveAttribute('data-active', 'true');
     await expect(showHistoricalPhasesToggle).toHaveAttribute('data-active', 'false');
-    await expect(hideCycleFactorsState).toHaveText('Currently visible in dashboard and calendar day editor.');
-    await expect(hideNotesFieldState).toHaveText('Currently visible in dashboard and calendar day editor.');
-    await expect(showHistoricalPhasesState).toHaveText(
-      'Currently hidden; only the next predicted cycles show fertile windows.'
-    );
 
-    await hideCycleFactors.check();
-    await hideNotesField.check();
+    await showCycleFactors.uncheck();
+    await showNotesField.uncheck();
     await showHistoricalPhases.check();
-    await expect(hideCycleFactorsToggle).toHaveAttribute('data-active', 'true');
-    await expect(hideNotesFieldToggle).toHaveAttribute('data-active', 'true');
+    await expect(showCycleFactorsToggle).toHaveAttribute('data-active', 'false');
+    await expect(showNotesFieldToggle).toHaveAttribute('data-active', 'false');
     await expect(showHistoricalPhasesToggle).toHaveAttribute('data-active', 'true');
-    await expect(hideCycleFactorsState).toHaveText('Currently hidden in dashboard and calendar day editor.');
-    await expect(hideNotesFieldState).toHaveText('Currently hidden in dashboard and calendar day editor.');
-    await expect(showHistoricalPhasesState).toHaveText('Currently shown on past months in the calendar.');
     await saveTrackingButton.click();
     await expect(page.locator('#settings-tracking-status .status-ok')).toBeVisible();
 
     await page.reload();
     await expect(page).toHaveURL(/\/settings$/);
-    await expect(hideCycleFactors).toBeChecked();
-    await expect(hideNotesField).toBeChecked();
+    await expect(showCycleFactors).not.toBeChecked();
+    await expect(showNotesField).not.toBeChecked();
     await expect(showHistoricalPhases).toBeChecked();
-    await expect(hideCycleFactorsToggle).toHaveAttribute('data-active', 'true');
-    await expect(hideNotesFieldToggle).toHaveAttribute('data-active', 'true');
+    await expect(showCycleFactorsToggle).toHaveAttribute('data-active', 'false');
+    await expect(showNotesFieldToggle).toHaveAttribute('data-active', 'false');
     await expect(showHistoricalPhasesToggle).toHaveAttribute('data-active', 'true');
-    await expect(hideCycleFactorsState).toHaveText('Currently hidden in dashboard and calendar day editor.');
-    await expect(hideNotesFieldState).toHaveText('Currently hidden in dashboard and calendar day editor.');
-    await expect(showHistoricalPhasesState).toHaveText('Currently shown on past months in the calendar.');
 
-    // Dashboard effect: hide_cycle_factors removes the cycle-factor fieldset
-    // and hide_notes_field removes the notes disclosure from the owner's day
-    // form, mirroring how the sibling tracking toggles above assert
-    // hide_sex_chip / track_cervical_mucus. show_historical_phases has no
+    // Dashboard effect: an unchecked show-cycle-factors removes the
+    // cycle-factor fieldset and an unchecked show-notes-field removes the notes
+    // disclosure from the owner's day form, mirroring how the sibling tracking
+    // toggles above assert show_sex_chip / track_cervical_mucus. The stored
+    // columns stay inverted (hide_cycle_factors / hide_notes_field), so this
+    // reload is also the browser-side proof that the settings render and the
+    // day form agree on one conversion. show_historical_phases has no
     // dashboard/day-form surface (it only affects past-month calendar
     // rendering), so persistence above is its end-to-end coverage here; the
     // clear-data reset invariant is covered separately.
@@ -526,22 +531,21 @@ test.describe('Settings: profile and cycle', () => {
 
     await page.goto('/settings');
     await expect(page).toHaveURL(/\/settings$/);
-    await hideCycleFactors.uncheck();
-    await hideNotesField.uncheck();
+    await showCycleFactors.check();
+    await showNotesField.check();
     await showHistoricalPhases.uncheck();
-    await expect(hideCycleFactorsState).toHaveText('Currently visible in dashboard and calendar day editor.');
-    await expect(hideNotesFieldState).toHaveText('Currently visible in dashboard and calendar day editor.');
-    await expect(showHistoricalPhasesState).toHaveText(
-      'Currently hidden; only the next predicted cycles show fertile windows.'
-    );
+    await expect(showCycleFactorsToggle).toHaveAttribute('data-active', 'true');
+    await expect(showNotesFieldToggle).toHaveAttribute('data-active', 'true');
+    await expect(showHistoricalPhasesToggle).toHaveAttribute('data-active', 'false');
     await saveTrackingButton.click();
     await expect(page.locator('#settings-tracking-status .status-ok')).toBeVisible();
-    await expect(hideCycleFactorsToggle).toHaveAttribute('data-active', 'false');
-    await expect(hideNotesFieldToggle).toHaveAttribute('data-active', 'false');
+    await expect(showCycleFactorsToggle).toHaveAttribute('data-active', 'true');
+    await expect(showNotesFieldToggle).toHaveAttribute('data-active', 'true');
     await expect(showHistoricalPhasesToggle).toHaveAttribute('data-active', 'false');
 
     await page.goto('/dashboard');
     await expect(page).toHaveURL(/\/dashboard$/);
+    await openDashboardMoreFields(page);
     await expect(page.locator('[data-dashboard-save-form] input[name="cycle_factor_keys"]').first()).toBeVisible();
     await expect(page.locator('[data-dashboard-save-form] [data-note-disclosure]')).toBeVisible();
   });
@@ -549,8 +553,8 @@ test.describe('Settings: profile and cycle', () => {
   test('cycle and tracking drafts discard unsaved changes before navigation', async ({ page }) => {
     await registerOwnerAndOpenSettings(page, 'settings-drafts');
 
-    const cycleForm = page.locator('section#settings-cycle form[data-settings-draft-form="cycle"]');
-    const trackingForm = page.locator('section#settings-tracking form[data-settings-draft-form="tracking"]');
+    const cycleForm = page.locator('#settings-cycle form[data-settings-draft-form="cycle"]');
+    const trackingForm = page.locator('#settings-tracking form[data-settings-draft-form="tracking"]');
     const cycleLength = cycleForm.locator('#settings-cycle-length');
     const cycleSave = cycleForm.locator('[data-settings-cycle-save]');
     const cycleDiscard = cycleForm.locator('[data-settings-cycle-discard]');
@@ -574,9 +578,18 @@ test.describe('Settings: profile and cycle', () => {
 
     await page.locator('a[href="/calendar"]').first().click();
     await expect(page.locator('#confirm-modal')).toBeVisible();
-    await expect(page.locator('#confirm-modal-message')).toContainText(
-      'You have unsaved settings changes. Leave without saving?'
-    );
+    // Compare the dialog against the prompt the form itself declared — the same
+    // pattern expectConfirmDialogCaptions uses for the accept/cancel captions.
+    // Asserting the declaration is non-empty first stops an empty attribute
+    // from making the comparison pass against an empty dialog.
+    const declaredUnsavedPrompt = (
+      (await cycleForm.getAttribute('data-settings-unsaved-prompt')) ?? ''
+    ).trim();
+    expect(
+      declaredUnsavedPrompt,
+      'the draft form must declare data-settings-unsaved-prompt'
+    ).not.toBe('');
+    await expect(page.locator('#confirm-modal-message')).toContainText(declaredUnsavedPrompt);
     await page.locator('#confirm-modal-cancel').click();
     await expect(page).toHaveURL(/\/settings$/);
     await expect(cycleLength).toHaveValue(String(initialCycleLength + 4));
@@ -597,9 +610,51 @@ test.describe('Settings: profile and cycle', () => {
     await page.goto('/settings');
     await expect(page).toHaveURL(/\/settings$/);
     await expect(page.locator('#settings-cycle-length')).toHaveValue(String(initialCycleLength));
-    await expect(page.locator('section#settings-tracking input[name="track_bbt"]')).not.toBeChecked();
+    await expect(page.locator('#settings-tracking input[name="track_bbt"]')).not.toBeChecked();
     await expect(page.locator('[data-settings-tracking-save]')).toBeDisabled();
     await expect(page.locator('[data-settings-tracking-discard]')).toBeDisabled();
+  });
+
+  test('the avoid-pregnancy warning follows the goal choice, a discard, and the saved goal', async ({
+    page,
+  }) => {
+    await registerOwnerAndOpenSettings(page, 'settings-avoid-warning');
+
+    const cycleForm = page.locator('#settings-cycle form[data-settings-draft-form="cycle"]');
+    const warning = cycleForm.locator('[data-usage-goal-avoid-warning]');
+    const goalChoice = (value: string) =>
+      cycleForm.locator(`label.choice-option:has(input[name="usage_goal"][value="${value}"])`);
+
+    // A new owner starts on the neutral goal: nothing to warn about.
+    await expect(cycleForm.locator('input[name="usage_goal"][value="health"]')).toBeChecked();
+    await expect(warning).toBeHidden();
+
+    await goalChoice('avoid_pregnancy').click();
+    await expect(warning).toBeVisible();
+    await expect(warning).toHaveText(localeText('en', 'usage_goal.avoid_warning'));
+
+    await goalChoice('trying_to_conceive').click();
+    await expect(warning).toBeHidden();
+
+    // A discard puts the saved goal back, and the warning with it.
+    await goalChoice('avoid_pregnancy').click();
+    await expect(warning).toBeVisible();
+    await cycleForm.locator('[data-settings-cycle-discard]').click();
+    await expect(cycleForm.locator('input[name="usage_goal"][value="health"]')).toBeChecked();
+    await expect(warning).toBeHidden();
+
+    // Saved, it is server-rendered visible on the next load, before any change.
+    await goalChoice('avoid_pregnancy').click();
+    await cycleForm.locator('button[data-save-button]').click();
+    await expect(page.locator('#settings-cycle-status .status-ok')).toBeVisible();
+    await page.waitForLoadState('networkidle');
+
+    await page.reload();
+    await expect(page).toHaveURL(/\/settings$/);
+    await expect(
+      page.locator('#settings-cycle input[name="usage_goal"][value="avoid_pregnancy"]')
+    ).toBeChecked();
+    await expect(page.locator('#settings-cycle [data-usage-goal-avoid-warning]')).toBeVisible();
   });
 
   test('onboarding selected start date persists into settings cycle field', async ({ page }) => {
@@ -629,7 +684,7 @@ test.describe('Settings: profile and cycle', () => {
   }) => {
     await registerOwnerAndOpenSettings(page, 'settings-custom-symptom-primary');
 
-    const symptomSection = page.locator('#settings-symptoms-section');
+    const symptomSection = page.locator('#settings-symptoms');
     await createCustomSymptom(symptomSection, 'Joint stiffness', '✨');
 
     await page.goto('/dashboard');
@@ -656,7 +711,7 @@ test.describe('Settings: profile and cycle', () => {
   }) => {
     await registerOwnerAndOpenSettings(page, 'settings-custom-symptoms');
 
-    const symptomSection = page.locator('#settings-symptoms-section');
+    const symptomSection = page.locator('#settings-symptoms');
     await expect(symptomSection).toBeVisible();
 
     const createForm = symptomSection.locator('[data-symptom-create-form]');
@@ -699,12 +754,81 @@ test.describe('Settings: profile and cycle', () => {
     ).toHaveCount(0);
   });
 
+  // Cancelling the confirmation must be inert. This is a real regression, not a
+  // hypothetical: while the hide control carried `data-confirm`, htmx issued the
+  // DELETE from its own listener on the form before the document-level
+  // interceptor ever ran, so the dialog was decorative and Cancel archived the
+  // symptom anyway. The control now uses `hx-confirm`, which htmx gates on. The
+  // template-level guard against the whole class is
+  // TestNoTemplateElementMixesHTMXRequestWithDataConfirm; the sibling
+  // cancel-is-inert tests cover the other gated surfaces in calendar.spec.ts,
+  // settings-calendar-feed.spec.ts, and settings-webhook.spec.ts.
+  test('cancelling the hide confirmation keeps the custom symptom active', async ({ page }) => {
+    await registerOwnerAndOpenSettings(page, 'settings-custom-symptom-hide-cancel');
+
+    const symptomSection = page.locator('#settings-symptoms');
+    await createCustomSymptom(symptomSection, 'Joint stiffness', '✨');
+
+    const activeRow = customSymptomRow(symptomSection, 'Joint stiffness', 'active');
+    await expect(activeRow).toBeVisible();
+    const symptomID = await activeRow.getAttribute('data-symptom-id');
+    expect(symptomID).toMatch(/^\d+$/);
+
+    const hideForm = activeRow.locator('form[hx-delete^="/api/v1/symptoms/"]');
+    const isSymptomMutation = (pathname: string) =>
+      pathname.endsWith(`/api/v1/symptoms/${symptomID}`);
+
+    const cancelledRequests = await mutatingRequestsDuring(page, isSymptomMutation, async () => {
+      await hideForm.locator('button[type="submit"]').click();
+
+      // The dialog must show the captions this surface declared, not a
+      // hardcoded fallback: backend coverage only pins that they are declared.
+      const captions = await expectConfirmDialogCaptions(page, hideForm);
+      // This surface names its own action instead of reusing the layout-wide
+      // delete wording, so the rendered caption also proves the per-control
+      // attribute — not the `data-confirm-delete` fallback — drove the button.
+      const layoutFallback = (
+        (await page.locator('body').getAttribute('data-confirm-delete')) ?? ''
+      ).trim();
+      expect(layoutFallback).not.toBe('');
+      expect(captions.accept).not.toBe(layoutFallback);
+
+      await cancelConfirmDialog(page);
+
+      // A reload is the concrete signal that any request the click was going to
+      // issue has had its chance — no arbitrary timeout involved.
+      await page.reload();
+      await expect(page).toHaveURL(/\/settings$/);
+    });
+    expect(cancelledRequests, 'cancelling the hide must issue no request').toEqual([]);
+
+    // Still active after the dialog and the reload: no archived group appeared,
+    // so nothing was hidden behind the owner's back.
+    await expect(customSymptomRow(symptomSection, 'Joint stiffness', 'active')).toBeVisible();
+    await expect(customSymptomRow(symptomSection, 'Joint stiffness', 'archived')).toHaveCount(0);
+    await expect(symptomSection.locator('[data-symptom-group="archived"]')).toHaveCount(0);
+
+    // And still offered for new entries — the behaviour hiding would have taken
+    // away, measured where the owner would notice it.
+    await page.goto('/dashboard');
+    await expect(page).toHaveURL(/\/dashboard$/);
+    await ensureSymptomInputVisible(dashboardSaveForm(page), 'Joint stiffness');
+
+    // Positive anchor: the same control, accepted, really does hide it — so the
+    // assertions above prove Cancel is inert, not that the control is dead.
+    await page.goto('/settings');
+    await expect(page).toHaveURL(/\/settings$/);
+    await archiveCustomSymptom(page, customSymptomRow(symptomSection, 'Joint stiffness', 'active'));
+    await expect(customSymptomRow(symptomSection, 'Joint stiffness', 'archived')).toBeVisible();
+    await expect(customSymptomRow(symptomSection, 'Joint stiffness', 'active')).toHaveCount(0);
+  });
+
   test('archived custom symptoms can be renamed, reject duplicates, and restore cleanly', async ({
     page,
   }) => {
     await registerOwnerAndOpenSettings(page, 'settings-custom-symptoms-restore');
 
-    const symptomSection = page.locator('#settings-symptoms-section');
+    const symptomSection = page.locator('#settings-symptoms');
     await expect(symptomSection).toBeVisible();
 
     await createCustomSymptom(symptomSection, 'Joint stiffness', '✨');
@@ -721,7 +845,7 @@ test.describe('Settings: profile and cycle', () => {
     await selectSymptomIcon(archivedRow.locator('[data-symptom-edit-form]'), '⚡');
     await archivedRow.locator('[data-symptom-edit-form] button[type="submit"]').click();
     await expect(archivedRow.locator('[data-symptom-row-error]')).toContainText(
-      'That symptom name already exists in your list.'
+      DUPLICATE_SYMPTOM_NAME_ERROR
     );
     await expect(archivedRow.locator('input[name="name"]')).toHaveValue('Joint support');
 
@@ -749,25 +873,45 @@ test.describe('Settings: profile and cycle', () => {
     }) => {
     await registerOwnerAndOpenSettings(page, 'settings-custom-symptom-validation');
 
-    const symptomSection = page.locator('#settings-symptoms-section');
+    const symptomSection = page.locator('#settings-symptoms');
     const createForm = symptomSection.locator('[data-symptom-create-form]');
 
     await createCustomSymptom(symptomSection, 'Joint stiffness', '✨');
     await expect(customSymptomRow(symptomSection, 'Joint stiffness', 'active')).toBeVisible();
 
+    // The create form has its own error container ([data-symptom-create-error]),
+    // a sibling of the per-row [data-symptom-row-error]. Addressing it directly
+    // — rather than the bare `.status-error` class shared with every row and
+    // section on the page — is what makes "the CREATE form rejected this"
+    // distinguishable from "something on this page errored".
+    const createError = createForm.locator('[data-symptom-create-error]');
+
     await createForm.locator('#settings-new-symptom-name').fill(' joint STIFFNESS ');
     await selectSymptomIcon(createForm, '🔥');
     await createForm.locator('button[type="submit"]').click();
-    await expect(symptomSection.locator('.status-error')).toContainText('That symptom name already exists in your list.');
+    await expect(createError).toContainText(DUPLICATE_SYMPTOM_NAME_ERROR);
     await expect(symptomSection.locator('[data-custom-symptom-row][data-symptom-name="Joint stiffness"]')).toHaveCount(1);
 
+    // The first rejection left its error node on the page, and this attempt
+    // expects the very same message — so the assertion below is satisfied by the
+    // previous submit's output even if this one never leaves the browser. Bind
+    // it to this click's own POST and its response, the way the save helpers do,
+    // so the rejection has to be re-earned against the server.
     await createForm.locator('#settings-new-symptom-name').fill('Усталость');
-    await createForm.locator('button[type="submit"]').click();
-    await expect(symptomSection.locator('.status-error')).toContainText('That symptom name already exists in your list.');
+    const [builtInDuplicateRequest] = await Promise.all([
+      page.waitForRequest(
+        (candidate) =>
+          candidate.method() === 'POST' && new URL(candidate.url()).pathname === '/api/v1/symptoms',
+      ),
+      createForm.locator('button[type="submit"]').click(),
+    ]);
+    const builtInDuplicateResponse = await builtInDuplicateRequest.response();
+    expect(builtInDuplicateResponse, 'expected a response for POST /api/v1/symptoms').not.toBeNull();
+    await expect(createError).toContainText(DUPLICATE_SYMPTOM_NAME_ERROR);
 
     await createForm.locator('#settings-new-symptom-name').fill('<script>alert(1)</script>');
     await createForm.locator('button[type="submit"]').click();
-    await expect(symptomSection.locator('.status-error')).toContainText(
+    await expect(createError).toContainText(
       'Use plain text only. Tags and angle brackets are not allowed.'
     );
 
@@ -782,7 +926,7 @@ test.describe('Settings: profile and cycle', () => {
     }) => {
     await registerOwnerAndOpenSettings(page, 'settings-custom-symptom-overflow');
 
-    const symptomSection = page.locator('#settings-symptoms-section');
+    const symptomSection = page.locator('#settings-symptoms');
     const createForm = symptomSection.locator('[data-symptom-create-form]');
     const longButAllowedName = 'Long symptom after evening workout';
     await createForm.locator('#settings-new-symptom-name').fill(longButAllowedName);
@@ -805,7 +949,7 @@ test.describe('Settings: profile and cycle', () => {
     await checkStyledControl(longSymptomInput);
     await assertSelectedSymptomChipHasNoTrailingMarker(
       page.locator(
-        `label.choice-option:has(input[name="symptom_ids"][data-symptom-name="${longButAllowedName}"]:checked) .check-chip`
+        `label.choice-option:has(input[name="symptom_ids"][data-symptom-name="${longButAllowedName}"]:checked) .chip-lead`
       )
     );
     await assertNoHorizontalOverflow(page);
@@ -829,23 +973,31 @@ test.describe('Settings: profile and cycle', () => {
   test('custom symptom empty states explain what happens next until rows exist', async ({ page }) => {
     await registerOwnerAndOpenSettings(page, 'settings-custom-symptom-empty-groups');
 
-    const symptomSection = page.locator('#settings-symptoms-section');
+    // Group presence is addressed through [data-symptom-group], not through the
+    // localized heading: a getByText('Active custom symptoms').toHaveCount(0)
+    // is satisfied by any rewording or by switching language, so it could not
+    // tell an absent group from a renamed heading.
+    const symptomSection = page.locator('#settings-symptoms');
     await expect(symptomSection.locator('[data-symptom-empty-state="empty"]')).toContainText(
       'No custom symptoms yet. Add one above to make it available in new entries.'
     );
-    await expect(symptomSection.getByText('Active custom symptoms')).toHaveCount(0);
-    await expect(symptomSection.getByText('Hidden custom symptoms')).toHaveCount(0);
+    await expect(symptomSection.locator('[data-symptom-group="active"]')).toHaveCount(0);
+    await expect(symptomSection.locator('[data-symptom-group="archived"]')).toHaveCount(0);
 
     const createForm = symptomSection.locator('[data-symptom-create-form]');
     await createForm.locator('#settings-new-symptom-name').fill('Joint stiffness');
     await selectSymptomIcon(createForm, '✨');
     await createForm.locator('button[type="submit"]').click();
 
-    await expect(symptomSection.getByText('Active custom symptoms')).toBeVisible();
-    await expect(symptomSection.locator('[data-symptom-group="active"]')).toContainText(
-      'These appear in dashboard and calendar day editing.'
-    );
-    await expect(symptomSection.getByText('Hidden custom symptoms')).toHaveCount(0);
+    await expect(symptomSection.locator('[data-symptom-group="active"]')).toBeVisible();
+    // The group is proved by the row it now holds. Its helper line ("These
+    // appear in dashboard and calendar day editing.") is no longer rendered —
+    // it restated the heading it sat under — so the empty-to-populated
+    // transition is asserted on the row, which is the fact the test is about.
+    await expect(
+      symptomSection.locator('[data-symptom-group="active"] [data-custom-symptom-row]')
+    ).toHaveCount(1);
+    await expect(symptomSection.locator('[data-symptom-group="archived"]')).toHaveCount(0);
     await expect(symptomSection.locator('[data-symptom-empty-state="empty"]')).toHaveCount(0);
   });
 });

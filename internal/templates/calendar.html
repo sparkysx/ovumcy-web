@@ -1,19 +1,23 @@
 {{define "content"}}
 <section class="space-y-6">
-  <div class="journal-card flex flex-col gap-4 p-4 sm:flex-row sm:items-center sm:justify-between sm:p-5">
+  <div class="card flex flex-col gap-4 p-4 sm:flex-row sm:items-center sm:justify-between sm:p-5">
     <div>
-      <h1 class="journal-subtitle">{{t .Messages "calendar.title"}}</h1>
-      <p class="journal-muted mt-1">{{.MonthLabel}}</p>
+      <h1 class="journal-subtitle" data-title-key="calendar.title">{{t .Messages "calendar.title"}}</h1>
+      <p class="journal-muted mt-1" data-calendar-month-label>{{.MonthLabel}}</p>
     </div>
 
-    <div class="flex flex-wrap items-center gap-2">
+    <div class="flex flex-wrap items-center gap-2" data-calendar-month-nav>
       {{if .PrevMonth}}
       <a href="/calendar?month={{.PrevMonth}}" class="btn-secondary">{{t .Messages "calendar.prev"}}</a>
       {{else}}
-      <span class="btn-secondary btn--disabled" aria-disabled="true">{{t .Messages "calendar.prev"}}</span>
+      <span class="btn-secondary btn-disabled" aria-disabled="true">{{t .Messages "calendar.prev"}}</span>
       {{end}}
+      {{if .NextMonth}}
       <a href="/calendar?month={{.NextMonth}}" class="btn-secondary">{{t .Messages "calendar.next"}}</a>
-      <a href="/calendar" class="btn-primary">{{t .Messages "calendar.today"}}</a>
+      {{else}}
+      <span class="btn-secondary btn-disabled" aria-disabled="true">{{t .Messages "calendar.next"}}</span>
+      {{end}}
+      <a href="/calendar" class="btn-secondary btn-compact" data-calendar-today data-action-weight="secondary">{{t .Messages "calendar.today"}}</a>
     </div>
   </div>
 
@@ -33,19 +37,49 @@
 
     <section
       id="calendar-grid-panel"
-      class="journal-card p-4 sm:p-5">
-      <div class="mb-3 grid grid-cols-7 gap-2 text-center text-xs font-semibold uppercase tracking-wide journal-muted">
+      class="card p-2 sm:p-5">
+      {{/* The legend leads the grid: it explains an encoding the reader is
+           about to use, so it has to be on screen while the month is. The
+           entries are concepts, not CSS states — each swatch paints exactly
+           what the matching day cell paints. */}}
+      <div class="calendar-legend mobile-safe-target mb-3 flex flex-wrap items-center gap-x-3 gap-y-1.5" data-calendar-legend>
+        <span class="legend-item"><span class="legend-swatch legend-swatch-period" aria-hidden="true"></span>{{t .Messages "calendar.legend.period_recorded"}}</span>
+        {{if not .CurrentUser.UnpredictableCycle}}
+        <span class="legend-item"><span class="legend-swatch legend-swatch-predicted" aria-hidden="true"></span>{{t .Messages "calendar.legend.predicted_period"}}</span>
+        <span class="legend-item"><span class="legend-swatch legend-swatch-start-window" aria-hidden="true"></span>{{t .Messages "calendar.legend.start_window"}}</span>
+        <span class="legend-item"><span class="legend-swatch legend-swatch-fertile" aria-hidden="true"></span>{{t .Messages "calendar.legend.fertility"}}</span>
+        <span class="legend-item"><span class="legend-swatch legend-swatch-overlap-period-fertile" aria-hidden="true"></span>{{t .Messages "calendar.legend.predicted_period_in_fertility"}}</span>
+        {{/* The dash marks a projection no temperature shift has confirmed yet,
+             and the grid draws it only where the service says it can
+             (CanDrawTentativeOvulation, the gate the grid itself applies).
+             Everyone else gets the solid dot alone, so the legend promises no
+             mark the grid cannot show. */}}
+        {{if .CanDrawTentativeOvulation}}
+        <span class="legend-item"><span class="calendar-ovulation-dot" aria-hidden="true"></span><span class="calendar-ovulation-dash" aria-hidden="true"></span>{{t .Messages "calendar.legend.ovulation_group"}}</span>
+        {{else}}
+        <span class="legend-item"><span class="calendar-ovulation-dot" aria-hidden="true"></span>{{t .Messages "calendar.legend.ovulation_estimate"}}</span>
+        {{end}}
+        {{end}}
+        <span class="legend-item"><span class="legend-swatch legend-swatch-today" aria-hidden="true"></span>{{t .Messages "calendar.tag.today"}}</span>
+        <span class="legend-item"><span class="calendar-data-marker" aria-hidden="true"></span><span class="calendar-sex-marker" aria-hidden="true">{{template "icon" "heart"}}</span>{{t .Messages "calendar.legend.logged_entry"}}</span>
+      </div>
+
+      <div class="mb-2 grid grid-cols-7 gap-1 text-center text-xs font-semibold uppercase tracking-wide journal-muted sm:mb-3 sm:gap-2">
         {{range .WeekdayKeys}}<span>{{t $.Messages .}}</span>{{end}}
       </div>
 
-      <div class="grid grid-cols-7 gap-2">
+      <div class="grid grid-cols-7 gap-1 sm:gap-2">
         {{range .CalendarDays}}
         <div class="relative">
           <button
             type="button"
+            {{if .Selectable}}
             hx-get="/calendar/day/{{.DateString}}{{if .OpenEditDirectly}}?mode=edit{{end}}"
             hx-target="#day-editor"
             hx-swap="innerHTML"
+            {{else}}
+            disabled
+            {{end}}
             data-day="{{.DateString}}"
             data-calendar-state="{{.StateKey}}"
             data-calendar-has-data="{{if .HasData}}true{{else}}false{{end}}"
@@ -73,7 +107,7 @@
               <span class="calendar-ovulation-dash" title="{{t $.Messages "calendar.ovulation_tentative"}}"></span>
               {{end}}
               {{if .HasSex}}
-              <span class="calendar-sex-marker" title="{{t $.Messages "calendar.sex_logged"}}">♥</span>
+              <span class="calendar-sex-marker" title="{{t $.Messages "calendar.sex_logged"}}" aria-hidden="true">{{template "icon" "heart"}}</span>
               {{end}}
             </div>
           </button>
@@ -93,22 +127,9 @@
       </div>
       {{end}}
 
-      <div class="calendar-legend mobile-safe-target mt-4 flex flex-wrap items-center gap-3 text-xs journal-muted">
-        <span class="legend-item"><span class="legend-dot legend-dot-period"></span>{{t .Messages "calendar.legend.actual_period"}}</span>
-        {{if not .CurrentUser.UnpredictableCycle}}
-        <span class="legend-item"><span class="legend-dot legend-dot-predicted"></span>{{t .Messages "calendar.legend.predicted_period"}}</span>
-        <span class="legend-item"><span class="legend-outline"></span>{{t .Messages "calendar.legend.low_probability"}}</span>
-        <span class="legend-item"><span class="legend-dot legend-dot-fertile-edge"></span>{{t .Messages "calendar.legend.fertility_edge"}}</span>
-        <span class="legend-item"><span class="legend-dot legend-dot-fertile-peak"></span>{{t .Messages "calendar.legend.fertility_peak"}}</span>
-        <span class="legend-item"><span class="calendar-ovulation-dot"></span>{{t .Messages "calendar.legend.ovulation"}}</span>
-        <span class="legend-item"><span class="calendar-ovulation-dash"></span>{{t .Messages "calendar.legend.ovulation_tentative"}}</span>
-        {{end}}
-        <span class="legend-item"><span class="calendar-data-marker"></span>{{t .Messages "calendar.legend.logged_entry"}}</span>
-        <span class="legend-item"><span class="calendar-sex-marker">♥</span>{{t .Messages "calendar.sex_logged"}}</span>
-      </div>
     </section>
 
-    <aside id="day-editor" class="journal-card p-4 sm:p-5">
+    <aside id="day-editor" class="card p-4 sm:p-5">
       {{if .SelectedDate}}
       <div
         hx-get="/calendar/day/{{.SelectedDate}}{{if .SelectedDateEditMode}}?mode=edit{{end}}"
@@ -133,7 +154,7 @@
   </div>
 
   {{if .IsOwner}}
-  <p class="journal-muted text-sm" data-calendar-prediction-disclaimer>{{t .Messages "dashboard.prediction_disclaimer"}}</p>
+  <p class="journal-muted text-sm" data-calendar-prediction-disclaimer>{{t .Messages "medical.disclaimer"}}</p>
   {{end}}
 </section>
 

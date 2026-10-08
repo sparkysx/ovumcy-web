@@ -10,6 +10,49 @@ import (
 	"github.com/ovumcy/ovumcy-web/internal/models"
 )
 
+// TestImportPlanEntriesRejectsADateOutsideTheAcceptedRange pins that a row dated
+// outside DayDateMin..DayDateMax is counted as rejected while every other row in
+// the file is still planned, in zones on both sides of UTC.
+func TestImportPlanEntriesRejectsADateOutsideTheAcceptedRange(t *testing.T) {
+	t.Parallel()
+
+	entries := []ExportJSONEntry{
+		{Date: "0001-01-01", Period: true},
+		{Date: "1899-12-31", Period: true},
+		{Date: "1900-01-01", Period: true},
+		{Date: "2026-01-10", Period: true},
+		{Date: "9999-12-30", Period: true},
+		{Date: "9999-12-31", Period: true},
+	}
+
+	for _, zone := range []string{"UTC", "Asia/Tokyo", "Pacific/Pago_Pago"} {
+		location, err := time.LoadLocation(zone)
+		if err != nil {
+			t.Fatalf("load %s: %v", zone, err)
+		}
+
+		planned, _, rejected := (&ImportService{}).planEntries(entries, location)
+		if rejected != 3 {
+			t.Errorf("%s: rejected = %d, want the 3 out-of-range rows", zone, rejected)
+		}
+		var got []string
+		for _, day := range planned {
+			got = append(got, CalendarDayKey(day.dayStart))
+		}
+		want := []string{"1900-01-01", "2026-01-10", "9999-12-30"}
+		if len(got) != len(want) {
+			t.Errorf("%s: planned %v, want %v", zone, got, want)
+			continue
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("%s: planned %v, want %v", zone, got, want)
+				break
+			}
+		}
+	}
+}
+
 // --- in-memory stubs with injectable errors, for the branches an integration
 // DB never exercises (repository failures, best-effort refresh, defaults). ---
 
@@ -25,6 +68,9 @@ func (s *importStubLogs) FindByUserAndDayRange(context.Context, uint, time.Time,
 		return models.DailyLog{}, false, s.findErr
 	}
 	return models.DailyLog{}, false, nil
+}
+func (s *importStubLogs) FindByUserAndDayRangeForUpdate(ctx context.Context, userID uint, dayStart time.Time, dayEnd time.Time) (models.DailyLog, bool, error) {
+	return s.FindByUserAndDayRange(ctx, userID, dayStart, dayEnd)
 }
 func (s *importStubLogs) Create(context.Context, *models.DailyLog) error { return s.createErr }
 func (s *importStubLogs) CreateBatch(context.Context, []models.DailyLog) error {
@@ -135,9 +181,22 @@ func TestImportServiceEmptySymptomNamesIgnored(t *testing.T) {
 }
 
 // TestImportServiceRefreshNilGuards: the defensive nil guards make the
-// best-effort refresh a no-op on a zero-value service (no panic).
+// best-effort refresh a no-op on a zero-value service.
+//
+// Surviving the zero-value call is a real assertion, not a vacuous one — dropping
+// the users/logs checks from the guard nil-derefs here (verified). The second case
+// adds what the zero-value one cannot observe: with a live users repository and
+// nil logs, the guard must also write NOTHING, so a fall-through cannot hide
+// behind "it did not panic".
 func TestImportServiceRefreshNilGuards(t *testing.T) {
-	(&ImportService{}).refreshDerivedCycleSettings(context.Background(), 1, time.UTC)
+	(&ImportService{}).refreshDerivedCycleSettings(context.Background(), 1, time.Now(), time.UTC)
+
+	users := &importRecordingUsers{}
+	NewImportService(nil, users, &importStubReconciler{}, nil).
+		refreshDerivedCycleSettings(context.Background(), 1, time.Now(), time.UTC)
+	if len(users.updates) != 0 {
+		t.Fatalf("expected the nil-logs guard to write nothing, got %d update(s)", len(users.updates))
+	}
 }
 
 // importRecordingUsers records every UpdateByID call so a test can assert the
@@ -163,7 +222,7 @@ func TestImportServiceRefreshUpdatesOnSuccess(t *testing.T) {
 	users := &importRecordingUsers{}
 	// listErr nil => ListByUser succeeds; the refresh must proceed to UpdateByID.
 	svc := &ImportService{logs: &importStubLogs{}, users: users}
-	svc.refreshDerivedCycleSettings(context.Background(), 7, time.UTC)
+	svc.refreshDerivedCycleSettings(context.Background(), 7, time.Now(), time.UTC)
 
 	if len(users.updates) != 1 {
 		t.Fatalf("expected one luteal_phase update on the success path, got %d", len(users.updates))

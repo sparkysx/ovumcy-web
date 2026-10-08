@@ -1,12 +1,14 @@
 package api
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/csrf"
+	"github.com/ovumcy/ovumcy-web/internal/apideps"
 	"github.com/ovumcy/ovumcy-web/internal/bootstrap"
 	"github.com/ovumcy/ovumcy-web/internal/db"
 	"github.com/ovumcy/ovumcy-web/internal/i18n"
@@ -42,6 +44,62 @@ type onboardingTestAppOptions struct {
 	oidcService      OIDCWorkflowService
 	auditLogEnabled  bool
 	assetVersion     string
+	// envelopeTransportErrors routes a *fiber.Error the app returns (a CSRF
+	// refusal) through RespondTransportError, as the production error handler
+	// does; without it the bare test app answers fiber's default text/plain.
+	envelopeTransportErrors bool
+	// oidcEnabled and oidcLogoutMode are the two halves of the configuration
+	// the provider-logout gate reads at sign-out time. The package default
+	// leaves OIDC off and the mode at its `local` default, under which a
+	// stored provider-logout row composes no end-session redirect at all — so
+	// a test that expects the provider hop has to name the configuration that
+	// allows it (providerLogoutTestAppOptions), and a test of the switched-off
+	// instance names the other one.
+	oidcEnabled    bool
+	oidcLogoutMode security.OIDCLogoutMode
+	// bodyLimit overrides fiber's DefaultBodyLimit for this app. Zero keeps the
+	// default. Body-cap regressions set a small value so the compressed payload
+	// under test stays a few hundred bytes on the wire while its decoded size
+	// crosses the cap.
+	bodyLimit int
+	// dayService replaces the day service the composition root builds, for the
+	// regressions that need one of its reads to fail. It is a factory rather
+	// than a value because the database is created inside the app helper, and
+	// a fault-injecting repository has to wrap the real one to stay a day
+	// service in every other respect.
+	dayService func(database *gorm.DB) *services.DayService
+	// outboundDeliveryEnabled mirrors REMINDER_SCHEDULER_ENABLED. It ships off,
+	// and an app left at the default renders every readable webhook row as
+	// "this instance sends no reminders" -- correct, and the reason the egress
+	// matrix has to be able to turn it on to reach the states behind it.
+	outboundDeliveryEnabled bool
+	// sessionIssuanceFault is installed as the handler's seam of the same name:
+	// while it returns an error, minting a session fails the way no request can
+	// make it fail. Tests arm it after signing in, so the sign-in itself works.
+	sessionIssuanceFault func() error
+	// recoveryCodeIssuanceFault is installed as the handler's seam of the same
+	// name: while it returns an error, sealing the recovery-code reveal cookie
+	// fails the way no request can make it fail.
+	recoveryCodeIssuanceFault func() error
+	// registerPickupTokenStoreWrap, when set, wraps the real
+	// RegisterPickupTokenStore the composition root builds (dependencies.RegisterPickupTokens)
+	// before it is handed to the handler. It receives the real store so
+	// Issue/Peek can still delegate to it, and returns the store the handler
+	// will use — for the two post-Peek Consume-stage races (a store error, a
+	// concurrent redeem that already won) that a real race cannot reliably
+	// reproduce in a test.
+	registerPickupTokenStoreWrap func(apideps.RegisterPickupTokenStore) apideps.RegisterPickupTokenStore
+	// revokingWrites, when set, is installed around the user repository the
+	// auth, settings and TOTP services write through, for the race regressions
+	// that commit another write between a request's authentication and its own
+	// revoking write (see revokingWriteHooks).
+	revokingWrites *revokingWriteHooks
+	// now is installed as the handler's clock seam; nil keeps the wall clock.
+	now func() time.Time
+	// totpEnrollWindow, when non-zero, replaces the totp.enroll budget's window
+	// (through the same ConfigureEnrollAttempts the composition root calls), so a
+	// regression can wait a spent budget out on the wall clock.
+	totpEnrollWindow time.Duration
 }
 
 func newOnboardingTestAppWithOptions(t *testing.T, options onboardingTestAppOptions) (*fiber.App, *gorm.DB) {
@@ -49,7 +107,7 @@ func newOnboardingTestAppWithOptions(t *testing.T, options onboardingTestAppOpti
 
 	databasePath := filepath.Join(t.TempDir(), "ovumcy-onboarding-test.db")
 
-	database, err := db.OpenSQLite(databasePath)
+	database, err := db.OpenDatabase(db.Config{Driver: db.DriverSQLite, SQLitePath: databasePath})
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
@@ -66,15 +124,29 @@ func newOnboardingTestAppWithOptions(t *testing.T, options onboardingTestAppOpti
 		t.Fatalf("init i18n: %v", err)
 	}
 
-	handler, err := NewHandler("test-secret-key", time.UTC, i18nManager, options.cookieSecure, newTestHandlerDependencies(database, i18nManager, options))
+	handler, err := NewHandler(testAppSecretKey, time.UTC, i18nManager, options.cookieSecure, newTestHandlerDependencies(database, i18nManager, options))
 	if err != nil {
 		t.Fatalf("init handler: %v", err)
 	}
 	if options.assetVersion != "" {
 		handler.SetAssetVersion(options.assetVersion)
 	}
+	handler.sessionIssuanceFault = options.sessionIssuanceFault
+	handler.recoveryCodeIssuanceFault = options.recoveryCodeIssuanceFault
+	handler.now = options.now
 
-	app := fiber.New()
+	appConfig := fiber.Config{BodyLimit: options.bodyLimit}
+	if options.envelopeTransportErrors {
+		appConfig.ErrorHandler = func(c fiber.Ctx, err error) error {
+			var fiberErr *fiber.Error
+			if errors.As(err, &fiberErr) {
+				return handler.RespondTransportError(c, fiberErr.Code)
+			}
+			return handler.RespondTransportError(c, fiber.StatusInternalServerError)
+		}
+	}
+	app := fiber.New(appConfig)
+	app.Use(MethodOverride(handler))
 	app.Use(handler.LanguageMiddleware)
 	if options.enableCSRF {
 		app.Use(csrf.New(testCSRFMiddlewareConfig(options.cookieSecure, handler)))
@@ -82,6 +154,29 @@ func newOnboardingTestAppWithOptions(t *testing.T, options onboardingTestAppOpti
 	RegisterRoutes(app, handler)
 	app.Use(handler.NotFound)
 	return app, database
+}
+
+// testAppSecretKey is the application secret the shared test app is wired with.
+// A test that mints something keyed by SECRET_KEY outside the app (a calendar-feed
+// verifier MAC, say) must use this same value, or the app will refuse what the
+// test just stored.
+const testAppSecretKey = "test-secret-key"
+
+// sealCookieForTestApp seals an arbitrary payload under the shared test app's
+// secret, producing a cookie value the app will genuinely open. Use it to hand
+// the app a well-sealed but adversarially SHAPED payload — one no production
+// producer would mint — so a read-path guard can be exercised on its own.
+func sealCookieForTestApp(t *testing.T, cookieName string, payload []byte) string {
+	t.Helper()
+	codec, err := newSecureCookieCodec([]byte(testAppSecretKey))
+	if err != nil {
+		t.Fatalf("init secure cookie codec: %v", err)
+	}
+	sealed, err := codec.seal(cookieName, payload)
+	if err != nil {
+		t.Fatalf("seal %s payload: %v", cookieName, err)
+	}
+	return sealed
 }
 
 func newTestHandlerDependencies(database *gorm.DB, i18nManager *i18n.Manager, options ...onboardingTestAppOptions) Dependencies {
@@ -97,22 +192,67 @@ func newTestHandlerDependencies(database *gorm.DB, i18nManager *i18n.Manager, op
 
 	// Delegate to the shared composition-root wiring (internal/bootstrap), the
 	// same recipe the production binary uses, so the two cannot drift. Tests pass
-	// the default attempt limits, an empty (disabled) OIDC config, and—unlike
-	// production—leave LogoutAttempts unset to keep the auth-service default.
-	return bootstrap.BuildDependencies(db.NewRepositories(database), []byte("test-secret-key"), i18nManager, bootstrap.Options{
-		RegistrationMode:    registrationMode,
-		OIDCConfig:          security.OIDCConfig{},
-		OIDCServiceOverride: appOptions.oidcService,
-		LoginAttempts:       bootstrap.AttemptLimit{Max: services.DefaultLoginAttemptsLimit, Window: services.DefaultLoginAttemptsWindow},
-		RecoveryAttempts:    bootstrap.AttemptLimit{Max: services.DefaultRecoveryAttemptsLimit, Window: time.Hour},
-		AuditLogEnabled:     appOptions.auditLogEnabled,
+	// the default attempt limits, an OIDC config that is disabled unless the
+	// options ask otherwise, and—unlike production—leave LogoutAttempts unset
+	// to keep the auth-service default. The config always names
+	// testOIDCIssuerURL and testOIDCPostLogoutRedirectURL, whatever the switch
+	// says: stored provider-logout state is pinned to the configured issuer
+	// origin and the provider redirect takes its return address from the
+	// configuration, so both stay observable on a switched-off instance —
+	// which is the state in which a stored row must NOT produce a hop.
+	repositories := db.NewRepositories(database)
+	dependencies := bootstrap.BuildDependencies(repositories, []byte(testAppSecretKey), i18nManager, bootstrap.Options{
+		RegistrationMode: registrationMode,
+		OIDCConfig: security.OIDCConfig{
+			Enabled:               appOptions.oidcEnabled,
+			LogoutMode:            appOptions.oidcLogoutMode,
+			IssuerURL:             testOIDCIssuerURL,
+			PostLogoutRedirectURL: testOIDCPostLogoutRedirectURL,
+			// The callback origin is what makes the post-logout address
+			// first-party; boot requires it whenever OIDC is on.
+			RedirectURL: testOIDCPostLogoutRedirectURL,
+		},
+		OIDCServiceOverride:     appOptions.oidcService,
+		LoginAttempts:           bootstrap.AttemptLimit{Max: services.DefaultLoginAttemptsLimit, Window: services.DefaultLoginAttemptsWindow},
+		RecoveryAttempts:        bootstrap.AttemptLimit{Max: services.DefaultRecoveryAttemptsLimit, Window: time.Hour},
+		AuditLogEnabled:         appOptions.auditLogEnabled,
+		OutboundDeliveryEnabled: appOptions.outboundDeliveryEnabled,
 	})
+	if appOptions.dayService != nil {
+		dependencies.DayService = appOptions.dayService(database)
+	}
+	if appOptions.revokingWrites != nil {
+		appOptions.revokingWrites.install(&dependencies, repositories.Users)
+	}
+	if appOptions.totpEnrollWindow != 0 {
+		dependencies.TOTPService.ConfigureEnrollAttempts(services.DefaultTOTPEnrollAttemptsLimit, appOptions.totpEnrollWindow)
+	}
+	if appOptions.registerPickupTokenStoreWrap != nil {
+		dependencies.RegisterPickupTokens = appOptions.registerPickupTokenStoreWrap(dependencies.RegisterPickupTokens)
+	}
+	return dependencies
 }
 
+// testCSRFMiddlewareConfig mirrors csrfMiddlewareConfig (cmd/ovumcy/server.go):
+// the same two Next clauses, the OIDC callback exemption scoped to POST and
+// the calendar-feed skip keyed on IsCalendarFeedRequest. Nothing type-checks
+// that this copy stays in sync with its source, so each clause is pinned
+// separately, on THIS copy, by TestTestAppCSRFExemptionIsExactlyProductionsShape
+// (calendar_feed_regressions_test.go): a mutating method at the feed route
+// still 403s (kills `Next: return true` and a feed clause widened past
+// GET/HEAD), and a GET at the OIDC callback still mints ovumcy_csrf (kills the
+// OIDC clause losing its POST-method guard). The PRODUCTION copy's own shape —
+// the exemption list, and the feed's no-cookie contract across every outcome —
+// is guarded independently, on the real app, by
+// cmd/ovumcy/csrf_exemption_guard_test.go and
+// cmd/ovumcy/calendar_feed_no_cookie_test.go.
 func testCSRFMiddlewareConfig(cookieSecure bool, handler *Handler) csrf.Config {
 	return csrf.Config{
 		Next: func(c fiber.Ctx) bool {
-			return c.Path() == security.OIDCCallbackPath
+			if c.Method() == fiber.MethodPost && c.Path() == security.OIDCCallbackPath {
+				return true
+			}
+			return IsCalendarFeedRequest(c.Method(), c.Path())
 		},
 		CookieName:     "ovumcy_csrf",
 		CookieSameSite: "Lax",

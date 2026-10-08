@@ -36,6 +36,20 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    # A pre-release golang builder is refused by CI, not here. Dependabot treats
+    # `1.27rc2` as simply newer than `1.26.6` and opened exactly that bump, which
+    # merged: the release image was then compiled by a release candidate while
+    # every CI Go job kept resolving its toolchain from go.mod's 1.26.6 —
+    # GOTOOLCHAIN upgrades but never downgrades, so nothing pulled the builder
+    # back. `Builder toolchain matches go.mod` in ci.yml now fails any diff where
+    # the two disagree, which is what closes that lane.
+    #
+    # An `ignore` entry here would only stop the pull request being offered, and
+    # it cannot be written: a docker ignore condition takes version requirements,
+    # so `"*rc*"` is rejected outright — and an invalid file stops Dependabot for
+    # EVERY ecosystem in this repository, not just this entry. Trading a working
+    # security-update feed for a pull request CI already refuses is the wrong way
+    # round.
 
   # docker-compose (GA since 2025) tracks image: tags in compose manifests —
   # the operator baseline at the repo root plus every example stack under

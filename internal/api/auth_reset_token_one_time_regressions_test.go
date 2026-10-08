@@ -20,7 +20,7 @@ func TestResetPasswordTokenCannotBeReusedAfterSuccessfulReset(t *testing.T) {
 	user := createOnboardingTestUser(t, database, "reset-one-time@example.com", "StrongPass1", true)
 
 	recoveryCode := mustSetRecoveryCodeForUser(t, database, user.ID)
-	resetCookieValue := requestResetCookieByRecoveryCode(t, app, user.Email, recoveryCode)
+	resetCookieValue := requestResetCookieByRecoveryCode(t, app, user.Email, recoveryCode, "StrongPass1")
 
 	firstResetForm := url.Values{
 		"password":         {"EvenStronger2"},
@@ -70,7 +70,7 @@ func TestResetPasswordRejectsExpiredResetToken(t *testing.T) {
 	user := createOnboardingTestUser(t, database, "reset-expired-token@example.com", "StrongPass1", true)
 
 	expiredToken := mustSignResetTokenForTest(t, user.ID, user.PasswordHash, time.Now().Add(-5*time.Minute), time.Now().Add(-30*time.Minute))
-	resetCookieValue := mustSealResetCookieValueForTest(t, []byte("test-secret-key"), expiredToken, false)
+	resetCookieValue := mustSealResetCookieValueForTest(t, []byte("test-secret-key"), expiredToken)
 
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/password-resets/redeem", strings.NewReader(url.Values{
 		"password":         {"EvenStronger2"},
@@ -110,7 +110,7 @@ func TestResetPasswordRejectsInvalidOrTamperedResetToken(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			resetCookieValue := mustSealResetCookieValueForTest(t, []byte("test-secret-key"), tc.tokenValue, false)
+			resetCookieValue := mustSealResetCookieValueForTest(t, []byte("test-secret-key"), tc.tokenValue)
 			request := httptest.NewRequest(http.MethodPost, "/api/v1/password-resets/redeem", strings.NewReader(url.Values{
 				"password":         {"EvenStronger2"},
 				"confirm_password": {"EvenStronger2"},
@@ -146,7 +146,7 @@ func TestOriginalRecoveryCodeRejectedAfterCompletedReset(t *testing.T) {
 	user := createOnboardingTestUser(t, database, "recovery-rotation-http@example.com", "StrongPass1", true)
 
 	originalRecoveryCode := mustSetRecoveryCodeForUser(t, database, user.ID)
-	resetCookieValue := requestResetCookieByRecoveryCode(t, app, user.Email, originalRecoveryCode)
+	resetCookieValue := requestResetCookieByRecoveryCode(t, app, user.Email, originalRecoveryCode, "StrongPass1")
 
 	resetForm := url.Values{
 		"password":         {"EvenStronger2"},
@@ -170,9 +170,13 @@ func TestOriginalRecoveryCodeRejectedAfterCompletedReset(t *testing.T) {
 
 	// A fresh recovery attempt with the ORIGINAL code must be rejected:
 	// no redirect into the reset flow and no usable reset cookie.
+	// The reset above rewrote the password, so the retry presents the
+	// CURRENT one: what is under test is the rotation of the recovery code,
+	// not the password operand the route also requires.
 	retryForm := url.Values{
 		"email":         {user.Email},
 		"recovery_code": {originalRecoveryCode},
+		"password":      {"EvenStronger2"},
 	}
 	retryRequest := httptest.NewRequest(http.MethodPost, "/api/v1/password-resets", strings.NewReader(retryForm.Encode()))
 	retryRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -191,12 +195,13 @@ func TestOriginalRecoveryCodeRejectedAfterCompletedReset(t *testing.T) {
 	}
 }
 
-func requestResetCookieByRecoveryCode(t *testing.T, app *fiber.App, email string, recoveryCode string) string {
+func requestResetCookieByRecoveryCode(t *testing.T, app *fiber.App, email string, recoveryCode string, password string) string {
 	t.Helper()
 
 	form := url.Values{
 		"email":         {email},
 		"recovery_code": {recoveryCode},
+		"password":      {password},
 	}
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/password-resets", strings.NewReader(form.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -220,6 +225,13 @@ func requestResetCookieByRecoveryCode(t *testing.T, app *fiber.App, email string
 func mustSignResetTokenForTest(t *testing.T, userID uint, passwordHash string, expiresAt time.Time, issuedAt time.Time) string {
 	t.Helper()
 
+	// The literal below is deliberately NOT one of the
+	// PasswordResetTokenPurpose* constants — it is the single pre-split
+	// purpose value every reset token used to carry, now a legacy/unrecognised
+	// value. It is irrelevant to the expiry/tampering scenarios this helper
+	// serves (both fail on signature/expiry before the purpose is ever
+	// consulted), and it doubles as the exact legacy fixture the migration
+	// story describes.
 	claims := services.PasswordResetClaims{
 		UserID:        userID,
 		Purpose:       "password_reset",
@@ -238,12 +250,11 @@ func mustSignResetTokenForTest(t *testing.T, userID uint, passwordHash string, e
 	return signed
 }
 
-func mustSealResetCookieValueForTest(t *testing.T, secretKey []byte, token string, forced bool) string {
+func mustSealResetCookieValueForTest(t *testing.T, secretKey []byte, token string) string {
 	t.Helper()
 
 	payload := resetPasswordCookiePayload{
-		Token:  token,
-		Forced: forced,
+		Token: token,
 	}
 	serialized, err := json.Marshal(payload)
 	if err != nil {
@@ -308,7 +319,7 @@ func TestShowResetPasswordPageWithoutCookieRendersForm(t *testing.T) {
 func TestShowResetPasswordPageWithInvalidCookieShowsInvalidTokenNoticeAndClearsCookie(t *testing.T) {
 	app, _ := newOnboardingTestApp(t)
 
-	cookieValue := mustSealResetCookieValueForTest(t, []byte(testHandlerSecretKey), "obviously-not-a-jwt", false)
+	cookieValue := mustSealResetCookieValueForTest(t, []byte(testHandlerSecretKey), "obviously-not-a-jwt")
 	request := httptest.NewRequest(http.MethodGet, "/reset-password", nil)
 	request.Header.Set("Cookie", resetPasswordCookieName+"="+cookieValue)
 	response := mustAppResponse(t, app, request)
@@ -341,11 +352,11 @@ func TestShowResetPasswordPageWithValidNonForcedTokenShowsFormOnly(t *testing.T)
 	app, database := newOnboardingTestApp(t)
 	user := createOnboardingTestUser(t, database, "reset-page-recovery@example.com", "StrongPass1", true)
 
-	token, err := services.BuildPasswordResetToken([]byte(testHandlerSecretKey), user.ID, user.PasswordHash, 30*time.Minute, time.Now())
+	token, err := services.BuildPasswordResetToken([]byte(testHandlerSecretKey), user.ID, user.PasswordHash, user.AuthSessionVersion, services.PasswordResetTokenPurposeRecovery, 30*time.Minute, time.Now())
 	if err != nil {
 		t.Fatalf("BuildPasswordResetToken: %v", err)
 	}
-	cookieValue := mustSealResetCookieValueForTest(t, []byte(testHandlerSecretKey), token, false)
+	cookieValue := mustSealResetCookieValueForTest(t, []byte(testHandlerSecretKey), token)
 
 	request := httptest.NewRequest(http.MethodGet, "/reset-password", nil)
 	request.Header.Set("Cookie", resetPasswordCookieName+"="+cookieValue)
@@ -366,11 +377,11 @@ func TestShowResetPasswordPageWithValidForcedTokenShowsForcedNoticeAndForm(t *te
 	app, database := newOnboardingTestApp(t)
 	user := createOnboardingTestUser(t, database, "reset-page-forced@example.com", "StrongPass1", true)
 
-	token, err := services.BuildPasswordResetToken([]byte(testHandlerSecretKey), user.ID, user.PasswordHash, 30*time.Minute, time.Now())
+	token, err := services.BuildPasswordResetToken([]byte(testHandlerSecretKey), user.ID, user.PasswordHash, user.AuthSessionVersion, services.PasswordResetTokenPurposeForcedLocal, 30*time.Minute, time.Now())
 	if err != nil {
 		t.Fatalf("BuildPasswordResetToken: %v", err)
 	}
-	cookieValue := mustSealResetCookieValueForTest(t, []byte(testHandlerSecretKey), token, true)
+	cookieValue := mustSealResetCookieValueForTest(t, []byte(testHandlerSecretKey), token)
 
 	request := httptest.NewRequest(http.MethodGet, "/reset-password", nil)
 	request.Header.Set("Cookie", resetPasswordCookieName+"="+cookieValue)
@@ -392,15 +403,12 @@ func TestShowResetPasswordPageWithValidForcedTokenShowsForcedNoticeAndForm(t *te
 // error must surface that error key on the GET page via the
 // data-auth-server-error / data-error-key hooks the front-end keys off.
 func TestShowResetPasswordPageSurfacesFlashAuthErrorThroughDataKey(t *testing.T) {
-	handler := &Handler{
-		secretKey:    []byte(testHandlerSecretKey),
-		cookieSecure: true,
-	}
+	handler := &Handler{secretKey: []byte(testHandlerSecretKey)}
 	codec, err := newSecureCookieCodec(handler.secretKey)
 	if err != nil {
 		t.Fatalf("newSecureCookieCodec: %v", err)
 	}
-	flashBytes, err := json.Marshal(FlashPayload{AuthError: "weak password"})
+	flashBytes, err := json.Marshal(FlashPayload{AuthError: "weak password", ExpiresAt: time.Now().Add(flashCookieTTL)})
 	if err != nil {
 		t.Fatalf("marshal flash: %v", err)
 	}

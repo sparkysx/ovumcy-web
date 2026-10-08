@@ -1,5 +1,6 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page } from './support/fixtures';
 import {
+  apiOriginHeader,
   completeOnboardingIfPresent,
   continueFromRecoveryCode,
   createCredentials,
@@ -10,7 +11,7 @@ import {
 
 const IMPORT_SECTION = '[data-import-section]';
 
-type ExportEntry = { date?: string };
+type ExportEntry = { date?: string; flow?: string };
 type ExportPayload = { entries?: ExportEntry[] };
 
 async function registerOwnerAndOpenSettings(page: Page, prefix: string) {
@@ -50,11 +51,17 @@ function lastToast(page: Page) {
   return page.locator('.toast-stack .toast-message').last();
 }
 
-async function exportedDates(page: Page): Promise<string[]> {
-  const response = await page.request.get('/api/v1/exports/json');
+async function exportedEntries(page: Page): Promise<ExportEntry[]> {
+  const response = await page.request.get('/api/v1/exports/json', {
+    headers: apiOriginHeader(page),
+  });
   expect(response.ok()).toBeTruthy();
   const payload = (await response.json()) as ExportPayload;
-  return (payload.entries ?? []).map((entry) => String(entry.date ?? ''));
+  return payload.entries ?? [];
+}
+
+async function exportedDates(page: Page): Promise<string[]> {
+  return (await exportedEntries(page)).map((entry) => String(entry.date ?? ''));
 }
 
 test.describe('Settings: restore from JSON backup', () => {
@@ -88,7 +95,27 @@ test.describe('Settings: restore from JSON backup', () => {
 
   test('submitting with no file selected shows a prompt and imports nothing', async ({ page }) => {
     await registerOwnerAndOpenSettings(page, 'settings-import-empty');
+
+    // Positive anchor: prove the probe can move at all before asking it to stay
+    // still. A restore path that imports nothing, or an export that never lists
+    // the day, satisfies "unchanged" for entirely the wrong reason.
+    await chooseImportFile(
+      page,
+      'ovumcy-export.json',
+      exportFileBuffer([{ date: '2026-10-01', period: true, flow: 'light', cycle_factors: [] }]),
+    );
+    await submitImport(page);
+    await expect(lastToast(page)).toBeVisible();
     const before = await exportedDates(page);
+    expect(before).toContain('2026-10-01');
+
+    // Reload so the file input is empty again — the precondition this test is
+    // named for — and so the toast asserted below can only be the one the
+    // no-file submit produced.
+    await page.reload();
+    await expect(page).toHaveURL(/\/settings$/);
+    await expect(page.locator(`${IMPORT_SECTION} [data-import-file]`)).toHaveJSProperty('value', '');
+    await expect(page.locator('.toast-stack .toast-message')).toHaveCount(0);
 
     await submitImport(page);
 
@@ -109,12 +136,28 @@ test.describe('Settings: restore from JSON backup', () => {
     await expect(lastToast(page)).toBeVisible();
     expect(await exportedDates(page)).toContain('2026-09-01');
 
-    await chooseImportFile(page, 'export.json', file);
-    await submitImport(page);
-    await expect(lastToast(page)).toBeVisible();
+    // The repeat carries a DIFFERENT value for the same day, so "no overwrite"
+    // is observable, and the test waits for the repeat's own import response:
+    // the toast from the first import is still on screen, so a toast wait would
+    // be satisfied before the second submit had even been sent.
+    const repeatFile = exportFileBuffer([
+      { date: '2026-09-01', period: true, flow: 'heavy', cycle_factors: [] },
+    ]);
+    await chooseImportFile(page, 'export.json', repeatFile);
+    const [repeatResponse] = await Promise.all([
+      page.waitForResponse(
+        (response) =>
+          response.request().method() === 'POST' &&
+          new URL(response.url()).pathname === '/api/v1/imports/json',
+      ),
+      submitImport(page),
+    ]);
+    expect(repeatResponse.status()).toBeLessThan(500);
 
-    // Skip-existing: the day is present exactly once, never duplicated.
-    const occurrences = (await exportedDates(page)).filter((date) => date === '2026-09-01').length;
-    expect(occurrences).toBe(1);
+    // Skip-existing: the day is present exactly once, never duplicated, and it
+    // still holds the value the first import wrote.
+    const entries = (await exportedEntries(page)).filter((entry) => entry.date === '2026-09-01');
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.flow).toBe('light');
   });
 });

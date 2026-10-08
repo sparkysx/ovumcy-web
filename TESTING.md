@@ -16,8 +16,19 @@ worth anything. Every claim here is backed by code in the repository and by CI.
 | **Fuzz** | Robustness of parsers/validators against arbitrary/invalid input | `internal/services/policy_fuzz_test.go` (native Go fuzzing) |
 | **Reference vectors** | Cycle predictions match the documented algorithm, number for number | `internal/services/cycles_reference_test.go` |
 
-Currently **2,150+ Go test functions** across `internal/` and **27 Playwright
-specs** (full suite on Chromium; cross-engine smoke on Firefox and WebKit).
+The Go suite runs to thousands of test functions across `internal/`, and the
+browser suite is every `e2e/*.spec.ts` file — `playwright.config.ts` declares
+only `testDir: 'e2e'`, with no `testMatch` or `testIgnore`, so the file listing
+*is* the suite (full suite on Chromium; cross-engine smoke on Firefox and
+WebKit). Exact figures are deliberately not written here: a number in prose
+goes stale on the next batch of tests and nothing re-derives it. Ask the tree
+instead:
+
+```bash
+grep -rE '^func Test[A-Z]' --include='*_test.go' internal | wc -l
+find e2e -name '*.spec.ts' | wc -l
+```
+
 Tests favor behavior and persisted state over markup or implementation details.
 
 ## We test our tests
@@ -30,7 +41,7 @@ fails ("kills" the mutant). Surviving mutants reveal weak assertions.
 - Run it locally: `scripts/mutation.sh baseline` (full) or `scripts/mutation.sh diff <ref>` (changed code only).
 - A weekly CI job tracks the trend; it is advisory and never blocks a merge.
 - Baseline scope now covers business-logic, security, and transport: `internal/services`, `internal/security`, and `internal/api`.
-- **Mutation efficacy** (gremlins, killed / (killed + survived); tracked weekly): `internal/services` **93.3%** (1529/1638), `internal/security` **97.8%** (134/137), and `internal/api` **97.3%** (649/667), measured on a clean-Linux CI run. Efficacy dipped from an earlier ~99% as v1.8.0 landed large new subsystems (webhooks, `.ics` feed, reminders) whose mutants were then triaged. An exhaustive per-mutant pass re-verified **every** survivor against a broad covering suite — the coverage-guided run over-reports survivors (Go leaves `const`/`case` lines uninstrumented, and its test selection can skip the killing test, so a mutant an existing test already kills can still show as survived) — closing the genuine gaps and documenting the residual as equivalents or coverage-attribution artifacts. `internal/api` is the largest package (~8.5k source lines, heavy DB-integration tests) and exceeds CI's 3h job timeout unsharded, so it runs as 5 file-subset shards (`internal_api_1`..`5`, a deterministic partition of the package's own files — see `scripts/mutation.sh`) merged into one `internal_api.json`. Canonical efficacy comes only from the weekly clean-Linux job, never a local Windows run; per-package breakdowns live in [`.mutation/`](.mutation/).
+- **Mutation efficacy** (gremlins, killed / (killed + survived); tracked weekly): `internal/services` **93.3%** (1529/1638), `internal/security` **97.8%** (134/137), and `internal/api` **97.3%** (649/667), measured on a clean-Linux CI run. `internal/services` dipped from an earlier ~99% as v1.8.0 landed large new subsystems (webhooks, `.ics` feed, reminders) whose mutants were then triaged; `internal/security` and `internal/api` rose to the figures above through the same hardening pass, from 93.4% and 79.2%. An exhaustive per-mutant pass re-verified **every** survivor against a broad covering suite — the coverage-guided run over-reports survivors (Go leaves `const`/`case` lines uninstrumented, and its test selection can skip the killing test, so a mutant an existing test already kills can still show as survived) — closing the genuine gaps and documenting the residual as equivalents or coverage-attribution artifacts. `internal/api` is the slowest package to mutate — not the largest (`internal/services` has more non-test source lines) but the one whose tests are heavy DB integration — and it exceeds CI's 3h job timeout unsharded, so it runs as 30 file-subset shards (`internal_api_1`..`30`, a deterministic partition of the package's own files dealt by estimated mutation weight — see `scripts/mutation.sh`) merged into one `internal_api.json`. `internal/services` is sharded 14 ways on the same mechanism. Canonical efficacy comes only from the weekly clean-Linux job, never a local Windows run; per-package breakdowns live in [`.mutation/`](.mutation/).
 - Statement coverage is lower than efficacy by design: mutation testing checks whether a test *fails when the code breaks*, not merely whether a line ran. The "not covered" mutants are dominated by package-level `const`/`var` declarations (which Go coverage never instruments) and the network-facing OIDC client (covered end-to-end).
 
 Surviving mutants are triaged honestly: a *real* gap gets a new behavior test; an
@@ -54,30 +65,42 @@ ships in the image.
 
 ### Sealed-cookie codec coverage
 
-All eleven AEAD-sealed cookie purposes are exercised by `internal/api/secure_cookie_codec_security_test.go`.
+All thirteen live AEAD-sealed cookie purposes are exercised by `internal/api/secure_cookie_codec_security_test.go`.
 Each purpose is bound to its own AAD so a ciphertext from one cookie cannot be opened as another.
+(WEB-77 removed `ovumcy_oidc_link_pending` along with the route it served, and WEB-40 round 3 added
+`ovumcy_oidc_stepup_continue` to this sweep, which the codec had carried since the cross-site
+step-up bounce shipped but this test file had not yet listed; a golden value sealed under the
+removed purpose string still has to open, so it stays pinned in
+`secure_cookie_codec_golden_test.go`'s backward-compat set below, not in the live-purposes table
+here.)
 
 | Cookie | Roundtrip | Cross-purpose rejection | Tamper detection |
 |--------|:---------:|:----------------------:|:----------------:|
 | `ovumcy_auth` | ✓ | ✓ | ✓ (auth-tag, body byte, nonce) |
 | `ovumcy_flash` | ✓ | ✓ | †  |
+| `ovumcy_flash_exempt` | ✓ | ✓ | †  |
 | `ovumcy_recovery_code` | ✓ | ✓ | †  |
+| `ovumcy_calendar_feed` | ✓ | ✓ | †  |
 | `ovumcy_register_pickup` | ✓ | ✓ | †  |
 | `ovumcy_reset_password` | ✓ | ✓ | †  |
 | `ovumcy_oidc_auth` | ✓ | ✓ | †  |
 | `ovumcy_oidc_stepup` | ✓ | ✓ | †  |
+| `ovumcy_oidc_stepup_continue` | ✓ | ✓ | †  |
 | `ovumcy_oidc_logout_bridge` | ✓ | ✓ | †  |
-| `ovumcy_oidc_link_pending` | ✓ | ✓ | ✓  |
 | `ovumcy_totp_pending` | ✓ | ✓ | ✓  |
 | `ovumcy_totp_setup` | ✓ | ✓ | ✓  |
 
 † AES-256-GCM guarantees tamper detection for all purposes by construction; explicit tests cover
-`ovumcy_auth` (three distinct mutation sites), `ovumcy_totp_pending`, `ovumcy_totp_setup`, and
-`ovumcy_oidc_link_pending` as representative high-value targets.
+`ovumcy_auth` (three distinct mutation sites), `ovumcy_totp_pending`, and `ovumcy_totp_setup` as
+representative high-value targets.
 
 Backward-compatibility goldens: `internal/api/secure_cookie_codec_golden_test.go` holds sealed
-values produced by the pre-consolidation codec for all eleven purposes, and
-`internal/security/field_crypto_golden_test.go` holds AAD-bound and legacy field ciphertexts.
+values produced by the pre-consolidation codec for the eleven purposes that predate the
+consolidation, plus one pinned under the current codec for `ovumcy_flash_exempt` (WEB-40), which
+postdates it and so has no genuine pre-consolidation artifact to reuse — twelve entries in total.
+`ovumcy_calendar_feed` also postdates the consolidation and, unlike `ovumcy_flash_exempt`, has no
+entry at all. `internal/security/field_crypto_golden_test.go` holds AAD-bound and legacy field
+ciphertexts.
 They pin the HKDF labels, AAD construction, envelope, and payload layout; never regenerate the
 fixtures to make these tests pass.
 
@@ -96,7 +119,12 @@ verify it against the numbers.
 # Go: unit + integration + property + fuzz seeds.
 # Scoped to the module's Go trees (not ./...) so a local node_modules/ — where a
 # vendored JS dependency ships a .go file — isn't swept into the wildcard.
-go test ./cmd/... ./internal/... ./migrations/... ./scripts/... ./web/...
+# -timeout 30m: Go's default is 10 minutes PER PACKAGE, and internal/api's
+# DB-integration suite alone took 887-1101 s here (measured 2026-09-20; CI
+# shards it into 20m cells), so the default dies as
+# `panic: test timed out after 10m0s` with a goroutine dump that reads like a
+# product bug. Read that panic as the budget, not a defect.
+go test ./cmd/... ./internal/... ./migrations/... ./scripts/... ./web/... -timeout 30m
 
 # Active fuzzing of a single target
 go test ./internal/services/ -run '^$' -fuzz FuzzParseDayDate -fuzztime 30s
@@ -104,7 +132,7 @@ go test ./internal/services/ -run '^$' -fuzz FuzzParseDayDate -fuzztime 30s
 # End-to-end (Playwright)
 npm run e2e
 
-# Mutation testing (slow; local or nightly)
+# Mutation testing (slow; local, or the weekly CI job)
 bash scripts/mutation.sh baseline
 ```
 
@@ -116,23 +144,26 @@ coverable Go line in your diff against `origin/main` must be exercised by a test
 the comment at the top of `scripts/patchcov/main.go`).
 
 **Warning: running `patchcov` against a stale `coverage.out` gives a false pass.**
-`go test -coverprofile` is subject to Go's test result cache — if you edit a file
-and re-run the coverage command without also touching its test, `go test` can
-silently reuse a cached run from *before* your latest edit. `coverage.out` then
-reflects the old code, `patchcov` reports your newest lines as covered, and CI
-(which always starts from a clean checkout with an empty test cache) fails on the
-same diff. This has bitten contributors more than once — always regenerate the
-profile fresh before trusting a local "gate OK".
+The gate reads whatever profile is on disk and never checks how it was produced.
+A `coverage.out` left over from before your latest edit — or written by a run over
+a narrower package set than the diff touches — still names your newest lines as
+covered, and CI, which always starts from a clean checkout and regenerates the
+profile over the whole scoped tree, fails on the same diff. This has bitten
+contributors more than once — always regenerate the profile fresh, over the full
+command below, before trusting a local "gate OK".
 
 This isn't enforced by a local hook — CI's `patch-coverage` job is the gate,
 run on every PR. To check before pushing, reproduce CI's coverage condition
-end to end. The two steps that matter are `go clean -testcache` and
-`-count=1`; either alone defeats the cache, run both for good measure:
+end to end: delete the old profile and regenerate it over the whole scoped
+package set. `go clean -testcache` and `-count=1` are belt and braces — an
+edited file already invalidates its own cached result — but the recipe keeps
+both so a partial local rerun cannot leave any of the profile stale:
 
 ```bash
 rm -f coverage.out
 go clean -testcache
 go test ./cmd/... ./internal/... ./migrations/... ./scripts/... ./web/... \
+  -timeout 30m \
   -coverprofile=coverage.out -covermode=atomic \
   -coverpkg=./cmd/...,./internal/...,./migrations/...,./scripts/...,./web/... \
   -count=1

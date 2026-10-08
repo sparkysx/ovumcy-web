@@ -15,7 +15,7 @@ func TestBuildPhaseMoodInsightsRequiresThreeCompletedCycles(t *testing.T) {
 	logs := buildPhaseInsightLogs(t)
 	logs = logs[:len(logs)-1]
 
-	insights, ok := service.BuildPhaseMoodInsights(owner, logs, time.UTC)
+	insights, ok := service.BuildPhaseMoodInsights(owner, logs, time.UTC, BoundaryContext{})
 	if ok {
 		t.Fatal("expected phase mood insights to stay gated with fewer than three completed cycles")
 	}
@@ -28,7 +28,7 @@ func TestBuildPhaseMoodInsightsBuildsOrderedPhaseAverages(t *testing.T) {
 	service := NewStatsService(&stubStatsDayReader{}, &stubStatsSymptomReader{})
 	owner := &models.User{ID: 7, Role: models.RoleOwner}
 
-	insights, ok := service.BuildPhaseMoodInsights(owner, buildPhaseInsightLogs(t), time.UTC)
+	insights, ok := service.BuildPhaseMoodInsights(owner, buildPhaseInsightLogs(t), time.UTC, BoundaryContext{})
 	if !ok {
 		t.Fatal("expected phase mood insights to be available")
 	}
@@ -53,12 +53,17 @@ func TestBuildPhaseSymptomInsightsSortsAndTruncatesTopThree(t *testing.T) {
 			{ID: 4, Name: "Headache", Icon: "H"},
 		},
 	})
-	owner := &models.User{ID: 7, Role: models.RoleOwner}
-
-	insights, ok, err := service.BuildPhaseSymptomInsights(context.Background(), owner, buildPhaseInsightLogs(t), time.UTC)
+	// The live path (buildOwnerStatsInsights) checks the owner role and the
+	// symptom reader itself, then resolves the catalogue and folds the logs
+	// against it — so the test drives those two steps rather than a wrapper of
+	// its own.
+	const ownerID uint = 7
+	symptomByID, err := service.phaseInsightSymptomMap(context.Background(), ownerID)
 	if err != nil {
 		t.Fatalf("expected nil error, got %v", err)
 	}
+
+	insights, ok := buildPhaseSymptomInsightsWithMap(buildPhaseInsightLogs(t), time.UTC, symptomByID, BoundaryContext{})
 	if !ok {
 		t.Fatal("expected phase symptom insights to be available")
 	}
@@ -88,18 +93,18 @@ func buildPhaseInsightLogs(t *testing.T) []models.DailyLog {
 	t.Helper()
 
 	return []models.DailyLog{
-		{Date: mustParseStatsServiceDay(t, "2026-01-01"), IsPeriod: true, Mood: 1, SymptomIDs: []uint{3}},
+		{Date: mustParseStatsServiceDay(t, "2026-01-01"), IsPeriod: true, CycleStart: true, Mood: 1, SymptomIDs: []uint{3}},
 		{Date: mustParseStatsServiceDay(t, "2026-01-10"), Mood: 4, SymptomIDs: []uint{2}},
 		{Date: mustParseStatsServiceDay(t, "2026-01-14"), Mood: 5, SymptomIDs: []uint{1}},
 		{Date: mustParseStatsServiceDay(t, "2026-01-20"), Mood: 3, SymptomIDs: []uint{3, 2, 1, 4}},
-		{Date: mustParseStatsServiceDay(t, "2026-01-29"), IsPeriod: true, Mood: 2, SymptomIDs: []uint{3}},
+		{Date: mustParseStatsServiceDay(t, "2026-01-29"), IsPeriod: true, CycleStart: true, Mood: 2, SymptomIDs: []uint{3}},
 		{Date: mustParseStatsServiceDay(t, "2026-02-07"), Mood: 4, SymptomIDs: []uint{2}},
 		{Date: mustParseStatsServiceDay(t, "2026-02-11"), Mood: 5, SymptomIDs: []uint{1}},
 		{Date: mustParseStatsServiceDay(t, "2026-02-18"), Mood: 3, SymptomIDs: []uint{3, 2, 1}},
-		{Date: mustParseStatsServiceDay(t, "2026-02-26"), IsPeriod: true, Mood: 3, SymptomIDs: []uint{3}},
+		{Date: mustParseStatsServiceDay(t, "2026-02-26"), IsPeriod: true, CycleStart: true, Mood: 3, SymptomIDs: []uint{3}},
 		{Date: mustParseStatsServiceDay(t, "2026-03-07"), Mood: 4, SymptomIDs: []uint{2}},
 		{Date: mustParseStatsServiceDay(t, "2026-03-11"), Mood: 5, SymptomIDs: []uint{1}},
 		{Date: mustParseStatsServiceDay(t, "2026-03-18"), Mood: 3, SymptomIDs: []uint{3, 1}},
-		{Date: mustParseStatsServiceDay(t, "2026-03-26"), IsPeriod: true, Mood: 2, SymptomIDs: []uint{3}},
+		{Date: mustParseStatsServiceDay(t, "2026-03-26"), IsPeriod: true, CycleStart: true, Mood: 2, SymptomIDs: []uint{3}},
 	}
 }

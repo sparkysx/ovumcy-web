@@ -3,45 +3,54 @@ package services
 import (
 	"context"
 	"errors"
+	"fmt"
+	"reflect"
 	"regexp"
 	"testing"
 	"time"
 
+	"github.com/ovumcy/ovumcy-web/internal/db"
 	"github.com/ovumcy/ovumcy-web/internal/models"
 	"golang.org/x/crypto/bcrypt"
 )
 
 type stubAuthUserRepo struct {
-	existsByEmail            bool
-	existsByEmailErr         error
-	findByEmailUser          models.User
-	findByEmailErr           error
-	findByEmailOptionalEmail string
-	findByEmailOptionalUser  models.User
-	findByEmailOptionalFound bool
-	findByEmailOptionalErr   error
-	user                     models.User
-	findByIDErr              error
-	createErr                error
-	createCalled             bool
-	createdUser              models.User
-	updatePasswordErr        error
-	updatePasswordCalled     bool
-	forceResetErr            error
-	forceResetCalled         bool
-	updateRecoveryPassErr    error
-	updateRecoveryCalled     bool
-	bumpSessionErr           error
-	bumpSessionCalled        bool
-	updateRecoveryCodeErr    error
-	updatedUserID            uint
-	updatedRecoveryHash      string
-	updatedPasswordHash      string
-	updatedMustChange        bool
-	updateHashOnlyErr        error
-	updateHashOnlyCalls      int
-	updateHashOnlyUserID     uint
-	updateHashOnlyHash       string
+	existsByEmail    bool
+	existsByEmailErr error
+	// emailMatches is FindAllByNormalizedEmail's answer; emailFor, when set,
+	// limits it to that one address; emailErr fails the lookup.
+	emailMatches          []models.User
+	emailFor              string
+	emailErr              error
+	findByIDOptionalUser  models.User
+	findByIDOptionalFound bool
+	findByIDOptionalErr   error
+	user                  models.User
+	findByIDErr           error
+	createErr             error
+	createCalled          bool
+	createdUser           models.User
+	updatePasswordErr     error
+	updatePasswordCalled  bool
+	forceResetErr         error
+	forceResetCalled      bool
+	updateRecoveryPassErr error
+	updateRecoveryCalled  bool
+	bumpSessionErr        error
+	bumpSessionCalled     bool
+	updateRecoveryCodeErr error
+	updatedUserID         uint
+	updatedRecoveryHash   string
+	updatedPasswordHash   string
+	updatedMustChange     bool
+	upgradeHashErr        error
+	upgradeHashLost       bool
+	upgradeHashCalls      int
+	upgradeHashUserID     uint
+	upgradeHashOld        string
+	upgradeHashNew        string
+	claimRevealErr        error
+	claimRevealUserID     uint
 }
 
 func (stub *stubAuthUserRepo) ExistsByNormalizedEmail(context.Context, string) (bool, error) {
@@ -51,27 +60,18 @@ func (stub *stubAuthUserRepo) ExistsByNormalizedEmail(context.Context, string) (
 	return stub.existsByEmail, nil
 }
 
-func (stub *stubAuthUserRepo) FindByNormalizedEmail(context.Context, string) (models.User, error) {
-	if stub.findByEmailErr != nil {
-		return models.User{}, stub.findByEmailErr
+// FindAllByNormalizedEmail answers with emailMatches, optionally narrowed to
+// emailFor, or fails with emailErr. There is no fallback to stub.user — a
+// test that needs FindAllByNormalizedEmail to see stub.user sets emailMatches
+// explicitly.
+func (stub *stubAuthUserRepo) FindAllByNormalizedEmail(ctx context.Context, email string) ([]models.User, error) {
+	switch {
+	case stub.emailErr != nil:
+		return nil, stub.emailErr
+	case stub.emailFor != "" && stub.emailFor != email:
+		return nil, nil
 	}
-	return stub.findByEmailUser, nil
-}
-
-func (stub *stubAuthUserRepo) FindByNormalizedEmailOptional(ctx context.Context, email string) (models.User, bool, error) {
-	if stub.findByEmailOptionalErr != nil {
-		return models.User{}, false, stub.findByEmailOptionalErr
-	}
-	if stub.findByEmailOptionalEmail != "" && stub.findByEmailOptionalEmail != email {
-		return models.User{}, false, nil
-	}
-	if stub.findByEmailOptionalFound {
-		return stub.findByEmailOptionalUser, true, nil
-	}
-	if stub.user.ID != 0 || stub.user.Email != "" || stub.user.RecoveryCodeHash != "" || stub.user.PasswordHash != "" {
-		return stub.user, true, nil
-	}
-	return models.User{}, false, nil
+	return stub.emailMatches, nil
 }
 
 func (stub *stubAuthUserRepo) FindByID(context.Context, uint) (models.User, error) {
@@ -79,6 +79,19 @@ func (stub *stubAuthUserRepo) FindByID(context.Context, uint) (models.User, erro
 		return models.User{}, stub.findByIDErr
 	}
 	return stub.user, nil
+}
+
+func (stub *stubAuthUserRepo) FindByIDOptional(context.Context, uint) (models.User, bool, error) {
+	if stub.findByIDOptionalErr != nil {
+		return models.User{}, false, stub.findByIDOptionalErr
+	}
+	if stub.findByIDOptionalFound {
+		return stub.findByIDOptionalUser, true, nil
+	}
+	if stub.user.ID != 0 {
+		return stub.user, true, nil
+	}
+	return models.User{}, false, nil
 }
 
 func (stub *stubAuthUserRepo) Create(ctx context.Context, user *models.User) error {
@@ -90,17 +103,28 @@ func (stub *stubAuthUserRepo) Create(ctx context.Context, user *models.User) err
 	return nil
 }
 
-func (stub *stubAuthUserRepo) UpdateRecoveryCodeHashAndRevokeSessions(ctx context.Context, userID uint, recoveryHash string) error {
+func (stub *stubAuthUserRepo) UpdateRecoveryCodeHashAndRevokeSessions(ctx context.Context, userID uint, expectedSessionVersion int, recoveryHash string, beforeCommit func(sessionVersion int) error) error {
 	if stub.updateRecoveryCodeErr != nil {
 		return stub.updateRecoveryCodeErr
 	}
+	// Mirrors the real compare-and-set, which writes the version after the
+	// expected one: a legacy 0 is expected as 1 and written as 2.
+	newVersion := NormalizeAuthSessionVersion(expectedSessionVersion) + 1
+	if beforeCommit != nil {
+		if err := beforeCommit(newVersion); err != nil {
+			return err
+		}
+	}
 	stub.updatedUserID = userID
 	stub.updatedRecoveryHash = recoveryHash
-	stub.user.AuthSessionVersion = NormalizeAuthSessionVersion(stub.user.AuthSessionVersion) + 1
+	// The real UPDATE NULLs recovery_code_revealed_at in the same statement, so
+	// a fresh code arrives with its one-time reveal armed.
+	stub.user.RecoveryCodeRevealedAt = nil
+	stub.user.AuthSessionVersion = newVersion
 	return nil
 }
 
-func (stub *stubAuthUserRepo) UpdatePasswordAndRevokeSessions(ctx context.Context, userID uint, passwordHash string, mustChangePassword bool) error {
+func (stub *stubAuthUserRepo) UpdatePasswordAndRevokeSessions(ctx context.Context, userID uint, _ int, passwordHash string, mustChangePassword bool) error {
 	if stub.updatePasswordErr != nil {
 		return stub.updatePasswordErr
 	}
@@ -135,9 +159,16 @@ func (stub *stubAuthUserRepo) ForceResetPasswordAndRevokeSessions(ctx context.Co
 	return nil
 }
 
-func (stub *stubAuthUserRepo) UpdatePasswordRecoveryCodeAndRevokeSessions(ctx context.Context, userID uint, passwordHash string, recoveryHash string, mustChangePassword bool) error {
+func (stub *stubAuthUserRepo) UpdatePasswordRecoveryCodeAndRevokeSessions(ctx context.Context, userID uint, expectedSessionVersion int, passwordHash string, recoveryHash string, mustChangePassword bool, beforeCommit func(sessionVersion int) error) error {
 	if stub.updateRecoveryPassErr != nil {
 		return stub.updateRecoveryPassErr
+	}
+	// Mirrors the real compare-and-set: the version after the expected one.
+	newVersion := NormalizeAuthSessionVersion(expectedSessionVersion) + 1
+	if beforeCommit != nil {
+		if err := beforeCommit(newVersion); err != nil {
+			return err
+		}
 	}
 	stub.updateRecoveryCalled = true
 	stub.updatedUserID = userID
@@ -147,25 +178,124 @@ func (stub *stubAuthUserRepo) UpdatePasswordRecoveryCodeAndRevokeSessions(ctx co
 	stub.user.ID = userID
 	stub.user.PasswordHash = passwordHash
 	stub.user.RecoveryCodeHash = recoveryHash
+	// Mirrors the same-statement NULL of recovery_code_revealed_at: the code
+	// this write mints arrives with its one-time reveal armed.
+	stub.user.RecoveryCodeRevealedAt = nil
 	stub.user.LocalAuthEnabled = true
 	stub.user.MustChangePassword = mustChangePassword
-	stub.user.AuthSessionVersion = NormalizeAuthSessionVersion(stub.user.AuthSessionVersion) + 1
+	stub.user.AuthSessionVersion = newVersion
 	return nil
 }
 
-func (stub *stubAuthUserRepo) UpdatePasswordRecoveryCodeAndRevokeSessionsCAS(ctx context.Context, userID uint, oldPasswordHash string, newPasswordHash string, recoveryHash string) error {
-	return stub.UpdatePasswordRecoveryCodeAndRevokeSessions(ctx, userID, newPasswordHash, recoveryHash, false)
+func (stub *stubAuthUserRepo) UpdatePasswordRecoveryCodeAndRevokeSessionsCAS(ctx context.Context, userID uint, oldPasswordHash string, oldSessionVersion int, newPasswordHash string, recoveryHash string, beforeCommit func(sessionVersion int) error) error {
+	return stub.UpdatePasswordRecoveryCodeAndRevokeSessions(ctx, userID, oldSessionVersion, newPasswordHash, recoveryHash, false, beforeCommit)
 }
 
-func (stub *stubAuthUserRepo) UpdatePasswordHashOnly(ctx context.Context, userID uint, passwordHash string) error {
-	stub.updateHashOnlyCalls++
-	if stub.updateHashOnlyErr != nil {
-		return stub.updateHashOnlyErr
+// noopRecoveryCodeDelivery satisfies RecoveryCodeDelivery for tests that do
+// not exercise delivery itself.
+func noopRecoveryCodeDelivery(*models.User, string) error { return nil }
+
+// callRotationRecoveringPanic reports a panic from rotate as its error. A
+// rotation that reaches its hook with a nil delivery calls it inside the
+// transaction; recovering here lets the case fail its own assertions by name
+// instead of aborting the package run.
+func callRotationRecoveringPanic(rotate func() (string, error)) (recoveryCode string, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("rotation panicked: %v", recovered)
+		}
+	}()
+	return rotate()
+}
+
+// TestRecoveryCodeRotationsRefuseANilDeliveryBeforeTheirWrite pins the
+// ErrRecoveryCodeDeliveryRequired guard of both AuthService rotations against
+// the real user repository: a rotation that names no delivery would mint a code
+// nobody can be shown, so it is refused before the write and the row stays
+// exactly as it was.
+func TestRecoveryCodeRotationsRefuseANilDeliveryBeforeTheirWrite(t *testing.T) {
+	database := newTwoOwnerIntegrationDatabase(t, "ovumcy-rotation-nil-delivery")
+	service := NewAuthService(db.NewUserRepository(database))
+	owner := createTwoOwnerUser(t, database, "rotation-nil-delivery@example.com", withLocalCredentials(t, "OwnerPass1"))
+
+	for _, rotation := range []struct {
+		name   string
+		rotate func(user *models.User) (string, error)
+	}{
+		{"regenerate", func(user *models.User) (string, error) {
+			return service.RegenerateRecoveryCode(context.Background(), user, nil)
+		}},
+		{"reset", func(user *models.User) (string, error) {
+			return service.ResetPasswordAndRotateRecoveryCodeCAS(context.Background(), user, user.PasswordHash, "EvenStronger2", nil)
+		}},
+	} {
+		t.Run(rotation.name, func(t *testing.T) {
+			before := readTwoOwnerUser(t, database, owner.ID)
+			acting := before
+			recoveryCode, err := callRotationRecoveringPanic(func() (string, error) { return rotation.rotate(&acting) })
+			if !errors.Is(err, ErrRecoveryCodeDeliveryRequired) {
+				t.Errorf("expected ErrRecoveryCodeDeliveryRequired, got %v", err)
+			}
+			if recoveryCode != "" {
+				t.Error("a rotation refused for want of a delivery must return no code")
+			}
+			if after := readTwoOwnerUser(t, database, owner.ID); !reflect.DeepEqual(before, after) {
+				t.Fatalf("a rotation with no delivery changed the users row:\nbefore %+v\nafter  %+v", before, after)
+			}
+		})
 	}
-	stub.updateHashOnlyUserID = userID
-	stub.updateHashOnlyHash = passwordHash
-	stub.user.PasswordHash = passwordHash
-	return nil
+}
+
+// TestRegenerateRecoveryCodeRefusesANilUserBeforeItsDelivery pins the
+// ErrAuthUserRequired guard: with no user there is no row to rotate and no
+// owner to deliver to, so neither the repository nor the delivery is reached.
+func TestRegenerateRecoveryCodeRefusesANilUserBeforeItsDelivery(t *testing.T) {
+	service := NewAuthService(&stubAuthUserRepo{})
+	delivered := 0
+	recoveryCode, err := callRotationRecoveringPanic(func() (string, error) {
+		return service.RegenerateRecoveryCode(context.Background(), nil, func(*models.User, string) error {
+			delivered++
+			return nil
+		})
+	})
+	if !errors.Is(err, ErrAuthUserRequired) {
+		t.Fatalf("expected ErrAuthUserRequired, got %v", err)
+	}
+	if recoveryCode != "" || delivered != 0 {
+		t.Fatalf("a refused rotation returned code %q and delivered %d time(s)", recoveryCode, delivered)
+	}
+}
+
+func (stub *stubAuthUserRepo) UpgradePasswordHashCAS(ctx context.Context, userID uint, oldPasswordHash string, newPasswordHash string) (bool, error) {
+	stub.upgradeHashCalls++
+	stub.upgradeHashUserID = userID
+	stub.upgradeHashOld = oldPasswordHash
+	if stub.upgradeHashErr != nil {
+		return false, stub.upgradeHashErr
+	}
+	if stub.upgradeHashLost {
+		return false, nil
+	}
+	stub.upgradeHashNew = newPasswordHash
+	stub.user.PasswordHash = newPasswordHash
+	return true, nil
+}
+
+// ClaimRecoveryCodeReveal models the real compare-and-set: the first call
+// consumes the reveal, every later one loses because the mark is already set.
+// The mint methods above reset it to nil the way their UPDATE statements NULL
+// recovery_code_revealed_at.
+func (stub *stubAuthUserRepo) ClaimRecoveryCodeReveal(ctx context.Context, userID uint, revealedAt time.Time) (bool, error) {
+	if stub.claimRevealErr != nil {
+		return false, stub.claimRevealErr
+	}
+	stub.claimRevealUserID = userID
+	if stub.user.RecoveryCodeRevealedAt != nil {
+		return false, nil
+	}
+	claimedAt := revealedAt.UTC()
+	stub.user.RecoveryCodeRevealedAt = &claimedAt
+	return true, nil
 }
 
 func (stub *stubAuthUserRepo) BumpAuthSessionVersion(ctx context.Context, userID uint) error {
@@ -272,7 +402,11 @@ func TestAuthServiceValidateResetPasswordInput(t *testing.T) {
 	}
 }
 
-func TestAuthServiceForceResetPasswordByEmail(t *testing.T) {
+func TestAuthServiceForceResetPasswordByID(t *testing.T) {
+	// TestAuthServiceForceResetPasswordByID/success is the session-invalidation
+	// row for the operator-forced reset in SECURITY.md: the new hash is stored,
+	// must_change_password is set, the routine authenticated writer is NOT the
+	// one used, and auth_session_version goes up in the same update.
 	t.Run("success", func(t *testing.T) {
 		originalHash, err := bcrypt.GenerateFromPassword([]byte("StrongPass1"), bcrypt.DefaultCost)
 		if err != nil {
@@ -280,8 +414,8 @@ func TestAuthServiceForceResetPasswordByEmail(t *testing.T) {
 		}
 
 		repo := &stubAuthUserRepo{
-			existsByEmail: true,
-			findByEmailUser: models.User{
+			findByIDOptionalFound: true,
+			findByIDOptionalUser: models.User{
 				ID:                 18,
 				Email:              "owner@example.com",
 				PasswordHash:       string(originalHash),
@@ -291,14 +425,17 @@ func TestAuthServiceForceResetPasswordByEmail(t *testing.T) {
 		}
 		service := NewAuthService(repo)
 
-		if err := service.ForceResetPasswordByEmail(context.Background(), " Owner@Example.com ", "EvenStronger2"); err != nil {
-			t.Fatalf("ForceResetPasswordByEmail() unexpected error: %v", err)
+		if err := service.ForceResetPasswordByID(context.Background(), 18, "EvenStronger2"); err != nil {
+			t.Fatalf("ForceResetPasswordByID() unexpected error: %v", err)
 		}
 		if !repo.forceResetCalled {
 			t.Fatal("expected ForceResetPasswordAndRevokeSessions() to be called")
 		}
 		if repo.updatePasswordCalled {
 			t.Fatal("operator reset must NOT use the routine UpdatePasswordAndRevokeSessions path")
+		}
+		if repo.updatedUserID != 18 {
+			t.Fatalf("expected reset to target id 18, got %d", repo.updatedUserID)
 		}
 		if !repo.user.MustChangePassword {
 			t.Fatal("expected MustChangePassword=true after forced reset")
@@ -311,58 +448,59 @@ func TestAuthServiceForceResetPasswordByEmail(t *testing.T) {
 		}
 	})
 
+	t.Run("missing id", func(t *testing.T) {
+		service := NewAuthService(&stubAuthUserRepo{})
+		if err := service.ForceResetPasswordByID(context.Background(), 0, "EvenStronger2"); !errors.Is(err, ErrAuthUserIDRequired) {
+			t.Fatalf("expected ErrAuthUserIDRequired, got %v", err)
+		}
+	})
+
 	t.Run("missing password", func(t *testing.T) {
 		service := NewAuthService(&stubAuthUserRepo{})
-		if err := service.ForceResetPasswordByEmail(context.Background(), "owner@example.com", " "); !errors.Is(err, ErrAuthResetInvalid) {
+		if err := service.ForceResetPasswordByID(context.Background(), 18, " "); !errors.Is(err, ErrAuthResetInvalid) {
 			t.Fatalf("expected ErrAuthResetInvalid, got %v", err)
 		}
 	})
 
+	// TestAuthServiceForceResetPasswordByID/weak_password covers the forced
+	// reset's own authPasswordPolicyError(ValidatePasswordStrength(...)) call,
+	// which nothing else in this file's suite reaches. The CLI runs the same
+	// policy once more ahead of the fence gate (resetPasswordPolicyError), so
+	// a weak password never spends the gate's one-shot confirmation.
 	t.Run("weak password", func(t *testing.T) {
 		service := NewAuthService(&stubAuthUserRepo{})
-		if err := service.ForceResetPasswordByEmail(context.Background(), "owner@example.com", "12345678"); !errors.Is(err, ErrAuthWeakPassword) {
+		if err := service.ForceResetPasswordByID(context.Background(), 18, "12345678"); !errors.Is(err, ErrAuthWeakPassword) {
 			t.Fatalf("expected ErrAuthWeakPassword, got %v", err)
 		}
 	})
 
-	t.Run("user not found", func(t *testing.T) {
-		repo := &stubAuthUserRepo{existsByEmail: false}
+	t.Run("id not found", func(t *testing.T) {
+		repo := &stubAuthUserRepo{}
 		service := NewAuthService(repo)
-		if err := service.ForceResetPasswordByEmail(context.Background(), "missing@example.com", "EvenStronger2"); !errors.Is(err, ErrAuthUserNotFound) {
+		if err := service.ForceResetPasswordByID(context.Background(), 9, "EvenStronger2"); !errors.Is(err, ErrAuthUserNotFound) {
 			t.Fatalf("expected ErrAuthUserNotFound, got %v", err)
 		}
 		if repo.forceResetCalled {
-			t.Fatal("did not expect password update when user is missing")
+			t.Fatal("did not expect password update when id is missing")
 		}
 	})
 
 	t.Run("lookup failure", func(t *testing.T) {
-		repo := &stubAuthUserRepo{existsByEmailErr: errors.New("db down")}
+		repo := &stubAuthUserRepo{findByIDOptionalErr: errors.New("db down")}
 		service := NewAuthService(repo)
-		if err := service.ForceResetPasswordByEmail(context.Background(), "owner@example.com", "EvenStronger2"); !errors.Is(err, ErrAuthUserLookupFailed) {
+		if err := service.ForceResetPasswordByID(context.Background(), 18, "EvenStronger2"); !errors.Is(err, ErrAuthUserLookupFailed) {
 			t.Fatalf("expected ErrAuthUserLookupFailed, got %v", err)
 		}
 	})
 
 	t.Run("save failure", func(t *testing.T) {
-		originalHash, err := bcrypt.GenerateFromPassword([]byte("StrongPass1"), bcrypt.DefaultCost)
-		if err != nil {
-			t.Fatalf("hash original password: %v", err)
-		}
-
 		repo := &stubAuthUserRepo{
-			existsByEmail: true,
-			findByEmailUser: models.User{
-				ID:               18,
-				Email:            "owner@example.com",
-				PasswordHash:     string(originalHash),
-				LocalAuthEnabled: true,
-			},
-			forceResetErr: errors.New("write failed"),
+			findByIDOptionalFound: true,
+			findByIDOptionalUser:  models.User{ID: 18, Email: "owner@example.com"},
+			forceResetErr:         errors.New("write failed"),
 		}
 		service := NewAuthService(repo)
-
-		if err := service.ForceResetPasswordByEmail(context.Background(), "owner@example.com", "EvenStronger2"); !errors.Is(err, ErrAuthPasswordUpdate) {
+		if err := service.ForceResetPasswordByID(context.Background(), 18, "EvenStronger2"); !errors.Is(err, ErrAuthPasswordUpdate) {
 			t.Fatalf("expected ErrAuthPasswordUpdate, got %v", err)
 		}
 	})
@@ -385,8 +523,10 @@ func TestAuthServiceBuildOwnerUserWithRecovery(t *testing.T) {
 	if user.CycleLength != models.DefaultCycleLength || user.PeriodLength != models.DefaultPeriodLength {
 		t.Fatalf("expected default cycle/period lengths, got %d/%d", user.CycleLength, user.PeriodLength)
 	}
-	if !user.AutoPeriodFill {
-		t.Fatalf("expected AutoPeriodFill=true")
+	// Off by default, per SECURITY.md's Art. 25 row; the whole producer set is
+	// swept in TestOwnerAccountConstructorsLeaveAutoPeriodFillOff.
+	if user.AutoPeriodFill != models.DefaultAutoPeriodFill {
+		t.Fatalf("expected AutoPeriodFill=%t, got %t", models.DefaultAutoPeriodFill, user.AutoPeriodFill)
 	}
 	if !user.CreatedAt.Equal(createdAt) {
 		t.Fatalf("expected CreatedAt preserved, got %s", user.CreatedAt)
@@ -415,12 +555,14 @@ func TestAuthServiceAuthenticateCredentials(t *testing.T) {
 	}
 
 	repo := &stubAuthUserRepo{
-		findByEmailUser: models.User{
-			ID:               77,
-			Email:            "login@example.com",
-			PasswordHash:     string(passwordHash),
-			LocalAuthEnabled: true,
-			Role:             models.RoleOwner,
+		emailMatches: []models.User{
+			{
+				ID:               77,
+				Email:            "login@example.com",
+				PasswordHash:     string(passwordHash),
+				LocalAuthEnabled: true,
+				Role:             models.RoleOwner,
+			},
 		},
 	}
 	service := NewAuthService(repo)
@@ -437,67 +579,109 @@ func TestAuthServiceAuthenticateCredentials(t *testing.T) {
 		t.Fatalf("expected ErrAuthInvalidCreds for wrong password, got %v", err)
 	}
 
-	repo.findByEmailErr = errors.New("user not found")
+	repo.emailErr = errors.New("user not found")
 	if _, err := service.AuthenticateCredentials(context.Background(), "missing@example.com", "StrongPass1"); !errors.Is(err, ErrAuthInvalidCreds) {
 		t.Fatalf("expected ErrAuthInvalidCreds for missing user, got %v", err)
 	}
 }
 
-func TestAuthServiceFindUserByEmailAndRecoveryCode(t *testing.T) {
+func TestAuthServiceFindUserByEmailRecoveryCodeAndPassword(t *testing.T) {
 	recoveryCode, recoveryHash, err := GenerateRecoveryCodeHash()
 	if err != nil {
 		t.Fatalf("GenerateRecoveryCodeHash() unexpected error: %v", err)
 	}
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte("StrongPass1"), bcrypt.DefaultCost)
+	if err != nil {
+		t.Fatalf("hash password: %v", err)
+	}
 
 	repo := &stubAuthUserRepo{
-		findByEmailOptionalEmail: "owner@example.com",
-		findByEmailOptionalFound: true,
-		findByEmailOptionalUser: models.User{
-			ID:               22,
-			Email:            "owner@example.com",
-			RecoveryCodeHash: recoveryHash,
-			LocalAuthEnabled: true,
-			Role:             models.RoleOwner,
+		emailFor: "owner@example.com",
+		emailMatches: []models.User{
+			{
+				ID:               22,
+				Email:            "owner@example.com",
+				PasswordHash:     string(passwordHash),
+				RecoveryCodeHash: recoveryHash,
+				LocalAuthEnabled: true,
+				Role:             models.RoleOwner,
+			},
 		},
 	}
 	service := NewAuthService(repo)
 
-	user, err := service.FindUserByEmailAndRecoveryCode(context.Background(), "Owner@Example.com", recoveryCode)
+	user, err := service.FindUserByEmailRecoveryCodeAndPassword(context.Background(), "Owner@Example.com", recoveryCode, "StrongPass1")
 	if err != nil {
-		t.Fatalf("FindUserByEmailAndRecoveryCode() unexpected error: %v", err)
+		t.Fatalf("FindUserByEmailRecoveryCodeAndPassword() unexpected error: %v", err)
 	}
 	if user == nil || user.ID != 22 {
 		t.Fatalf("expected user id 22, got %#v", user)
 	}
 }
 
-func TestAuthServiceFindUserByEmailAndRecoveryCodeRejectsMismatch(t *testing.T) {
+// TestAuthServiceFindUserByEmailRecoveryCodeAndPasswordRejectsWrongPassword
+// pins the second operand: a correct recovery code alone must not resolve an
+// account, or the recovery code is again a single-secret takeover credential.
+func TestAuthServiceFindUserByEmailRecoveryCodeAndPasswordRejectsWrongPassword(t *testing.T) {
+	recoveryCode, recoveryHash, err := GenerateRecoveryCodeHash()
+	if err != nil {
+		t.Fatalf("GenerateRecoveryCodeHash() unexpected error: %v", err)
+	}
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte("StrongPass1"), bcrypt.DefaultCost)
+	if err != nil {
+		t.Fatalf("hash password: %v", err)
+	}
+
+	repo := &stubAuthUserRepo{
+		emailFor: "owner@example.com",
+		emailMatches: []models.User{
+			{
+				ID:               22,
+				Email:            "owner@example.com",
+				PasswordHash:     string(passwordHash),
+				RecoveryCodeHash: recoveryHash,
+				LocalAuthEnabled: true,
+				Role:             models.RoleOwner,
+			},
+		},
+	}
+	service := NewAuthService(repo)
+
+	for name, password := range map[string]string{"wrong": "NotThePassword9", "empty": ""} {
+		if _, err := service.FindUserByEmailRecoveryCodeAndPassword(context.Background(), "Owner@Example.com", recoveryCode, password); !errors.Is(err, ErrRecoveryCodeNotFound) {
+			t.Fatalf("expected ErrRecoveryCodeNotFound for a %s password, got %v", name, err)
+		}
+	}
+}
+
+func TestAuthServiceFindUserByEmailRecoveryCodeAndPasswordRejectsMismatch(t *testing.T) {
 	recoveryCode, recoveryHash, err := GenerateRecoveryCodeHash()
 	if err != nil {
 		t.Fatalf("GenerateRecoveryCodeHash() unexpected error: %v", err)
 	}
 
 	repo := &stubAuthUserRepo{
-		findByEmailOptionalEmail: "owner@example.com",
-		findByEmailOptionalFound: true,
-		findByEmailOptionalUser: models.User{
-			ID:               22,
-			Email:            "owner@example.com",
-			RecoveryCodeHash: recoveryHash,
-			LocalAuthEnabled: true,
+		emailFor: "owner@example.com",
+		emailMatches: []models.User{
+			{
+				ID:               22,
+				Email:            "owner@example.com",
+				RecoveryCodeHash: recoveryHash,
+				LocalAuthEnabled: true,
+			},
 		},
 	}
 	service := NewAuthService(repo)
 
-	if _, err := service.FindUserByEmailAndRecoveryCode(context.Background(), "other@example.com", recoveryCode); !errors.Is(err, ErrRecoveryCodeNotFound) {
+	if _, err := service.FindUserByEmailRecoveryCodeAndPassword(context.Background(), "other@example.com", recoveryCode, "StrongPass1"); !errors.Is(err, ErrRecoveryCodeNotFound) {
 		t.Fatalf("expected ErrRecoveryCodeNotFound for mismatched email, got %v", err)
 	}
 }
 
-func TestAuthServiceFindUserByEmailAndRecoveryCodeRejectsMissingUser(t *testing.T) {
+func TestAuthServiceFindUserByEmailRecoveryCodeAndPasswordRejectsMissingUser(t *testing.T) {
 	service := NewAuthService(&stubAuthUserRepo{})
 
-	if _, err := service.FindUserByEmailAndRecoveryCode(context.Background(), "missing@example.com", "OVUM-ABCD-2345-EFGH"); !errors.Is(err, ErrRecoveryCodeNotFound) {
+	if _, err := service.FindUserByEmailRecoveryCodeAndPassword(context.Background(), "missing@example.com", "OVUM-ABCD-2345-EFGH", "StrongPass1"); !errors.Is(err, ErrRecoveryCodeNotFound) {
 		t.Fatalf("expected ErrRecoveryCodeNotFound for missing user, got %v", err)
 	}
 }
@@ -520,7 +704,7 @@ func TestAuthServiceResolveUserByResetToken(t *testing.T) {
 	}
 	service := NewAuthService(repo)
 
-	token, err := service.BuildPasswordResetToken(secret, 42, repo.user.PasswordHash, 30*time.Minute, now)
+	token, err := service.BuildPasswordResetToken(secret, 42, repo.user.PasswordHash, 1, PasswordResetTokenPurposeRecovery, 30*time.Minute, now)
 	if err != nil {
 		t.Fatalf("BuildPasswordResetToken() unexpected error: %v", err)
 	}
@@ -555,7 +739,7 @@ func TestAuthServiceResolveUserByResetTokenRejectsStateMismatch(t *testing.T) {
 		},
 	}
 	service := NewAuthService(repo)
-	token, err := service.BuildPasswordResetToken(secret, 42, string(originalHash), 30*time.Minute, now)
+	token, err := service.BuildPasswordResetToken(secret, 42, string(originalHash), 1, PasswordResetTokenPurposeRecovery, 30*time.Minute, now)
 	if err != nil {
 		t.Fatalf("BuildPasswordResetToken() unexpected error: %v", err)
 	}
@@ -569,7 +753,8 @@ func TestAuthServiceRegenerateRecoveryCode(t *testing.T) {
 	repo := &stubAuthUserRepo{}
 	service := NewAuthService(repo)
 
-	recoveryCode, err := service.RegenerateRecoveryCode(context.Background(), 55)
+	user := &models.User{ID: 55}
+	recoveryCode, err := service.RegenerateRecoveryCode(context.Background(), user, noopRecoveryCodeDelivery)
 	if err != nil {
 		t.Fatalf("RegenerateRecoveryCode() unexpected error: %v", err)
 	}
@@ -582,8 +767,68 @@ func TestAuthServiceRegenerateRecoveryCode(t *testing.T) {
 	if repo.updatedRecoveryHash == "" {
 		t.Fatalf("expected non-empty recovery hash update")
 	}
+	// The caller's user started at the zero value (AuthSessionVersion 0), which
+	// reads as version 1; the compare-and-set writes the version after it, so a
+	// never-set row becomes 2 — a 1 would read as the version it was revoking.
 	if repo.user.AuthSessionVersion != 2 {
 		t.Fatalf("expected AuthSessionVersion to be bumped to 2, got %d", repo.user.AuthSessionVersion)
+	}
+	if user.AuthSessionVersion != 2 {
+		t.Fatalf("expected the caller's user to carry the rotated AuthSessionVersion 2, got %d", user.AuthSessionVersion)
+	}
+}
+
+// TestAuthServiceClaimRecoveryCodeRevealIsSingleUseAndOwnerBound pins the seam
+// the reveal handlers gate on: the first claim wins, a replay loses, and a claim
+// naming no account is refused BEFORE it reaches the repository — an absent
+// owner id is invalid input, never a claim that skips the comparison.
+func TestAuthServiceClaimRecoveryCodeRevealIsSingleUseAndOwnerBound(t *testing.T) {
+	repo := &stubAuthUserRepo{}
+	service := NewAuthService(repo)
+	now := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
+
+	claimed, err := service.ClaimRecoveryCodeReveal(context.Background(), 42, now)
+	if err != nil {
+		t.Fatalf("ClaimRecoveryCodeReveal() unexpected error: %v", err)
+	}
+	if !claimed {
+		t.Fatal("expected the first claim to consume the reveal")
+	}
+	if repo.claimRevealUserID != 42 {
+		t.Fatalf("expected the claim to name owner 42, got %d", repo.claimRevealUserID)
+	}
+
+	replayed, err := service.ClaimRecoveryCodeReveal(context.Background(), 42, now)
+	if err != nil {
+		t.Fatalf("ClaimRecoveryCodeReveal() replay error: %v", err)
+	}
+	if replayed {
+		t.Fatal("expected a replayed claim to lose against the mark already set")
+	}
+
+	unattributed := &stubAuthUserRepo{}
+	if _, err := NewAuthService(unattributed).ClaimRecoveryCodeReveal(context.Background(), 0, now); !errors.Is(err, ErrAuthUserRequired) {
+		t.Fatalf("expected ErrAuthUserRequired for a claim naming no account, got %v", err)
+	}
+	if unattributed.claimRevealUserID != 0 || unattributed.user.RecoveryCodeRevealedAt != nil {
+		t.Fatal("a claim naming no account must never reach the repository")
+	}
+}
+
+// TestAuthServiceClaimRecoveryCodeRevealSurfacesStorageFailure keeps the
+// storage error distinguishable from "already claimed": the handler refuses on
+// either, but conflating them here would hide a database outage behind a
+// perfectly ordinary-looking replay.
+func TestAuthServiceClaimRecoveryCodeRevealSurfacesStorageFailure(t *testing.T) {
+	storageFailure := errors.New("claim failed")
+	repo := &stubAuthUserRepo{claimRevealErr: storageFailure}
+
+	claimed, err := NewAuthService(repo).ClaimRecoveryCodeReveal(context.Background(), 42, time.Now())
+	if !errors.Is(err, storageFailure) {
+		t.Fatalf("expected the storage failure to surface, got %v", err)
+	}
+	if claimed {
+		t.Fatal("a claim that could not be recorded must never report success")
 	}
 }
 
@@ -600,9 +845,9 @@ func TestAuthServiceResolveUserByAuthSessionToken(t *testing.T) {
 	}
 	service := NewAuthService(repo)
 
-	token, err := service.BuildAuthSessionToken(secret, 42, models.RoleOwner, 1, 30*time.Minute, now)
+	token, _, err := service.BuildAuthSessionTokenWithSessionID(secret, 42, models.RoleOwner, 1, 30*time.Minute, now)
 	if err != nil {
-		t.Fatalf("BuildAuthSessionToken() unexpected error: %v", err)
+		t.Fatalf("BuildAuthSessionTokenWithSessionID() unexpected error: %v", err)
 	}
 
 	user, err := service.ResolveUserByAuthSessionToken(context.Background(), secret, token, now.Add(1*time.Minute))
@@ -628,9 +873,9 @@ func TestAuthServiceResolveUserByAuthSessionTokenRejectsRevokedSession(t *testin
 	}
 	service := NewAuthService(repo)
 
-	token, err := service.BuildAuthSessionToken(secret, 42, models.RoleOwner, 1, 30*time.Minute, now)
+	token, _, err := service.BuildAuthSessionTokenWithSessionID(secret, 42, models.RoleOwner, 1, 30*time.Minute, now)
 	if err != nil {
-		t.Fatalf("BuildAuthSessionToken() unexpected error: %v", err)
+		t.Fatalf("BuildAuthSessionTokenWithSessionID() unexpected error: %v", err)
 	}
 
 	if _, err := service.ResolveUserByAuthSessionToken(context.Background(), secret, token, now.Add(1*time.Minute)); !errors.Is(err, ErrAuthSessionTokenRevoked) {

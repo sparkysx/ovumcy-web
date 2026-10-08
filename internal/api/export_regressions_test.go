@@ -11,6 +11,8 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/ovumcy/ovumcy-web/internal/models"
+	"github.com/ovumcy/ovumcy-web/internal/services"
+	"github.com/ovumcy/ovumcy-web/internal/testenv"
 )
 
 func TestExportCSVRespectsRequestedDateRange(t *testing.T) {
@@ -107,7 +109,7 @@ func TestExportCSVIncludesKnownAndOtherSymptoms(t *testing.T) {
 		Flow:            models.FlowLight,
 		Mood:            5,
 		SexActivity:     models.SexActivityUnprotected,
-		BBT:             models.NewBBT(36.70),
+		BBT:             new(36.70),
 		CervicalMucus:   models.CervicalMucusCreamy,
 		CycleStart:      true,
 		IsUncertain:     true,
@@ -204,7 +206,7 @@ func TestExportJSONNormalizesFlowAndMapsSymptoms(t *testing.T) {
 		Flow:            "unexpected-flow",
 		Mood:            4,
 		SexActivity:     models.SexActivityProtected,
-		BBT:             models.NewBBT(36.55),
+		BBT:             new(36.55),
 		CervicalMucus:   models.CervicalMucusEggWhite,
 		CycleStart:      true,
 		IsUncertain:     true,
@@ -229,14 +231,14 @@ func TestExportJSONNormalizesFlowAndMapsSymptoms(t *testing.T) {
 }
 
 func decodeExportJSONPayload(t *testing.T, body io.Reader) struct {
-	ExportedAt string            `json:"exported_at"`
-	Entries    []exportJSONEntry `json:"entries"`
+	ExportedAt string                     `json:"exported_at"`
+	Entries    []services.ExportJSONEntry `json:"entries"`
 } {
 	t.Helper()
 
 	payload := struct {
-		ExportedAt string            `json:"exported_at"`
-		Entries    []exportJSONEntry `json:"entries"`
+		ExportedAt string                     `json:"exported_at"`
+		Entries    []services.ExportJSONEntry `json:"entries"`
 	}{}
 	if err := json.NewDecoder(body).Decode(&payload); err != nil {
 		t.Fatalf("decode json payload: %v", err)
@@ -245,8 +247,8 @@ func decodeExportJSONPayload(t *testing.T, body io.Reader) struct {
 }
 
 func assertExportJSONPayload(t *testing.T, payload struct {
-	ExportedAt string            `json:"exported_at"`
-	Entries    []exportJSONEntry `json:"entries"`
+	ExportedAt string                     `json:"exported_at"`
+	Entries    []services.ExportJSONEntry `json:"entries"`
 }) {
 	t.Helper()
 
@@ -267,7 +269,7 @@ func assertExportJSONPayloadMetadata(t *testing.T, exportedAt string) {
 	}
 }
 
-func assertSingleExportJSONEntry(t *testing.T, entries []exportJSONEntry) exportJSONEntry {
+func assertSingleExportJSONEntry(t *testing.T, entries []services.ExportJSONEntry) services.ExportJSONEntry {
 	t.Helper()
 
 	if len(entries) != 1 {
@@ -276,7 +278,7 @@ func assertSingleExportJSONEntry(t *testing.T, entries []exportJSONEntry) export
 	return entries[0]
 }
 
-func assertExportJSONTrackingFields(t *testing.T, entry exportJSONEntry) {
+func assertExportJSONTrackingFields(t *testing.T, entry services.ExportJSONEntry) {
 	t.Helper()
 
 	if entry.Flow != models.FlowNone {
@@ -308,7 +310,7 @@ func assertExportJSONTrackingFields(t *testing.T, entry exportJSONEntry) {
 	}
 }
 
-func assertExportJSONSymptomFields(t *testing.T, entry exportJSONEntry) {
+func assertExportJSONSymptomFields(t *testing.T, entry services.ExportJSONEntry) {
 	t.Helper()
 
 	if !entry.Symptoms.Mood {
@@ -427,10 +429,7 @@ func TestExportSummaryUsesRequestTimezoneForRangeParsing(t *testing.T) {
 	app, database := newOnboardingTestApp(t)
 	user := createOnboardingTestUser(t, database, "export-summary-timezone@example.com", "StrongPass1", true)
 
-	location, err := time.LoadLocation("Pacific/Kiritimati")
-	if err != nil {
-		t.Skipf("load Pacific/Kiritimati timezone: %v", err)
-	}
+	location := testenv.RequireTimeZone(t, "Pacific/Kiritimati")
 
 	localDay := time.Date(2026, time.March, 13, 0, 0, 0, 0, location)
 	if err := database.Create(&models.DailyLog{

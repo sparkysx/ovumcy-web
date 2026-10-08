@@ -15,8 +15,8 @@ import (
 // specific surviving/not-covered gremlins mutant so the mutant is killed:
 //
 //   - The per-purpose TTL constants (oidcStateCookieTTL, oidcStepupCookieTTL,
-//     oidcLinkPendingCookieTTL, resetPasswordCookieTTL, recoveryCodeCookieTTL,
-//     totpPendingCookieTTL) were ARITHMETIC_BASE "NOT COVERED": `N * time.Minute`
+//     resetPasswordCookieTTL, recoveryCodeCookieTTL, totpPendingCookieTTL)
+//     were ARITHMETIC_BASE "NOT COVERED": `N * time.Minute`
 //     mutates to `N / time.Minute` == 0s (integer division; N < 60e9 ns), so a
 //     freshly issued cookie would expire immediately. Each test pins the expiry
 //     distance against a *literal* duration — never the production constant,
@@ -103,28 +103,6 @@ func TestNewOIDCStepupStateExpiryHonorsTenMinuteTTL(t *testing.T) {
 	}
 }
 
-// --- oidcLinkPendingCookieTTL: 5 * time.Minute (payload ExpiresAt) ----------
-
-func TestNewOIDCLinkPendingPayloadExpiryHonorsFiveMinuteTTL(t *testing.T) {
-	t.Parallel()
-
-	now := time.Date(2026, 6, 2, 9, 0, 0, 0, time.UTC)
-	payload, err := newOIDCLinkPendingPayload(now, 11, "https://idp.example", "subject-123", "user@example.test")
-	if err != nil {
-		t.Fatalf("newOIDCLinkPendingPayload: %v", err)
-	}
-
-	expiresAt, err := time.Parse(time.RFC3339Nano, payload.ExpiresAt)
-	if err != nil {
-		t.Fatalf("parse ExpiresAt %q: %v", payload.ExpiresAt, err)
-	}
-	assertDurationApprox(t, "oidc link-pending cookie TTL", expiresAt.UTC().Sub(now.UTC()), 5*time.Minute)
-
-	if !payload.validAt(now) {
-		t.Fatal("freshly issued OIDC link-pending payload must be valid at issuance time")
-	}
-}
-
 // --- totpPendingCookieTTL: 5 * time.Minute (payload ExpiresAt) --------------
 //
 // Round-trips through the real seal/write path, then opens the produced sealed
@@ -137,7 +115,7 @@ func TestTOTPPendingCookieExpiryHonorsFiveMinuteTTL(t *testing.T) {
 	handler := ttlMutationTestHandler()
 	app := fiber.New()
 	app.Get("/set", func(c fiber.Ctx) error {
-		if err := handler.setTOTPPendingCookie(c, 42, true); err != nil {
+		if err := handler.setTOTPPendingCookie(c, 42, 1, true, ""); err != nil {
 			t.Fatalf("setTOTPPendingCookie: %v", err)
 		}
 		return c.SendStatus(http.StatusNoContent)
@@ -150,6 +128,9 @@ func TestTOTPPendingCookieExpiryHonorsFiveMinuteTTL(t *testing.T) {
 	}
 	defer func() { _ = response.Body.Close() }()
 	after := time.Now()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected status 204, got %d", response.StatusCode)
+	}
 
 	sealed := responseCookieValue(response.Cookies(), totpPendingCookieName)
 	if sealed == "" {
@@ -187,7 +168,7 @@ func TestResetPasswordCookieExpiresHonorsThirtyMinuteTTL(t *testing.T) {
 	handler := ttlMutationTestHandler()
 	app := fiber.New()
 	app.Get("/set", func(c fiber.Ctx) error {
-		if err := handler.setResetPasswordCookie(c, "reset-token-fixture", false); err != nil {
+		if err := handler.setResetPasswordCookie(c, "reset-token-fixture"); err != nil {
 			t.Fatalf("setResetPasswordCookie: %v", err)
 		}
 		return c.SendStatus(http.StatusNoContent)
@@ -200,6 +181,9 @@ func TestResetPasswordCookieExpiresHonorsThirtyMinuteTTL(t *testing.T) {
 	}
 	defer func() { _ = response.Body.Close() }()
 	after := time.Now()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected status 204, got %d", response.StatusCode)
+	}
 
 	cookie := responseCookie(response.Cookies(), resetPasswordCookieName)
 	if cookie == nil {
@@ -237,6 +221,9 @@ func TestRecoveryCodeCookieExpiresHonorsTwentyMinuteTTL(t *testing.T) {
 	}
 	defer func() { _ = response.Body.Close() }()
 	after := time.Now()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected status 204, got %d", response.StatusCode)
+	}
 
 	cookie := responseCookie(response.Cookies(), recoveryCodeCookieName)
 	if cookie == nil {
@@ -276,6 +263,10 @@ func TestClearSealedCookieBackdatesExpiryIntoThePast(t *testing.T) {
 	}
 	defer func() { _ = response.Body.Close() }()
 
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected status 204, got %d", response.StatusCode)
+	}
+
 	cookie := responseCookie(response.Cookies(), resetPasswordCookieName)
 	if cookie == nil {
 		t.Fatal("expected a clearing Set-Cookie")
@@ -284,7 +275,13 @@ func TestClearSealedCookieBackdatesExpiryIntoThePast(t *testing.T) {
 		t.Fatalf("expected an empty clearing cookie value, got %q", cookie.Value)
 	}
 	// -1h backdating must put the expiry at least half an hour before the
-	// request began; a 0s (un-backdated) clear would sit at ~requestStart.
+	// request began; a 0s (un-backdated) clear would sit at ~requestStart. A
+	// zero Expires (the Expires attribute dropped entirely) must not satisfy
+	// this either: cookie.Expires.Before(cutoff) is trivially true for the zero
+	// time.Time, so require a genuinely-set, in-the-past expiry.
+	if cookie.Expires.IsZero() {
+		t.Fatal("expected clearing cookie to carry an explicit Expires attribute, got none")
+	}
 	cutoff := requestStart.Add(-30 * time.Minute)
 	if !cookie.Expires.Before(cutoff) {
 		t.Fatalf("expected clearing cookie expiry before %s (backdated ~1h), got %s", cutoff, cookie.Expires)
@@ -301,7 +298,10 @@ func TestOIDCLogoutBridgeValidAtBoundarySecondIsStillValid(t *testing.T) {
 
 	now := time.Date(2026, 6, 2, 9, 0, 0, 0, time.UTC)
 	payload := oidcLogoutBridgeCookiePayload{
-		SessionID:     "session-boundary",
+		SessionID: "session-boundary",
+		// validAt also refuses a payload naming no owner, so the boundary this
+		// case is about is only reachable with one supplied.
+		UserID:        oidcLogoutBridgeTestOwnerID,
 		ExpiresAtUnix: now.UTC().Unix(),
 	}
 	if !payload.validAt(now) {
@@ -339,7 +339,8 @@ func TestReadRecoveryCodeDisplayStateEmptyTargetDerivesFromPath(t *testing.T) {
 		RecoveryCode: "recovery-code-fixture",
 		ContinuePath: "/settings",
 		// ContinueTarget intentionally empty.
-		Surface: recoveryCodeSurfaceDedicated,
+		Surface:   recoveryCodeSurfaceDedicated,
+		ExpiresAt: time.Now().Add(recoveryCodeCookieTTL),
 	}
 	serialized, err := json.Marshal(payload)
 	if err != nil {
@@ -400,6 +401,9 @@ func TestFlashCookieExpiresHonorsFiveMinuteTTL(t *testing.T) {
 	}
 	defer func() { _ = response.Body.Close() }()
 	after := time.Now()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected status 204, got %d", response.StatusCode)
+	}
 
 	cookie := responseCookie(response.Cookies(), flashCookieName)
 	if cookie == nil {
@@ -422,9 +426,10 @@ func TestFlashCookieExpiresHonorsFiveMinuteTTL(t *testing.T) {
 // `20 * time.Minute` mutates to `20 / time.Minute` == 0s. This cookie seals the
 // one-time calendar-feed subscribe URL (a SECRET) for a shown-once reveal; a 0s
 // Expires makes it session-immediately-expiring so the reveal page can never
-// read it back. The payload carries no expiry and readCalendarFeedRevealState
-// does not validate one, so the Set-Cookie Expires attribute is the only TTL
-// surface — pin it against a literal 20m.
+// read it back. The same value is also written into the payload's `expires_at`,
+// which is the bound readCalendarFeedRevealState actually verifies; this test
+// pins the attribute half against a literal 20m, and the payload half is pinned
+// by the refusal guards in calendar_feed_reveal_expiry_regression_test.go.
 
 func TestCalendarFeedRevealCookieExpiresHonorsTwentyMinuteTTL(t *testing.T) {
 	t.Parallel()
@@ -445,6 +450,9 @@ func TestCalendarFeedRevealCookieExpiresHonorsTwentyMinuteTTL(t *testing.T) {
 	}
 	defer func() { _ = response.Body.Close() }()
 	after := time.Now()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected status 204, got %d", response.StatusCode)
+	}
 
 	cookie := responseCookie(response.Cookies(), calendarFeedRevealCookieName)
 	if cookie == nil {

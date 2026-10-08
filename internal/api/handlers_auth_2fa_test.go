@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,26 +28,34 @@ func setupTOTPForUser(t *testing.T, database *gorm.DB, userID uint, secretKey []
 	if err != nil {
 		t.Fatalf("GenerateSetupKey: %v", err)
 	}
-	if err := svc.EnableTOTP(context.Background(), userID, key.Secret()); err != nil {
+	if err := svc.EnableTOTP(context.Background(), userID, 1, key.Secret(), verifiedEnrollmentStepForTest(t, key.Secret())); err != nil {
 		t.Fatalf("EnableTOTP: %v", err)
 	}
 	return key.Secret()
 }
 
 // dbUserRepoForTest adapts *gorm.DB to services.TOTPUserRepository for test setup.
+// Its TOTP write bumps the session version unconditionally: it seeds fixtures,
+// and the compare-and-set the production repository runs is not its subject.
 type dbUserRepoForTest struct{ db *gorm.DB }
 
-func (r *dbUserRepoForTest) UpdateTOTPFieldsAndRevokeSessions(ctx context.Context, userID uint, encryptedSecret string, enabled bool) error {
+func (r *dbUserRepoForTest) UpdateTOTPFieldsAndRevokeSessions(ctx context.Context, userID uint, _ int, encryptedSecret string, enabled bool, lastUsedStep int64) error {
 	return r.db.Model(&models.User{}).Where("id = ?", userID).Updates(map[string]any{
 		"totp_secret":          encryptedSecret,
 		"totp_enabled":         enabled,
-		"totp_last_used_step":  0,
+		"totp_last_used_step":  lastUsedStep,
 		"auth_session_version": gorm.Expr("auth_session_version + 1"),
 	}).Error
 }
 
-func (r *dbUserRepoForTest) UpdateTOTPSecretCiphertext(ctx context.Context, userID uint, encryptedSecret string) error {
-	return r.db.Model(&models.User{}).Where("id = ?", userID).Update("totp_secret", encryptedSecret).Error
+func (r *dbUserRepoForTest) UpgradeTOTPSecretCiphertextCAS(ctx context.Context, userID uint, oldCiphertext string, newCiphertext string) (bool, error) {
+	result := r.db.Model(&models.User{}).
+		Where("id = ? AND totp_secret = ?", userID, oldCiphertext).
+		Update("totp_secret", newCiphertext)
+	if result.Error != nil {
+		return false, result.Error
+	}
+	return result.RowsAffected == 1, nil
 }
 
 func (r *dbUserRepoForTest) ClaimTOTPStep(ctx context.Context, userID uint, step int64) (bool, error) {
@@ -65,6 +74,10 @@ func sealTOTPPendingCookieForTest(t *testing.T, secretKey []byte, userID uint, r
 		UserID:     userID,
 		RememberMe: rememberMe,
 		ExpiresAt:  time.Now().Add(5 * time.Minute),
+		// setupTOTPForUser enables TOTP through the same write production uses,
+		// which bumps auth_session_version from 1 to 2; the first factor of a
+		// sign-in that follows passes at that version.
+		SessionVersion: 2,
 	}
 	serialized, err := json.Marshal(payload)
 	if err != nil {
@@ -84,8 +97,9 @@ func sealTOTPPendingCookieForTest(t *testing.T, secretKey []byte, userID uint, r
 func sealExpiredTOTPPendingCookieForTest(t *testing.T, secretKey []byte, userID uint) string {
 	t.Helper()
 	payload := totpPendingCookiePayload{
-		UserID:    userID,
-		ExpiresAt: time.Now().Add(-1 * time.Minute), // already expired
+		UserID:         userID,
+		ExpiresAt:      time.Now().Add(-1 * time.Minute), // already expired
+		SessionVersion: 1,
 	}
 	serialized, err := json.Marshal(payload)
 	if err != nil {
@@ -199,6 +213,120 @@ func TestVerifyTOTPLogin_ExpiredPendingCookie_ReturnsError(t *testing.T) {
 	}
 }
 
+// TestTOTPChallengeClearsAPendingCookieItCannotUse pins the clear at the two
+// handler boundaries that read `ovumcy_totp_pending`, because they answer
+// differently and a clear owed by only one of them would be easy to miss: the
+// challenge POST maps to the session-expired spec, the challenge page redirects
+// to /login.
+//
+// The cookie is session-scoped at path "/", so a value the server has just
+// refused kept being sent on every later request until the browser closed. The
+// payload's own ExpiresAt fails closed, so this is blast radius, not a bypass —
+// but a refused value has no business surviving the response that refused it.
+//
+// Anchored on the retry case: a wrong six-digit code is a refusal ABOUT the
+// code, and it must leave the pending cookie alone, otherwise the challenge the
+// response redirects back to could never be answered.
+func TestTOTPChallengeClearsAPendingCookieItCannotUse(t *testing.T) {
+	app, database := newOnboardingTestAppWithCSRF(t)
+	user := createOnboardingTestUser(t, database, "totp-pending-clear@example.com", "StrongPass1", true)
+	secretKey := []byte("test-secret-key")
+	setupTOTPForUser(t, database, user.ID, secretKey)
+	csrfToken, csrfCookieHeader := extractCSRFCookieAndToken(t, app)
+
+	validPending := sealTOTPPendingCookieForTest(t, secretKey, user.ID, false)
+
+	// Anchor: the cookie survives a refusal that is not about the cookie.
+	wrongCode := doTOTPChallengeRequest(t, app, joinCookieHeader(validPending, csrfCookieHeader), "000000", csrfToken)
+	defer func() { _ = wrongCode.Body.Close() }()
+	if wrongCode.StatusCode != http.StatusSeeOther {
+		t.Fatalf("expected a wrong code to redirect back to the challenge, got %d", wrongCode.StatusCode)
+	}
+	assertTOTPCookieLeftInPlace(t, wrongCode, totpPendingCookieName)
+
+	tamperedPending := totpPendingCookieName + "=" + flipLastBaseEncodedByte(t, strings.TrimPrefix(validPending, totpPendingCookieName+"="))
+	unusable := map[string]string{
+		"expired":  sealExpiredTOTPPendingCookieForTest(t, secretKey, user.ID),
+		"tampered": tamperedPending,
+	}
+	for name, pendingCookie := range unusable {
+		t.Run(name, func(t *testing.T) {
+			response := doTOTPChallengeRequest(t, app, joinCookieHeader(pendingCookie, csrfCookieHeader), "123456", csrfToken)
+			defer func() { _ = response.Body.Close() }()
+
+			if response.StatusCode != http.StatusSeeOther {
+				t.Fatalf("expected the challenge to refuse the %s pending cookie, got status %d", name, response.StatusCode)
+			}
+			if issued := responseCookie(response.Cookies(), authCookieName); issued != nil && issued.Value != "" {
+				t.Fatalf("a %s pending cookie must not issue an auth session", name)
+			}
+			assertTOTPCookieCleared(t, response, totpPendingCookieName)
+		})
+	}
+
+	// The challenge PAGE reads the same cookie and answers with a redirect
+	// instead of a mapped error, so it owes the clear separately.
+	t.Run("challenge_page", func(t *testing.T) {
+		expiredRequest := httptest.NewRequest(http.MethodGet, "/auth/2fa", nil)
+		expiredRequest.Header.Set("Accept-Language", "en")
+		expiredRequest.Header.Set("Cookie", sealExpiredTOTPPendingCookieForTest(t, secretKey, user.ID))
+		expiredPage := mustAppResponse(t, app, expiredRequest)
+
+		if expiredPage.StatusCode != http.StatusSeeOther {
+			t.Fatalf("expected an expired pending cookie to send the challenge page back to login, got %d", expiredPage.StatusCode)
+		}
+		if location := expiredPage.Header.Get("Location"); location != "/login" {
+			t.Fatalf("expected a redirect to /login, got %q", location)
+		}
+		assertTOTPCookieCleared(t, expiredPage, totpPendingCookieName)
+
+		// Anchor: the page still renders for a valid pending cookie, and does not
+		// retract it on the way — otherwise a reload would drop the challenge.
+		validRequest := httptest.NewRequest(http.MethodGet, "/auth/2fa", nil)
+		validRequest.Header.Set("Accept-Language", "en")
+		validRequest.Header.Set("Cookie", validPending)
+		validPage := mustAppResponse(t, app, validRequest)
+
+		if validPage.StatusCode != http.StatusOK {
+			t.Fatalf("expected the challenge page to render for a valid pending cookie, got %d", validPage.StatusCode)
+		}
+		assertTOTPCookieLeftInPlace(t, validPage, totpPendingCookieName)
+	})
+}
+
+// TestVerifyTOTPLogin_StaleSessionVersion_RefusesAndClearsCookie pins the
+// grant's binding to auth_session_version (handlers_auth_2fa.go,
+// services.SecondFactorGrantCurrent): a pending cookie minted before a
+// posture change bumped the row — here, TOTP enrollment itself, which bumps
+// the version from 1 to 2 — must be refused even though the cookie is
+// well-formed, unexpired, and names a user whose secret decrypts (Verifiable
+// is true), so this exercises the version check specifically and not the
+// earlier Verifiable/FindByID branch.
+func TestVerifyTOTPLogin_StaleSessionVersion_RefusesAndClearsCookie(t *testing.T) {
+	app, database := newOnboardingTestAppWithCSRF(t)
+	user := createOnboardingTestUser(t, database, "totp-stale-version@example.com", "StrongPass1", true)
+	secretKey := []byte("test-secret-key")
+	setupTOTPForUser(t, database, user.ID, secretKey) // bumps auth_session_version from 1 to 2
+	csrfToken, csrfCookieHeader := extractCSRFCookieAndToken(t, app)
+
+	stalePending := totpPendingCookieName + "=" + sealTOTPCookiePayloadForTest(t, secretKey, totpPendingCookieName, totpPendingCookiePayload{
+		UserID:         user.ID,
+		ExpiresAt:      time.Now().Add(5 * time.Minute),
+		SessionVersion: 1,
+	})
+
+	response := doTOTPChallengeRequest(t, app, joinCookieHeader(stalePending, csrfCookieHeader), "123456", csrfToken)
+	defer func() { _ = response.Body.Close() }()
+
+	if response.StatusCode != http.StatusSeeOther {
+		t.Fatalf("expected a stale-version pending grant to redirect back to the challenge, got %d", response.StatusCode)
+	}
+	if issued := responseCookie(response.Cookies(), authCookieName); issued != nil && issued.Value != "" {
+		t.Fatal("a stale-version pending grant must not issue an auth session")
+	}
+	assertTOTPCookieCleared(t, response, totpPendingCookieName)
+}
+
 func TestVerifyTOTPLogin_ValidCode_IssuesSessionAndRedirects(t *testing.T) {
 	app, database := newOnboardingTestAppWithCSRF(t)
 	user := createOnboardingTestUser(t, database, "totp-valid@example.com", "StrongPass1", true)
@@ -229,6 +357,108 @@ func TestVerifyTOTPLogin_ValidCode_IssuesSessionAndRedirects(t *testing.T) {
 	}
 }
 
+// TestVerifyTOTPLogin_AcceptsBothPublishedAndFormBodies pins the endpoint's two
+// transports against each other in one test: the JSON body docs/openapi.yaml
+// publishes as the request shape, and the urlencoded form the challenge page
+// posts. Reading the code with c.FormValue alone answered every JSON request
+// with "totp invalid code" — the same answer a wrong code gets — so an API
+// client written against the published contract could never complete 2FA while
+// the browser flow, and every test driving it, stayed green.
+func TestVerifyTOTPLogin_AcceptsBothPublishedAndFormBodies(t *testing.T) {
+	for _, transport := range []struct {
+		name        string
+		contentType string
+		wantStatus  int
+		body        func(code, csrfToken string) string
+	}{
+		{
+			// The spec documents both outcomes for this endpoint: 200 with
+			// {"ok":true} for a JSON caller, 303 for the browser form.
+			name:        "json body (published contract)",
+			contentType: "application/json",
+			wantStatus:  http.StatusOK,
+			body: func(code, _ string) string {
+				return `{"code":"` + code + `"}`
+			},
+		},
+		{
+			name:        "urlencoded form (challenge page)",
+			contentType: "application/x-www-form-urlencoded",
+			wantStatus:  http.StatusSeeOther,
+			body: func(code, csrfToken string) string {
+				return url.Values{"code": {code}, "csrf_token": {csrfToken}}.Encode()
+			},
+		},
+	} {
+		t.Run(transport.name, func(t *testing.T) {
+			app, database := newOnboardingTestAppWithCSRF(t)
+			user := createOnboardingTestUser(t, database, "totp-transport@example.com", "StrongPass1", true)
+			secretKey := []byte("test-secret-key")
+			rawSecret := setupTOTPForUser(t, database, user.ID, secretKey)
+			pendingCookie := sealTOTPPendingCookieForTest(t, secretKey, user.ID, false)
+
+			code, err := totp.GenerateCode(rawSecret, time.Now())
+			if err != nil {
+				t.Fatalf("GenerateCode: %v", err)
+			}
+
+			csrfToken, csrfCookieHeader := extractCSRFCookieAndToken(t, app)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/2fa-challenge",
+				strings.NewReader(transport.body(code, csrfToken)))
+			req.Header.Set("Content-Type", transport.contentType)
+			req.Header.Set("X-CSRF-Token", csrfToken)
+			req.Header.Set("Cookie", joinCookieHeader(pendingCookie, csrfCookieHeader))
+			req.Header.Set("Accept-Language", "en")
+			resp, err := app.Test(req, testConfigNoTimeout)
+			if err != nil {
+				t.Fatalf("POST /api/v1/sessions/2fa-challenge: %v", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+
+			if resp.StatusCode != transport.wantStatus {
+				t.Fatalf("status = %d, want %d — the valid code was not accepted over %s",
+					resp.StatusCode, transport.wantStatus, transport.contentType)
+			}
+			if authCookie := responseCookie(resp.Cookies(), authCookieName); authCookie == nil || authCookie.Value == "" {
+				t.Errorf("expected an auth cookie after a valid code over %s", transport.contentType)
+			}
+		})
+	}
+}
+
+// TestVerifyTOTPLogin_MalformedJSONBody_AnswersInvalidCode covers the other
+// branch of the JSON transport: a body that announces itself as JSON and does
+// not parse. It must land on the same neutral "invalid code" answer as a wrong
+// code — never a 500, and never a message that tells a caller how its payload
+// was misread.
+func TestVerifyTOTPLogin_MalformedJSONBody_AnswersInvalidCode(t *testing.T) {
+	app, database := newOnboardingTestAppWithCSRF(t)
+	user := createOnboardingTestUser(t, database, "totp-malformed@example.com", "StrongPass1", true)
+	secretKey := []byte("test-secret-key")
+	setupTOTPForUser(t, database, user.ID, secretKey)
+	pendingCookie := sealTOTPPendingCookieForTest(t, secretKey, user.ID, false)
+
+	csrfToken, csrfCookieHeader := extractCSRFCookieAndToken(t, app)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/2fa-challenge",
+		strings.NewReader(`{"code":`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-CSRF-Token", csrfToken)
+	req.Header.Set("Cookie", joinCookieHeader(pendingCookie, csrfCookieHeader))
+	req.Header.Set("Accept-Language", "en")
+	resp, err := app.Test(req, testConfigNoTimeout)
+	if err != nil {
+		t.Fatalf("POST /api/v1/sessions/2fa-challenge: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 for a malformed JSON body", resp.StatusCode)
+	}
+	if authCookie := responseCookie(resp.Cookies(), authCookieName); authCookie != nil && authCookie.Value != "" {
+		t.Error("a malformed body must not issue an auth cookie")
+	}
+}
+
 func TestVerifyTOTPLogin_InvalidCode_DoesNotIssueSession(t *testing.T) {
 	app, database := newOnboardingTestAppWithCSRF(t)
 	user := createOnboardingTestUser(t, database, "totp-invalid@example.com", "StrongPass1", true)
@@ -246,13 +476,50 @@ func TestVerifyTOTPLogin_InvalidCode_DoesNotIssueSession(t *testing.T) {
 	if authCookie != nil && authCookie.Value != "" {
 		t.Error("invalid code should not issue an auth cookie")
 	}
+
+	// "No auth cookie" alone is satisfied by ANY refusal, so on its own this test
+	// stayed green when the request never reached TOTP verification: a corrupted CSRF
+	// token and a dropped pending cookie both look identical through that assertion.
+	//
+	// The browser path answers a rejected code with a redirect back to the challenge
+	// (the HTMX path is the one that surfaces the raw status — see the rate-limit test
+	// below). The status alone rules out a CSRF refusal, which is a 403.
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("expected 303 back to the challenge, got %d — the request may have been refused before TOTP verification", resp.StatusCode)
+	}
+	if location := resp.Header.Get("Location"); location != "/auth/2fa" {
+		t.Fatalf("expected a redirect back to /auth/2fa after a rejected code, got %q", location)
+	}
+
+	// It does NOT rule out a refusal that never reached the code check: dropping the
+	// pending cookie produces the same 303 to the same place (verified by injection).
+	// The rejection reason travels in the flash, so following the redirect is the only
+	// way to prove the code check is what refused.
+	flashValue := responseCookieValue(resp.Cookies(), flashCookieName)
+	if flashValue == "" {
+		t.Fatal("expected a flash cookie carrying the rejection reason")
+	}
+	follow := httptest.NewRequest(http.MethodGet, "/auth/2fa", nil)
+	follow.Header.Set("Accept-Language", "en")
+	follow.Header.Set("Cookie", joinCookieHeader(pendingCookie, flashCookieName+"="+flashValue))
+	followResp := mustAppResponse(t, app, follow)
+	defer func() { _ = followResp.Body.Close() }()
+	rendered := mustReadBodyString(t, followResp.Body)
+	// The page reports the error by its LOCALE key: the flash carries the error
+	// spec key ("totp invalid code") and the page resolves it through
+	// AuthErrorTranslationKey before rendering, so the observable hook is
+	// error.totp_invalid_code. Keyed off the spec so the two cannot drift.
+	invalidCodeKey := services.AuthErrorTranslationKey(totpInvalidCodeErrorSpec().Key)
+	if htmlAuthErrorByKey(mustParseHTMLDocument(t, rendered), invalidCodeKey) == nil {
+		t.Fatalf("expected the invalid-code error (%s) on the challenge page; a request that never reached verification carries a session-expired flash instead, with an identical status and destination", invalidCodeKey)
+	}
 }
 
 // TestVerifyTOTPLogin_RateLimited_HTMXReturns429 drives more failures than the
 // configured limit through /api/v1/sessions/2fa-challenge via the HTMX path (which surfaces the
 // real status code) and asserts the 6th attempt is rejected with 429 by the
-// rate limiter. Guards against accidental removal of the CheckRateLimit call
-// in the handler or wiring breakage between handler and service.
+// rate limiter. Guards against accidental removal of the attempt reservation in
+// the handler or wiring breakage between handler and service.
 func TestVerifyTOTPLogin_RateLimited_HTMXReturns429(t *testing.T) {
 	app, database := newOnboardingTestAppWithCSRF(t)
 	user := createOnboardingTestUser(t, database, "totp-ratelimit@example.com", "StrongPass1", true)
@@ -298,6 +565,331 @@ func TestVerifyTOTPLogin_RateLimited_HTMXReturns429(t *testing.T) {
 	}
 }
 
+// TestVerifyTOTPLogin_ConcurrentWrongCodesAreComparedNoMoreThanTheLimit throws a
+// burst of simultaneous wrong codes at one account through the real handler.
+// A 401 is answered only after ValidateCode compared the code and found it
+// wrong, so the number of 401s is the number of comparisons that ran: it must
+// equal the limit, with every other submission refused before any compare. A
+// handler that counted the failures first and booked them after the compare
+// would let the whole burst through.
+func TestVerifyTOTPLogin_ConcurrentWrongCodesAreComparedNoMoreThanTheLimit(t *testing.T) {
+	const burst = 40
+	app, database := newOnboardingTestAppWithCSRF(t)
+	user := createOnboardingTestUser(t, database, "totp-burst@example.com", "StrongPass1", true)
+	secretKey := []byte("test-secret-key")
+	setupTOTPForUser(t, database, user.ID, secretKey)
+	csrfToken, csrfCookieHeader := extractCSRFCookieAndToken(t, app)
+	pending := sealTOTPPendingCookieForTest(t, secretKey, user.ID, false)
+
+	statuses := make([]int, burst)
+	failures := make([]error, burst)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for index := range burst {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			form := url.Values{"code": {"000000"}, "csrf_token": {csrfToken}}
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/2fa-challenge", strings.NewReader(form.Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.Header.Set("HX-Request", "true")
+			req.Header.Set("Cookie", joinCookieHeader(pending, csrfCookieHeader))
+			req.Header.Set("Accept-Language", "en")
+			<-start
+			resp, err := app.Test(req, testConfigNoTimeout)
+			if err != nil {
+				failures[index] = err
+				return
+			}
+			statuses[index] = resp.StatusCode
+			_ = resp.Body.Close()
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	compared, refused := 0, 0
+	for index, status := range statuses {
+		if failures[index] != nil {
+			t.Fatalf("request %d: %v", index, failures[index])
+		}
+		switch status {
+		case http.StatusUnauthorized:
+			compared++
+		case http.StatusTooManyRequests:
+			refused++
+		default:
+			t.Fatalf("request %d status = %d, want 401 (compared) or 429 (refused)", index, status)
+		}
+	}
+	if compared != services.DefaultTOTPAttemptsLimit || refused != burst-services.DefaultTOTPAttemptsLimit {
+		t.Fatalf("%d codes were compared and %d refused, want %d compared and %d refused", compared, refused, services.DefaultTOTPAttemptsLimit, burst-services.DefaultTOTPAttemptsLimit)
+	}
+}
+
+// TestVerifyTOTPLogin_MalformedCodesNeverDrawTheAttemptBudget pins that a code
+// no authenticator could produce leaves the budget untouched: a submission that
+// is not six digits is the caller's own input and no compare runs for it, so any
+// number of them leaves the full budget for the real codes after. That it is
+// refused before the budget is even consulted is the next test's subject.
+func TestVerifyTOTPLogin_MalformedCodesNeverDrawTheAttemptBudget(t *testing.T) {
+	app, database := newOnboardingTestAppWithCSRF(t)
+	user := createOnboardingTestUser(t, database, "totp-malformed@example.com", "StrongPass1", true)
+	secretKey := []byte("test-secret-key")
+	setupTOTPForUser(t, database, user.ID, secretKey)
+	csrfToken, csrfCookieHeader := extractCSRFCookieAndToken(t, app)
+
+	submit := func(code string) int {
+		t.Helper()
+		// The HTMX path surfaces the real status code; the browser path answers
+		// every refusal with a redirect.
+		pending := sealTOTPPendingCookieForTest(t, secretKey, user.ID, false)
+		form := url.Values{"code": {code}, "csrf_token": {csrfToken}}
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/2fa-challenge", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("HX-Request", "true")
+		req.Header.Set("Cookie", joinCookieHeader(pending, csrfCookieHeader))
+		req.Header.Set("Accept-Language", "en")
+		resp, err := app.Test(req, testConfigNoTimeout)
+		if err != nil {
+			t.Fatalf("POST /api/v1/sessions/2fa-challenge: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		return resp.StatusCode
+	}
+
+	for attempt := range 3 * services.DefaultTOTPAttemptsLimit {
+		if status := submit("12345"); status == http.StatusTooManyRequests {
+			t.Fatalf("malformed submission %d was rate limited: it drew the attempt budget", attempt+1)
+		}
+	}
+	for attempt := range services.DefaultTOTPAttemptsLimit {
+		if status := submit("000000"); status == http.StatusTooManyRequests {
+			t.Fatalf("wrong code %d was rate limited before the limit: the malformed submissions kept their slots", attempt+1)
+		}
+	}
+	if status := submit("000000"); status != http.StatusTooManyRequests {
+		t.Fatalf("wrong code past the limit = %d, want 429", status)
+	}
+}
+
+// TestVerifyTOTPLogin_InternalErrorsNeverDrawTheAttemptBudget pins the other
+// way out that compared no verdict: a correct code whose step claim fails in
+// storage answers an internal error and gives its slot back, so a storage fault
+// cannot lock the owner out of the challenge.
+func TestVerifyTOTPLogin_InternalErrorsNeverDrawTheAttemptBudget(t *testing.T) {
+	app, database := newOnboardingTestAppWithCSRF(t)
+	user := createOnboardingTestUser(t, database, "totp-internal@example.com", "StrongPass1", true)
+	secretKey := []byte("test-secret-key")
+	rawSecret := setupTOTPForUser(t, database, user.ID, secretKey)
+	csrfToken, csrfCookieHeader := extractCSRFCookieAndToken(t, app)
+	if err := database.Exec(`CREATE TRIGGER refuse_totp_step_claim BEFORE UPDATE OF totp_last_used_step ON users BEGIN SELECT RAISE(ABORT, 'claim refused'); END`).Error; err != nil {
+		t.Fatalf("install the failing claim: %v", err)
+	}
+	code, err := totp.GenerateCode(rawSecret, time.Now())
+	if err != nil {
+		t.Fatalf("GenerateCode: %v", err)
+	}
+
+	for attempt := range 2 * services.DefaultTOTPAttemptsLimit {
+		pending := sealTOTPPendingCookieForTest(t, secretKey, user.ID, false)
+		form := url.Values{"code": {code}, "csrf_token": {csrfToken}}
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/2fa-challenge", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("HX-Request", "true")
+		req.Header.Set("Cookie", joinCookieHeader(pending, csrfCookieHeader))
+		req.Header.Set("Accept-Language", "en")
+		resp, err := app.Test(req, testConfigNoTimeout)
+		if err != nil {
+			t.Fatalf("POST /api/v1/sessions/2fa-challenge: %v", err)
+		}
+		status := resp.StatusCode
+		_ = resp.Body.Close()
+		if status != http.StatusInternalServerError {
+			t.Fatalf("submission %d status = %d, want 500 (the storage fault reaches the handler; 429 means an internal error drew the budget)", attempt+1, status)
+		}
+	}
+}
+
+// submitTOTPChallengeHTMX posts one code through the HTMX path, which surfaces
+// the real status code, and returns the response for the caller to close.
+func submitTOTPChallengeHTMX(t *testing.T, app *fiber.App, pending string, csrfCookieHeader string, csrfToken string, code string) *http.Response {
+	t.Helper()
+	form := url.Values{"code": {code}, "csrf_token": {csrfToken}}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/2fa-challenge", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("HX-Request", "true")
+	req.Header.Set("Cookie", joinCookieHeader(pending, csrfCookieHeader))
+	req.Header.Set("Accept-Language", "en")
+	resp, err := app.Test(req, testConfigNoTimeout)
+	if err != nil {
+		t.Fatalf("POST /api/v1/sessions/2fa-challenge: %v", err)
+	}
+	return resp
+}
+
+// TestVerifyTOTPLogin_MalformedCodeIsRefusedBeforeTheBudgetIsConsulted pins the
+// order: a code that cannot be a TOTP code is answered as an invalid code even
+// when the account's budget is spent, and it leaves the pending cookie in place.
+// A handler that reserved first answered such a request 429 and cleared the
+// cookie, so a malformed body could take the owner's challenge away.
+func TestVerifyTOTPLogin_MalformedCodeIsRefusedBeforeTheBudgetIsConsulted(t *testing.T) {
+	app, database := newOnboardingTestAppWithCSRF(t)
+	user := createOnboardingTestUser(t, database, "totp-malformed-order@example.com", "StrongPass1", true)
+	secretKey := []byte("test-secret-key")
+	setupTOTPForUser(t, database, user.ID, secretKey)
+	csrfToken, csrfCookieHeader := extractCSRFCookieAndToken(t, app)
+	pending := func() string { return sealTOTPPendingCookieForTest(t, secretKey, user.ID, false) }
+
+	for range services.DefaultTOTPAttemptsLimit {
+		resp := submitTOTPChallengeHTMX(t, app, pending(), csrfCookieHeader, csrfToken, "000000")
+		_ = resp.Body.Close()
+	}
+	// Anchor: the budget is spent, so a well-formed code is refused with 429.
+	anchor := submitTOTPChallengeHTMX(t, app, pending(), csrfCookieHeader, csrfToken, "000000")
+	defer func() { _ = anchor.Body.Close() }()
+	if anchor.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("well-formed code with a spent budget = %d, want 429: the premise of this test is broken", anchor.StatusCode)
+	}
+
+	for _, code := range []string{"", "12345", "1234567", "abcdef", "12 456"} {
+		resp := submitTOTPChallengeHTMX(t, app, pending(), csrfCookieHeader, csrfToken, code)
+		status := resp.StatusCode
+		assertTOTPCookieLeftInPlace(t, resp, totpPendingCookieName)
+		_ = resp.Body.Close()
+		if status != http.StatusUnauthorized {
+			t.Fatalf("malformed code %q with a spent budget = %d, want 401: it reached the budget", code, status)
+		}
+	}
+}
+
+// TestVerifyTOTPLogin_ARefusalWithoutACompareKeepsNoSlot pins the refund on the
+// two refusals that come after the reservation and before any compare: a pending
+// grant naming no account or an account with no usable second factor, and a grant
+// older than the account's session version. Twice the limit of each leaves the
+// full budget, so only the wrong codes after them are counted.
+func TestVerifyTOTPLogin_ARefusalWithoutACompareKeepsNoSlot(t *testing.T) {
+	app, database := newOnboardingTestAppWithCSRF(t)
+	secretKey := []byte("test-secret-key")
+	enrolled := createOnboardingTestUser(t, database, "totp-no-slot@example.com", "StrongPass1", true)
+	setupTOTPForUser(t, database, enrolled.ID, secretKey) // bumps auth_session_version from 1 to 2
+	plain := createOnboardingTestUser(t, database, "totp-no-slot-plain@example.com", "StrongPass1", true)
+	csrfToken, csrfCookieHeader := extractCSRFCookieAndToken(t, app)
+
+	stale := totpPendingCookieName + "=" + sealTOTPCookiePayloadForTest(t, secretKey, totpPendingCookieName, totpPendingCookiePayload{
+		UserID:         enrolled.ID,
+		ExpiresAt:      time.Now().Add(5 * time.Minute),
+		SessionVersion: 1,
+	})
+	unknownAccount := totpPendingCookieName + "=" + sealTOTPCookiePayloadForTest(t, secretKey, totpPendingCookieName, totpPendingCookiePayload{
+		UserID:         enrolled.ID + 1000,
+		ExpiresAt:      time.Now().Add(5 * time.Minute),
+		SessionVersion: 1,
+	})
+	noSecondFactor := sealTOTPPendingCookieForTest(t, secretKey, plain.ID, false)
+
+	for name, grant := range map[string]string{
+		"stale grant":      stale,
+		"unknown account":  unknownAccount,
+		"no second factor": noSecondFactor,
+	} {
+		t.Run(name, func(t *testing.T) {
+			for attempt := range 2 * services.DefaultTOTPAttemptsLimit {
+				resp := submitTOTPChallengeHTMX(t, app, grant, csrfCookieHeader, csrfToken, "123456")
+				status := resp.StatusCode
+				_ = resp.Body.Close()
+				if status == http.StatusTooManyRequests {
+					t.Fatalf("refusal %d was rate limited: the refusals before it kept their slots", attempt+1)
+				}
+			}
+		})
+	}
+
+	// The enrolled account's budget is whole: its limit of wrong codes is
+	// compared, and only the next one is refused.
+	for attempt := range services.DefaultTOTPAttemptsLimit {
+		resp := submitTOTPChallengeHTMX(t, app, sealTOTPPendingCookieForTest(t, secretKey, enrolled.ID, false), csrfCookieHeader, csrfToken, "000000")
+		status := resp.StatusCode
+		_ = resp.Body.Close()
+		if status != http.StatusUnauthorized {
+			t.Fatalf("wrong code %d = %d, want 401 (compared): the earlier refusals kept their slots", attempt+1, status)
+		}
+	}
+	resp := submitTOTPChallengeHTMX(t, app, sealTOTPPendingCookieForTest(t, secretKey, enrolled.ID, false), csrfCookieHeader, csrfToken, "000000")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("wrong code past the limit = %d, want 429", resp.StatusCode)
+	}
+}
+
+// TestVerifyTOTPLogin_AFailedAccountLookupKeepsItsSlot pins the fail-closed side
+// of the lookup: when the store cannot answer the account read, the submission
+// answers an internal error and keeps its slot, so the limit of them is spent
+// and the next is refused. A handler that gave the slot back on any lookup error
+// let a flapping store submit codes without ever drawing the budget; the refund
+// belongs to a grant naming no account, which the neighbouring test keeps.
+func TestVerifyTOTPLogin_AFailedAccountLookupKeepsItsSlot(t *testing.T) {
+	app, database := newOnboardingTestAppWithCSRF(t)
+	user := createOnboardingTestUser(t, database, "totp-lookup-fault@example.com", "StrongPass1", true)
+	secretKey := []byte("test-secret-key")
+	setupTOTPForUser(t, database, user.ID, secretKey)
+	csrfToken, csrfCookieHeader := extractCSRFCookieAndToken(t, app)
+	if err := database.Exec(`ALTER TABLE users RENAME TO users_unreachable`).Error; err != nil {
+		t.Fatalf("make the account lookup fail: %v", err)
+	}
+
+	for attempt := range services.DefaultTOTPAttemptsLimit {
+		resp := submitTOTPChallengeHTMX(t, app, sealTOTPPendingCookieForTest(t, secretKey, user.ID, false), csrfCookieHeader, csrfToken, "123456")
+		status := resp.StatusCode
+		_ = resp.Body.Close()
+		if status != http.StatusInternalServerError {
+			t.Fatalf("submission %d status = %d, want 500 (the lookup fault reaches the handler as an internal error)", attempt+1, status)
+		}
+	}
+	resp := submitTOTPChallengeHTMX(t, app, sealTOTPPendingCookieForTest(t, secretKey, user.ID, false), csrfCookieHeader, csrfToken, "123456")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("submission past the limit = %d, want 429: the failed lookups gave their slots back", resp.StatusCode)
+	}
+}
+
+// TestVerifyTOTPLogin_AReplayedCodeKeepsItsSlot pins the other side of the
+// refund: a replayed code is a compared code that failed, so each replay stays
+// booked and the budget runs out. A handler that gave the slot back for a replay
+// would let a captured code be replayed without limit.
+func TestVerifyTOTPLogin_AReplayedCodeKeepsItsSlot(t *testing.T) {
+	app, database := newOnboardingTestAppWithCSRF(t)
+	user := createOnboardingTestUser(t, database, "totp-replay-slot@example.com", "StrongPass1", true)
+	secretKey := []byte("test-secret-key")
+	rawSecret := setupTOTPForUser(t, database, user.ID, secretKey)
+	csrfToken, csrfCookieHeader := extractCSRFCookieAndToken(t, app)
+	code, err := totp.GenerateCode(rawSecret, time.Now())
+	if err != nil {
+		t.Fatalf("GenerateCode: %v", err)
+	}
+
+	first := submitTOTPChallengeHTMX(t, app, sealTOTPPendingCookieForTest(t, secretKey, user.ID, false), csrfCookieHeader, csrfToken, code)
+	firstStatus := first.StatusCode
+	_ = first.Body.Close()
+	if firstStatus == http.StatusUnauthorized || firstStatus == http.StatusTooManyRequests {
+		t.Fatalf("first submission status = %d, want the code accepted: the replay premise is broken", firstStatus)
+	}
+
+	for attempt := range services.DefaultTOTPAttemptsLimit {
+		resp := submitTOTPChallengeHTMX(t, app, sealTOTPPendingCookieForTest(t, secretKey, user.ID, false), csrfCookieHeader, csrfToken, code)
+		status := resp.StatusCode
+		_ = resp.Body.Close()
+		if status != http.StatusUnauthorized {
+			t.Fatalf("replay %d = %d, want 401 (compared and refused)", attempt+1, status)
+		}
+	}
+	resp := submitTOTPChallengeHTMX(t, app, sealTOTPPendingCookieForTest(t, secretKey, user.ID, false), csrfCookieHeader, csrfToken, code)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("replay past the limit = %d, want 429: the replays gave their slots back", resp.StatusCode)
+	}
+}
+
 // TestVerifyTOTPLogin_ReplayCode_Rejected proves the handler rejects a TOTP
 // code that has already been consumed for the same user. Guards against
 // removal of the replay check in ValidateCode or its wiring in the handler.
@@ -335,6 +927,124 @@ func TestVerifyTOTPLogin_ReplayCode_Rejected(t *testing.T) {
 
 	if c := responseCookie(resp2.Cookies(), authCookieName); c != nil && c.Value != "" {
 		t.Error("replayed code must not issue a new auth cookie — replay protection failed")
+	}
+}
+
+// TestVerifyTOTPLogin_InvalidCodeRendersLocalizedErrorNotTheSpecKey walks the
+// real browser path of a wrong 2FA code — form POST, flash cookie, redirect back
+// to the challenge page — and pins that the page renders a LOCALIZED message.
+//
+// The challenge page used to pass the flash value (the error spec key) straight
+// into ErrorKey, and the template translates whatever ErrorKey holds; an unknown
+// key comes back unchanged from translateMessage, so every user in every language
+// was shown the literal string "totp invalid code". Nothing failed: the four
+// error.totp_* locale entries existed all along, unreferenced.
+func TestVerifyTOTPLogin_InvalidCodeRendersLocalizedErrorNotTheSpecKey(t *testing.T) {
+	app, database := newOnboardingTestAppWithCSRF(t)
+	user := createOnboardingTestUser(t, database, "totp-i18n@example.com", "StrongPass1", true)
+	secretKey := []byte("test-secret-key")
+	setupTOTPForUser(t, database, user.ID, secretKey)
+	csrfToken, csrfCookieHeader := extractCSRFCookieAndToken(t, app)
+
+	pending := sealTOTPPendingCookieForTest(t, secretKey, user.ID, false)
+	challengeResponse := doTOTPChallengeRequest(t, app, joinCookieHeader(pending, csrfCookieHeader), "000000", csrfToken)
+	flashCookie := responseCookie(challengeResponse.Cookies(), flashCookieName)
+	status := challengeResponse.StatusCode
+	_ = challengeResponse.Body.Close()
+
+	if status != http.StatusSeeOther {
+		t.Fatalf("wrong code status = %d, want 303 (flash redirect back to the challenge page)", status)
+	}
+	if flashCookie == nil || flashCookie.Value == "" {
+		t.Fatal("expected the wrong code to set a flash cookie — the rest of this test has no premise without it")
+	}
+
+	specKey := totpInvalidCodeErrorSpec().Key
+	localeKey := services.AuthErrorTranslationKey(specKey)
+	if localeKey == "" {
+		t.Fatalf("error spec %q has no locale mapping — the page cannot localize it", specKey)
+	}
+
+	rendered := map[string]string{}
+	for _, language := range []string{"en", "ru"} {
+		request := httptest.NewRequest(http.MethodGet, "/auth/2fa", nil)
+		request.Header.Set("Accept-Language", language)
+		request.Header.Set("Cookie", joinCookieHeader(pending, cookiePair(flashCookie)))
+
+		response := mustAppResponse(t, app, request)
+		body := mustReadBodyString(t, response.Body)
+		_ = response.Body.Close()
+
+		errorBlock := htmlAuthErrorByKey(mustParseHTMLDocument(t, body), localeKey)
+		if errorBlock == nil {
+			t.Fatalf("expected the challenge page (%s) to report the error under the locale key %s after a wrong code", language, localeKey)
+		}
+		message := normalizeHTMLText(htmlNodeText(errorBlock))
+		if strings.Contains(message, specKey) {
+			t.Fatalf("challenge page (%s) rendered the raw error spec key as its message: %q", language, message)
+		}
+		if message == "" {
+			t.Fatalf("challenge page (%s) rendered an empty error message", language)
+		}
+		rendered[language] = message
+	}
+
+	// Two languages resolving to the same string would mean the lookup is not
+	// reaching the locale files at all — the failure mode this test exists for.
+	if rendered["en"] == rendered["ru"] {
+		t.Fatalf("expected per-language messages, got the same string for en and ru: %q", rendered["en"])
+	}
+}
+
+// TestVerifyTOTPLogin_IgnoresACodeInTheQueryString pins the challenge's input
+// to the request body. FormValue searched the URL first, so a valid code
+// carried in a link completed the second factor for a body that held none — or
+// a wrong one — and a code in a URL is logged and replayable.
+func TestVerifyTOTPLogin_IgnoresACodeInTheQueryString(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		contentType string
+		body        func(csrfToken string) string
+	}{
+		{"form without a code", "application/x-www-form-urlencoded", func(csrf string) string { return url.Values{"csrf_token": {csrf}}.Encode() }},
+		{"form with a wrong code", "application/x-www-form-urlencoded", func(csrf string) string {
+			return url.Values{"code": {"000000"}, "csrf_token": {csrf}}.Encode()
+		}},
+		{"json without a code", "application/json", func(string) string { return `{}` }},
+		{"json with a wrong code", "application/json", func(string) string { return `{"code":"000000"}` }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app, database := newOnboardingTestAppWithCSRF(t)
+			user := createOnboardingTestUser(t, database, "totp-query-code@example.com", "StrongPass1", true)
+			secretKey := []byte("test-secret-key")
+			rawSecret := setupTOTPForUser(t, database, user.ID, secretKey)
+			pendingCookie := sealTOTPPendingCookieForTest(t, secretKey, user.ID, false)
+
+			validCode, err := totp.GenerateCode(rawSecret, time.Now())
+			if err != nil {
+				t.Fatalf("GenerateCode: %v", err)
+			}
+
+			csrfToken, csrfCookieHeader := extractCSRFCookieAndToken(t, app)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/2fa-challenge?code="+validCode,
+				strings.NewReader(tc.body(csrfToken)))
+			req.Header.Set("Content-Type", tc.contentType)
+			req.Header.Set("X-CSRF-Token", csrfToken)
+			req.Header.Set("Cookie", joinCookieHeader(pendingCookie, csrfCookieHeader))
+			req.Header.Set("Accept-Language", "en")
+			resp, err := app.Test(req, testConfigNoTimeout)
+			if err != nil {
+				t.Fatalf("POST /api/v1/sessions/2fa-challenge: %v", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+
+			if authCookie := responseCookie(resp.Cookies(), authCookieName); authCookie != nil && authCookie.Value != "" {
+				t.Fatal("a code carried only in the query completed the second factor")
+			}
+			if tc.contentType == "application/json" && resp.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401 (totp invalid code)", resp.StatusCode)
+			}
+		})
 	}
 }
 

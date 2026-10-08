@@ -3,16 +3,168 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/printer"
+	"go/token"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/ovumcy/ovumcy-web/internal/i18n"
 	"github.com/ovumcy/ovumcy-web/internal/services"
 )
+
+// TestErrorMappingSwitchesLiveInErrorMappingFiles sweeps every non-test file
+// in the package for a domain-error mapping switch (a function named
+// map…Error) declared outside the error_mapping_*.go files. The mapping layer
+// is centralized so every error path is reviewed in one place; a mapper hiding
+// in a handler file drifts out of that review (the OIDC link-confirm mapper
+// did exactly that). No allowlist: a future offender fails here by name.
+func TestErrorMappingSwitchesLiveInErrorMappingFiles(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
+	}
+	fileSet := token.NewFileSet()
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") || strings.HasPrefix(name, "error_mapping_") {
+			continue
+		}
+		parsed, err := parser.ParseFile(fileSet, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		for _, decl := range parsed.Decls {
+			funcDecl, ok := decl.(*ast.FuncDecl)
+			if !ok {
+				continue
+			}
+			if strings.HasPrefix(funcDecl.Name.Name, "map") && strings.HasSuffix(funcDecl.Name.Name, "Error") {
+				t.Errorf("%s declares %s: map…Error switches belong in an error_mapping_*.go file", name, funcDecl.Name.Name)
+			}
+		}
+	}
+}
+
+// TestNoSwitchDefaultRepeatsAnExplicitCase sweeps every non-test file in the
+// package for an error-classifying switch — a tagless switch whose every case
+// predicate is an errors.Is call — with a default arm byte-identical to one of
+// its own explicit cases. Such an arm cannot be regression-pinned: a
+// table-driven mapper test that asserts the spec for its sentinel stays green
+// after the arm is deleted, so a reader cannot tell which arms classify an
+// error and which are decoration, and every new sentinel has to be triaged
+// against mappers where the classification and the fallback are the same edit.
+// Fold the arm into the default — saying in a comment that the shared outcome
+// is deliberate — rather than restating it.
+//
+// Two shapes are deliberately out of scope, and both are why the sweep asks
+// for errors.Is rather than for any duplicated body. A switch on a *value*
+// (respondAuthError's per-path redirects) enumerates known inputs in the case
+// values themselves, with the default as the forward-compat net for the ones
+// nobody enumerated yet. A chain of *shape predicates* (sanitizeRequestLogSegment)
+// is ordered, so an early arm returning its input unchanged short-circuits the
+// masking rules below it and is load-bearing however the default reads. Error
+// sentinels are mutually exclusive, so neither excuse applies to them. No
+// allowlist: a future offender fails here by file and line.
+func TestNoSwitchDefaultRepeatsAnExplicitCase(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
+	}
+	fileSet := token.NewFileSet()
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		parsed, err := parser.ParseFile(fileSet, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		ast.Inspect(parsed, func(node ast.Node) bool {
+			switchStmt, ok := node.(*ast.SwitchStmt)
+			if !ok || switchStmt.Body == nil || switchStmt.Tag != nil {
+				return true
+			}
+			defaultBody := ""
+			haveDefault := false
+			caseBodies := map[string]token.Pos{}
+			for _, statement := range switchStmt.Body.List {
+				clause, ok := statement.(*ast.CaseClause)
+				if !ok {
+					continue
+				}
+				rendered := renderCaseClauseBody(t, fileSet, clause)
+				if clause.List == nil {
+					defaultBody, haveDefault = rendered, true
+					continue
+				}
+				if !classifiesErrorSentinels(clause) {
+					return true
+				}
+				if _, seen := caseBodies[rendered]; !seen {
+					caseBodies[rendered] = clause.Case
+				}
+			}
+			if !haveDefault {
+				return true
+			}
+			if casePos, duplicated := caseBodies[defaultBody]; duplicated {
+				t.Errorf(
+					"%s: the case at line %d repeats the default of the switch at line %d verbatim; fold it into the default",
+					name,
+					fileSet.Position(casePos).Line,
+					fileSet.Position(switchStmt.Switch).Line,
+				)
+			}
+			return true
+		})
+	}
+}
+
+// classifiesErrorSentinels reports whether every predicate of one case arm is
+// an errors.Is call, which is how this package spells "classify a domain
+// sentinel" and what makes the arms of a switch mutually exclusive.
+func classifiesErrorSentinels(clause *ast.CaseClause) bool {
+	for _, predicate := range clause.List {
+		call, ok := predicate.(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || selector.Sel.Name != "Is" {
+			return false
+		}
+		pkg, ok := selector.X.(*ast.Ident)
+		if !ok || pkg.Name != "errors" {
+			return false
+		}
+	}
+	return len(clause.List) > 0
+}
+
+// renderCaseClauseBody prints a case clause's statements without their
+// comments, so two arms that differ only in formatting or in an explanatory
+// comment still compare equal.
+func renderCaseClauseBody(t *testing.T, fileSet *token.FileSet, clause *ast.CaseClause) string {
+	t.Helper()
+
+	rendered := &strings.Builder{}
+	for _, statement := range clause.Body {
+		if err := printer.Fprint(rendered, fileSet, statement); err != nil {
+			t.Fatalf("print case clause body: %v", err)
+		}
+		rendered.WriteString("\n")
+	}
+	return strings.TrimSpace(rendered.String())
+}
 
 func TestCommonErrorSpecs(t *testing.T) {
 	testCases := []struct {
@@ -91,8 +243,9 @@ func TestRequestTooLargeErrorSpecIsCanonical(t *testing.T) {
 // client receives the shared status-error fragment carrying the stable key.
 func TestRespondRequestEntityTooLargeNegotiatesFormat(t *testing.T) {
 	t.Run("json envelope", func(t *testing.T) {
+		handler := &Handler{}
 		app := fiber.New()
-		app.Post("/probe", RespondRequestEntityTooLarge)
+		app.Post("/probe", handler.RespondRequestEntityTooLarge)
 
 		request := httptest.NewRequest(http.MethodPost, "/probe", strings.NewReader("{}"))
 		request.Header.Set("Content-Type", "application/json")
@@ -127,8 +280,9 @@ func TestRespondRequestEntityTooLargeNegotiatesFormat(t *testing.T) {
 	})
 
 	t.Run("htmx status fragment", func(t *testing.T) {
+		handler := &Handler{i18n: newRateLimitResponderTestI18n(t)}
 		app := fiber.New()
-		app.Post("/probe", RespondRequestEntityTooLarge)
+		app.Post("/probe", handler.RespondRequestEntityTooLarge)
 
 		request := httptest.NewRequest(http.MethodPost, "/probe", strings.NewReader("{}"))
 		request.Header.Set("HX-Request", "true")
@@ -145,9 +299,21 @@ func TestRespondRequestEntityTooLargeNegotiatesFormat(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read body: %v", err)
 		}
+		// The flash key is the RESOLVED i18n key, not the spec key: it is what a
+		// surface asserts on and what a localized rendering keys off. This app
+		// carries no request-scoped messages — the early-path case the exported
+		// responder is built for — but RespondRequestEntityTooLarge resolves the
+		// catalogue itself (apiError -> ensureRequestMessages) before rendering,
+		// so the visible text is the real English copy rather than a fallback to
+		// the machine key (WEB-86).
+		expected := newRateLimitResponderTestI18n(t).Messages(i18n.LangEN)["common.error.request_too_large"]
+		if strings.TrimSpace(expected) == "" {
+			t.Fatal("locale en defines no common.error.request_too_large")
+		}
 		assertBodyContainsAll(t, string(body),
 			bodyStringMatch{fragment: `class="status-error"`, message: "expected shared status-error wrapper for HTMX 413"},
-			bodyStringMatch{fragment: `data-flash-key="request_too_large"`, message: "expected stable flash key on HTMX 413 fragment"},
+			bodyStringMatch{fragment: `data-flash-key="common.error.request_too_large"`, message: "expected the resolved i18n key on the HTMX 413 fragment"},
+			bodyStringMatch{fragment: expected, message: "expected the localized request-too-large sentence, not the raw machine key"},
 		)
 	})
 }
@@ -250,9 +416,12 @@ func TestMapSettingsPasswordChangeError(t *testing.T) {
 			want: settingsFormErrorSpec(fiber.StatusUnauthorized, APIErrorCategoryUnauthorized, "invalid current password"),
 		},
 		{
-			name: "local password required",
+			// WEB-54: no local password answers IDENTICALLY to a wrong current
+			// password — same 401 SettingsPasswordChangeKeyInvalidCurrent spec,
+			// not the distinct "local password required" 403 this used to map to.
+			name: "no local password merges into invalid current password",
 			err:  services.ErrSettingsLocalPasswordNotSet,
-			want: settingsLocalPasswordRequiredErrorSpec(),
+			want: settingsFormErrorSpec(fiber.StatusUnauthorized, APIErrorCategoryUnauthorized, "invalid current password"),
 		},
 		{
 			name: "new password must differ",
@@ -263,6 +432,13 @@ func TestMapSettingsPasswordChangeError(t *testing.T) {
 			name: "weak password",
 			err:  services.ErrSettingsWeakPassword,
 			want: settingsFormErrorSpec(fiber.StatusBadRequest, APIErrorCategoryValidation, "weak password"),
+		},
+		{
+			// Shares one spec key with the auth forms on purpose, so the HTML
+			// render and the JSON payload cannot drift onto different sentences.
+			name: "password too long",
+			err:  services.ErrSettingsPasswordTooLong,
+			want: settingsFormErrorSpec(fiber.StatusBadRequest, APIErrorCategoryValidation, "password too long"),
 		},
 		{
 			name: "hash failed",
@@ -278,6 +454,14 @@ func TestMapSettingsPasswordChangeError(t *testing.T) {
 			name: "update failed",
 			err:  services.ErrSettingsPasswordUpdateFailed,
 			want: globalErrorSpec(fiber.StatusInternalServerError, APIErrorCategoryInternal, "failed to update password"),
+		},
+		{
+			// An exhausted re-auth budget must surface as 429, never as "invalid
+			// current password": reporting it as a credential failure would leak
+			// that the budget, not the password, was the blocker.
+			name: "reauth rate limited",
+			err:  services.ErrSettingsReauthRateLimited,
+			want: settingsRateLimitErrorSpec(),
 		},
 		{
 			name: "unknown",
@@ -469,6 +653,136 @@ func TestRespondAPIRateLimitedRoutesByRequestShape(t *testing.T) {
 	}
 }
 
+// TestAccountLockoutOmitsRetryAfterUnlikeEdgeRateLimiter locks the WEB-89
+// contract on POST /api/v1/sessions and POST /api/v1/password-resets: the
+// account-lockout 429 (services.ErrAuthLoginRateLimited /
+// services.ErrPasswordRecoveryRateLimited, raised by the attempt-budget
+// service behind the route and answered through mapAuthLoginError /
+// mapPasswordRecoveryStartError -> respondMappedError -> apiError) carries
+// NEITHER a Retry-After header NOR a retry_after_seconds field, because no
+// budget window backs it with a concrete back-off second count. The edge
+// rate-limiter 429 on the same routes (RespondAPIRateLimited, mounted ahead
+// of the handler in cmd/ovumcy/server.go) carries BOTH, derived from the
+// Retry-After it has already stamped. A client conflating the two would
+// either wait on a hint the lockout never gives, or retry a lockout
+// immediately because it saw no hint at all.
+func TestAccountLockoutOmitsRetryAfterUnlikeEdgeRateLimiter(t *testing.T) {
+	tests := []struct {
+		name        string
+		path        string
+		lockoutSpec APIErrorSpec
+	}{
+		{
+			name:        "sessions",
+			path:        "/api/v1/sessions",
+			lockoutSpec: mapAuthLoginError(services.ErrAuthLoginRateLimited),
+		},
+		{
+			name:        "password-resets",
+			path:        "/api/v1/password-resets",
+			lockoutSpec: mapPasswordRecoveryStartError(services.ErrPasswordRecoveryRateLimited),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Run("account lockout carries neither header nor field", func(t *testing.T) {
+				handler := &Handler{}
+				app := fiber.New()
+				app.Post(tt.path, func(c fiber.Ctx) error {
+					// Mirrors the real handlers' own call shape (Login ->
+					// mapAuthLoginError, ForgotPassword ->
+					// mapPasswordRecoveryStartError), each feeding
+					// respondMappedError with no Retry-After header ever set on
+					// this path.
+					return handler.respondMappedError(c, tt.lockoutSpec)
+				})
+
+				request := httptest.NewRequest(http.MethodPost, tt.path, nil)
+				request.Header.Set("Accept", "application/json")
+				response, err := app.Test(request, testConfigNoTimeout)
+				if err != nil {
+					t.Fatalf("app.Test: %v", err)
+				}
+				defer func() { _ = response.Body.Close() }()
+
+				if response.StatusCode != fiber.StatusTooManyRequests {
+					t.Fatalf("status: got %d want 429", response.StatusCode)
+				}
+				if got := response.Header.Get(fiber.HeaderRetryAfter); got != "" {
+					t.Fatalf("did not expect Retry-After on the account-lockout 429, got %q", got)
+				}
+				body, err := io.ReadAll(response.Body)
+				if err != nil {
+					t.Fatalf("read body: %v", err)
+				}
+				payload := map[string]any{}
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("unmarshal JSON envelope %q: %v", body, err)
+				}
+				if retry, has := payload["retry_after_seconds"]; has {
+					t.Fatalf("did not expect retry_after_seconds on the account-lockout 429, got %v", retry)
+				}
+			})
+
+			t.Run("edge rate limiter carries both", func(t *testing.T) {
+				handler := &Handler{}
+				app := fiber.New()
+				const wantRetryAfter = 9
+				app.Post(tt.path, func(c fiber.Ctx) error {
+					c.Response().Header.Set(fiber.HeaderRetryAfter, strconv.Itoa(wantRetryAfter))
+					return handler.RespondAPIRateLimited(c)
+				})
+
+				request := httptest.NewRequest(http.MethodPost, tt.path, nil)
+				request.Header.Set("Accept", "application/json")
+				response, err := app.Test(request, testConfigNoTimeout)
+				if err != nil {
+					t.Fatalf("app.Test: %v", err)
+				}
+				defer func() { _ = response.Body.Close() }()
+
+				if response.StatusCode != fiber.StatusTooManyRequests {
+					t.Fatalf("status: got %d want 429", response.StatusCode)
+				}
+				if got := response.Header.Get(fiber.HeaderRetryAfter); got != strconv.Itoa(wantRetryAfter) {
+					t.Fatalf("Retry-After: got %q want %q", got, strconv.Itoa(wantRetryAfter))
+				}
+				body, err := io.ReadAll(response.Body)
+				if err != nil {
+					t.Fatalf("read body: %v", err)
+				}
+				payload := map[string]any{}
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("unmarshal JSON envelope %q: %v", body, err)
+				}
+				retry, has := payload["retry_after_seconds"]
+				if !has {
+					t.Fatalf("expected retry_after_seconds on the edge rate-limiter 429, got %v", payload)
+				}
+				if int(retry.(float64)) != wantRetryAfter {
+					t.Fatalf("retry_after_seconds: got %v want %d", retry, wantRetryAfter)
+				}
+			})
+		})
+	}
+}
+
+// newRateLimitResponderTestI18n supplies the locale manager the browser arms of
+// the rate-limit responder now need. The edge limiters answer BEFORE
+// LanguageMiddleware runs, so a refusal resolves its own catalogue rather than
+// rendering the machine key as the visible message — which means these arms can
+// no longer be driven by a zero-value Handler.
+func newRateLimitResponderTestI18n(t *testing.T) *i18n.Manager {
+	t.Helper()
+
+	manager, err := i18n.NewManager("en")
+	if err != nil {
+		t.Fatalf("init i18n manager: %v", err)
+	}
+	return manager
+}
+
 // TestRespondAPIRateLimitedWithoutJSONAcceptFallsBackToMappedError locks
 // the browser-client path of the rate-limit responder: without an
 // application/json Accept header, the JSON envelope branch is skipped and
@@ -477,7 +791,7 @@ func TestRespondAPIRateLimitedRoutesByRequestShape(t *testing.T) {
 // retry-after payload. Without this lock a regression that silently
 // removed the JSON-accept gate could leak the envelope to browser clients.
 func TestRespondAPIRateLimitedWithoutJSONAcceptFallsBackToMappedError(t *testing.T) {
-	handler := &Handler{}
+	handler := &Handler{i18n: newRateLimitResponderTestI18n(t)}
 	app := fiber.New()
 	app.Get("/api/v1/days", func(c fiber.Ctx) error {
 		return handler.RespondAPIRateLimited(c)
@@ -505,10 +819,17 @@ func TestRespondAPIRateLimitedWithoutJSONAcceptFallsBackToMappedError(t *testing
 // path for the auth form variant. Without a JSON Accept header, the
 // response goes through the auth flash + redirect plumbing rather than the
 // JSON envelope, matching what the rate-limited login form sees.
+//
+// The write lands in the CSRF-exempt slot, never the page slot (WEB-40 round
+// 5): the login rate limiter is mounted ahead of csrf.New, so its refusal
+// carries no proof of a token or same-origin request, exactly like the SSO
+// limiter's. respondRateLimitedFormError routes every limiter-originated
+// auth-form refusal through respondAuthErrorCSRFExempt for that reason.
 func TestRespondAuthRateLimitedFallsBackThroughAuthFlash(t *testing.T) {
 	handler := &Handler{
 		secretKey:    []byte(testHandlerSecretKey),
 		cookieSecure: true,
+		i18n:         newRateLimitResponderTestI18n(t),
 	}
 	app := fiber.New()
 	app.Post("/api/v1/sessions", func(c fiber.Ctx) error {
@@ -525,12 +846,120 @@ func TestRespondAuthRateLimitedFallsBackThroughAuthFlash(t *testing.T) {
 	if response.StatusCode != fiber.StatusSeeOther {
 		t.Fatalf("expected 303 redirect for HTML rate-limited auth form, got %d", response.StatusCode)
 	}
-	flashCookie := responseCookie(response.Cookies(), flashCookieName)
-	if flashCookie == nil || flashCookie.Value == "" {
-		t.Fatal("expected flash cookie carrying the rate-limited auth error")
+	if pageCookie := responseCookie(response.Cookies(), flashCookieName); pageCookie != nil && pageCookie.Value != "" {
+		t.Fatalf("did not expect the rate limiter to write the page flash cookie, got %#v", pageCookie)
 	}
-	payload := decodeFlashCookieForTest(t, flashCookie.Value)
+	exemptCookie := responseCookie(response.Cookies(), exemptFlashCookieName)
+	if exemptCookie == nil || exemptCookie.Value == "" {
+		t.Fatal("expected the exempt flash cookie carrying the rate-limited auth error")
+	}
+	payload := mustReadFlashPayloadFromCookie(t, handler.secretKey, response.Cookies(), exemptFlashCookieName)
 	if payload.AuthError != "too many login attempts" {
 		t.Fatalf("expected flash auth_error %q, got %q", "too many login attempts", payload.AuthError)
+	}
+}
+
+// sendStringCallsOutsideHTMLFragmentHelper reports every SendString call in
+// the parsed file that is not inside sendHTMLFragment, as file:line.
+func sendStringCallsOutsideHTMLFragmentHelper(fileSet *token.FileSet, parsed *ast.File) []string {
+	var offenders []string
+	for _, decl := range parsed.Decls {
+		funcDecl, isFunc := decl.(*ast.FuncDecl)
+		if isFunc && funcDecl.Recv == nil && funcDecl.Name.Name == "sendHTMLFragment" {
+			continue
+		}
+		ast.Inspect(decl, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			if selector, ok := call.Fun.(*ast.SelectorExpr); ok && selector.Sel.Name == "SendString" {
+				offenders = append(offenders, fileSet.Position(call.Pos()).String())
+			}
+			return true
+		})
+	}
+	return offenders
+}
+
+// TestSendStringIsCalledOnlyByTheHTMLFragmentHelper sweeps every non-test file
+// in the package for a SendString call outside sendHTMLFragment. fiber's
+// SendString sets no Content-Type, so a status fragment sent through it goes
+// out as fasthttp's default text/plain; HTMX error and success fragments did
+// exactly that while sibling sites set text/html by hand. No
+// allowlist: a future offender fails here by file and line. The anchors are
+// fixtures the test owns, not the package it judges.
+func TestSendStringIsCalledOnlyByTheHTMLFragmentHelper(t *testing.T) {
+	anchorSet := token.NewFileSet()
+	anchor, err := parser.ParseFile(anchorSet, "anchor.go", `package api
+func sendHTMLFragment(c fiber.Ctx, markup string) error { return c.SendString(markup) }
+func offender(c fiber.Ctx) error { return c.Status(400).SendString("x") }
+`, 0)
+	if err != nil {
+		t.Fatalf("parse anchor fixture: %v", err)
+	}
+	if got := sendStringCallsOutsideHTMLFragmentHelper(anchorSet, anchor); len(got) != 1 || !strings.HasPrefix(got[0], "anchor.go:3:") {
+		t.Fatalf("anchor fixture: expected exactly the offender on line 3, got %v", got)
+	}
+
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
+	}
+	fileSet := token.NewFileSet()
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		parsed, err := parser.ParseFile(fileSet, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		for _, offender := range sendStringCallsOutsideHTMLFragmentHelper(fileSet, parsed) {
+			t.Errorf("%s calls SendString directly: answer through sendHTMLFragment so the body is labelled text/html", offender)
+		}
+	}
+}
+
+// TestHTMXFragmentsAreServedAsHTML pins the Content-Type on real routes whose
+// HTMX answer is a hand-built fragment: a mapped error, a settings success
+// toast and the not-found fragment. Each went out as text/plain before the
+// fragments were routed through sendHTMLFragment.
+func TestHTMXFragmentsAreServedAsHTML(t *testing.T) {
+	app, database := newOnboardingTestApp(t)
+	user := createOnboardingTestUser(t, database, "fragment-content-type@example.com", "StrongPass1", true)
+	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
+
+	cases := []struct {
+		name       string
+		method     string
+		path       string
+		form       string
+		wantMarker string
+	}{
+		{name: "settings validation error", method: http.MethodPatch, path: "/api/v1/users/current/cycle", form: "cycle_length=5&period_length=5", wantMarker: "status-error"},
+		{name: "settings success toast", method: http.MethodPatch, path: "/api/v1/users/current/cycle", form: "cycle_length=28&period_length=5", wantMarker: "status-ok"},
+		{name: "not found fragment", method: http.MethodGet, path: "/no-such-page-for-fragment-test", wantMarker: "status-error"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			request := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.form))
+			if tc.form != "" {
+				request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			}
+			request.Header.Set("HX-Request", "true")
+			request.Header.Set("Accept-Language", "en")
+			request.Header.Set("Cookie", authCookie)
+
+			response := mustAppResponse(t, app, request)
+			body := mustReadBodyString(t, response.Body)
+			if !strings.Contains(body, tc.wantMarker) {
+				t.Fatalf("expected a %s fragment, got status %d body %q", tc.wantMarker, response.StatusCode, body)
+			}
+			if got := response.Header.Get("Content-Type"); got != "text/html; charset=utf-8" {
+				t.Fatalf("expected Content-Type text/html; charset=utf-8, got %q", got)
+			}
+		})
 	}
 }

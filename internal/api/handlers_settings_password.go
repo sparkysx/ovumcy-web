@@ -11,7 +11,7 @@ import (
 )
 
 // stepupReauthMaxAge is the maximum acceptable age of an OIDC ID token's
-// auth_time / iat claim relative to the moment we finish the step-up callback.
+// auth_time claim relative to the moment we finish the step-up callback.
 // 5 minutes is long enough for an interactive sign-in (typically 30-60 seconds)
 // but short enough that a captured ID token from an earlier session cannot be
 // replayed to bypass the re-auth requirement.
@@ -43,15 +43,33 @@ func (handler *Handler) ChangePassword(c fiber.Ctx) error {
 		return handler.respondMappedError(c, spec)
 	}
 
-	if err := handler.settingsService.ChangePassword(c.Context(), user, input.CurrentPassword, input.NewPassword, input.ConfirmPassword); err != nil {
+	attempt := services.ReauthAttempt{ClientKey: c.IP(), UserID: user.ID, Now: time.Now()}
+	if err := handler.settingsService.ChangePassword(c.Context(), attempt, user, input.CurrentPassword, input.NewPassword, input.ConfirmPassword); err != nil {
+		if errors.Is(err, services.ErrAuthSessionVersionChanged) {
+			return handler.respondSignedOutRefusal(c, handler.refuseSessionRevokedDuring(c, "auth.password_change", "password_change"))
+		}
 		return handler.respondPasswordChangeError(c, err)
 	}
 
-	if err := handler.refreshPasswordChangeSession(c, user); err != nil {
-		return err
+	// Logged before the reissue attempt below: ChangePassword has already
+	// committed, so the event is true either way (precedent: "unlinked" before
+	// UnlinkOIDCIdentity's reissue).
+	handler.logSecurityEvent(c, "auth.password_change", "success")
+	if _, ok := handler.refreshPasswordChangeSession(c, user); !ok {
+		// The auth cookie is already cleared, so the refusal goes out on the
+		// signed-out channel; returning is what makes it the answer, since
+		// respondPasswordChanged below would otherwise write `{"ok":true}` over it.
+		// The change already committed, so the caller is told to sign in again
+		// (with the new password) rather than that it failed;
+		// refreshCurrentSession still logs authSessionCreateErrorSpec internally
+		// under this scope.
+		//
+		// codecov:ignore:start -- owner-only route behind AuthRequired, so only
+		// the AEAD seal error is left and no request-shaped input provokes it.
+		return handler.respondSignedOutRefusal(c, passwordChangedSignInAgainErrorSpec())
+		// codecov:ignore:end
 	}
 
-	handler.logSecurityEvent(c, "auth.password_change", "success")
 	return handler.respondPasswordChanged(c)
 }
 
@@ -127,8 +145,7 @@ func (handler *Handler) StartLocalPasswordSetupReauth(c fiber.Ctx) error {
 	// Chromium enforces that across the form navigation's redirect chain, so the
 	// cross-origin hop aborts client-side (net::ERR_ABORTED). Hand back a
 	// same-origin interstitial whose meta-refresh performs the hop instead.
-	c.Type("html", "utf-8")
-	return c.SendString(oidcSameOriginRedirectInterstitial(authURL))
+	return respondOIDCSameOriginHandoff(c, authURL)
 }
 
 // completeLocalPasswordSetupReauth is dispatched from CompleteOIDCLogin when
@@ -136,14 +153,13 @@ func (handler *Handler) StartLocalPasswordSetupReauth(c fiber.Ctx) error {
 // the ordinary login state cookie. It must verify the OIDC exchange against
 // the same user that initiated the flow before committing the prepared
 // password.
-func (handler *Handler) completeLocalPasswordSetupReauth(c fiber.Ctx, state oidcStepupState) error {
+func (handler *Handler) completeLocalPasswordSetupReauth(c fiber.Ctx, state oidcStepupState, exchange oidcCallbackExchange) error {
 	if state.Purpose != oidcStepupPurposeLocalPasswordSetup {
 		// codecov:ignore:start -- forward-compat guard: local_password_setup is the only stepup
 		// purpose value today, so a mismatching sealed payload cannot be minted.
 		spec := authOIDCAuthenticationFailedErrorSpec()
 		handler.logSecurityError(c, "auth.local_password_setup.callback", spec)
-		handler.setFlashCookie(c, FlashPayload{AuthError: spec.Key})
-		return c.Redirect().Status(fiber.StatusSeeOther).To("/settings")
+		return handler.redirectSettingsRefusal(c, spec)
 		// codecov:ignore:end
 	}
 
@@ -154,27 +170,21 @@ func (handler *Handler) completeLocalPasswordSetupReauth(c fiber.Ctx, state oidc
 	if err != nil || user == nil || user.ID != state.UserID {
 		spec := settingsOIDCReauthMismatchErrorSpec()
 		handler.logSecurityError(c, "auth.local_password_setup.callback", spec)
-		handler.setFlashCookie(c, FlashPayload{AuthError: spec.Key})
-		return c.Redirect().Status(fiber.StatusSeeOther).To("/settings")
+		return handler.redirectSettingsRefusal(c, spec)
 	}
 	if user.LocalAuthEnabled {
 		// Another flow finished first; nothing left to do.
 		return c.Redirect().Status(fiber.StatusSeeOther).To("/settings")
 	}
 
-	callbackState := handler.oidcCallbackValue(c, "state")
-	code := handler.oidcCallbackValue(c, "code")
-	if !state.matchesState(callbackState) {
-		spec := authOIDCAuthenticationFailedErrorSpec()
-		handler.logSecurityError(c, "auth.local_password_setup.callback", spec)
-		handler.setFlashCookie(c, FlashPayload{AuthError: spec.Key})
-		return c.Redirect().Status(fiber.StatusSeeOther).To("/settings")
-	}
-	if handler.oidcCallbackValue(c, "error") != "" {
+	// The callback state is matched at the dispatch seam every completion
+	// passes through (dispatchStepupCompletion), not here: a copy per purpose
+	// fixed the class at N of N+1, because the next purpose inherits nothing.
+	code := exchange.Code
+	if exchange.Error != "" {
 		spec := authOIDCUnavailableErrorSpec()
 		handler.logSecurityError(c, "auth.local_password_setup.callback", spec)
-		handler.setFlashCookie(c, FlashPayload{AuthError: spec.Key})
-		return c.Redirect().Status(fiber.StatusSeeOther).To("/settings")
+		return handler.redirectSettingsRefusal(c, spec)
 	}
 
 	ctx, cancel := oidcRequestContext(c)
@@ -182,58 +192,93 @@ func (handler *Handler) completeLocalPasswordSetupReauth(c fiber.Ctx, state oidc
 	if err := handler.validateLocalPasswordSetupReauth(ctx, code, state.CodeVerifier, state.Nonce, user.ID, time.Now()); err != nil {
 		spec := mapLocalPasswordSetupReauthError(err)
 		handler.logSecurityError(c, "auth.local_password_setup.callback", spec)
-		handler.setFlashCookie(c, FlashPayload{AuthError: spec.Key})
-		return c.Redirect().Status(fiber.StatusSeeOther).To("/settings")
+		return handler.redirectSettingsRefusal(c, spec)
 	}
 
-	recoveryCode, err := handler.settingsService.FinalizeLocalPasswordSetup(c.Context(), user, state.PasswordHash)
+	// The enrollment revokes every session, this one included, so the device
+	// is re-issued one at the version the write stored. That session and the
+	// new code's reveal are sealed before the write commits: if either cannot
+	// be, nothing is enrolled and the owner keeps the session she is using, with
+	// no recovery code minted that nobody was shown (WEB-58).
+	deliver, delivery := handler.newRecoveryCodeDelivery(sessionWasRemembered(c), settingsContinuePath, recoveryCodeSurfaceDedicated)
+	_, err = handler.settingsService.FinalizeLocalPasswordSetup(c.Context(), user, state.PasswordHash, deliver)
+	if delivery.failure != nil {
+		spec := mapRecoveryCodeDeliveryError(delivery.failure)
+		handler.logSecurityError(c, "auth.local_password_setup.callback", spec)
+		return handler.redirectSettingsRefusal(c, spec)
+	}
+	// The enrollment is written only from the version this session carries: a
+	// revocation committed since the request was authenticated refuses it, and
+	// this device is signed out rather than re-issued past that revocation.
+	if errors.Is(err, services.ErrAuthSessionVersionChanged) {
+		return handler.redirectSignedOutRefusal(c, handler.refuseSessionRevokedDuring(c, "auth.local_password_setup.callback", "local_password_setup"))
+	}
 	if err != nil {
-		return handler.respondPasswordChangeError(c, err)
+		// The commit's refusals leave the same way the re-auth refusals above
+		// do. respondPasswordChangeError is the CHANGE-PASSWORD FORM's
+		// transport: respondSettingsError only flash-redirects to /settings for
+		// paths under /api/v1/users/current, and this handler runs on
+		// /auth/oidc/callback with neither HTMX nor a JSON Accept, so it fell
+		// through to the JSON envelope — rendered as the page to a browser
+		// returning from the identity provider.
+		//
+		// Where each mapped key lands is deliberate. Past the revoked-session
+		// refusal answered above, Finalize can raise exactly three more:
+		// ErrSettingsPasswordChangeInvalidInput carries
+		// services.SettingsPasswordChangeKeyInvalidInput, which
+		// IsChangePasswordErrorMessage attaches to the enrollment form rather
+		// than to the page banner, and that is the right place here too — it
+		// means the prepared pair no longer applies (a password appeared on the
+		// account, or the sealed hash was empty) and the form is where the owner
+		// re-enters one. The other two — "failed to secure password" and
+		// "failed to update password" — are general settings errors: nothing
+		// about the submitted passwords was refused, the write was, so pinning
+		// them to the form would point the owner at fields that are not the
+		// problem. No other services.SettingsPasswordChange* key can arrive
+		// here: the rest are raised by PrepareLocalPasswordHash, which runs on
+		// the form's own route.
+		spec := mapSettingsPasswordChangeError(err)
+		handler.logSecurityError(c, "auth.local_password_setup.callback", spec, settingsReauthCauseField(err))
+		return handler.redirectSettingsRefusal(c, spec)
 	}
-	if err := handler.refreshPasswordChangeSession(c, user); err != nil {
-		return err
-	}
+	handler.installRefreshedSession(c, user, delivery.session, "auth.local_password_setup.callback")
+	handler.writeSealed(c, delivery.reveal)
 
+	// The reveal surface spends the account's one-time reveal mark, so it is
+	// guarded on Fetch Metadata: only a same-origin initiator may claim it
+	// (firstPartyRequestRefusal). Sec-Fetch-Site describes the whole redirect
+	// CHAIN, and this callback is a cross-site POST the provider makes, so a 303
+	// from here reaches /recovery-code still labelled off-origin and the owner's
+	// freshly minted code is refused on the one navigation entitled to it —
+	// silently, landing her on the dashboard with no code and no way back to it.
+	// Handing over a same-origin document instead breaks the chain: the
+	// interstitial's own navigation is initiated by this origin, so the label
+	// becomes true rather than excused, and an attacker's page still cannot
+	// produce one. Same primitive as the outbound hop in
+	// StartLocalPasswordSetupReauth above.
 	handler.logSecurityEvent(c, "auth.local_password_setup.callback", "success")
-	return handler.renderRecoveryCodeResponseWithContinuePath(c, user, recoveryCode, fiber.StatusOK, "/settings")
+	return respondOIDCSameOriginHandoff(c, delivery.nextPath)
 }
 
 func (handler *Handler) validateLocalPasswordSetupReauth(ctx context.Context, code, codeVerifier, nonce string, userID uint, now time.Time) error {
 	return handler.oidcService.ValidateReauthExchange(ctx, code, codeVerifier, nonce, userID, stepupReauthMaxAge, now)
 }
 
-func mapLocalPasswordSetupReauthError(err error) APIErrorSpec {
-	switch {
-	case errors.Is(err, services.ErrOIDCReauthStale):
-		return settingsOIDCReauthStaleErrorSpec()
-	case errors.Is(err, services.ErrOIDCReauthIdentityMismatch):
-		return settingsOIDCReauthMismatchErrorSpec()
-	case errors.Is(err, services.ErrOIDCCallbackInvalid):
-		return authOIDCAuthenticationFailedErrorSpec()
-	case errors.Is(err, services.ErrOIDCAuthenticationFailed):
-		return authOIDCAuthenticationFailedErrorSpec()
-	case errors.Is(err, services.ErrOIDCDisabled), errors.Is(err, services.ErrOIDCUnavailable):
-		return authOIDCUnavailableErrorSpec()
-	default:
-		return authOIDCAuthenticationFailedErrorSpec()
-	}
-}
-
 func parseChangePasswordInput(c fiber.Ctx) (changePasswordInput, error) {
 	input := changePasswordInput{}
-	if err := c.Bind().Body(&input); err != nil {
+	if err := bindRequestBody(c, &input); err != nil {
 		return changePasswordInput{}, err
 	}
 	return input, nil
 }
 
-func (handler *Handler) refreshPasswordChangeSession(c fiber.Ctx, user *models.User) error {
+func (handler *Handler) refreshPasswordChangeSession(c fiber.Ctx, user *models.User) (APIErrorSpec, bool) {
 	return handler.refreshCurrentSession(c, user, "auth.password_change")
 }
 
 func (handler *Handler) respondPasswordChangeError(c fiber.Ctx, err error) error {
 	spec := mapSettingsPasswordChangeError(err)
-	handler.logSecurityError(c, "auth.password_change", spec)
+	handler.logSecurityError(c, "auth.password_change", spec, settingsReauthCauseField(err))
 	return handler.respondMappedError(c, spec)
 }
 
@@ -242,7 +287,7 @@ func (handler *Handler) respondPasswordChanged(c fiber.Ctx) error {
 		return c.JSON(fiber.Map{"ok": true})
 	}
 	if isHTMX(c) {
-		return c.SendString(htmxSettingsSuccessMarkup(c, "password_changed", "Password changed successfully."))
+		return sendHTMLFragment(c, htmxSettingsSuccessMarkup(c, "password_changed", "Password changed successfully."))
 	}
 	handler.setFlashCookie(c, FlashPayload{SettingsSuccess: "password_changed"})
 	return redirectOrJSON(c, "/settings")

@@ -18,9 +18,10 @@ type sealedCookieSpec struct {
 	// sameSite defaults to "Lax" when empty.
 	sameSite string
 	// forceSecure marks cross-site cookies (SameSite=None) that must be
-	// written Secure regardless of COOKIE_SECURE — browsers reject
-	// SameSite=None without Secure. Clears still follow handler.cookieSecure,
-	// matching the long-standing behavior of the OIDC transport cookies.
+	// Secure regardless of COOKIE_SECURE — browsers reject SameSite=None
+	// without Secure. Applies to both write and clear: a clear without
+	// Secure is itself a SameSite=None cookie the browser drops instead of
+	// honoring, leaving the stale cookie in place.
 	forceSecure bool
 }
 
@@ -36,24 +37,46 @@ func (spec sealedCookieSpec) sameSiteOrLax() string {
 // A zero expires writes a session-scoped cookie (payloads carry their own
 // TTL in that case).
 func (handler *Handler) writeSealedCookie(c fiber.Ctx, spec sealedCookieSpec, plaintext []byte, expires time.Time) error {
-	encoded, err := handler.sealCookieValue(spec.name, plaintext)
+	sealed, err := handler.sealCookie(spec, plaintext, expires)
 	if err != nil {
 		return err
 	}
+	handler.writeSealed(c, sealed)
+	return nil
+}
 
+// sealedCookie is a cookie value already sealed and not yet written. Sealing
+// is the half that can fail; writing it cannot, so a caller that must not
+// commit anything it could then fail to hand over seals first and writes
+// after (the recovery-code rotations, WEB-58).
+type sealedCookie struct {
+	spec    sealedCookieSpec
+	value   string
+	expires time.Time
+}
+
+func (handler *Handler) sealCookie(spec sealedCookieSpec, plaintext []byte, expires time.Time) (sealedCookie, error) {
+	encoded, err := handler.sealCookieValue(spec.name, plaintext)
+	if err != nil {
+		return sealedCookie{}, err
+	}
+	return sealedCookie{spec: spec, value: encoded, expires: expires}, nil
+}
+
+func (handler *Handler) writeSealed(c fiber.Ctx, sealed sealedCookie) {
+	spec := sealed.spec
 	cookie := &fiber.Cookie{
 		Name:     spec.name,
-		Value:    encoded,
+		Value:    sealed.value,
 		Path:     spec.path,
 		HTTPOnly: true,
 		Secure:   handler.cookieSecure || spec.forceSecure,
 		SameSite: spec.sameSiteOrLax(),
 	}
-	if !expires.IsZero() {
-		cookie.Expires = expires
+	if !sealed.expires.IsZero() {
+		cookie.Expires = sealed.expires
 	}
 	c.Cookie(cookie)
-	return nil
 }
 
 // clearSealedCookie expires the spec's cookie with attributes matching the
@@ -64,7 +87,7 @@ func (handler *Handler) clearSealedCookie(c fiber.Ctx, spec sealedCookieSpec) {
 		Value:    "",
 		Path:     spec.path,
 		HTTPOnly: true,
-		Secure:   handler.cookieSecure,
+		Secure:   handler.cookieSecure || spec.forceSecure,
 		SameSite: spec.sameSiteOrLax(),
 		Expires:  time.Now().Add(-1 * time.Hour),
 	})
@@ -84,4 +107,21 @@ func (handler *Handler) openCookieValue(cookieName string, raw string) ([]byte, 
 		return nil, err
 	}
 	return codec.open(cookieName, raw)
+}
+
+// sealedPayloadBelongsToSession reports whether a sealed payload minted for one
+// account may be acted on by the session that presented it. It is the
+// cookie-side form of the privacy boundary: an owner id carried by the request
+// is never trusted alone, always combined with the session's own.
+//
+// A zero id on EITHER side is unattributed and never matches. An unattributed
+// payload names no account, so there is nothing to scope its contents to — it
+// must be refused outright rather than treated as a comparison that does not
+// apply. Skipping the comparison in that case would hand whatever the payload
+// carries to whichever session happens to hold the cookie.
+func sealedPayloadBelongsToSession(payloadUserID uint, sessionUserID uint) bool {
+	if payloadUserID == 0 || sessionUserID == 0 {
+		return false
+	}
+	return payloadUserID == sessionUserID
 }

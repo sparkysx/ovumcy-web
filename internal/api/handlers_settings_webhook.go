@@ -32,7 +32,7 @@ func (handler *Handler) UpdateWebhookSettings(c fiber.Ctx) error {
 
 	input, err := parseWebhookSettingsInput(c)
 	if err != nil {
-		return handler.failMutation(c, webhookSettingsMutation, settingsInvalidInputErrorSpec())
+		return handler.failEgressMutation(c, webhookSettingsMutation, user, settingsInvalidInputErrorSpec())
 	}
 
 	form := services.WebhookSettingsFormUpdate{
@@ -44,27 +44,40 @@ func (handler *Handler) UpdateWebhookSettings(c fiber.Ctx) error {
 		RemoveURL:       input.RemoveURL,
 	}
 	if err := handler.webhookSettingsSvc.SaveWebhookSettingsFromForm(c.Context(), user.ID, form); err != nil {
-		return handler.failMutation(c, webhookSettingsMutation, mapSettingsWebhookSaveError(err))
+		return handler.failEgressMutation(c, webhookSettingsMutation, user, mapSettingsWebhookSaveError(err))
 	}
 
 	status := services.SettingsWebhookUpdatedStatus
 	handler.logMutationSuccess(c, webhookSettingsMutation)
 
 	if acceptsJSON(c) {
+		// The three flags come from a read issued after the write, never from the
+		// request: the service normalises what it is asked to store (a removal
+		// forces delivery off whatever `webhook_enabled` said), and an answer built
+		// from the request reports a state the row does not hold. The read is the
+		// one the browser path rebuilds its card from; the endpoint is not part of
+		// what it hands back, so nothing new can leave through this answer.
+		ledger, err := handler.settingsViewService.BuildSettingsEgressViewData(c.Context(), user)
+		if err != nil {
+			// The write has committed, so the honest answer is a failure rather than
+			// a body built from the request.
+			return handler.respondMappedError(c, settingsLoadErrorSpec())
+		}
 		return c.JSON(fiber.Map{
 			"ok":               true,
 			"status":           status,
-			"webhook_enabled":  form.Enabled,
-			"notify_period":    form.NotifyPeriod,
-			"notify_ovulation": form.NotifyOvulation,
+			"webhook_enabled":  ledger.Webhook.Enabled,
+			"notify_period":    ledger.Webhook.NotifyPeriod,
+			"notify_ovulation": ledger.Webhook.NotifyOvulation,
 		})
 	}
-	if isHTMX(c) {
-		return c.SendString(htmxSettingsSuccessMarkup(c, status, "Webhook settings updated successfully."))
-	}
-
-	handler.setFlashCookie(c, FlashPayload{SettingsSuccess: status})
-	return redirectOrJSON(c, "/settings")
+	// The save is the fifth mutation on the egress card and answers like the
+	// other four. It used to return a bare status toast, which was right while
+	// the form targeted its own island; the card now replaces itself, so a toast
+	// alone would swap the whole section -- states, controls and payload lists --
+	// out of the page. Rebuilding from a read after the write is also what stops
+	// the freshly saved endpoint being described by the state it had before.
+	return handler.respondEgressMutationHTML(c, user, status)
 }
 
 func parseWebhookSettingsInput(c fiber.Ctx) (webhookSettingsInput, error) {

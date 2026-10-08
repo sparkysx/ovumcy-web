@@ -75,10 +75,11 @@ func (handler *Handler) Login(c fiber.Ctx) error {
 		handler.logSecurityError(c, "auth.login", spec)
 		return handler.respondMappedError(c, spec)
 	}
+	clientKey := c.IP()
 	result, err := handler.loginService.Authenticate(
 		c.Context(),
 		handler.secretKey,
-		c.IP(),
+		clientKey,
 		credentials.Email,
 		credentials.Password,
 		30*time.Minute,
@@ -90,12 +91,16 @@ func (handler *Handler) Login(c fiber.Ctx) error {
 		return handler.respondMappedError(c, spec)
 	}
 
+	// Each arm below forgives the client's failures only once the cookie that
+	// carries the sign-in onward has been issued: a correct password whose
+	// sign-in could not continue keeps the count it found.
 	if result.RequiresPasswordReset {
-		if err := handler.setResetPasswordCookie(c, result.ResetToken, true); err != nil {
+		if err := handler.setResetPasswordCookie(c, result.ResetToken); err != nil {
 			spec := authResetTokenCreateErrorSpec()
 			handler.logSecurityError(c, "auth.login", spec)
 			return handler.respondMappedError(c, spec)
 		}
+		handler.loginService.ResetAttempts(clientKey)
 		handler.logSecurityEvent(c, "auth.login", "reset_required")
 		if acceptsJSON(c) {
 			return handler.respondMappedError(c, passwordChangeRequiredErrorSpec())
@@ -104,11 +109,12 @@ func (handler *Handler) Login(c fiber.Ctx) error {
 	}
 
 	if result.RequiresTOTP {
-		if err := handler.setTOTPPendingCookie(c, result.User.ID, credentials.RememberMe); err != nil {
+		if err := handler.setTOTPPendingCookie(c, result.User.ID, result.User.AuthSessionVersion, credentials.RememberMe, ""); err != nil {
 			spec := authSessionCreateErrorSpec()
 			handler.logSecurityError(c, "auth.login", spec)
 			return handler.respondMappedError(c, spec)
 		}
+		handler.loginService.ResetAttempts(clientKey)
 		handler.logSecurityEvent(c, "auth.login", "totp_required")
 		if acceptsJSON(c) {
 			return c.Status(fiber.StatusOK).JSON(fiber.Map{"requires_totp": true})
@@ -127,6 +133,7 @@ func (handler *Handler) Login(c fiber.Ctx) error {
 	}
 	handler.clearOIDCLogoutBridgeCookie(c)
 
+	handler.loginService.ResetAttempts(clientKey)
 	handler.logSecurityEvent(
 		c,
 		"auth.login",
@@ -143,37 +150,64 @@ func (handler *Handler) Logout(c fiber.Ctx) error {
 		handler.logSecurityError(c, "auth.logout", spec)
 		return handler.respondMappedError(c, spec)
 	}
+	sessionClaims, hasSession := currentAuthSession(c)
+	// The revoke comes first and the budget check second: a sign-out the owner
+	// asked for must end the session even when the budget is spent, or an
+	// exhausted budget would keep a session alive on a device the owner is
+	// leaving. What the refusal below still withholds is the provider sign-out
+	// bridge and the success answer — the cookies are already gone.
+	if err := handler.authService.RevokeAuthSessions(c.Context(), user.ID); err != nil {
+		// codecov:ignore:start -- the revoke fails only on a storage error, which no
+		// request-shaped input can provoke. The branch stays in step with the
+		// success path below: the auth cookie goes either way, so the session end is
+		// just as deliberate and the language cache goes with it.
+		handler.clearSessionEndCookies(c)
+		spec := authSessionRevokeErrorSpec()
+		handler.logSecurityError(c, "auth.logout", spec)
+		return handler.respondMappedError(c, spec)
+		// codecov:ignore:end
+	}
+	handler.clearSessionEndCookies(c)
+	// The session has ended by this line on every branch below, so the audit
+	// record of it is written here rather than on the success answer alone: a
+	// refused sign-out still terminated a session and must not read as a bare 429.
+	handler.logSecurityEvent(c, "auth.logout", "success")
 	if handler.authService.CheckAndRecordLogoutAttempt(
 		handler.secretKey,
 		c.IP(),
-		strconv.FormatUint(uint64(user.ID), 10),
+		services.LogoutAttemptIdentity(user.ID),
 		time.Now(),
 	) {
 		spec := tooManyLogoutAttemptsErrorSpec()
 		handler.logSecurityError(c, "auth.logout", spec)
-		return handler.respondMappedError(c, spec)
-	}
-	if err := handler.authService.RevokeAuthSessions(c.Context(), user.ID); err != nil {
-		handler.clearAuthRelatedCookies(c)
-		spec := authSessionRevokeErrorSpec()
-		handler.logSecurityError(c, "auth.logout", spec)
-		return handler.respondMappedError(c, spec)
+		if acceptsJSON(c) || isHTMX(c) {
+			return handler.respondMappedError(c, spec)
+		}
+		// The session is already gone, so a browser lands where a signed-out
+		// browser belongs, with the refusal as a flash, not on a JSON body.
+		handler.setFlashCookie(c, FlashPayload{AuthError: spec.Key})
+		return c.Redirect().Status(fiber.StatusSeeOther).To("/login")
 	}
 
 	logoutTransportPath := ""
-	sessionClaims, hasSession := currentAuthSession(c)
-	handler.clearAuthRelatedCookies(c)
 	if hasSession && sessionClaims != nil {
-		logoutState, found, err := handler.oidcLogoutStateSvc.Load(c.Context(), sessionClaims.SessionID, time.Now())
+		logoutState, found, err := handler.oidcLogoutStateSvc.Load(c.Context(), sessionClaims.SessionID, sessionClaims.UserID, time.Now())
 		if err != nil {
 			handler.logSecurityEvent(c, "auth.logout", "provider_logout_state_unavailable")
-		} else if found && validOIDCLogoutState(logoutState) {
-			if err := handler.setOIDCLogoutBridgeCookie(c, sessionClaims.SessionID, time.Now()); err == nil {
+		} else if found && !handler.providerLogoutConfigured() {
+			// The row was written under a configuration that asked for a
+			// provider sign-out; the one in force now does not. It carries the
+			// per-session material for a hop this instance no longer makes, so
+			// the sign-out completes locally and the row goes with the session
+			// rather than waiting out its days-long TTL.
+			_ = handler.oidcLogoutStateSvc.Delete(c.Context(), sessionClaims.SessionID, sessionClaims.UserID)
+			handler.logSecurityEvent(c, "auth.logout", "provider_logout_state_discarded")
+		} else if found && validOIDCLogoutState(logoutState, handler.oidcIssuerURL()) {
+			if err := handler.setOIDCLogoutBridgeCookie(c, sessionClaims.SessionID, sessionClaims.UserID, time.Now()); err == nil {
 				logoutTransportPath = oidcLogoutBridgePath
 			}
 		}
 	}
-	handler.logSecurityEvent(c, "auth.logout", "success")
 	if logoutTransportPath != "" {
 		if isHTMX(c) {
 			c.Set("HX-Redirect", logoutTransportPath)

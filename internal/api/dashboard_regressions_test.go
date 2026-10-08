@@ -85,7 +85,12 @@ func TestDashboardStaleCycleWarningIncludesSettingsCTAAndEstimatedPhase(t *testi
 	user := createOnboardingTestUser(t, database, "dashboard-stale-ui@example.com", "StrongPass1", true)
 	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
 
-	lastPeriodStart := services.DateAtLocation(time.Now().UTC(), time.UTC).AddDate(0, 0, -60)
+	// Cycle day 31 against a 28-day reference: past the reference (stale) but
+	// inside the seven-day grace window, so the late-cycle notice — which now
+	// outranks the stale hint, see
+	// TestDashboardLateCycleNoticeOutranksTheStaleHintAndClaimsNoInventedRange —
+	// stays silent and this test still observes the state it names.
+	lastPeriodStart := services.DateAtLocation(time.Now().UTC(), time.UTC).AddDate(0, 0, -30)
 	if err := database.Model(&models.User{}).Where("id = ?", user.ID).Updates(map[string]any{
 		"cycle_length":      28,
 		"period_length":     5,
@@ -124,12 +129,12 @@ func TestDashboardStaleCycleWarningIncludesSettingsCTAAndEstimatedPhase(t *testi
 		t.Fatal("expected stale cycle warning to include direct settings CTA")
 	}
 
-	statusLine := dashboardElementByDataAttr(document, "data-dashboard-status-line")
-	if statusLine == nil {
-		t.Fatal("expected dashboard status line when stale baseline suppresses the hero")
+	header := dashboardElementByDataAttr(document, "data-dashboard-status-header")
+	if header == nil {
+		t.Fatal("expected the dashboard status header while cycle data is stale")
 	}
-	if got := htmlAttr(statusLine, "data-dashboard-phase"); got != "unknown" {
-		t.Fatalf("expected dashboard status line phase %q while cycle data is stale, got %q", "unknown", got)
+	if got := htmlAttr(header, "data-dashboard-phase"); got != "unknown" {
+		t.Fatalf("expected dashboard status header phase %q while cycle data is stale, got %q", "unknown", got)
 	}
 }
 
@@ -157,12 +162,15 @@ func TestDashboardAndStatsUseSameStalePhasePresentation(t *testing.T) {
 	defer func() { _ = dashboardResponse.Body.Close() }()
 
 	dashboardDocument := mustParseHTMLDocument(t, mustReadBodyString(t, dashboardResponse.Body))
-	dashboardStatusLine := dashboardElementByDataAttr(dashboardDocument, "data-dashboard-status-line")
-	if dashboardStatusLine == nil {
-		t.Fatal("expected dashboard status line while cycle data is stale")
+	dashboardHeader := dashboardElementByDataAttr(dashboardDocument, "data-dashboard-status-header")
+	if dashboardHeader == nil {
+		t.Fatal("expected the dashboard status header while cycle data is stale")
 	}
-	if got := htmlAttr(dashboardStatusLine, "data-dashboard-phase"); got != "unknown" {
-		t.Fatalf("expected dashboard status line phase %q while cycle data is stale, got %q", "unknown", got)
+	if got := htmlAttr(dashboardHeader, "data-dashboard-phase"); got != "unknown" {
+		t.Fatalf("expected dashboard status header phase %q while cycle data is stale, got %q", "unknown", got)
+	}
+	if got := htmlAttr(dashboardHeader, "data-fertility-status"); got != "unknown" {
+		t.Fatalf("expected dashboard status header fertility %q while cycle data is stale, got %q", "unknown", got)
 	}
 
 	statsRequest := httptest.NewRequest(http.MethodGet, "/stats", nil)
@@ -177,6 +185,466 @@ func TestDashboardAndStatsUseSameStalePhasePresentation(t *testing.T) {
 	statsDocument := mustParseHTMLDocument(t, mustReadBodyString(t, statsResponse.Body))
 	if dashboardElementByDataAttr(statsDocument, "data-stats-empty-state") == nil {
 		t.Fatal("expected stats page to show gated empty state before enough completed cycles")
+	}
+}
+
+// dashboardLateCycleNotice returns the late-cycle paragraph and the row of
+// logging actions rendered beside it, so a test can address the chosen state by
+// its data-late-cycle-key attribute rather than by the rendered phrase.
+func dashboardLateCycleNotice(t *testing.T, app *fiber.App, authCookie string) (*html.Node, *html.Node) {
+	t.Helper()
+
+	request := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
+	request.Header.Set("Accept-Language", "en")
+	request.Header.Set("Cookie", authCookie)
+	response := mustAppResponse(t, app, request)
+	assertStatusCode(t, response, http.StatusOK)
+
+	document := mustParseHTMLDocument(t, mustReadBodyString(t, response.Body))
+	warnings := dashboardElementByDataAttr(document, "data-dashboard-cycle-warnings")
+	if warnings == nil {
+		t.Fatal("expected the dashboard cycle warning container on a cycle past its expected end")
+	}
+	if dashboardElementByDataAttr(warnings, "data-dashboard-stale-warning") != nil {
+		t.Fatal("expected the late-cycle notice to replace the stale hint, not to render beside it")
+	}
+	notice := dashboardElementByDataAttr(warnings, "data-dashboard-cycle-day-warning")
+	if notice == nil {
+		t.Fatal("expected the late-cycle notice inside the warning container")
+	}
+	return notice, dashboardElementByDataAttr(warnings, "data-dashboard-late-cycle-actions")
+}
+
+// TestDashboardLateCycleNoticeOutranksTheStaleHintAndClaimsNoInventedRange is
+// the design-item-38 render regression for the insufficient-history half of the
+// late-cycle matrix. An account whose only cycle input is the onboarding
+// baseline has no completed cycle to compare against, so the notice must select
+// the no-personal-range key: the "usual range" it would otherwise cite is the
+// settings value, not a measurement.
+func TestDashboardLateCycleNoticeOutranksTheStaleHintAndClaimsNoInventedRange(t *testing.T) {
+	app, database := newOnboardingTestApp(t)
+	user := createOnboardingTestUser(t, database, "dashboard-late-cycle-no-history@example.com", "StrongPass1", true)
+	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
+
+	lastPeriodStart := services.DateAtLocation(time.Now().UTC(), time.UTC).AddDate(0, 0, -60)
+	if err := database.Model(&models.User{}).Where("id = ?", user.ID).Updates(map[string]any{
+		"cycle_length":      28,
+		"period_length":     5,
+		"last_period_start": lastPeriodStart,
+	}).Error; err != nil {
+		t.Fatalf("update user cycle context: %v", err)
+	}
+
+	notice, actions := dashboardLateCycleNotice(t, app, authCookie)
+	if got := htmlAttr(notice, "data-late-cycle-key"); got != services.LateCycleNoPersonalRangeKey {
+		t.Fatalf("expected late-cycle key %q with no completed cycles, got %q", services.LateCycleNoPersonalRangeKey, got)
+	}
+	if got := htmlAttr(notice, "data-late-cycle-tone"); got != services.LateCycleToneNeutral {
+		t.Fatalf("expected a neutral tone when no range can be measured, got %q", got)
+	}
+
+	if actions == nil {
+		t.Fatal("expected the late-cycle notice to offer the logging actions that fit")
+	}
+	for _, action := range []string{"cycle-start", "pregnancy-test", "symptoms"} {
+		link := htmlFindElement(actions, func(node *html.Node) bool {
+			return node.Type == html.ElementNode && htmlAttr(node, "data-late-cycle-action") == action
+		})
+		if link == nil {
+			t.Fatalf("expected a %q logging action beside the late-cycle notice", action)
+		}
+		target := strings.TrimPrefix(htmlAttr(link, "href"), "#")
+		if target == "" {
+			t.Fatalf("expected the %q action to link to a control on the page", action)
+		}
+	}
+}
+
+// TestDashboardLateCycleNoticeStatesTheMeasuredExcessOnceHistoryExists is the
+// paired positive: the same surface, the same hooks, but an account that owns
+// two completed cycles — which is exactly the threshold the stats
+// prediction-reliability card uses — so the notice may state a measured excess.
+func TestDashboardLateCycleNoticeStatesTheMeasuredExcessOnceHistoryExists(t *testing.T) {
+	app, database := newOnboardingTestApp(t)
+	user := createOnboardingTestUser(t, database, "dashboard-late-cycle-history@example.com", "StrongPass1", true)
+	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
+
+	if err := database.Model(&models.User{}).Where("id = ?", user.ID).Updates(map[string]any{
+		"cycle_length":  28,
+		"period_length": 5,
+	}).Error; err != nil {
+		t.Fatalf("update user cycle context: %v", err)
+	}
+	// Two completed 28-day cycles, then a running cycle on day 41 — past the
+	// 28-day reference plus the seven-day grace window, and past the observed
+	// maximum of 28 days by 13.
+	for _, offsetDays := range []int{-96, -68, -40} {
+		start := services.DateAtLocation(time.Now().UTC(), time.UTC).AddDate(0, 0, offsetDays)
+		if err := database.Create(&models.DailyLog{
+			UserID:     user.ID,
+			Date:       start,
+			IsPeriod:   true,
+			CycleStart: true,
+		}).Error; err != nil {
+			t.Fatalf("seed cycle start %d: %v", offsetDays, err)
+		}
+	}
+
+	notice, actions := dashboardLateCycleNotice(t, app, authCookie)
+	if got := htmlAttr(notice, "data-late-cycle-key"); got != services.LateCycleBeyondRangeKey {
+		t.Fatalf("expected late-cycle key %q once a personal range exists, got %q", services.LateCycleBeyondRangeKey, got)
+	}
+	if got := htmlAttr(notice, "data-late-cycle-tone"); got != services.LateCycleToneWarning {
+		t.Fatalf("expected the measured-excess state to carry the warning tone, got %q", got)
+	}
+	if actions == nil {
+		t.Fatal("expected the late-cycle notice to offer the logging actions that fit")
+	}
+}
+
+// TestDashboardAndStatsAgreeOnPhaseAndFertilityOnAFertileWindowDay is the
+// item-24 render regression: on a fertile-window day both primary surfaces
+// declare the same 4-value phase, and "fertile" appears only as the separate
+// fertility-status axis — never in the phase slot.
+func TestDashboardAndStatsAgreeOnPhaseAndFertilityOnAFertileWindowDay(t *testing.T) {
+	app, database := newOnboardingTestApp(t)
+	user := createOnboardingTestUser(t, database, "dashboard-fertile-window-day@example.com", "StrongPass1", true)
+	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
+
+	// Three completed 28-day cycles lift the fertility floor; cycle 28 /
+	// luteal 14 → ovulation day 14, fertile window days 9–14. Day 12 sits
+	// inside the window with a ±1-day timezone slack on both sides.
+	lastPeriodStart := services.DateAtLocation(time.Now().UTC(), time.UTC).AddDate(0, 0, -11)
+	if err := database.Model(&models.User{}).Where("id = ?", user.ID).Updates(map[string]any{
+		"cycle_length":      28,
+		"period_length":     5,
+		"last_period_start": lastPeriodStart,
+	}).Error; err != nil {
+		t.Fatalf("update user cycle context: %v", err)
+	}
+	for _, offsetDays := range []int{-95, -67, -39, -11} {
+		start := services.DateAtLocation(time.Now().UTC(), time.UTC).AddDate(0, 0, offsetDays)
+		if err := database.Create(&models.DailyLog{
+			UserID:     user.ID,
+			Date:       start,
+			IsPeriod:   true,
+			CycleStart: true,
+		}).Error; err != nil {
+			t.Fatalf("seed cycle start %d: %v", offsetDays, err)
+		}
+	}
+
+	dashboardRequest := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
+	dashboardRequest.Header.Set("Accept-Language", "en")
+	dashboardRequest.Header.Set("Cookie", authCookie)
+	dashboardResponse, err := app.Test(dashboardRequest, testConfigNoTimeout)
+	if err != nil {
+		t.Fatalf("dashboard request failed: %v", err)
+	}
+	defer func() { _ = dashboardResponse.Body.Close() }()
+
+	dashboardDocument := mustParseHTMLDocument(t, mustReadBodyString(t, dashboardResponse.Body))
+	header := dashboardElementByDataAttr(dashboardDocument, "data-dashboard-status-header")
+	if header == nil {
+		t.Fatal("expected the status header on a fresh predictable baseline")
+	}
+	if got := htmlAttr(header, "data-dashboard-phase"); got != "follicular" {
+		t.Fatalf("expected status header phase %q on a fertile-window day, got %q", "follicular", got)
+	}
+	if got := htmlAttr(header, "data-fertility-status"); got != "fertile" {
+		t.Fatalf("expected status header fertility status %q on a fertile-window day, got %q", "fertile", got)
+	}
+
+	statsRequest := httptest.NewRequest(http.MethodGet, "/stats", nil)
+	statsRequest.Header.Set("Accept-Language", "en")
+	statsRequest.Header.Set("Cookie", authCookie)
+	statsResponse, err := app.Test(statsRequest, testConfigNoTimeout)
+	if err != nil {
+		t.Fatalf("stats request failed: %v", err)
+	}
+	defer func() { _ = statsResponse.Body.Close() }()
+
+	statsDocument := mustParseHTMLDocument(t, mustReadBodyString(t, statsResponse.Body))
+	phaseValue := dashboardElementByDataAttr(statsDocument, "data-stats-current-phase")
+	if phaseValue == nil {
+		t.Fatal("expected the stats current-phase value to declare its phase hook")
+	}
+	if got := htmlAttr(phaseValue, "data-stats-current-phase"); got != "follicular" {
+		t.Fatalf("expected stats phase %q on a fertile-window day, got %q", "follicular", got)
+	}
+	if got := htmlAttr(phaseValue, "data-fertility-status"); got != "fertile" {
+		t.Fatalf("expected stats fertility status %q on a fertile-window day, got %q", "fertile", got)
+	}
+	if dashboardElementByDataAttr(statsDocument, "data-fertile-window") == nil {
+		t.Fatal("expected the stats phase card to render the fertile-window line on a fertile day")
+	}
+}
+
+// TestStatsFertileWindowCardIsSuppressedByAPregnancyPause is the render
+// regression for the one prediction surface the pregnancy pause did not reach.
+// /stats resolved the flag its phase card gates on from
+// DashboardPredictionDisabled — the owner's unpredictable-cycle setting alone —
+// while the calendar grid, the .ics feed and the webhook pass all gate on the
+// shared suppression predicate, so an owner whose latest fertility signal is a
+// positive pregnancy test still read "Fertile window" on /stats: a claim
+// projected from the onboarding cycle-length slider, which the medical-safety
+// invariant says must be suppressed rather than captioned.
+//
+// Both accounts sit on day 12 of a 28-day baseline with two completed cycles
+// behind them — the tier the card lives in (HasInsights, >= 2) and a
+// fertile-window day by the same math the test above uses — and differ only in
+// the positive pregnancy test. The unpaused case is the positive anchor for the
+// paused one: it proves the two hooks asserted absent under the pause are the
+// hooks this surface actually renders, so the suppression case cannot pass by
+// naming an attribute that no longer exists.
+//
+// Deliberately narrower than its subject: it pins the pregnancy pause only. The
+// zero-completed-cycle tier never reaches this card (HasInsights excludes it)
+// and an overdue cycle is already caught by the stronger CycleDataStale branch
+// above the card's fertility line.
+func TestStatsFertileWindowCardIsSuppressedByAPregnancyPause(t *testing.T) {
+	for name, testCase := range map[string]struct {
+		account         string
+		pregnancyPaused bool
+	}{
+		"no pregnancy test: the fertile-window claim renders": {account: "unpaused"},
+		"positive pregnancy test: the claim is withheld":      {account: "paused", pregnancyPaused: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			app, database := newOnboardingTestApp(t)
+			user := createOnboardingTestUser(t, database, "stats-pregnancy-pause-"+testCase.account+"@example.com", "StrongPass1", true)
+			today := services.DateAtLocation(time.Now().UTC(), time.UTC)
+			if err := database.Model(&models.User{}).Where("id = ?", user.ID).Updates(map[string]any{
+				"cycle_length":      28,
+				"period_length":     5,
+				"last_period_start": today.AddDate(0, 0, -11),
+			}).Error; err != nil {
+				t.Fatalf("seed cycle baseline: %v", err)
+			}
+			// Four recorded starts 28 days apart: three completed cycles, and the
+			// running one on day 12 — inside the fertile window (ovulation day 14,
+			// window days 9-14) with a day of timezone slack on either side.
+			for _, offsetDays := range []int{-95, -67, -39, -11} {
+				if err := database.Create(&models.DailyLog{
+					UserID:     user.ID,
+					Date:       today.AddDate(0, 0, offsetDays),
+					IsPeriod:   true,
+					CycleStart: true,
+				}).Error; err != nil {
+					t.Fatalf("seed cycle start %d: %v", offsetDays, err)
+				}
+			}
+			if testCase.pregnancyPaused {
+				// Positive test after the running cycle's start, with no later cycle
+				// start: ResolvePregnancyPause reports an active pause.
+				if err := database.Create(&models.DailyLog{
+					UserID:        user.ID,
+					Date:          today.AddDate(0, 0, -2),
+					PregnancyTest: models.PregnancyTestPositive,
+				}).Error; err != nil {
+					t.Fatalf("seed positive pregnancy test: %v", err)
+				}
+			}
+
+			authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
+			request := httptest.NewRequest(http.MethodGet, "/stats", nil)
+			request.Header.Set("Accept-Language", "en")
+			request.Header.Set("Cookie", authCookie)
+			response, err := app.Test(request, testConfigNoTimeout)
+			if err != nil {
+				t.Fatalf("stats request failed: %v", err)
+			}
+			defer func() { _ = response.Body.Close() }()
+
+			document := mustParseHTMLDocument(t, mustReadBodyString(t, response.Body))
+			fertilityStatus := ""
+			if statusValue := dashboardElementByDataAttr(document, "data-fertility-status"); statusValue != nil {
+				fertilityStatus = htmlAttr(statusValue, "data-fertility-status")
+			}
+			fertileWindowLine := dashboardElementByDataAttr(document, "data-fertile-window")
+
+			if !testCase.pregnancyPaused {
+				if fertilityStatus != "fertile" {
+					t.Errorf("anchor: expected /stats to declare fertility %q on a fertile-window day, got %q", "fertile", fertilityStatus)
+				}
+				if fertileWindowLine == nil {
+					t.Error("anchor: expected /stats to render the fertile-window line on a fertile-window day")
+				}
+				return
+			}
+			if fertilityStatus == "fertile" {
+				t.Errorf("expected /stats to withhold the fertility status under a pregnancy pause, got data-fertility-status=%q", fertilityStatus)
+			}
+			if fertileWindowLine != nil {
+				t.Error("expected /stats to withhold the fertile-window line under a pregnancy pause, got data-fertile-window rendered")
+			}
+		})
+	}
+}
+
+// TestDashboardHeaderWithholdsFertilityUntilThreeCompletedCycles is the render
+// regression for the early reliability tiers. Every account below sits on cycle
+// day 12 of a 28-day baseline — a fertile-window day by the same math the test
+// above uses — and differs only in how many cycles have been observed.
+//
+// With none, the fertile window and the ovulation date exist only because the
+// onboarding cycle-length slider was projected forward, so the header shows
+// neither and declares no fertility status; an account tracking to conceive
+// reads one bridge line naming when the window arrives instead. With one or two
+// completed cycles they rest on too few observed lengths: still withheld, under
+// the explainer that names the three-cycle floor, with no bridge line. With
+// three the header renders exactly as it always did. What the tiers never touch
+// is asserted in every state: the phase and the next-period item, which carries
+// its own estimate qualifier.
+func TestDashboardHeaderWithholdsFertilityUntilThreeCompletedCycles(t *testing.T) {
+	for name, testCase := range map[string]struct {
+		account         string
+		goal            string
+		completedCycles int
+		wantFertility   bool
+		wantOvulation   bool
+		wantBridge      bool
+		wantMoreBridge  bool
+		// wantExplainerKey is the copy key the explainer line names; empty means
+		// the tier renders no explainer at all.
+		wantExplainerKey string
+	}{
+		"trying to conceive, fresh baseline": {
+			account:          "trying-fresh",
+			goal:             models.UsageGoalTrying,
+			wantBridge:       true,
+			wantExplainerKey: "prediction.explainer.awaiting_first_cycle",
+		},
+		"trying to conceive, two completed cycles": {
+			account:          "trying-two-cycles",
+			goal:             models.UsageGoalTrying,
+			completedCycles:  2,
+			wantMoreBridge:   true,
+			wantExplainerKey: "prediction.explainer.awaiting_more_cycles",
+		},
+		"trying to conceive, one completed cycle": {
+			account:          "trying-one-cycle",
+			goal:             models.UsageGoalTrying,
+			completedCycles:  1,
+			wantMoreBridge:   true,
+			wantExplainerKey: "prediction.explainer.awaiting_more_cycles",
+		},
+		"trying to conceive, three completed cycles": {
+			account:         "trying-three-cycles",
+			goal:            models.UsageGoalTrying,
+			completedCycles: 3,
+			wantFertility:   true,
+			wantOvulation:   true,
+		},
+		"general health, fresh baseline": {
+			account:          "health-fresh",
+			goal:             models.UsageGoalHealth,
+			wantExplainerKey: "prediction.explainer.awaiting_first_cycle",
+		},
+		"general health, one completed cycle": {
+			account:          "health-one-cycle",
+			goal:             models.UsageGoalHealth,
+			completedCycles:  1,
+			wantExplainerKey: "prediction.explainer.awaiting_more_cycles",
+		},
+		"general health, three completed cycles": {
+			account:         "health-three-cycles",
+			goal:            models.UsageGoalHealth,
+			completedCycles: 3,
+			wantFertility:   true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			app, database := newOnboardingTestApp(t)
+			user := createOnboardingTestUser(t, database, "dashboard-first-tier-"+testCase.account+"@example.com", "StrongPass1", true)
+			today := services.DateAtLocation(time.Now().UTC(), time.UTC)
+			if err := database.Model(&models.User{}).Where("id = ?", user.ID).Updates(map[string]any{
+				"usage_goal":        testCase.goal,
+				"cycle_length":      28,
+				"period_length":     5,
+				"last_period_start": today.AddDate(0, 0, -11),
+			}).Error; err != nil {
+				t.Fatalf("seed cycle baseline: %v", err)
+			}
+			if testCase.completedCycles > 0 {
+				// completedCycles+1 recorded starts 28 days apart: that many
+				// completed cycles, and the running one still on day 12.
+				for index := range testCase.completedCycles + 1 {
+					offsetDays := -11 - 28*index
+					if err := database.Create(&models.DailyLog{
+						UserID:     user.ID,
+						Date:       today.AddDate(0, 0, offsetDays),
+						IsPeriod:   true,
+						CycleStart: true,
+					}).Error; err != nil {
+						t.Fatalf("seed cycle start %d: %v", offsetDays, err)
+					}
+				}
+			}
+
+			authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
+			document := mustParseHTMLDocument(t, mustRenderDashboard(t, app, authCookie, "en"))
+
+			header := dashboardElementByDataAttr(document, "data-dashboard-status-header")
+			if header == nil {
+				t.Fatal("expected the dashboard status header")
+			}
+			wantStatus := "unknown"
+			if testCase.wantFertility {
+				wantStatus = "fertile"
+			}
+			if got := htmlAttr(header, "data-fertility-status"); got != wantStatus {
+				t.Fatalf("expected the header to declare fertility %q, got %q", wantStatus, got)
+			}
+
+			statusLine := dashboardElementByDataAttr(document, "data-dashboard-status-line")
+			if statusLine == nil {
+				t.Fatal("expected the dashboard status line")
+			}
+			if got := htmlFindElement(statusLine, htmlNodeHasAttr("data-fertile-window")) != nil; got != testCase.wantFertility {
+				t.Fatalf("expected the fertile-window item=%v, got %v", testCase.wantFertility, got)
+			}
+			if got := htmlFindElement(statusLine, htmlNodeHasAttr("data-dashboard-ovulation")) != nil; got != testCase.wantOvulation {
+				t.Fatalf("expected the ovulation estimate=%v, got %v", testCase.wantOvulation, got)
+			}
+
+			bridge := htmlFindElement(statusLine, htmlNodeHasAttr("data-dashboard-first-cycle-bridge"))
+			if got := bridge != nil; got != testCase.wantBridge {
+				t.Fatalf("expected the first-cycle bridge line=%v, got %v", testCase.wantBridge, got)
+			}
+			if bridge != nil {
+				if got := htmlAttr(bridge, "data-first-cycle-bridge-key"); got != "dashboard.fertile_window_after_first_cycle" {
+					t.Fatalf("expected the bridge line to name its copy key, got %q", got)
+				}
+			}
+
+			moreBridge := htmlFindElement(statusLine, htmlNodeHasAttr("data-dashboard-more-cycles-bridge"))
+			if got := moreBridge != nil; got != testCase.wantMoreBridge {
+				t.Fatalf("expected the more-cycles bridge line=%v, got %v", testCase.wantMoreBridge, got)
+			}
+			if moreBridge != nil {
+				if got := htmlAttr(moreBridge, "data-more-cycles-bridge-key"); got != "dashboard.fertile_window_after_three_cycles" {
+					t.Fatalf("expected the more-cycles bridge line to name its copy key, got %q", got)
+				}
+			}
+
+			explainer := dashboardElementByDataAttr(document, "data-dashboard-prediction-explainer")
+			if testCase.wantExplainerKey == "" {
+				if explainer != nil {
+					t.Fatalf("expected no prediction explainer, got key %q", htmlAttr(explainer, "data-explainer-key"))
+				}
+			} else if explainer == nil || htmlAttr(explainer, "data-explainer-key") != testCase.wantExplainerKey {
+				t.Fatalf("expected the prediction explainer to name %q", testCase.wantExplainerKey)
+			}
+
+			// The tier withholds the two slider-derived items and nothing else.
+			if got := htmlAttr(header, "data-dashboard-phase"); got == "" || got == "unknown" {
+				t.Fatalf("expected the phase to survive the tier, got %q", got)
+			}
+			if htmlFindElement(statusLine, htmlNodeHasAttr("data-dashboard-next-period")) == nil {
+				t.Fatal("expected the next-period estimate to survive the tier")
+			}
+		})
 	}
 }
 
@@ -462,12 +930,73 @@ func TestBuildDashboardViewDataOmitsReminderBannerForNonOwner(t *testing.T) {
 	}
 }
 
+// TestDashboardDoesNotFlagTodaysOvulationAsPastWestOfUTC is the rendered half of
+// the services-layer guard in calendar_day_comparison_regression_test.go: the
+// projected ovulation date is a UTC-midnight value while the request's "today"
+// is a location midnight, so west of UTC the ovulation day itself read as
+// already past and the amber prediction-past notice rendered beside the very
+// date the header had just named. One ordinary account, no irregular mode, no
+// DST date — the state appeared on the ovulation day of every cycle.
+//
+// The anchor is seeded relative to the live clock: the subject computes against
+// time.Now(), so a fixed calendar date would drift out of the cycle it was
+// written for.
+func TestDashboardDoesNotFlagTodaysOvulationAsPastWestOfUTC(t *testing.T) {
+	const timezoneName = "America/New_York"
+
+	location, err := time.LoadLocation(timezoneName)
+	if err != nil {
+		t.Fatalf("load %s: %v", timezoneName, err)
+	}
+
+	app, database, _ := newOnboardingTestAppWithLocation(t, time.UTC)
+	user := createOnboardingTestUser(t, database, "dashboard-ovulation-today@example.com", "StrongPass1", true)
+
+	// A 28-day cycle with the default 14-day luteal phase ovulates on cycle
+	// day 14, so an anchor 13 days back puts the predicted ovulation on today.
+	today := services.DateAtLocation(time.Now(), location)
+	currentStart := today.AddDate(0, 0, -13)
+	previousStart := currentStart.AddDate(0, 0, -28)
+	for _, cycleStart := range []time.Time{previousStart, currentStart} {
+		for offset := range 5 {
+			day := services.CalendarDay(cycleStart.AddDate(0, 0, offset), time.UTC)
+			entry := models.DailyLog{
+				UserID:     user.ID,
+				Date:       day,
+				IsPeriod:   true,
+				CycleStart: offset == 0,
+				Flow:       models.FlowMedium,
+			}
+			if err := database.Create(&entry).Error; err != nil {
+				t.Fatalf("seed period day %s: %v", day.Format("2006-01-02"), err)
+			}
+		}
+	}
+	if err := database.Model(&models.User{}).Where("id = ?", user.ID).Updates(map[string]any{
+		"cycle_length":      28,
+		"period_length":     5,
+		"last_period_start": services.CalendarDay(currentStart, time.UTC),
+	}).Error; err != nil {
+		t.Fatalf("update ovulation-today cycle context: %v", err)
+	}
+
+	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
+	response := dashboardWithTimezoneResponse(t, app, authCookie, timezoneName)
+	document := mustParseHTMLDocument(t, mustReadBodyString(t, response.Body))
+
+	if htmlFindElement(document, func(node *html.Node) bool {
+		return node.Type == html.ElementNode && htmlHasAttr(node, "data-dashboard-prediction-past")
+	}) != nil {
+		t.Fatal("did not expect the prediction-past notice on the ovulation day itself")
+	}
+}
+
 func newOnboardingTestAppWithLocation(t *testing.T, location *time.Location) (*fiber.App, *gorm.DB, *time.Location) {
 	t.Helper()
 
 	databasePath := filepath.Join(t.TempDir(), "ovumcy-onboarding-test-tz.db")
 
-	database, err := db.OpenSQLite(databasePath)
+	database, err := db.OpenDatabase(db.Config{Driver: db.DriverSQLite, SQLitePath: databasePath})
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}

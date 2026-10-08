@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -106,12 +107,6 @@ func TestDailyLogRepositoryRangeQueriesAndWhitelist(t *testing.T) {
 		t.Fatalf("expected 2 logs from d5 onward, got %d", len(ranged))
 	}
 
-	// ListPeriodDays returns only period rows.
-	periods, err := repo.ListPeriodDays(context.Background(), userID)
-	requireNoErr(t, err, "list period days")
-	if len(periods) != 2 {
-		t.Fatalf("expected 2 period days (d1, d10), got %d", len(periods))
-	}
 
 	// Save persists a mutation on an existing row.
 	entry.Notes = "updated note"
@@ -152,7 +147,7 @@ func TestDailyLogWriteScopedToUser(t *testing.T) {
 		SexActivity:     models.SexActivityNone,
 		CervicalMucus:   models.CervicalMucusNone,
 		PregnancyTest:   models.PregnancyTestNone,
-		BBT:             models.NewBBT(36.6),
+		BBT:             new(36.6),
 		CycleFactorKeys: []string{},
 		SymptomIDs:      []uint{11, 22},
 		Notes:           "owner A private note",
@@ -213,5 +208,49 @@ func TestDailyLogWriteScopedToUser(t *testing.T) {
 	}
 	if len(afterSym.SymptomIDs) != 2 || afterSym.SymptomIDs[0] != 11 || afterSym.SymptomIDs[1] != 22 {
 		t.Fatalf("cross-owner UpdateSymptomIDs mutated row R symptom_ids: got %v, want [11 22]", afterSym.SymptomIDs)
+	}
+}
+
+// TestDailyLogWriteRefusesZeroOwner proves Save and UpdateSymptomIDs treat a
+// zero UserID as invalid input rather than a wildcard. Without the guard,
+// Where("user_id = ?", 0) ordinarily matches zero rows (no user is ever id 0)
+// and both methods return nil — a silent no-op indistinguishable from a
+// successful write of an entry nobody asked to persist.
+func TestDailyLogWriteRefusesZeroOwner(t *testing.T) {
+	database := openSQLiteForMigrationBootstrapTest(t, filepath.Join(t.TempDir(), "daily-write-zero-owner.db"))
+	repo := NewDailyLogRepository(database)
+
+	zeroSave := &models.DailyLog{ID: 1, UserID: 0, Date: time.Date(2026, time.June, 1, 0, 0, 0, 0, time.UTC)}
+	if err := repo.Save(context.Background(), zeroSave); !errors.Is(err, ErrDailyLogOwnerRequired) {
+		t.Fatalf("Save with UserID==0: got %v, want ErrDailyLogOwnerRequired", err)
+	}
+
+	zeroSym := &models.DailyLog{ID: 1, UserID: 0, SymptomIDs: []uint{1}}
+	if err := repo.UpdateSymptomIDs(context.Background(), zeroSym); !errors.Is(err, ErrDailyLogOwnerRequired) {
+		t.Fatalf("UpdateSymptomIDs with UserID==0: got %v, want ErrDailyLogOwnerRequired", err)
+	}
+
+	// Create and CreateBatch must refuse a zero-owner row too: a row with no
+	// owner can never be reached by an owner-scoped read or by account erasure,
+	// so it would sit in the table forever instead of failing loudly here.
+	zeroCreate := &models.DailyLog{UserID: 0, Date: time.Date(2026, time.June, 2, 0, 0, 0, 0, time.UTC)}
+	if err := repo.Create(context.Background(), zeroCreate); !errors.Is(err, ErrDailyLogOwnerRequired) {
+		t.Fatalf("Create with UserID==0: got %v, want ErrDailyLogOwnerRequired", err)
+	}
+
+	owner := createDailyLogTestUser(t, database, "daily-write-zero-owner-batch@example.com")
+	zeroBatch := []models.DailyLog{
+		{UserID: owner, Date: time.Date(2026, time.June, 3, 0, 0, 0, 0, time.UTC)},
+		{UserID: 0, Date: time.Date(2026, time.June, 4, 0, 0, 0, 0, time.UTC)},
+	}
+	if err := repo.CreateBatch(context.Background(), zeroBatch); !errors.Is(err, ErrDailyLogOwnerRequired) {
+		t.Fatalf("CreateBatch with a zero-owner entry: got %v, want ErrDailyLogOwnerRequired", err)
+	}
+	logs, err := repo.ListByUser(context.Background(), owner)
+	if err != nil {
+		t.Fatalf("list after refused batch: %v", err)
+	}
+	if len(logs) != 0 {
+		t.Fatalf("expected the whole batch refused (none written), got %d rows", len(logs))
 	}
 }

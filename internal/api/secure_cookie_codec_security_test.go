@@ -25,14 +25,15 @@ func TestSecureCookieCodecRoundtripsAllKnownPurposes(t *testing.T) {
 	purposes := []string{
 		authCookieName,
 		flashCookieName,
+		exemptFlashCookieName,
 		recoveryCodeCookieName,
 		calendarFeedRevealCookieName,
 		registerPickupCookieName,
 		resetPasswordCookieName,
 		oidcStateCookieName,
 		oidcStepupCookieName,
+		oidcStepupContinuationCookieName,
 		oidcLogoutBridgeCookieName,
-		oidcLinkPendingCookieName,
 		totpPendingCookieName,
 		totpSetupCookieName,
 	}
@@ -73,14 +74,15 @@ func TestSecureCookieCodecRejectsCrossPurposeOpen(t *testing.T) {
 
 	otherPurposes := []string{
 		flashCookieName,
+		exemptFlashCookieName,
 		recoveryCodeCookieName,
 		calendarFeedRevealCookieName,
 		registerPickupCookieName,
 		resetPasswordCookieName,
 		oidcStateCookieName,
 		oidcStepupCookieName,
+		oidcStepupContinuationCookieName,
 		oidcLogoutBridgeCookieName,
-		oidcLinkPendingCookieName,
 		totpPendingCookieName,
 		totpSetupCookieName,
 	}
@@ -118,33 +120,22 @@ func TestSecureCookieCodecRejectsTamperedCiphertext(t *testing.T) {
 		t.Fatalf("unexpectedly short sealed payload: %d bytes", len(payload))
 	}
 
-	// Flip the last byte (inside the GCM auth tag).
-	tamperedTail := append([]byte{}, payload...)
-	tamperedTail[len(tamperedTail)-1] ^= 0xFF
-	tamperedTailEncoded := version + "." + base64.RawURLEncoding.EncodeToString(tamperedTail)
-	if _, err := codec.open(authCookieName, tamperedTailEncoded); !errors.Is(err, errInvalidSecureCookieValue) {
-		t.Fatalf("expected tampered auth tag to be rejected, got %v", err)
-	}
-
-	// Flip a byte in the middle (inside ciphertext body, past the nonce).
-	nonceSize := codec.aead.NonceSize()
-	tamperedBody := append([]byte{}, payload...)
-	tamperedBody[nonceSize+1] ^= 0x01
-	tamperedBodyEncoded := version + "." + base64.RawURLEncoding.EncodeToString(tamperedBody)
-	if _, err := codec.open(authCookieName, tamperedBodyEncoded); !errors.Is(err, errInvalidSecureCookieValue) {
-		t.Fatalf("expected tampered ciphertext byte to be rejected, got %v", err)
-	}
-
-	// Flip a byte in the nonce.
-	tamperedNonce := append([]byte{}, payload...)
-	tamperedNonce[0] ^= 0x01
-	tamperedNonceEncoded := version + "." + base64.RawURLEncoding.EncodeToString(tamperedNonce)
-	if _, err := codec.open(authCookieName, tamperedNonceEncoded); !errors.Is(err, errInvalidSecureCookieValue) {
-		t.Fatalf("expected tampered nonce to be rejected, got %v", err)
+	// Flip one byte at every offset of the sealed payload. The three regions
+	// the earlier version of this test picked by offset — nonce, ciphertext
+	// body, GCM auth tag — are all covered, and so is any region a future
+	// envelope adds, without this package having to know where the nonce
+	// prefix ends. The layout is internal/security's, not the codec's.
+	for offset := range payload {
+		tampered := append([]byte{}, payload...)
+		tampered[offset] ^= 0x01
+		tamperedEncoded := version + "." + base64.RawURLEncoding.EncodeToString(tampered)
+		if _, err := codec.open(authCookieName, tamperedEncoded); !errors.Is(err, errInvalidSecureCookieValue) {
+			t.Fatalf("expected a flipped byte at offset %d of %d to be rejected, got %v", offset, len(payload), err)
+		}
 	}
 }
 
-func TestSecureCookieCodecRejectsTamperedCiphertextForTOTPAndLinkPendingCookies(t *testing.T) {
+func TestSecureCookieCodecRejectsTamperedCiphertextForTOTPCookies(t *testing.T) {
 	t.Parallel()
 
 	codec, err := newSecureCookieCodec([]byte("test-secret-key"))
@@ -152,7 +143,7 @@ func TestSecureCookieCodecRejectsTamperedCiphertextForTOTPAndLinkPendingCookies(
 		t.Fatalf("new secure cookie codec: %v", err)
 	}
 
-	for _, purpose := range []string{oidcLinkPendingCookieName, totpPendingCookieName, totpSetupCookieName} {
+	for _, purpose := range []string{totpPendingCookieName, totpSetupCookieName} {
 
 		t.Run(purpose, func(t *testing.T) {
 			t.Parallel()
@@ -216,8 +207,6 @@ func TestSecureCookieCodecRejectsTruncatedPayload(t *testing.T) {
 		{name: "version_only", value: secureCookieVersion},
 		{name: "wrong_version_prefix", value: "v9." + base64.RawURLEncoding.EncodeToString(randomBytes(t, 32))},
 		{name: "non_base64_payload", value: secureCookieVersion + ".!!not-base64!!"},
-		{name: "shorter_than_nonce", value: secureCookieVersion + "." + base64.RawURLEncoding.EncodeToString(randomBytes(t, 8))},
-		{name: "exactly_nonce_no_ciphertext", value: secureCookieVersion + "." + base64.RawURLEncoding.EncodeToString(randomBytes(t, codec.aead.NonceSize()))},
 	}
 	for _, tc := range cases {
 
@@ -228,6 +217,30 @@ func TestSecureCookieCodecRejectsTruncatedPayload(t *testing.T) {
 				t.Fatalf("expected truncated/malformed payload %q to be rejected, got %v", tc.name, err)
 			}
 		})
+	}
+
+	// Every proper prefix of a genuine sealed payload must be refused:
+	// shorter than the nonce, exactly the nonce with no ciphertext, and a
+	// nonce plus a partial ciphertext are all in the sweep, so the boundary
+	// cases hold without the codec asking internal/security for the nonce
+	// length.
+	sealed, err := codec.seal(authCookieName, []byte("genuine-payload"))
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	version, encoded, _ := strings.Cut(sealed, ".")
+	payload, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatalf("decode sealed payload: %v", err)
+	}
+	if len(payload) < 16 {
+		t.Fatalf("unexpectedly short sealed payload: %d bytes — the length sweep below would assert nothing", len(payload))
+	}
+	for length := range payload {
+		truncated := version + "." + base64.RawURLEncoding.EncodeToString(payload[:length])
+		if _, err := codec.open(authCookieName, truncated); !errors.Is(err, errInvalidSecureCookieValue) {
+			t.Fatalf("expected a %d-byte prefix of a %d-byte sealed payload to be rejected, got %v", length, len(payload), err)
+		}
 	}
 }
 

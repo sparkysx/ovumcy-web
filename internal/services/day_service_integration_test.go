@@ -125,13 +125,27 @@ func TestDayServiceFetchLogByDateNilsOutOfRangeStoredBBT(t *testing.T) {
 	}
 }
 
+// TestMergePreservedDayEntryInputDropsOutOfRangeExistingBBT covers both ends of
+// the stored range. Only the above-maximum value was checked, here and on the
+// read path, so the lower bound could be dropped from IsValidDayBBT and a
+// stored value no thermometer produced — a Fahrenheit reading saved on a
+// Celsius form, say — would be carried forward into the next save untouched.
 func TestMergePreservedDayEntryInputDropsOutOfRangeExistingBBT(t *testing.T) {
-	outOfRange := 200.0
-	existing := models.DailyLog{BBT: &outOfRange}
+	for _, outOfRange := range []float64{200.0, 20.0} {
+		existing := models.DailyLog{BBT: &outOfRange}
 
-	merged := mergePreservedDayEntryInput(existing, DayEntryInput{PreserveBBT: true})
-	if merged.BBT != nil {
-		t.Fatalf("expected preserved out-of-range bbt to be dropped to nil, got %v", *merged.BBT)
+		merged := mergePreservedDayEntryInput(existing, DayEntryInput{PreserveBBT: true})
+		if merged.BBT != nil {
+			t.Fatalf("expected preserved out-of-range bbt %.2f to be dropped to nil, got %v", outOfRange, *merged.BBT)
+		}
+	}
+
+	// Positive control: a real reading must still be preserved, so the guard is
+	// not simply dropping every stored temperature.
+	inRange := 36.6
+	merged := mergePreservedDayEntryInput(models.DailyLog{BBT: &inRange}, DayEntryInput{PreserveBBT: true})
+	if merged.BBT == nil || *merged.BBT != inRange {
+		t.Fatalf("expected an in-range stored bbt to be preserved, got %v", merged.BBT)
 	}
 }
 
@@ -323,6 +337,55 @@ func TestDayServiceMarkCycleStartManuallyPreservesEntryAndMarksExplicitStart(t *
 	}
 	if got := updatedUser.LastPeriodStart.Format("2006-01-02"); got != "2026-02-01" {
 		t.Fatalf("expected settings last_period_start 2026-02-01 to remain unchanged, got %s", got)
+	}
+}
+
+// The replace confirmation and the clearing it authorizes read the same
+// UTC-midnight period-cluster bounds, so both must re-anchor the days they
+// compare. Ahead of UTC a competing start on the FIRST day of the cluster used
+// to read as sitting before the cluster: the owner confirmed the replacement
+// and the old start survived it, leaving two cycle starts in one bleeding
+// cluster.
+func TestDayServiceMarkCycleStartManuallyClearsAFirstClusterDayStartAheadOfUTC(t *testing.T) {
+	service, database := newDayServiceIntegration(t)
+	user := createDayServiceTestUser(t, database, "manual-cycle-start-replace-tz-service@example.com")
+
+	logs := []models.DailyLog{}
+	for day := 1; day <= 5; day++ {
+		logs = append(logs, models.DailyLog{
+			UserID:     user.ID,
+			Date:       time.Date(2026, time.March, day, 0, 0, 0, 0, time.UTC),
+			IsPeriod:   true,
+			Flow:       models.FlowMedium,
+			CycleStart: day == 1,
+		})
+	}
+	if err := database.Create(&logs).Error; err != nil {
+		t.Fatalf("create logs: %v", err)
+	}
+
+	belgrade := time.FixedZone("UTC+1", 1*60*60)
+	targetDay := time.Date(2026, time.March, 3, 0, 0, 0, 0, belgrade)
+	now := time.Date(2026, time.March, 5, 9, 0, 0, 0, belgrade)
+	// Both confirmations the flow asks for here are granted: the replacement
+	// itself and the short gap to the start being replaced.
+	options := ManualCycleStartOptions{ReplaceExisting: true, MarkUncertain: true}
+	if err := service.MarkCycleStartManually(context.Background(), user.ID, targetDay, now, belgrade, options); err != nil {
+		t.Fatalf("MarkCycleStartManually returned error: %v", err)
+	}
+
+	reloaded := []models.DailyLog{}
+	if err := database.Where("user_id = ?", user.ID).Order("date ASC").Find(&reloaded).Error; err != nil {
+		t.Fatalf("reload logs: %v", err)
+	}
+	starts := []string{}
+	for _, entry := range reloaded {
+		if entry.CycleStart {
+			starts = append(starts, CalendarDayKey(entry.Date))
+		}
+	}
+	if len(starts) != 1 || starts[0] != "2026-03-03" {
+		t.Fatalf("expected 2026-03-03 to be the only cycle start left, got %v", starts)
 	}
 }
 

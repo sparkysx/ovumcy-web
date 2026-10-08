@@ -17,19 +17,20 @@ import (
 // robustness). Together: transparent and verifiable.
 //
 // The per-vector prediction cases (TestCyclePrediction_GoldenVectors) are driven
-// by a shared golden-vector fixture,
-// testdata/cycle-prediction-golden-vectors.json, that is kept byte-identical
-// with ovumcy-app's src/services/__fixtures__/cycle-prediction-golden-vectors.json
-// (ovumcy-app PR #75). The Go (cycles.go) and TypeScript
-// (cycle-prediction-policy.ts) prediction implementations are hand-parallel
-// ports; consuming one shared file makes any divergence between them fail CI on
-// both sides instead of silently drifting. If the prediction math changes,
-// update the fixture, docs/cycle-prediction.md, and BOTH reference tests
-// (this file and ovumcy-app's cycle-prediction-reference.test.ts) in the same
-// change.
+// by a golden-vector fixture, testdata/cycle-prediction-golden-vectors.json.
+// The fixture originated with ovumcy-app's
+// src/services/__fixtures__/cycle-prediction-golden-vectors.json (ovumcy-app
+// PR #75), but the two copies are NOT currently byte-identical and nothing in
+// CI enforces that they match: lockstep with the app is not established. The Go
+// (cycles.go) and TypeScript (cycle-prediction-policy.ts) prediction
+// implementations are hand-parallel ports; once the copies are brought back in
+// sync, a shared file would make any divergence fail CI on both sides. If the
+// prediction math changes, update the fixture, docs/cycle-prediction.md, and
+// both reference tests (this file and ovumcy-app's
+// cycle-prediction-reference.test.ts) in the same change.
 
-// goldenVectorsFile is the shared golden-vector fixture, vendored byte-identical
-// from ovumcy-app (see the package comment above).
+// goldenVectorsFile is this repository's golden-vector fixture, originally
+// taken from ovumcy-app (see the package comment above).
 const goldenVectorsFile = "cycle-prediction-golden-vectors.json"
 
 // goldenVectorFixture is the parsed shape of the shared fixture. Field names
@@ -139,10 +140,70 @@ func TestCalcOvulationDay_ReferenceVectors(t *testing.T) {
 	}
 }
 
+// TestLutealPhaseRoundTrip_ReferenceVectors pins the inverse direction of the
+// same arithmetic: given the cycle day an ovulation was OBSERVED on,
+// calcLutealPhase must return the parameter CalcOvulationDay maps back to that
+// very day. Every row is also a row of the "Step 2a" table in
+// docs/cycle-prediction.md.
+//
+// This crossing is the whole point. Each direction is self-consistent on its
+// own, so only a test that runs one into the other can catch them disagreeing
+// about whether the ovulation day itself belongs to the luteal phase — the
+// disagreement that put every personalized prediction one day early.
+func TestLutealPhaseRoundTrip_ReferenceVectors(t *testing.T) {
+	// wantDay is the cycle day the round trip lands on and wantExact says whether
+	// it got there without Step 2's reserve clamp. They are separate fields
+	// because the last row is the exception the invariant carries: an observation
+	// can imply a luteal phase the cycle cannot hold, and there the clamp is the
+	// designed answer rather than a broken round trip.
+	cases := []struct {
+		name              string
+		cycleLen          int
+		observedOvulation int
+		wantLuteal        int
+		wantDay           int
+		wantExact         bool
+	}{
+		{name: "28-day cycle, ovulation on day 14 is the 14-day model default", cycleLen: 28, observedOvulation: 14, wantLuteal: 14, wantDay: 14, wantExact: true},
+		{name: "28-day cycle, ovulation on day 15", cycleLen: 28, observedOvulation: 15, wantLuteal: 13, wantDay: 15, wantExact: true},
+		{name: "short 21-day cycle, ovulation on day 8", cycleLen: 21, observedOvulation: 8, wantLuteal: 13, wantDay: 8, wantExact: true},
+		{name: "long 35-day cycle, ovulation on day 21", cycleLen: 35, observedOvulation: 21, wantLuteal: 14, wantDay: 21, wantExact: true},
+		{name: "long 40-day cycle, ovulation on day 26", cycleLen: 40, observedOvulation: 26, wantLuteal: 14, wantDay: 26, wantExact: true},
+		{name: "30-day cycle, ovulation on day 20 lands on the 10-day floor", cycleLen: 30, observedOvulation: 20, wantLuteal: 10, wantDay: 20, wantExact: true},
+		// The exception the invariant carries. An ovulation observed on day 4 of a
+		// 15-day cycle implies an 11-day luteal phase: physiologically ordinary,
+		// admitted by the plausibility window, and still more than the cycle can
+		// hold, since the reserve caps the parameter at cycleLength-5 = 10. The
+		// round trip does NOT return day 4 here, and must not pretend to.
+		{name: "15-day cycle, an observation the cycle cannot hold", cycleLen: 15, observedOvulation: 4, wantLuteal: 11, wantDay: 5, wantExact: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotLuteal := calcLutealPhase(tc.cycleLen, tc.observedOvulation)
+			if gotLuteal != tc.wantLuteal {
+				t.Fatalf("calcLutealPhase(%d,%d) = %d, want %d",
+					tc.cycleLen, tc.observedOvulation, gotLuteal, tc.wantLuteal)
+			}
+			gotDay, gotExact := CalcOvulationDay(tc.cycleLen, gotLuteal)
+			if gotExact != tc.wantExact {
+				t.Errorf("CalcOvulationDay(%d,%d) exact = %t, want %t",
+					tc.cycleLen, gotLuteal, gotExact, tc.wantExact)
+			}
+			if gotDay != tc.wantDay {
+				t.Fatalf("round trip: ovulation observed on cycle day %d inferred luteal %d, which predicts cycle day %d, want %d",
+					tc.observedOvulation, gotLuteal, gotDay, tc.wantDay)
+			}
+			if tc.wantExact && gotDay != tc.observedOvulation {
+				t.Fatalf("round trip broken: an exact fit must land back on the observed cycle day %d, got %d",
+					tc.observedOvulation, gotDay)
+			}
+		})
+	}
+}
+
 // TestCyclePrediction_GoldenVectors asserts every vector in the shared fixture
-// against PredictCycleWindow (and the next-period formula), so the Go source of
-// truth and ovumcy-app's TypeScript port cannot drift apart without failing CI
-// on both sides. The fixture uses the TypeScript port's field vocabulary
+// against PredictCycleWindow (and the next-period formula), pinning the Go
+// source of truth to the documented vectors. The fixture uses the TypeScript port's field vocabulary
 // (calculable / fertilityStart / fertilityEnd / ovulationDate / isExact /
 // nextPeriodStart); the mapping onto CycleWindowPrediction is spelled out below.
 func TestCyclePrediction_GoldenVectors(t *testing.T) {

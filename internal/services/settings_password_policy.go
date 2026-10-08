@@ -16,16 +16,25 @@ var (
 	ErrSettingsInvalidCurrentPassword     = errors.New("settings invalid current password")
 	ErrSettingsNewPasswordMustDiffer      = errors.New("settings new password must differ")
 	ErrSettingsWeakPassword               = errors.New("settings weak password")
+	ErrSettingsPasswordTooLong            = errors.New("settings password too long")
 	ErrSettingsPasswordHashFailed         = errors.New("settings password hash failed")
 	ErrSettingsRecoveryCodeGenerateFailed = errors.New("settings recovery code generate failed")
 	ErrSettingsPasswordUpdateFailed       = errors.New("settings password update failed")
 )
 
-func (service *SettingsService) ValidatePasswordChange(passwordHash string, currentPassword string, newPassword string, confirmPassword string) error {
+func (service *SettingsService) ValidatePasswordChange(user *models.User, currentPassword string, newPassword string, confirmPassword string) error {
+	passwordHash := reauthPasswordHash(user)
 	currentPassword = strings.TrimSpace(currentPassword)
 	newPassword = strings.TrimSpace(newPassword)
 	confirmPassword = strings.TrimSpace(confirmPassword)
 
+	// The two refusals above this line are decided by what the caller itself
+	// submitted, so their latency tells it nothing it did not already know —
+	// and equalizing them would spend a full passwordHashCost bcrypt on a
+	// branch the re-auth budget gives its reservation back for (the caller
+	// reserved the attempt before this ran, and reauthRefusalSpentACompare does
+	// not count these refusals as a compare), i.e. CPU no re-auth budget caps.
+	// Only the account-state branch below is equalized.
 	if currentPassword == "" || newPassword == "" || confirmPassword == "" {
 		return ErrSettingsPasswordChangeInvalidInput
 	}
@@ -33,25 +42,59 @@ func (service *SettingsService) ValidatePasswordChange(passwordHash string, curr
 		return ErrSettingsPasswordMismatch
 	}
 	if strings.TrimSpace(passwordHash) == "" {
+		equalizeSettingsReauthTiming(currentPassword)
 		return ErrSettingsLocalPasswordNotSet
 	}
 	if bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(currentPassword)) != nil {
+		// The compare above spends only what the STORED hash carries, so an
+		// account still on a pre-rotation cost is refused faster than the
+		// equalized branch above pays — the same reverse oracle
+		// AuthenticateCredentials closes. Buy the difference here too.
+		topUpAuthCredentialsTiming(passwordHash, currentPassword)
 		return ErrSettingsInvalidCurrentPassword
 	}
 	if currentPassword == newPassword {
 		return ErrSettingsNewPasswordMustDiffer
 	}
-	if err := ValidatePasswordStrength(newPassword); err != nil {
-		return ErrSettingsWeakPassword
+	if err := settingsPasswordPolicyError(ValidatePasswordStrength(newPassword)); err != nil {
+		return err
 	}
 	return nil
 }
 
-func (service *SettingsService) ChangePassword(ctx context.Context, user *models.User, currentPassword string, newPassword string, confirmPassword string) error {
+// settingsPasswordPolicyError is the settings-layer twin of
+// authPasswordPolicyError: the same split, carried through this package's own
+// sentinels so both the change-password form and the local-password setup form
+// can name the length refusal on its own.
+func settingsPasswordPolicyError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, ErrPasswordTooLong):
+		return ErrSettingsPasswordTooLong
+	default:
+		return ErrSettingsWeakPassword
+	}
+}
+
+func (service *SettingsService) ChangePassword(ctx context.Context, attempt ReauthAttempt, user *models.User, currentPassword string, newPassword string, confirmPassword string) error {
 	if user == nil {
 		return ErrSettingsPasswordChangeInvalidInput
 	}
-	if err := service.ValidatePasswordChange(user.PasswordHash, currentPassword, newPassword, confirmPassword); err != nil {
+	// The current-password check inside ValidatePasswordChange is a re-auth
+	// factor, so it draws on the same budget as the erasure flows. Without this
+	// the change-password form would be a faster password oracle than the login
+	// form it protects.
+	//
+	// It goes through the same budgeted verify as VerifyReauth; only the compare
+	// differs. ValidatePasswordChange is that compare because the current-password
+	// check cannot be lifted out of it: the blank and mismatch refusals on all
+	// three fields must answer before the account-state branch, or their latency
+	// would reopen the distinguisher that branch's equalization removes.
+	budget := service.SettingsReauthBudget()
+	if err := budget.verify(attempt, func() error {
+		return service.ValidatePasswordChange(user, currentPassword, newPassword, confirmPassword)
+	}); err != nil {
 		return err
 	}
 
@@ -61,9 +104,15 @@ func (service *SettingsService) ChangePassword(ctx context.Context, user *models
 		return fmt.Errorf("%w: %v", ErrSettingsPasswordHashFailed, err)
 	}
 
-	if err := service.users.UpdatePasswordAndRevokeSessions(ctx, user.ID, string(hashedPassword), false); err != nil {
+	if err := service.users.UpdatePasswordAndRevokeSessions(ctx, user.ID, NormalizeAuthSessionVersion(user.AuthSessionVersion), string(hashedPassword), false); err != nil {
+		if errors.Is(err, ErrAuthSessionVersionChanged) {
+			return ErrAuthSessionVersionChanged
+		}
 		return fmt.Errorf("%w: %v", ErrSettingsPasswordUpdateFailed, err)
 	}
+	// Only a change that committed clears the budget: a correct current
+	// password whose write was refused proved nothing lasting.
+	budget.Reset(attempt)
 	user.PasswordHash = string(hashedPassword)
 	user.LocalAuthEnabled = true
 	user.AuthSessionVersion = NormalizeAuthSessionVersion(user.AuthSessionVersion) + 1
@@ -92,8 +141,8 @@ func (service *SettingsService) PrepareLocalPasswordHash(user *models.User, newP
 	if newPassword != confirmPassword {
 		return "", ErrSettingsPasswordMismatch
 	}
-	if err := ValidatePasswordStrength(newPassword); err != nil {
-		return "", ErrSettingsWeakPassword
+	if err := settingsPasswordPolicyError(ValidatePasswordStrength(newPassword)); err != nil {
+		return "", err
 	}
 
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(newPassword), passwordHashCost)
@@ -106,26 +155,38 @@ func (service *SettingsService) PrepareLocalPasswordHash(user *models.User, newP
 // FinalizeLocalPasswordSetup commits a previously prepared local password
 // hash, mints a fresh recovery code, and flips LocalAuthEnabled. Called only
 // after a successful step-up OIDC re-auth that has been bound to user.ID.
-func (service *SettingsService) FinalizeLocalPasswordSetup(ctx context.Context, user *models.User, preparedPasswordHash string) (string, error) {
+// deliver seals the re-issued session and the code's reveal before the write
+// commits (see RecoveryCodeDelivery); if it fails, nothing is enrolled and user
+// is unchanged.
+func (service *SettingsService) FinalizeLocalPasswordSetup(ctx context.Context, user *models.User, preparedPasswordHash string, deliver RecoveryCodeDelivery) (string, error) {
 	if user == nil || user.LocalAuthEnabled {
 		return "", ErrSettingsPasswordChangeInvalidInput
 	}
 	if strings.TrimSpace(preparedPasswordHash) == "" {
 		return "", ErrSettingsPasswordChangeInvalidInput
 	}
+	if deliver == nil {
+		return "", ErrRecoveryCodeDeliveryRequired
+	}
 
 	recoveryCode, recoveryHash, err := GenerateRecoveryCodeHash()
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", ErrSettingsRecoveryCodeGenerateFailed, err)
 	}
-	if err := service.users.UpdatePasswordRecoveryCodeAndRevokeSessions(ctx, user.ID, preparedPasswordHash, recoveryHash, false); err != nil {
+	staged := *user
+	if err := service.users.UpdatePasswordRecoveryCodeAndRevokeSessions(ctx, user.ID, NormalizeAuthSessionVersion(user.AuthSessionVersion), preparedPasswordHash, recoveryHash, false, func(sessionVersion int) error {
+		staged.PasswordHash = preparedPasswordHash
+		staged.RecoveryCodeHash = recoveryHash
+		staged.LocalAuthEnabled = true
+		staged.AuthSessionVersion = sessionVersion
+		staged.MustChangePassword = false
+		return deliver(&staged, recoveryCode)
+	}); err != nil {
+		if errors.Is(err, ErrAuthSessionVersionChanged) {
+			return "", ErrAuthSessionVersionChanged
+		}
 		return "", fmt.Errorf("%w: %v", ErrSettingsPasswordUpdateFailed, err)
 	}
-
-	user.PasswordHash = preparedPasswordHash
-	user.RecoveryCodeHash = recoveryHash
-	user.LocalAuthEnabled = true
-	user.AuthSessionVersion = NormalizeAuthSessionVersion(user.AuthSessionVersion) + 1
-	user.MustChangePassword = false
+	*user = staged
 	return recoveryCode, nil
 }

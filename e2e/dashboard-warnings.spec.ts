@@ -1,4 +1,4 @@
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect, type Page } from './support/fixtures';
 import {
   completeOnboardingIfPresent,
   continueFromRecoveryCode,
@@ -6,10 +6,16 @@ import {
   expectInlineRegisterRecoveryStep,
   readRecoveryCode,
   registerOwnerViaUI,
+  apiOriginHeader,
 } from './support/auth-helpers';
-import { dateFieldRoot, fillDateField } from './support/date-field-helpers';
+import { localeText } from './support/locale-helpers';
 import { setRequestTimezoneFromBrowser } from './support/timezone-helpers';
-import { openCalendarDayEditor, shiftISODate, todayISOFromDashboard } from './support/stats-helpers';
+import {
+  openCalendarDayEditor,
+  registerAndOnboardWithStartDaysAgo,
+  shiftISODate,
+  todayISOFromDashboard,
+} from './support/stats-helpers';
 
 async function registerAndOnboardDefault(page: Page, prefix: string): Promise<void> {
   const credentials = createCredentials(prefix);
@@ -18,47 +24,6 @@ async function registerAndOnboardDefault(page: Page, prefix: string): Promise<vo
   await readRecoveryCode(page);
   await continueFromRecoveryCode(page);
   await completeOnboardingIfPresent(page);
-  await setRequestTimezoneFromBrowser(page);
-}
-
-function isoDateDaysAgo(days: number): string {
-  const date = new Date();
-  date.setHours(0, 0, 0, 0);
-  date.setDate(date.getDate() - days);
-  const yyyy = date.getFullYear();
-  const mm = String(date.getMonth() + 1).padStart(2, '0');
-  const dd = String(date.getDate()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd}`;
-}
-
-async function registerAndOnboardWithStartDaysAgo(
-  page: Page,
-  prefix: string,
-  startDaysAgo: number,
-): Promise<void> {
-  // completeOnboardingIfPresent hardcodes today-3 as the period start, which
-  // makes today an auto-period-fill day. Spotting-warning + future-cycle-
-  // start scenarios need today to sit outside the onboarding period cluster,
-  // so we run a custom onboarding flow that submits an explicit older date.
-  const credentials = createCredentials(prefix);
-  await registerOwnerViaUI(page, credentials);
-  await expectInlineRegisterRecoveryStep(page);
-  await readRecoveryCode(page);
-  await continueFromRecoveryCode(page);
-
-  const startISO = isoDateDaysAgo(startDaysAgo);
-  const startInput = page.locator('#last-period-start');
-  await expect(dateFieldRoot(startInput)).toBeVisible();
-  await fillDateField(startInput, startISO);
-  await page.locator('form[hx-post="/api/v1/onboarding/steps/1"] button[type="submit"]').click();
-
-  const stepTwoForm = page.locator('form[hx-post="/api/v1/onboarding/steps/2"]');
-  await expect(stepTwoForm).toBeVisible();
-  await Promise.all([
-    page.waitForURL(/\/dashboard(?:\?.*)?$/, { timeout: 15000 }),
-    stepTwoForm.locator('button[type="submit"]').click(),
-  ]);
-
   await setRequestTimezoneFromBrowser(page);
 }
 
@@ -80,6 +45,7 @@ test.describe('Dashboard: spotting cycle warning', () => {
 
     const response = await page.request.put(`/api/v1/days/${today}`, {
       headers: {
+        ...apiOriginHeader(page),
         'X-CSRF-Token': await csrfToken(page),
         'Content-Type': 'application/json',
       },
@@ -90,12 +56,15 @@ test.describe('Dashboard: spotting cycle warning', () => {
     await page.goto('/dashboard');
     await expect(page).toHaveURL(/\/dashboard$/);
 
-    // The warning sits inside the [data-period-fields] fieldset right after
-    // the flow chips — scope the locator so a generic copy match on
-    // .journal-muted elsewhere on the page cannot mask a regression.
-    const periodFields = page.locator('[data-period-fields]');
+    // The warning sits inside the flow fieldset right after the flow chips —
+    // scope the locator so a generic copy match on .journal-muted elsewhere on
+    // the page cannot mask a regression. [data-period-fields] marks every
+    // section the period toggle reveals (the flow chips, the cycle-start
+    // question beside the toggle), so name this one by the controls it holds
+    // rather than by the shared reveal hook, which resolves to several nodes.
+    const periodFields = page.locator('[data-period-fields]:has(input[name="flow"])');
     await expect(periodFields).toBeVisible();
-    await expect(periodFields).toContainText('Spotting may not be day 1. Check again tomorrow.');
+    await expect(periodFields).toContainText(localeText('en', 'dashboard.spotting_cycle_warning'));
   });
 });
 
@@ -145,7 +114,7 @@ test.describe('Dashboard: period tip once', () => {
     });
     await expect(periodInput).toBeChecked();
     await expect(tipCopy).toBeVisible();
-    await expect(tipCopy).toContainText('Day 1 is the first day of full flow, not spotting.');
+    await expect(tipCopy).toContainText(localeText('en', 'dashboard.period_tip_once'));
     const autosaveRequest = await autosaveRequestPromise;
     const autosaveResponse = await autosaveRequest.response();
     expect(autosaveResponse, `expected a response for PUT ${todayPath}`).not.toBeNull();
@@ -175,7 +144,15 @@ test.describe('Calendar: future cycle start notice', () => {
     const tomorrow = shiftISODate(today, 1);
 
     await openCalendarDayEditor(page, tomorrow);
-    const dayEditor = page.locator('#day-editor');
-    await expect(dayEditor).toContainText('Predictions will be recalculated when that day arrives.');
+    // Addressed through the notice's own hook + key, the same way
+    // calendar.spec.ts pins it: one element, one contract, two specs.
+    const futureNotice = page.locator('#day-editor [data-future-cycle-start-notice]');
+    await expect(futureNotice.first()).toBeVisible();
+    await expect(futureNotice.first()).toHaveAttribute(
+      'data-notice-key',
+      'warning.future_cycle_start'
+    );
+    // One rendered-copy assertion for this notice, sourced from the catalogue.
+    await expect(futureNotice.first()).toHaveText(localeText('en', 'warning.future_cycle_start'));
   });
 });

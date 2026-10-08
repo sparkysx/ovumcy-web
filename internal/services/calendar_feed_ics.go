@@ -12,17 +12,33 @@ import (
 // Calendar (.ics) feed builder (issue #126-replacement / .ics, slice 3). This
 // file is the PURE, transport-free RFC 5545 builder: given an owner, their day
 // logs, an injected now/location, and the localized medical-safety disclaimer,
-// it renders a read-only text/calendar body of the owner's upcoming cycle
-// events. It performs NO transport, NO auth, and NO persistence — the api layer
+// it renders a read-only text/calendar body of the owner's estimated period and
+// ovulation days: the projections plus the current cycle's temperature-confirmed
+// ovulation day. It performs NO transport, NO auth, and NO persistence — the api layer
 // owns token resolution, headers, and rate-limiting.
 //
 // Medical-safety invariant (same as the webhook reminder decision): it reuses
 // the EXACT prediction path the dashboard uses (BuildCycleStatsFromLogs →
-// DashboardUpcomingPredictions, gated by DashboardPredictionDisabled /
-// stats.PregnancyPaused). It NEVER fabricates a date the app itself refuses to
-// show — when in-app predictions are suppressed (unpredictable cycle, or a
-// pregnancy pause), it emits ZERO prediction events, so a "fertile window" is
-// never pushed into a pregnant owner's calendar.
+// DashboardUpcomingPredictions, gated by PredictionsSuppressed and shaped by
+// ResolveProjectionRanges). It NEVER fabricates a date the app itself refuses
+// to show — where the dashboard shows a window, the feed carries that window —
+// and when in-app predictions are suppressed (unpredictable cycle, a pregnancy
+// pause, a cycle running past its reference length by more than a week, or
+// irregular-cycle mode with fewer than three completed cycles), it emits ZERO
+// prediction events, so neither a
+// "fertile window" is pushed into a pregnant owner's calendar nor three cycles
+// of invented period dates into a calendar client the app itself would not name
+// a single date to.
+//
+// The feed carries estimated dates, and one of them is not a projection: the
+// current cycle's ovulation day as the owner's own temperatures confirm it
+// (ConfirmedCurrentCycleOvulation). It is published exactly when the dashboard,
+// the calendar grid and the JSON API name it — that resolver's gate
+// (ConfirmedOvulationWithheld) is the only one it passes, so it outlives the
+// overdue signal and stays withheld in unpredictable-cycle mode, during a
+// pregnancy pause and before the first completed cycle. It is the one event the
+// feed publishes for a day already behind the owner; past cycles are never
+// carried.
 //
 // Data-minimization invariant: every VEVENT SUMMARY is the SAME neutral,
 // contentless title (calendarFeedNeutralSummary) — no cycle phase, no date, no
@@ -74,12 +90,31 @@ type CalendarFeedICSInput struct {
 	Disclaimer string
 }
 
-// calendarFeedEvent is one resolved all-day prediction event before rendering.
+const (
+	// calendarFeedKindPeriod and calendarFeedKindOvulation are the two UID
+	// discriminators. The confirmed ovulation day shares the projected one's
+	// kind on purpose: a client that already holds the projection for that date
+	// sees the same UID and updates the event in place instead of adding a
+	// second one.
+	calendarFeedKindPeriod    = "period"
+	calendarFeedKindOvulation = "ovulation"
+
+	// calendarFeedKindPeriodWindow and calendarFeedKindOvulationWindow mark the
+	// multi-day events the feed sends where the dashboard shows a range
+	// (ResolveProjectionRanges). A distinct kind keeps a window's UID from ever
+	// matching a single-day event that starts on the same date.
+	calendarFeedKindPeriodWindow    = "period-window"
+	calendarFeedKindOvulationWindow = "ovulation-window"
+)
+
+// calendarFeedEvent is one resolved all-day event before rendering.
 // kind is a stable, non-secret discriminator used only to build a deterministic
-// UID; it is NEVER placed in the SUMMARY (that stays neutral).
+// UID; it is NEVER placed in the SUMMARY (that stays neutral). end is the last
+// day of a multi-day event, and the zero time for a single day.
 type calendarFeedEvent struct {
 	kind string
 	date time.Time
+	end  time.Time
 }
 
 // BuildCalendarFeedICS renders the owner's upcoming-cycle .ics body. It always
@@ -89,10 +124,14 @@ type calendarFeedEvent struct {
 //
 // The decision, in order (mirrors DecideDueReminders' medical-safety gate):
 //   - Build cycle stats from the owner's logs via the SAME path the dashboard
-//     uses (StatsService.BuildCycleStatsFromLogs, which needs no repositories).
+//     uses (BuildCycleStatsFromLogs, which needs no repositories).
+//   - Emit the current cycle's temperature-confirmed ovulation day when
+//     ConfirmedCurrentCycleOvulation names one — its own gate, the same answer
+//     the dashboard, the calendar grid and the JSON API read.
 //   - If in-app predictions are suppressed (DashboardPredictionDisabled — the
-//     owner's unpredictable-cycle mode — or stats.PregnancyPaused), emit ZERO
-//     events. This is the hard medical-safety suppression gate.
+//     owner's unpredictable-cycle mode — stats.PregnancyPaused, or
+//     DashboardCycleOverdue), emit ZERO prediction events. This is the hard
+//     medical-safety suppression gate.
 //   - Otherwise project the next calendarFeedProjectionCycles cycles forward from
 //     the owner's last period start, reusing the dashboard's own cycle-start
 //     projection + window helpers, and emit a predicted-next-period event and an
@@ -103,69 +142,157 @@ func BuildCalendarFeedICS(input CalendarFeedICSInput) []byte {
 	return renderCalendarFeedICS(events, input.Disclaimer, input.Now)
 }
 
-// calendarFeedEvents resolves the neutral, all-day prediction events for the
-// feed. Returns nil when predictions are suppressed or no cycle can be
-// projected.
+// calendarFeedEvents resolves the neutral, all-day events for the feed: the
+// current cycle's confirmed ovulation day when its gate lets it through, then
+// the projected events. Returns no prediction event when predictions are
+// suppressed or no cycle can be projected.
 func calendarFeedEvents(input CalendarFeedICSInput) []calendarFeedEvent {
 	user := input.User
 	if user == nil {
 		return nil
 	}
 
-	// Reuse the exact dashboard prediction path — a zero-dependency StatsService
-	// runs precisely the dashboard's stats derivation (baseline + pregnancy-pause
-	// resolution) without a store, exactly as DecideDueReminders does.
-	stats := NewStatsService(nil, nil).BuildCycleStatsFromLogs(user, input.Logs, input.Now, input.Location)
-
-	// Medical-safety suppression gate: if the app suppresses predictions, emit
-	// nothing. Pregnancy-pause OR unpredictable-cycle mode both suppress.
-	if DashboardPredictionDisabled(user) || stats.PregnancyPaused {
-		return nil
-	}
-
+	// Reuse the exact dashboard prediction path — package-level
+	// BuildCycleStatsFromLogs runs precisely the dashboard's stats derivation
+	// (baseline + pregnancy-pause resolution) without a store, exactly as
+	// DecideDueReminders does.
 	today := DateAtLocation(input.Now, input.Location)
-	cycleLength := DashboardProjectionCycleLength(user, stats)
-	if stats.LastPeriodStart.IsZero() || cycleLength <= 0 {
-		return nil
-	}
+	// Published through the one adapter every projection surface shares, so the
+	// feed holds the same cleared stats the pages and the JSON API publish, and
+	// reads the verdict it returns rather than asking the predicates again.
+	stats, suppression := PublishedStats(user, BuildCycleStatsFromLogs(user, input.Logs, input.Now, input.Location), input.Logs, today, input.Location)
 
-	// Anchor the first projected cycle to the current/next cycle start exactly as
-	// DashboardUpcomingPredictions does, then step forward one cycle at a time.
-	cycleStart, _, ok := ProjectCycleStart(stats.LastPeriodStart, cycleLength, today)
-	if !ok {
-		// codecov:ignore -- defensive: ProjectCycleStart only reports !ok for a zero
-		// LastPeriodStart or non-positive cycleLength, both already returned above.
-		return nil
-	}
-
-	events := make([]calendarFeedEvent, 0, calendarFeedProjectionCycles*2)
-	seen := make(map[string]struct{}, calendarFeedProjectionCycles*2)
-	appendEvent := func(kind string, date time.Time) {
-		key := kind + "-" + date.Format(calendarFeedDateLayout)
-		if _, dup := seen[key]; dup {
-			// codecov:ignore -- defensive: projected cycles step strictly forward, so
-			// (kind, date) is unique in practice; dedupe guards the UID invariant if
-			// that ever stops holding rather than falling back to a disambiguating
-			// suffix that would break UID stability across renders.
+	events := make([]calendarFeedEvent, 0, calendarFeedProjectionCycles*2+1)
+	seen := make(map[string]struct{}, calendarFeedProjectionCycles*2+1)
+	appendSpan := func(kind string, date time.Time, end time.Time) {
+		// An all-day event spells its exclusive DTEND as the day after its last
+		// day, and an RFC 5545 DATE has a four-digit year, so the last day an event
+		// can name is 9999-12-30: an event whose end has no spelling is left out
+		// (projectedDay).
+		lastDay := date
+		if !end.IsZero() {
+			lastDay = end
+		}
+		if projectedDay(AddCalendarDays(lastDay, 1, lastDay.Location())).IsZero() {
 			return
 		}
+		key := kind + "-" + date.Format(calendarFeedDateLayout)
+		// codecov:ignore:start -- defensive: a confirmed day is behind today and
+		// every projected ovulation is on or after it, and projected cycles step
+		// strictly forward, so (kind, date) is unique in practice; dedupe guards
+		// the UID invariant if that ever stops holding rather than falling back
+		// to a disambiguating suffix that would break UID stability across
+		// renders.
+		if _, dup := seen[key]; dup {
+			return
+		}
+		// codecov:ignore:end
 		seen[key] = struct{}{}
-		events = append(events, calendarFeedEvent{kind: kind, date: date})
+		events = append(events, calendarFeedEvent{kind: kind, date: date, end: end})
 	}
-	for cycle := range calendarFeedProjectionCycles {
-		anchor := CalendarDay(cycleStart.AddDate(0, 0, cycle*cycleLength), input.Location)
+	appendEvent := func(kind string, date time.Time) {
+		appendSpan(kind, date, time.Time{})
+	}
 
-		nextPeriodStart := CalendarDay(anchor.AddDate(0, 0, cycleLength), input.Location)
-		if !nextPeriodStart.Before(today) {
-			appendEvent("period", nextPeriodStart)
+	// The confirmed ovulation day comes first and ahead of the suppression gate
+	// below. Whether it may be named is decided once, inside
+	// ConfirmedCurrentCycleOvulation (ConfirmedOvulationWithheld), which the
+	// dashboard, the calendar grid and the JSON API read too — so the feed shows
+	// the day exactly when they do, never under a gate of its own. That gate
+	// leaves out the overdue signal (the day was read off recorded temperatures,
+	// not rolled forward from a cycle length) and keeps unpredictable-cycle mode,
+	// the pregnancy pause and the first-cycle floor. No "not in the past" filter
+	// applies: a confirmed day is always behind the owner, and it stays in the
+	// feed only while its cycle is the current one. It takes the ovulation kind,
+	// so a projection a client already holds for the same date keeps its UID.
+	confirmed, hasConfirmed := ConfirmedCurrentCycleOvulation(user, input.Logs, stats, today, input.Location)
+	if hasConfirmed {
+		appendEvent(calendarFeedKindOvulation, CalendarDay(confirmed, input.Location))
+	}
+
+	// Medical-safety suppression gate: if the app suppresses predictions, emit
+	// no projected event. Unpredictable-cycle mode, a pregnancy pause, an overdue
+	// cycle (DashboardCycleOverdue — past the account's own cycle length by more
+	// than a week, where the projection can only roll a whole cycle forward), or
+	// irregular-cycle mode with fewer than three completed cycles each suppress on
+	// their own, and they are read here through the one predicate every surface
+	// shares. Without a confirmed day above, this is the
+	// empty-but-well-formed VCALENDAR path.
+	if suppression.PredictionsSuppressed {
+		return events
+	}
+
+	// The ovulation events carry the extra completed-cycle floor: with fewer than
+	// three completed cycles behind it, the projected ovulation day is the
+	// onboarding slider or one or two observed lengths, and this feed sends it off
+	// the instance into a calendar client that keeps it long after the app would
+	// correct it (FertilityProjectionSuppressed).
+	includeOvulation := !suppression.FertilitySuppressed
+	cycleLength := DashboardProjectionCycleLength(user, stats)
+	if stats.LastPeriodStart.IsZero() || cycleLength <= 0 {
+		return events
+	}
+
+	// The next period start and ovulation the dashboard header names take the
+	// header's shape here too (ResolveProjectionRanges): where the page shows a
+	// start window or an ovulation range, the feed carries that window as one
+	// multi-day event instead of the median day inside it. The single event a
+	// window replaces is the one that falls INSIDE it. A window already behind
+	// today is not sent. The cycles chained after are projections of a
+	// projection, and the dashboard names no range for them either. A confirmed
+	// ovulation outranks the ovulation range exactly as it does on the dashboard.
+	prediction := DashboardUpcomingPredictions(stats, user, today, cycleLength)
+	ranges := ResolveProjectionRanges(user, stats, prediction.NextPeriodStart, input.Location)
+	periodWindow := ranges.NextPeriodUseRange
+	if periodWindow && CalendarDaysBetween(today, ranges.NextPeriodEnd) >= 0 {
+		appendSpan(calendarFeedKindPeriodWindow, ranges.NextPeriodStart, ranges.NextPeriodEnd)
+	}
+	ovulationWindow := includeOvulation && ranges.OvulationUseRange && !hasConfirmed && !prediction.OvulationImpossible
+	if ovulationWindow && CalendarDaysBetween(today, ranges.OvulationEnd) >= 0 {
+		appendSpan(calendarFeedKindOvulationWindow, ranges.OvulationStart, ranges.OvulationEnd)
+	}
+
+	// The chain starts at the running cycle, whose period DashboardUpcomingPredictions
+	// names even once it is late, and gains one cycle per whole cycle already
+	// elapsed, so it reaches as far as a chain from today's cycle would: a late
+	// period keeps its own day while it is not behind today, and no later cycle
+	// drops off the end.
+	runningStart := CalendarDay(stats.LastPeriodStart, input.Location)
+	cycles := calendarFeedProjectionCycles + max(CalendarDaysBetween(runningStart, today), 0)/cycleLength
+	for cycle := range cycles {
+		anchor := AddCalendarDays(runningStart, cycle*cycleLength, input.Location)
+
+		nextPeriodStart := AddCalendarDays(anchor, cycleLength, input.Location)
+		if !nextPeriodStart.Before(today) &&
+			(!periodWindow || !calendarDayWithin(nextPeriodStart, ranges.NextPeriodStart, ranges.NextPeriodEnd)) {
+			appendEvent(calendarFeedKindPeriod, nextPeriodStart)
 		}
 
 		window := PredictCycleWindow(anchor, cycleLength, stats.LutealPhase)
-		if window.Calculable && !window.OvulationDate.Before(today) {
-			appendEvent("ovulation", CalendarDay(window.OvulationDate, input.Location))
+		// nextPeriodStart above is a location midnight like today, so it compares
+		// directly; window.OvulationDate is a UTC-midnight date-only value and
+		// needs a calendar-day comparison, or the ovulation event disappears from
+		// the feed on the ovulation day itself in every UTC-minus zone (issue #48
+		// class).
+		// A confirmed thermal shift outranks the projection it supersedes. Once the
+		// current cycle's shift has named the day, the confirmed event above
+		// carries it, and this cycle's projected event would be a second date for
+		// one shift going out to a calendar client that keeps it —
+		// ConfirmedOvulationSupersedes bounds that to the confirmation's own cycle,
+		// so the later projected cycles here are untouched.
+		if includeOvulation && window.Calculable && CalendarDaysBetween(window.OvulationDate, today) <= 0 &&
+			(!ovulationWindow || !calendarDayWithin(window.OvulationDate, ranges.OvulationStart, ranges.OvulationEnd)) &&
+			!ConfirmedOvulationSupersedes(user, input.Logs, stats, window.OvulationDate, today, input.Location) {
+			appendEvent(calendarFeedKindOvulation, CalendarDay(window.OvulationDate, input.Location))
 		}
 	}
 	return events
+}
+
+// calendarDayWithin reports whether day falls on or between first and last, by
+// calendar day (the operands may carry different midnight shapes).
+func calendarDayWithin(day time.Time, first time.Time, last time.Time) bool {
+	return CalendarDaysBetween(first, day) >= 0 && CalendarDaysBetween(day, last) >= 0
 }
 
 // renderCalendarFeedICS assembles the RFC 5545 VCALENDAR text. Every line is
@@ -191,7 +318,11 @@ func renderCalendarFeedICS(events []calendarFeedEvent, disclaimer string, now ti
 
 func writeCalendarFeedEvent(b *strings.Builder, event calendarFeedEvent, stamp string, disclaimer string) {
 	start := event.date.Format(calendarFeedDateLayout)
-	end := event.date.AddDate(0, 0, 1).Format(calendarFeedDateLayout)
+	lastDay := event.date
+	if !event.end.IsZero() {
+		lastDay = event.end
+	}
+	end := AddCalendarDays(lastDay, 1, lastDay.Location()).Format(calendarFeedDateLayout)
 
 	writeICSLine(b, "BEGIN:VEVENT")
 	// UID is a pure function of (kind, date) — stable across renders/polls at

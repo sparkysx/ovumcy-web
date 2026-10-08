@@ -17,7 +17,7 @@ GET /api/v1/exports/json?from=2026-01-01&to=2026-05-31
 Cookie: ovumcy_auth=...
 ```
 
-Response headers: `Content-Disposition: attachment; filename="ovumcy-export-<timestamp>.json"`, `Content-Type: application/json`.
+Response headers: `Content-Disposition: attachment; filename=ovumcy-export-<timestamp>.json`, `Content-Type: application/json`. The filename is unquoted, as the server emits it.
 
 Response body:
 
@@ -68,15 +68,16 @@ Field semantics:
 | --- | --- | --- |
 | `exported_at` | RFC 3339 string | Server time at export, in the user's timezone. |
 | `entries` | array | One entry per logged day. Days with no data are not exported. |
+| `last_period_start` | `YYYY-MM-DD` string, optional | The owner's onboarding start, a cycle boundary no logged day carries. Present only when the account has one and the requested range includes it. Restore sets it only on an account that holds none. |
 | `date` | `YYYY-MM-DD` string | Calendar day in the user's timezone. |
 | `period` | boolean | Whether the day is marked as a period day. |
 | `flow` | string | One of `none`, `spotting`, `light`, `medium`, `heavy`. |
 | `mood_rating` | integer | User-selected mood scale. Zero means unset. |
 | `sex_activity` | string | One of `none`, `protected`, `unprotected`. |
-| `bbt` | float | Basal body temperature in Celsius, always — storage is canonical Celsius regardless of the account's display unit, and export emits the stored value unconverted. Emitted only when measured; the key is absent on unmeasured days. On import, an absent key, an explicit `null`, or a legacy `0` are all read as "not measured". |
+| `bbt` | float | Basal body temperature in Celsius, always — storage is canonical Celsius regardless of the account's display unit, and export emits the stored value unconverted. Emitted only when measured; the key is absent on unmeasured days. On import, an absent key, an explicit `null`, or a legacy `0` are all read as "not measured"; a value outside the accepted range is read as "not measured" too, like any other malformed field, rather than rejecting the day. |
 | `cervical_mucus` | string | One of `none`, `dry`, `moist`, `creamy`, `eggwhite`. |
 | `pregnancy_test` | string | One of `none`, `negative`, `positive`. |
-| `cycle_factors` | array of strings | Free-form factor keys recorded that day (e.g. `stress`, `travel`, `illness`). |
+| `cycle_factors` | array of strings | Factor keys recorded that day, from the closed catalog `stress`, `illness`, `travel`, `sleep_disruption`, `medication_change`. Any other key is dropped on import. |
 | `symptoms` | object of booleans | Flags for the 16 built-in symptoms. Always present, even when all false. |
 | `other_symptoms` | array of strings | Names of owner-managed custom symptoms recorded that day. |
 | `notes` | string | Free-text note. |
@@ -92,7 +93,7 @@ GET /api/v1/exports/csv?from=2026-01-01&to=2026-05-31
 Cookie: ovumcy_auth=...
 ```
 
-Response headers: `Content-Disposition: attachment; filename="ovumcy-export-<timestamp>.csv"`, `Content-Type: text/csv`.
+Response headers: `Content-Disposition: attachment; filename=ovumcy-export-<timestamp>.csv`, `Content-Type: text/csv`. The filename is unquoted, as the server emits it.
 
 Columns (in order, single header row):
 
@@ -111,12 +112,13 @@ Cell semantics:
 - `Swelling` was appended after `Constipation` (the last symptom column at the time) rather than at the very end of the file; every column at or after `Cycle factors` therefore shifted one position to the right for files generated after this change. Downstream consumers reading columns by position (not by header name) must account for the shift.
 - `Flow`, `Sex activity`, `Cervical mucus`, `Pregnancy test` are human-readable, capitalized labels (e.g. `Spotting`, `Protected`, `Egg white`, `Negative`), not the same lowercase enum strings used by the JSON export.
 - `BBT (C)` is always the stored value in Celsius; storage is canonical Celsius regardless of the account's display unit, and export emits it unconverted. The cell is empty on days with no measurement. The header keeps the literal text `BBT (C)` for stability even though it always holds Celsius.
-- `Cycle factors` is a `;`-separated list of factor keys; empty when none were recorded.
-- `Other` is a `;`-separated list of owner-managed custom symptom names; empty when none.
+- `Cycle factors` is a `; `-separated list of the same human-readable labels the app shows (`Stress`, `Illness`, `Travel`, `Sleep disruption`, `Medication change`) — not the lowercase keys the JSON export emits; empty when none were recorded.
+- `Other` is a `; `-separated list of owner-managed custom symptom names; empty when none.
 - `Notes` is the free-text note; the CSV writer quotes the cell as needed.
 - CSV-injection mitigation: `Cycle factors`, `Other`, and `Notes` are the only cells built from user-entered text. If such a cell (after stripping leading spaces) starts with `=`, `+`, `-`, `@`, or a tab/CR/LF, a leading `'` is prepended so spreadsheet apps do not interpret it as a formula.
 - `Pregnancy test` was introduced after the 1.1.1 layout and appended after the original columns so existing column positions stay stable, per the stability rule below.
 - `Cycle start` and `Uncertain` are `Yes`/`No`. They are the last two columns, appended after `Pregnancy test` so existing column positions stay stable, per the stability rule below. `Cycle start` marks the manually flagged start of a cycle; `Uncertain` marks a day the owner flagged as uncertain. Both are owner-only.
+- The owner's onboarding start (the JSON export's `last_period_start`, under the same range rule) is marked `Cycle start = Yes` on its row; when no day was logged on it, the file carries a bare row holding only the date and that mark.
 
 ## Summary Export
 
@@ -136,7 +138,7 @@ Response is JSON (not a file download), used by the Settings UI before showing t
 }
 ```
 
-`date_from`/`date_to` are absent or empty strings when the range is unbounded.
+All four keys are always present. `date_from`/`date_to` report the **extent of the data found**, not the requested range: they are the earliest and latest logged day inside it, so an unbounded query with logs still returns concrete dates. They are empty strings exactly when the range holds no entries at all (alongside `has_data: false` and `total_entries: 0`).
 
 ## Import (restore)
 
@@ -144,7 +146,7 @@ Response is JSON (not a file download), used by the Settings UI before showing t
 
 Request: `Content-Type: application/json`, body = the raw export file. Requires the `owner` role, a valid auth session, and a CSRF token (`X-CSRF-Token` header or `csrf_token` form field) — it is state-mutating, unlike the GET exports.
 
-The restore is **additive**: each entry creates its day only if the account does not already have that calendar day. Existing days are never overwritten or deleted, so no password re-authentication is required (contrast clear-data / delete-account), and re-importing the same file is safe and idempotent.
+The restore is **additive**: each entry creates its day only if the account does not already have that calendar day. Existing days are never overwritten or deleted, so no re-authentication is required at all (contrast clear-data / delete-account, which always cost one), and re-importing the same file is safe and idempotent.
 
 Every field is re-validated and sanitized server-side (the file is untrusted input): unknown enum values fall back to their neutral default, `notes` is length-capped, invalid cycle-factor keys are dropped, and `cycle_start`/`is_uncertain` are cleared on non-period days. Built-in symptom flags map back to the owner's own catalog; names in `other_symptoms` are matched to existing symptoms or created as custom symptoms. All writes are scoped to the session owner.
 
@@ -158,7 +160,20 @@ Response `200`:
 - `skipped` — days that already existed and were left untouched.
 - `rejected` — malformed or duplicate day records dropped without writing.
 
-Error responses use stable, PII-free keys: `400 invalid import file` (not valid JSON), `413 import file too large`, `500 failed to import data`.
+### Size limits
+
+Two independent caps bound a restore, and they surface as **two different 413 keys** — a client keying on the error string needs both:
+
+| Cap | Value | Error |
+| --- | --- | --- |
+| Request body | **16 MiB** | `413 request_too_large`, enforced at the transport layer before the handler runs — the import service never sees the bytes. Applies to the body as the server reads it, decompressed size included; see below. |
+| Entries per file | **20 000** | `413 import file too large`. Enforced by the import service on the parsed payload. |
+
+The body limit is sized to the entry cap (20 000 day records serialize to roughly 8–12 MiB), so a file at the documented entry ceiling stays comfortably under it. A file that trips the body limit is therefore either far past the entry cap or carrying unusually large `notes`.
+
+**Compressed requests (`Content-Encoding: gzip`/`deflate`/`br`/`zstd`) are bounded by the same 16 MiB, applied twice.** The raw bytes on the wire are capped regardless of encoding, so a compressed body that is itself over 16 MiB is refused while the request is read. A well-compressed body can stay under that on the wire and still expand past 16 MiB, so the cap is applied a second time to the **decompressed** stream, and a body that crosses it is refused there too. Either way the answer is the same `413 request_too_large` and the restore never starts: the import service is never handed a partial or substituted payload, so an oversized upload is never reported as a malformed file. Uncompressed requests only ever meet the first check — their wire size and parsed size are the same number.
+
+Error responses use stable, PII-free keys: `400 invalid import file` (not valid JSON), the two 413s above, and `500 failed to import data`.
 
 Importing from other trackers (e.g. Drip) is out of scope for this endpoint — see [issue #116](https://github.com/ovumcy/ovumcy-web/issues/116).
 

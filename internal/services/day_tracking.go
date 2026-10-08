@@ -16,6 +16,12 @@ const (
 
 	MinDayBBTCelsius = 34.0
 	MaxDayBBTCelsius = 43.0
+
+	// bbtStoredScale is the canonical stored precision for a BBT reading:
+	// ten-thousandths of a degree Celsius. bbtStoredGridValue is the one
+	// rounding onto that grid; roundStoredTemperatureValue and the shift
+	// detector's comparisons (cycle_signals.go) both go through it.
+	bbtStoredScale = 10000
 )
 
 func NormalizeDaySexActivity(value string) string {
@@ -145,24 +151,122 @@ func ParseDayBBTRawWithUnit(raw string, unit string) (*float64, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid day bbt: %w", err)
 	}
-	if NormalizeTemperatureUnit(unit) == TemperatureUnitFahrenheit {
-		value = fahrenheitToCelsius(value)
-	}
-	return normalizeStoredDayBBT(&value), nil
+	return ConvertDayBBTToStorage(&value, unit), nil
 }
 
-// normalizeStoredDayBBT collapses any non-measurement (nil or a non-positive
-// value, the old sentinel range) to nil, and rounds a genuine reading. The
-// result is the canonical stored form: nil for unmeasured, a rounded pointer
-// otherwise.
+// ConvertDayBBTToStorage is the INPUT gate for a temperature: it takes what the
+// owner typed, in the account's own unit, and answers that value converted to
+// Celsius and rounded onto the stored grid — or nil for "not measured". It
+// judges nothing beyond the sentinel: 32 °F comes back as a pointer to 0.0 and
+// 20 °F as one to -6.6667, both of them readings left for IsValidDayBBT to
+// refuse. So the order is fixed, convert HERE and validate after, and a caller
+// that validates first is judging a number in the wrong unit.
+//
+// Both transports go through it before NormalizeDayEntryInput judges the
+// result, the form via ParseDayBBTRawWithUnit's string parse and the JSON bind
+// with the float encoding/json gave it, so neither writes whatever unit the
+// caller sent straight to storage and both round identically.
+//
+// The "not measured" sentinel is read HERE, in the unit that was typed, and
+// this is the only place entitled to read it. A non-positive entry is the owner
+// saying nothing was measured; anything above it is a reading, and the
+// physiological range (IsValidDayBBT) is what then accepts or refuses it. Read
+// after the conversion instead, that same test swallowed every Fahrenheit entry
+// in (0, 32] as well — 20 °F is not an empty field, it is an impossible
+// reading — and the day was saved with a null temperature and no word to the
+// owner. This is the one full statement of that placement; the tests, the
+// changelog and the spec point back here.
+//
+// A non-finite entry is neither answer and is handed on as it stands, so the
+// range refuses it — which makes validation a PRECONDITION of every caller:
+// what comes back is a value in stored units, not a value fit to store, and the
+// two callers here both reach NormalizeDayEntryInput before anything is written. Without that, -Inf would BE the sentinel — it is
+// non-positive — and a value no thermometer can produce would be filed as the
+// owner's "nothing measured", while NaN, non-positive under no comparison, was
+// already refused. Same input, opposite outcomes, on the sign of an infinity.
+func ConvertDayBBTToStorage(value *float64, unit string) *float64 {
+	if value == nil {
+		return nil
+	}
+	if math.IsNaN(*value) || math.IsInf(*value, 0) {
+		nonFinite := *value
+		return &nonFinite
+	}
+	if *value <= 0 {
+		return nil
+	}
+	converted := *value
+	if NormalizeTemperatureUnit(unit) == TemperatureUnitFahrenheit {
+		converted = fahrenheitToCelsius(converted)
+	}
+	rounded := roundStoredTemperatureValue(converted)
+	return &rounded
+}
+
+// normalizeStoredDayBBT rounds an already-Celsius value onto the stored grid
+// and answers nil for a non-measurement. Its two halves are reached very
+// differently.
+//
+// The nil half runs on every ordinary path: a day saved without a temperature
+// (NormalizeDayEntryInput's closing pass, day_input.go), a restored file whose
+// reading the import already emptied (normalizeExportBBT, import_service.go),
+// and a row the day form renders as an empty field (FormatDayBBTForInput).
+//
+// The non-positive half is a floor rather than a live path. Migration 024
+// rewrote the legacy 0 sentinel to NULL on both engines
+// (migrations/024_daily_logs_bbt_nullable.sql and its postgres twin), and since
+// the "not measured" answer moved into the owner's own unit no writer can store
+// a non-positive value at all — a save is refused by IsValidDayBBT one step
+// earlier, an import emptied by normalizeExportBBT. It stays for the row that
+// arrives from outside those writers: a backup taken before 024, a database
+// edited by hand. Such a row has to render as an empty field, not as a
+// measurement of zero. Regression:
+// TestFormatDayBBTForInputRendersALegacyZeroAsNotMeasured.
+//
+// Because it runs after any conversion and never learns the owner's unit, it
+// cannot be the place the sentinel is judged — ConvertDayBBTToStorage says why.
 func normalizeStoredDayBBT(value *float64) *float64 {
 	if value == nil || *value <= 0 {
 		return nil
 	}
-	rounded := roundTemperatureValue(*value)
+	rounded := roundStoredTemperatureValue(*value)
 	return &rounded
 }
 
+// roundStoredTemperatureValue rounds a reading to its canonical STORED form.
+// Storage is always Celsius, and it keeps more decimals than either unit
+// displays on purpose: a reading entered in Fahrenheit is converted before it
+// is stored, and one step of 0.01 °F is 0.0056 °C, so a stored value rounded to
+// the two Celsius decimals the form shows cannot represent what the owner
+// typed. It came back one hundredth of a degree away after every save — a
+// recorded measurement altered without notice, far below the 0.1-0.5 °F shift a
+// BBT chart is read for and therefore invisible to every other check. Four
+// decimals keep every 0.01 °F step distinct and exactly recoverable, while
+// still collapsing the float noise the conversion produces.
+func roundStoredTemperatureValue(value float64) float64 {
+	return bbtStoredGridValue(value) / bbtStoredScale
+}
+
+// bbtStoredGridValue is the one rounding onto the stored grid: the reading as
+// a whole number of bbtStoredScale-ths, kept as float64 so whatever the form
+// parser lets through (NaN, 1e300) stays a defined value for IsValidDayBBT to
+// refuse rather than an out-of-range int64 conversion.
+func bbtStoredGridValue(value float64) float64 {
+	return math.Round(value * bbtStoredScale)
+}
+
+// bbtStoredUnits is bbtStoredGridValue as an integer, for values already known
+// to be finite and small: readings that passed IsValidDayBBT, and the margin
+// constant. Comparisons in these units are exact where a float64 addition is
+// not: 36.2 + 0.2 is 36.400000000000006, one ULP above a third day recorded
+// as 36.4.
+func bbtStoredUnits(value float64) int64 {
+	return int64(bbtStoredGridValue(value))
+}
+
+// roundTemperatureValue rounds to the two decimals a temperature is DISPLAYED
+// with, in whichever unit it is being shown. It is a presentation rounding, not
+// the stored one.
 func roundTemperatureValue(value float64) float64 {
 	return math.Round(value*100) / 100
 }

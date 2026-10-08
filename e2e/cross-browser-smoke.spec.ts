@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page } from './support/fixtures';
 import {
   completeOnboardingIfPresent,
   continueFromRecoveryCode,
@@ -7,8 +7,22 @@ import {
   readRecoveryCode,
   registerOwnerViaUI,
 } from './support/auth-helpers';
+import { saveDashboardEntry } from './support/dashboard-helpers';
+import { saveSettingsLanguage } from './support/language-helpers';
+import { localeText, type Locale } from './support/locale-helpers';
 import { ensureNotesFieldVisible } from './support/note-helpers';
 import { setRequestTimezoneFromBrowser } from './support/timezone-helpers';
+
+// Address the page title by the key it declares and take the expected copy from
+// the catalogue. The literals this replaces ('Configuración', 'Calendario') and
+// the /Insights|Аналитика|Análisis/ alternation both re-typed shipped strings
+// into the spec, and the alternation matched any of three languages regardless
+// of which one the page was rendering.
+async function expectPageTitle(page: Page, key: string, locale: Locale = 'en'): Promise<void> {
+  const title = page.locator(`h1[data-title-key="${key}"]`);
+  await expect(title).toBeVisible();
+  await expect(title).toContainText(localeText(locale, key));
+}
 
 async function registerOwnerAndReachDashboard(page: Page, prefix: string): Promise<void> {
   const credentials = createCredentials(prefix);
@@ -23,14 +37,8 @@ async function registerOwnerAndReachDashboard(page: Page, prefix: string): Promi
 
   await page.goto('/dashboard');
   await expect(page).toHaveURL(/\/dashboard$/);
-  const cycleHero = page.locator('[data-dashboard-cycle-hero]');
-  const fallbackStatusLine = page.locator('[data-dashboard-status-line]');
-  if ((await cycleHero.count()) > 0) {
-    await expect(cycleHero).toBeVisible();
-    await expect(fallbackStatusLine).toHaveCount(0);
-  } else {
-    await expect(fallbackStatusLine).toBeVisible();
-  }
+  await expect(page.locator('[data-dashboard-status-header]')).toBeVisible();
+  await expect(page.locator('[data-dashboard-status-line]')).toBeVisible();
   await expect(page.locator('[data-dashboard-save-form]').first()).toBeVisible();
 }
 
@@ -53,15 +61,15 @@ test.describe('Cross-browser smoke', () => {
 
     const flowMedium = page.locator('input[name="flow"][value="medium"]');
     const flowMediumChip = page.locator(
-      'label.choice-option:has(input[name="flow"][value="medium"]) .radio-tile'
+      'label.choice-option:has(input[name="flow"][value="medium"]) .chip-stack'
     );
-    await page.locator('input[name="is_period"]').check();
-    await expect(flowMedium).toBeEnabled();
-    await flowMediumChip.click();
-    await expect(flowMedium).toBeChecked();
-    await notes.fill(noteText);
-    await page.locator('button[data-save-button]').first().click();
-    await expect(page.locator('#save-status .status-ok')).toBeVisible();
+    await saveDashboardEntry(page, async () => {
+      await page.locator('input[name="is_period"]').check();
+      await expect(flowMedium).toBeEnabled();
+      await flowMediumChip.click();
+      await expect(flowMedium).toBeChecked();
+      await notes.fill(noteText);
+    });
 
     const iso = await todayISO(page);
     await page.goto(`/calendar?month=${iso.slice(0, 7)}&day=${iso}`);
@@ -70,7 +78,7 @@ test.describe('Cross-browser smoke', () => {
 
     await page.goto('/stats');
     await expect(page).toHaveURL(/\/stats$/);
-    await expect(page.locator('h1.journal-title')).toContainText(/Insights|Аналитика|Análisis/);
+    await expectPageTitle(page, 'stats.title');
   });
 
   test('theme and language switches persist across core routes', async ({ page }) => {
@@ -81,19 +89,20 @@ test.describe('Cross-browser smoke', () => {
 
     const html = page.locator('html');
     const interfaceForm = page.locator('[data-settings-interface-form]');
-    await interfaceForm.locator('[data-settings-interface-theme-option="dark"] .radio-tile').click();
+    await interfaceForm.locator('[data-settings-interface-theme-option="dark"] .chip-stack').click();
     await expect(html).toHaveAttribute('data-theme', 'dark');
-    await interfaceForm.locator('[data-settings-interface-language-option="es"] .radio-tile').click();
-    await interfaceForm.locator('[data-settings-interface-save]').click();
-    await expect(page).toHaveURL(/\/settings$/);
+    // Bind the language save to its own PATCH before navigating away — a bare
+    // save click followed by page.goto races the in-flight request and can drop
+    // the just-chosen language (saveSettingsLanguage documents the mechanism).
+    await saveSettingsLanguage(page, 'es');
     await expect(html).toHaveAttribute('lang', 'es');
-    await expect(page.locator('h1.journal-title')).toContainText('Configuración');
+    await expectPageTitle(page, 'settings.title', 'es');
 
     await page.goto('/calendar');
     await expect(page).toHaveURL(/\/calendar(?:\?.*)?$/);
     await expect(html).toHaveAttribute('lang', 'es');
     await expect(html).toHaveAttribute('data-theme', 'dark');
     await expect(page.locator('#calendar-grid-panel')).toBeVisible();
-    await expect(page.locator('h1')).toContainText('Calendario');
+    await expectPageTitle(page, 'calendar.title', 'es');
   });
 });

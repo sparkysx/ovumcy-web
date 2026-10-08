@@ -1,65 +1,41 @@
-import { test, expect, type Page } from '@playwright/test';
-import { dateFieldRoot, fillDateField } from './support/date-field-helpers';
+import { test, expect, type Page } from './support/fixtures';
+import { apiOriginHeader } from './support/auth-helpers';
 import {
-  continueFromRecoveryCode,
-  createCredentials,
-  expectInlineRegisterRecoveryStep,
-  readRecoveryCode,
-  registerOwnerViaUI,
-} from './support/auth-helpers';
-import { setRequestTimezoneFromBrowser } from './support/timezone-helpers';
-import { shiftISODate } from './support/stats-helpers';
+  isoToday,
+  markCycleStartViaAPI,
+  registerAndOnboardWithStartDaysAgo,
+  shiftISODate,
+} from './support/stats-helpers';
+import { localeText } from './support/locale-helpers';
 
-function isoDateDaysAgo(days: number): string {
-  const date = new Date();
-  date.setHours(0, 0, 0, 0);
-  date.setDate(date.getDate() - days);
-  const yyyy = date.getFullYear();
-  const mm = String(date.getMonth() + 1).padStart(2, '0');
-  const dd = String(date.getDate()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd}`;
-}
-
-async function registerAndOnboardWithStartDaysAgo(
-  page: Page,
-  prefix: string,
-  startDaysAgo: number
-): Promise<string> {
-  const credentials = createCredentials(prefix);
-  await registerOwnerViaUI(page, credentials);
-  await expectInlineRegisterRecoveryStep(page);
-  await readRecoveryCode(page);
-  await continueFromRecoveryCode(page);
-
-  // Replicate completeOnboardingIfPresent's UI flow but with a custom
-  // start_date so the cycle window is wide enough for the BBT chart.
-  const startISO = isoDateDaysAgo(startDaysAgo);
-  const startInput = page.locator('#last-period-start');
-  await expect(dateFieldRoot(startInput)).toBeVisible();
-  await fillDateField(startInput, startISO);
-  await page.locator('form[hx-post="/api/v1/onboarding/steps/1"] button[type="submit"]').click();
-
-  const stepTwoForm = page.locator('form[hx-post="/api/v1/onboarding/steps/2"]');
-  await expect(stepTwoForm).toBeVisible();
-  await Promise.all([
-    page.waitForURL(/\/dashboard(?:\?.*)?$/, { timeout: 15000 }),
-    stepTwoForm.locator('button[type="submit"]').click(),
-  ]);
-
-  await setRequestTimezoneFromBrowser(page);
-  return startISO;
-}
+// The shape `mapStatsBBTChartData` serialises into the chart's `data-chart`
+// attribute (lowercase keys; `baseline`/`marker*` are present only when a
+// coverline was detected, with no separate boolean). Naming it once is what
+// lets the assertions below read fields instead of indexing an `any`: an
+// untyped `JSON.parse` makes every `parsed.<field>` unverifiable, so a typo in
+// a field name reads as `undefined` and quietly satisfies a `toBeUndefined()`.
+type BBTChartPayload = {
+  labels: string[];
+  values: (number | null)[];
+  valueTexts?: string[];
+  baseline?: number;
+  markerIndex?: number;
+  markerLabel?: string;
+  markerLabelKey?: string;
+};
 
 async function csrfToken(page: Page): Promise<string> {
   return (await page.locator('meta[name="csrf-token"]').getAttribute('content')) ?? '';
 }
 
 async function saveDayBBT(page: Page, isoDate: string, bbt: number): Promise<void> {
-  // Send JSON so buildUpsertDayEntryInput skips the "preserve hidden fields"
-  // shortcut that drops BBT when the user has TrackBBT=false. JSON callers
-  // are treated as programmatic clients and the payload is taken as-is.
+  // Send JSON because a form body from an account that hides temperature does
+  // not read the bbt field at all (hiddenDayFields): the day would save with no
+  // reading on it. A JSON body is a programmatic client replacing the record
+  // with exactly what it states, so every field it sends is read.
   const response = await page.request.put(`/api/v1/days/${isoDate}`, {
     headers: {
+      ...apiOriginHeader(page),
       'X-CSRF-Token': await csrfToken(page),
       'Content-Type': 'application/json',
     },
@@ -71,28 +47,13 @@ async function saveDayBBT(page: Page, isoDate: string, bbt: number): Promise<voi
 async function savePeriodDay(page: Page, isoDate: string): Promise<void> {
   const response = await page.request.put(`/api/v1/days/${isoDate}`, {
     headers: {
+      ...apiOriginHeader(page),
       'X-CSRF-Token': await csrfToken(page),
       'Content-Type': 'application/json',
     },
     data: { is_period: true, flow: 'medium' },
   });
   expect(response.status(), `save period on ${isoDate}`).toBeLessThan(400);
-}
-
-async function markCycleStartViaAPI(page: Page, isoDate: string): Promise<void> {
-  // POST /api/v1/days/{date}/cycle-start sets IsPeriod=true AND CycleStart=true
-  // on the day, then triggers auto-period-fill. Setting CycleStart explicitly
-  // is what makes latestExplicitCycleStartBeforeOrOn pick the day up; a plain
-  // is_period upsert without the explicit flag leaves stats.LastPeriodStart
-  // anchored to user.LastPeriodStart from onboarding.
-  const response = await page.request.post(`/api/v1/days/${isoDate}/cycle-start`, {
-    headers: {
-      'X-CSRF-Token': await csrfToken(page),
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    form: { replace_existing: 'true' },
-  });
-  expect(response.status(), `mark cycle start at ${isoDate}`).toBeLessThan(400);
 }
 
 test.describe('Stats: BBT chart', () => {
@@ -113,7 +74,7 @@ test.describe('Stats: BBT chart', () => {
     // today-30 (cycle 2 start) and today-7 (cycle 3 start, the current
     // cycle). Layer the BBT samples on today-5..today.
     await registerAndOnboardWithStartDaysAgo(page, 'stats-bbt-chart', 60);
-    const today = isoDateDaysAgo(0);
+    const today = isoToday();
 
     await savePeriodDay(page, shiftISODate(today, -30));
     await savePeriodDay(page, shiftISODate(today, -7));
@@ -128,10 +89,10 @@ test.describe('Stats: BBT chart', () => {
     for (let offset = -5; offset <= 0; offset += 1) {
       const isoDate = shiftISODate(today, offset);
       const response = await page.request.get(`/api/v1/days/${isoDate}`, {
-        headers: { Accept: 'application/json' },
+        headers: { Accept: 'application/json', ...apiOriginHeader(page) },
       });
       expect(response.status(), `GET ${isoDate}`).toBe(200);
-      const body = await response.json();
+      const body = (await response.json()) as { BBT?: number; bbt?: number };
       expect(body.BBT ?? body.bbt, `BBT on ${isoDate}`).toBeGreaterThan(35);
     }
 
@@ -153,14 +114,84 @@ test.describe('Stats: BBT chart', () => {
     // WITHOUT a coverline: the section itself is gated only on >= 5 values.
     const chartData = await bbtChart.getAttribute('data-chart');
     expect(chartData).toBeTruthy();
-    const parsed = JSON.parse(chartData ?? '');
+    const parsed = JSON.parse(chartData ?? '') as BBTChartPayload;
     expect(Array.isArray(parsed.labels)).toBe(true);
     expect(parsed.labels.length).toBeGreaterThanOrEqual(5);
     expect(Array.isArray(parsed.values)).toBe(true);
-    const numericValues = parsed.values.filter((v: number | null) => v !== null);
+    const numericValues = parsed.values.filter((v) => v !== null);
     expect(numericValues.length).toBeGreaterThanOrEqual(5);
     expect(parsed.baseline).toBeUndefined();
     expect(parsed.markerIndex).toBeUndefined();
+
+    // The table twin. The canvas is aria-hidden and the crosshair is a pointer
+    // affordance, so this table is the only path to a per-day value that needs
+    // neither: it lists one row per plotted day and the same numbers the chart
+    // was handed.
+    const unit = localeText('en', 'stats.bbt_unit');
+    const noReading = localeText('en', 'stats.bbt_table_no_reading');
+    const disclosure = page.locator('[data-bbt-table-disclosure]');
+    await expect(disclosure).toBeAttached();
+    await expect(disclosure.locator('summary')).toHaveText(
+      localeText('en', 'stats.bbt_table_toggle')
+    );
+    await disclosure.locator('summary').click();
+    await expect(disclosure.locator('caption')).toHaveText(
+      localeText('en', 'stats.bbt_table_caption')
+    );
+
+    // A reading becomes text once, on the server; both the table and the
+    // crosshair print that string. Ground it in the seeded readings first, so
+    // the comparison below is not payload against payload.
+    // The same ±1 day boundary the rest of this spec tolerates can drop the
+    // sample logged on "today", so the rendered readings are the leading run of
+    // the seeded ones rather than all of them.
+    const valueTexts = parsed.valueTexts ?? [];
+    const expectedCells = valueTexts.map((text) => (text === '' ? noReading : `${text}${unit}`));
+    const renderedReadings = expectedCells.filter((cell) => cell !== noReading);
+    expect(renderedReadings.length).toBeGreaterThanOrEqual(5);
+    expect(renderedReadings).toEqual(
+      bbtSeries.slice(0, renderedReadings.length).map((value) => `${value.toFixed(1)}${unit}`)
+    );
+
+    const values = parsed.values;
+    await expect(disclosure.locator('[data-bbt-table-row]')).toHaveCount(values.length);
+    expect(await disclosure.locator('[data-bbt-table-value]').allTextContents()).toEqual(
+      expectedCells
+    );
+
+    // The crosshair. Nothing is shown until the pointer is on the chart; a
+    // hover then names the day under it, its date and its reading. Opacity is
+    // the painted proof — Playwright's visibility check ignores it, so a
+    // readout stuck at 0 would pass toBeVisible() while showing nothing.
+    const hoverLayer = bbtChart.locator('.chart-hover-layer');
+    await expect(hoverLayer).toHaveCSS('opacity', '0');
+    expect(await bbtChart.getAttribute('data-chart-hover-index')).toBeNull();
+
+    const box = await bbtChart.boundingBox();
+    expect(box).not.toBeNull();
+    await bbtChart.hover({ position: { x: (box?.width ?? 0) - 6, y: (box?.height ?? 0) / 2 } });
+    await expect(hoverLayer).toHaveCSS('opacity', '1');
+
+    // Read back which day the crosshair resolved to instead of pinning an
+    // index: the plot's pixel geometry is the browser's business, the mapping
+    // from that day to the value shown is the product's.
+    const hoveredIndex = Number(await bbtChart.getAttribute('data-chart-hover-index'));
+    expect(hoveredIndex).toBe(values.length - 1);
+    await expect(bbtChart.locator('[data-chart-tooltip-day]')).toHaveText(
+      `${localeText('en', 'stats.bbt_table_day')} ${parsed.labels[hoveredIndex]}`
+    );
+    // The same cell the table prints for that day — one reading, one string.
+    await expect(bbtChart.locator('[data-chart-tooltip-value]')).toHaveText(
+      expectedCells[hoveredIndex]
+    );
+    await expect(
+      disclosure.locator('[data-bbt-table-row]').nth(hoveredIndex).locator('[data-bbt-table-value]')
+    ).toHaveText(expectedCells[hoveredIndex]);
+
+    // Dismissible: the same readout must not stay pinned over the chart.
+    await page.keyboard.press('Escape');
+    await expect(hoverLayer).toHaveCSS('opacity', '0');
+    expect(await bbtChart.getAttribute('data-chart-hover-index')).toBeNull();
   });
 
   test('a sustained BBT rise after the baseline window flags the probable ovulation marker', async ({
@@ -169,7 +200,7 @@ test.describe('Stats: BBT chart', () => {
     // Same HasInsights gate as the chart test, but the current cycle starts
     // at today-14 so it can host nine consecutive BBT samples (cycle days
     // 6..14). markCycleStartViaAPI also sets CycleStart=true (not just
-    // is_period) so latestExplicitCycleStartBeforeOrOn picks the day up and
+    // is_period) so LatestCycleStartAnchorBeforeOrOn picks the day up and
     // stats.LastPeriodStart actually anchors to today-14 instead of remaining
     // on the onboarding date. Default period_length=5 means the auto-period
     // -fill range for the current cycle is cycle days 1..5 = today-14..
@@ -177,7 +208,35 @@ test.describe('Stats: BBT chart', () => {
     // so the bare { bbt: ... } JSON payloads never wipe an is_period flag we
     // care about.
     await registerAndOnboardWithStartDaysAgo(page, 'stats-bbt-marker', 60);
-    const today = isoDateDaysAgo(0);
+    const today = isoToday();
+
+    // The marker is an interpretation of the BBT series, gated on the same
+    // ConfirmedCurrentCycleOvulation predicate (user.TrackBBT) as the
+    // dashboard, the calendar's confirmed-vs-tentative ovulation dot, and the
+    // API: an account that never turned tracking on gets no temperature-
+    // derived marker anywhere, so it must be enabled before the rows below are
+    // written. Send the full default snapshot through the tracking endpoint —
+    // the JSON body parser does not treat missing fields as no-op, so a
+    // single-field patch would wipe the other tracking flags (see
+    // calendar.spec.ts's TrackBBT block for the same spelling).
+    const csrf = await csrfToken(page);
+    const trackingResponse = await page.request.patch('/api/v1/users/current/tracking', {
+      headers: {
+        ...apiOriginHeader(page),
+        'X-CSRF-Token': csrf,
+        'Content-Type': 'application/json',
+      },
+      data: {
+        track_bbt: true,
+        temperature_unit: 'celsius',
+        track_cervical_mucus: false,
+        hide_sex_chip: false,
+        hide_cycle_factors: false,
+        hide_notes_field: false,
+        show_historical_phases: false,
+      },
+    });
+    expect(trackingResponse.status()).toBeLessThan(400);
 
     await markCycleStartViaAPI(page, shiftISODate(today, -30));
     await markCycleStartViaAPI(page, shiftISODate(today, -14));
@@ -209,7 +268,7 @@ test.describe('Stats: BBT chart', () => {
 
     const chartData = await page.locator('#bbt-chart').getAttribute('data-chart');
     expect(chartData).toBeTruthy();
-    const parsed = JSON.parse(chartData ?? '');
+    const parsed = JSON.parse(chartData ?? '') as BBTChartPayload;
     // The exact maxDay (and therefore markerIndex) shifts by ±1 with TZ
     // boundary effects between the JS local date and the server's calendar
     // day for stats.LastPeriodStart. Instead of pinning the index, assert
@@ -217,14 +276,21 @@ test.describe('Stats: BBT chart', () => {
     // the detected coverline, and the three values starting from
     // markerIndex+1 (the day after the marker = first elevated day) are all
     // strictly above it, the third by at least 0.2 °C.
-    expect(parsed.markerLabel).toBe('Probable ovulation');
+    // Assert the marker's identity through its catalogue key, not the rendered
+    // sentence: the copy is owned by the locale files and changes with them,
+    // while the key is the stable half of the pair the payload now carries.
+    expect(parsed.markerLabelKey).toBe('stats.bbt_probable_ovulation');
+    expect(parsed.markerLabel).toBe(localeText('en', 'stats.bbt_probable_ovulation'));
     expect(typeof parsed.markerIndex).toBe('number');
     expect(parsed.markerIndex).toBeGreaterThanOrEqual(0);
     expect(typeof parsed.baseline).toBe('number');
 
-    const coverline = parsed.baseline as number;
-    const values = parsed.values as Array<number | null>;
-    const riseValues = values.slice(parsed.markerIndex + 1, parsed.markerIndex + 4);
+    // Both were just asserted to be numbers; `!` keeps the reads typed
+    // without restating the check as a type guard.
+    const coverline = parsed.baseline!;
+    const markerIndex = parsed.markerIndex!;
+    const values = parsed.values;
+    const riseValues = values.slice(markerIndex + 1, markerIndex + 4);
     expect(riseValues).toHaveLength(3);
     for (const v of riseValues) {
       expect(v).not.toBeNull();
@@ -239,15 +305,17 @@ test.describe('Stats: symptom patterns', () => {
     page,
   }) => {
     // buildSymptomPatternInsights requires >= minimumPhaseInsightCycles (3)
-    // completed cycles. OnboardingDateBounds caps last_period_start at
-    // max(Jan 1 of current year, today-60), so the deepest onboarding can
-    // anchor is today-60. Lay three more cycle starts with 18-day gaps:
+    // completed cycles. OnboardingDateBounds floors last_period_start at
+    // today-60 on every calendar date, so the deepest onboarding can anchor
+    // is today-60 — including in January and February, where the floor used
+    // to be raised to 1 January and this spec's 60 would have been rejected.
+    // Lay three more cycle starts with 18-day gaps:
     // ResolveManualCycleStartPolicy floors gapDays through int truncation
     // after a TZ-aware diff, so a nominal 15-day gap can collapse to 14
     // and trip the short-gap confirmation requirement. 18 days leaves
     // headroom regardless of the boundary direction.
     await registerAndOnboardWithStartDaysAgo(page, 'stats-symptom-pattern', 60);
-    const today = isoDateDaysAgo(0);
+    const today = isoToday();
 
     await markCycleStartViaAPI(page, shiftISODate(today, -42));
     await markCycleStartViaAPI(page, shiftISODate(today, -24));
@@ -277,6 +345,7 @@ test.describe('Stats: symptom patterns', () => {
     for (const offset of [-51, -33, -15]) {
       const response = await page.request.put(`/api/v1/days/${shiftISODate(today, offset)}`, {
         headers: {
+          ...apiOriginHeader(page),
           'X-CSRF-Token': csrf,
           'Content-Type': 'application/json',
         },
@@ -289,14 +358,132 @@ test.describe('Stats: symptom patterns', () => {
     await expect(page).toHaveURL(/\/stats$/);
 
     // HasSymptomPatterns gate -> the section renders, and at least one card
-    // shows the localized "Usually on day N of the cycle" / "Usually on days
-    // N-M of the cycle" copy from stats.symptom_pattern_day(s).
-    await expect(page.getByRole('heading', { name: 'Symptom patterns' })).toBeVisible();
-    const patternCard = page
-      .locator('.phase-symptom-card')
-      .filter({ hasText: /Usually on days? \d+(?:-\d+)? of the cycle/ })
-      .first();
+    // reports the cycle-day window it detected. Read the window off the card's
+    // own attributes instead of parsing "Usually on day N of the cycle" out of
+    // the rendered sentence: the copy is localized (and pluralized), so the old
+    // filter only worked because the run happens to be in English, and a card
+    // whose day numbers were wrong still matched.
+    const patternsSection = page.locator('[data-stats-symptom-patterns]');
+    await expect(patternsSection).toBeVisible();
+    await expect(patternsSection.locator('[data-stats-symptom-patterns-heading]')).toHaveAttribute(
+      'data-heading-key',
+      'stats.symptom_patterns_title'
+    );
+
+    const patternCard = patternsSection.locator('[data-symptom-pattern-card]').first();
     await expect(patternCard).toBeVisible();
+    const dayStart = Number(await patternCard.getAttribute('data-symptom-pattern-day-start'));
+    const dayEnd = Number(await patternCard.getAttribute('data-symptom-pattern-day-end'));
+    expect(dayStart).toBeGreaterThan(0);
+    expect(dayEnd).toBeGreaterThanOrEqual(dayStart);
+    // The symptom was logged on cycle day 10 of each completed cycle. Every
+    // cycle start and every symptom day above is an ISO date offset from the
+    // same `today` string, so the cycle day is pure calendar arithmetic
+    // (today-51 - (today-60) + 1 = 10, and likewise for the other two) with
+    // no instant or zone in between: a window of exactly day 10 is the only
+    // correct answer, and a derived day 9 or 11 is an off-by-one defect.
+    expect(dayStart).toBe(10);
+    expect(dayEnd).toBe(10);
+    // One rendered-copy assertion for this surface: the card really does print
+    // the day window, not just carry it in an attribute.
+    await expect(patternCard).toContainText(String(dayStart));
+  });
+});
+
+test.describe('Stats: history statements', () => {
+  test('completed cycles and a recurring luteal symptom render both statement families', async ({
+    page,
+  }) => {
+    // Two gates layer here, the same way the symptom-pattern test describes:
+    //   1. the trend statement needs three completed cycle lengths, and
+    //      CompletedCycleTrendLengths counts only starts strictly before today,
+    //      so four cycle starts have to precede today;
+    //   2. the recurrence family needs three closed cycles whose luteal phase
+    //      holds a logged day.
+    // Onboarding can anchor no deeper than today-60, so lay starts at -60,
+    // -42, -22 and -2: cycles of 18, 20 and 20 days, all comfortably above the
+    // short-gap confirmation boundary.
+    await registerAndOnboardWithStartDaysAgo(page, 'stats-statements', 60);
+    const today = isoToday();
+
+    await markCycleStartViaAPI(page, shiftISODate(today, -42));
+    await markCycleStartViaAPI(page, shiftISODate(today, -22));
+    await markCycleStartViaAPI(page, shiftISODate(today, -2));
+
+    await page.goto('/dashboard');
+    await expect(page).toHaveURL(/\/dashboard$/);
+    const firstSymptomInput = page
+      .locator('fieldset[data-dashboard-section="symptoms"] input[name="symptom_ids"]')
+      .first();
+    await expect(firstSymptomInput).toBeAttached();
+    const symptomIDRaw = await firstSymptomInput.getAttribute('value');
+    expect(symptomIDRaw).toMatch(/^\d+$/);
+    const symptomID = Number(symptomIDRaw);
+
+    // Cycle day 10 of each closed cycle. With a 5-day period and cycles of
+    // 18-20 days the ovulation day lands on day 4-6, so day 10 is luteal in
+    // every one of them — and it sits past the auto-period-fill window, so the
+    // JSON PUT never clears a period flag.
+    const csrf = await csrfToken(page);
+    for (const offset of [-51, -33, -13]) {
+      const response = await page.request.put(`/api/v1/days/${shiftISODate(today, offset)}`, {
+        headers: {
+          ...apiOriginHeader(page),
+          'X-CSRF-Token': csrf,
+          'Content-Type': 'application/json',
+        },
+        data: { symptom_ids: [symptomID] },
+      });
+      expect(response.status(), `save symptom at offset ${offset}`).toBeLessThan(400);
+    }
+
+    await page.goto('/stats');
+    await expect(page).toHaveURL(/\/stats$/);
+
+    const statements = page.locator('[data-stats-statements]');
+    await expect(statements).toBeVisible();
+    await expect(statements.locator('[data-stats-statements-heading]')).toHaveAttribute(
+      'data-heading-key',
+      'stats.statements_title'
+    );
+
+    // The cycle-length trend leads the section. Which of the three directions
+    // it lands on depends on how the seeded starts round across a timezone
+    // boundary, so read the chosen key off the row and resolve its copy from
+    // the shipped catalogue rather than re-typing a sentence here.
+    const trend = statements.locator('[data-stats-statement="cycle_length_trend"]');
+    await expect(trend).toHaveCount(1);
+    const trendKey = await trend.getAttribute('data-statement-key');
+    expect(trendKey).toMatch(/^stats\.statement_cycle_trend_(shorter|longer|steady)$/);
+    const trendCount = Number(await trend.getAttribute('data-statement-count'));
+    expect(trendCount).toBeGreaterThan(0);
+    const trendCopy = localeText('en', `${trendKey}.${trendCount === 1 ? 'one' : 'other'}`);
+    await expect(trend).toContainText(trendCopy.replace('%d', String(trendCount)));
+
+    // The recurrence statement names a cycle phase — never a fertility status —
+    // the symptom it counted, and the two numbers its sentence prints.
+    const recurrence = statements.locator('[data-stats-statement="symptom_phase_recurrence"]');
+    await expect(recurrence).toHaveCount(1);
+    await expect(recurrence).toHaveAttribute(
+      'data-statement-key',
+      'stats.statement_symptom_recurrence'
+    );
+    const phase = await recurrence.getAttribute('data-statement-phase');
+    expect(['menstrual', 'follicular', 'ovulation', 'luteal']).toContain(phase);
+    const count = Number(await recurrence.getAttribute('data-statement-count'));
+    const total = Number(await recurrence.getAttribute('data-statement-total'));
+    expect(count).toBeGreaterThanOrEqual(2);
+    expect(total).toBeGreaterThanOrEqual(count);
+    expect(count * 2).toBeGreaterThan(total);
+
+    await expect(recurrence).toContainText(localeText('en', `phases.${phase}`));
+    const recurrenceCopy = localeText(
+      'en',
+      `stats.statement_symptom_recurrence.${total === 1 ? 'one' : 'other'}`
+    );
+    await expect(recurrence).toContainText(
+      recurrenceCopy.replace('%d', String(count)).replace('%d', String(total))
+    );
   });
 });
 
@@ -309,7 +496,7 @@ test.describe('Stats: cycle range', () => {
     // MinCycleLength / MaxCycleLength from cycleLengths(observedStarts), and
     // the Range card prints stats.cycle_range_summary when MinCycleLength>0.
     await registerAndOnboardWithStartDaysAgo(page, 'stats-cycle-range', 60);
-    const today = isoDateDaysAgo(0);
+    const today = isoToday();
 
     await markCycleStartViaAPI(page, shiftISODate(today, -40));
     await markCycleStartViaAPI(page, shiftISODate(today, -15));
@@ -317,21 +504,24 @@ test.describe('Stats: cycle range', () => {
     await page.goto('/stats');
     await expect(page).toHaveURL(/\/stats$/);
 
-    // Match the stat card by its label, then read the populated value.
+    // Address the card by its hook and read the observed lengths off its own
+    // attributes. Matching `.stat-label` on the literal "Range" and then
+    // parsing "Your cycles: N to M days" out of the value made this test an
+    // English-only test of a localized, pluralized sentence.
     // Avoid pinning the exact numbers: a TZ-induced ±1 boundary shift on
     // the seeded starts can shift the observed cycle lengths by one, and
     // the card behaviour we want to lock in is "renders with two distinct
     // positive integers", not "renders with literal 20 and 25".
-    const rangeArticle = page
-      .locator('article.journal-panel')
-      .filter({ has: page.locator('.stat-label', { hasText: 'Range' }) });
+    const rangeArticle = page.locator('[data-stat-card="cycle-range"]');
     await expect(rangeArticle).toBeVisible();
-    const valueText = (await rangeArticle.locator('.stat-value').textContent()) ?? '';
-    const match = valueText.match(/Your cycles:\s+(\d+)\s+to\s+(\d+)\s+days/);
-    expect(match, `range card value: ${valueText}`).not.toBeNull();
-    const minLen = Number(match![1]);
-    const maxLen = Number(match![2]);
+    const minLen = Number(await rangeArticle.getAttribute('data-cycle-range-min'));
+    const maxLen = Number(await rangeArticle.getAttribute('data-cycle-range-max'));
     expect(minLen).toBeGreaterThan(0);
     expect(maxLen).toBeGreaterThan(minLen);
+    // One rendered-copy assertion: the populated card prints both bounds rather
+    // than only carrying them in attributes.
+    const valueText = (await rangeArticle.locator('.stat-value').textContent()) ?? '';
+    expect(valueText, `range card value: ${valueText}`).toContain(String(minLen));
+    expect(valueText, `range card value: ${valueText}`).toContain(String(maxLen));
   });
 });

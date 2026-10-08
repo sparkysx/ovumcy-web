@@ -22,6 +22,19 @@ type stubOperatorUserRepo struct {
 	createWasCalled bool
 	createdUser     *models.User
 	createdSymptoms []models.SymptomType
+	existsTaken     bool
+	existsErr       error
+	existsEmail     string
+	existsExcluded  uint
+	setEmailChanged bool
+	setEmailErr     error
+	setEmailUserID  uint
+	setEmailFrom    string
+	setEmailTo      string
+	// findAllByEmailUsers overrides the single-row [stub.user] shape
+	// FindAllByNormalizedEmail otherwise derives from stub.found, for the one
+	// case that shape cannot express: more than one row on the same address.
+	findAllByEmailUsers []models.User
 }
 
 func (stub *stubOperatorUserRepo) ListOperatorUserSummaries(context.Context) ([]models.OperatorUserSummary, error) {
@@ -31,11 +44,37 @@ func (stub *stubOperatorUserRepo) ListOperatorUserSummaries(context.Context) ([]
 	return stub.listUsers, nil
 }
 
-func (stub *stubOperatorUserRepo) FindByNormalizedEmailOptional(context.Context, string) (models.User, bool, error) {
+func (stub *stubOperatorUserRepo) FindAllByNormalizedEmail(context.Context, string) ([]models.User, error) {
+	if stub.findErr != nil {
+		return nil, stub.findErr
+	}
+	if stub.findAllByEmailUsers != nil {
+		return stub.findAllByEmailUsers, nil
+	}
+	if stub.found {
+		return []models.User{stub.user}, nil
+	}
+	return nil, nil
+}
+
+func (stub *stubOperatorUserRepo) FindByIDOptional(context.Context, uint) (models.User, bool, error) {
 	if stub.findErr != nil {
 		return models.User{}, false, stub.findErr
 	}
 	return stub.user, stub.found, nil
+}
+
+func (stub *stubOperatorUserRepo) ExistsByNormalizedEmailExcludingUser(_ context.Context, email string, excludeUserID uint) (bool, error) {
+	stub.existsEmail = email
+	stub.existsExcluded = excludeUserID
+	return stub.existsTaken, stub.existsErr
+}
+
+func (stub *stubOperatorUserRepo) SetUserEmailByIDAndRevokeSessions(_ context.Context, userID uint, fromEmail string, toEmail string) (bool, error) {
+	stub.setEmailUserID = userID
+	stub.setEmailFrom = fromEmail
+	stub.setEmailTo = toEmail
+	return stub.setEmailChanged, stub.setEmailErr
 }
 
 func (stub *stubOperatorUserRepo) DeleteAccountAndRelatedData(ctx context.Context, userID uint) error {
@@ -115,6 +154,40 @@ func TestOperatorUserServiceGetUserByEmailNormalizesInput(t *testing.T) {
 	}
 	if user.ID != 7 || user.Email != "owner@example.com" || user.DisplayName != "Owner" {
 		t.Fatalf("unexpected user summary: %#v", user)
+	}
+}
+
+// TestOperatorUserServiceGetUserByEmailRefusesAnAmbiguousAddress pins the
+// shared resolveUniqueUserByEmail behaviour at this call site: two rows on
+// one mailbox (the shape RenormalizeUserEmail leaves standing) must be
+// refused, naming both ids, rather than resolved to whichever the repository
+// happens to return first. DeleteUserByEmail inherits this because it calls
+// GetUserByEmail.
+func TestOperatorUserServiceGetUserByEmailRefusesAnAmbiguousAddress(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubOperatorUserRepo{
+		findAllByEmailUsers: []models.User{
+			{ID: 5, Email: "owner@example.com"},
+			{ID: 18, Email: "owner@example.com"},
+		},
+	}
+	service := NewOperatorUserService(repo, nil)
+
+	_, err := service.GetUserByEmail(context.Background(), "owner@example.com")
+	var ambiguous *AmbiguousEmailError
+	if !errors.As(err, &ambiguous) {
+		t.Fatalf("expected *AmbiguousEmailError, got %v", err)
+	}
+	if got, want := ambiguous.IDs, []uint{5, 18}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("expected ambiguous ids %v, got %v", want, got)
+	}
+
+	if _, err := service.DeleteUserByEmail(context.Background(), "owner@example.com"); !errors.As(err, &ambiguous) {
+		t.Fatalf("expected DeleteUserByEmail to inherit the ambiguity refusal, got %v", err)
+	}
+	if repo.deleteWasCalled {
+		t.Fatal("did not expect a delete write on an ambiguous address")
 	}
 }
 
@@ -303,6 +376,177 @@ func TestOperatorUserServiceCreateOwnerValidatesInput(t *testing.T) {
 			}
 			if repo.createWasCalled {
 				t.Fatal("expected no creation on validation failure")
+			}
+		})
+	}
+}
+
+func TestOperatorUserServiceSetEmailByIDWritesTheCanonicalAddress(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubOperatorUserRepo{
+		user:            models.User{ID: 9, Email: "second account <dup@example.com>", Role: models.RoleOwner},
+		found:           true,
+		setEmailChanged: true,
+	}
+	service := NewOperatorUserService(repo, nil)
+
+	before, after, err := service.SetEmailByID(context.Background(), 9, "  Second@Example.com ")
+	if err != nil {
+		t.Fatalf("SetEmailByID() unexpected error: %v", err)
+	}
+	if repo.setEmailUserID != 9 || repo.setEmailFrom != "second account <dup@example.com>" || repo.setEmailTo != "second@example.com" {
+		t.Fatalf("unexpected write: id=%d from=%q to=%q", repo.setEmailUserID, repo.setEmailFrom, repo.setEmailTo)
+	}
+	// The uniqueness pre-check must exclude the row being repaired, or a
+	// case-only correction would report itself as the conflict.
+	if repo.existsEmail != "second@example.com" || repo.existsExcluded != 9 {
+		t.Fatalf("unexpected uniqueness probe: email=%q excluded=%d", repo.existsEmail, repo.existsExcluded)
+	}
+	if before.Email != "second account <dup@example.com>" || after.Email != "second@example.com" || after.ID != before.ID {
+		t.Fatalf("unexpected summaries: before=%#v after=%#v", before, after)
+	}
+}
+
+func TestOperatorUserServiceSetEmailByIDLeavesAnUnchangedAddressAlone(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubOperatorUserRepo{
+		user:            models.User{ID: 9, Email: "owner@example.com", Role: models.RoleOwner},
+		found:           true,
+		setEmailChanged: true,
+	}
+	service := NewOperatorUserService(repo, nil)
+
+	before, after, err := service.SetEmailByID(context.Background(), 9, " Owner@Example.com ")
+	if err != nil {
+		t.Fatalf("SetEmailByID() unexpected error: %v", err)
+	}
+	if repo.setEmailUserID != 0 || repo.setEmailTo != "" {
+		t.Fatalf("a no-op repair must not reach the write: id=%d to=%q", repo.setEmailUserID, repo.setEmailTo)
+	}
+	if before.Email != "owner@example.com" || after.Email != before.Email {
+		t.Fatalf("unexpected summaries: before=%#v after=%#v", before, after)
+	}
+}
+
+func TestOperatorUserServiceSetEmailByIDErrors(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name   string
+		userID uint
+		email  string
+		repo   *stubOperatorUserRepo
+		want   error
+	}{
+		{name: "missing id", userID: 0, email: "owner@example.com", repo: &stubOperatorUserRepo{}, want: ErrOperatorUserIDRequired},
+		{name: "unknown id", userID: 9, email: "owner@example.com", repo: &stubOperatorUserRepo{}, want: ErrOperatorUserNotFound},
+		{
+			name: "decorated address", userID: 9, email: "jane doe <jane@example.com>",
+			repo: &stubOperatorUserRepo{user: models.User{ID: 9, Email: "stored@example.com"}, found: true},
+			want: ErrOperatorUserEmailInvalid,
+		},
+		{
+			name: "address already taken", userID: 9, email: "taken@example.com",
+			repo: &stubOperatorUserRepo{user: models.User{ID: 9, Email: "stored@example.com"}, found: true, existsTaken: true},
+			want: ErrOperatorUserEmailExists,
+		},
+		{
+			name: "unique index refuses the write", userID: 9, email: "taken@example.com",
+			repo: &stubOperatorUserRepo{user: models.User{ID: 9, Email: "stored@example.com"}, found: true, setEmailErr: fakeUniqueConstraintError{}},
+			want: ErrOperatorUserEmailExists,
+		},
+		{
+			name: "row moved under the repair", userID: 9, email: "owner@example.com",
+			repo: &stubOperatorUserRepo{user: models.User{ID: 9, Email: "stored@example.com"}, found: true},
+			want: ErrOperatorUserChangedUnderRepair,
+		},
+		{
+			name: "write failed", userID: 9, email: "owner@example.com",
+			repo: &stubOperatorUserRepo{user: models.User{ID: 9, Email: "stored@example.com"}, found: true, setEmailErr: errors.New("db down")},
+			want: ErrOperatorUserSetEmailFailed,
+		},
+		{
+			name: "lookup failed", userID: 9, email: "owner@example.com",
+			repo: &stubOperatorUserRepo{findErr: errors.New("db down")},
+			want: ErrOperatorUserLookupFailed,
+		},
+		{
+			name: "uniqueness probe failed", userID: 9, email: "owner@example.com",
+			repo: &stubOperatorUserRepo{user: models.User{ID: 9, Email: "stored@example.com"}, found: true, existsErr: errors.New("db down")},
+			want: ErrOperatorUserLookupFailed,
+		},
+	}
+
+	for _, testCase := range testCases {
+
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			service := NewOperatorUserService(testCase.repo, nil)
+			_, _, err := service.SetEmailByID(context.Background(), testCase.userID, testCase.email)
+			if !errors.Is(err, testCase.want) {
+				t.Fatalf("expected %v, got %v", testCase.want, err)
+			}
+		})
+	}
+}
+
+func TestOperatorUserServiceDeleteUserByID(t *testing.T) {
+	t.Parallel()
+
+	repo := &stubOperatorUserRepo{
+		user:  models.User{ID: 9, Email: "second account <dup@example.com>", Role: models.RoleOwner},
+		found: true,
+	}
+	service := NewOperatorUserService(repo, nil)
+
+	user, err := service.DeleteUserByID(context.Background(), 9)
+	if err != nil {
+		t.Fatalf("DeleteUserByID() unexpected error: %v", err)
+	}
+	if !repo.deleteWasCalled || repo.deletedUserID != 9 {
+		t.Fatalf("expected delete for user id 9, got called=%t id=%d", repo.deleteWasCalled, repo.deletedUserID)
+	}
+	// The summary carries the STORED identity, which is what the CLI puts in
+	// front of the operator before it erases anything.
+	if user.Email != "second account <dup@example.com>" {
+		t.Fatalf("unexpected deleted user summary: %#v", user)
+	}
+}
+
+func TestOperatorUserServiceDeleteUserByIDErrors(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name   string
+		userID uint
+		repo   *stubOperatorUserRepo
+		want   error
+	}{
+		{name: "missing id", userID: 0, repo: &stubOperatorUserRepo{}, want: ErrOperatorUserIDRequired},
+		{name: "unknown id", userID: 9, repo: &stubOperatorUserRepo{}, want: ErrOperatorUserNotFound},
+		{
+			name: "delete failed", userID: 9,
+			repo: &stubOperatorUserRepo{user: models.User{ID: 9, Email: "owner@example.com"}, found: true, deleteErr: errors.New("db down")},
+			want: ErrOperatorUserDeleteFailed,
+		},
+	}
+
+	for _, testCase := range testCases {
+
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			service := NewOperatorUserService(testCase.repo, nil)
+			_, err := service.DeleteUserByID(context.Background(), testCase.userID)
+			if !errors.Is(err, testCase.want) {
+				t.Fatalf("expected %v, got %v", testCase.want, err)
+			}
+			// An id that never resolved must not reach the erasure.
+			if testCase.want != ErrOperatorUserDeleteFailed && testCase.repo.deleteWasCalled {
+				t.Fatal("expected no erasure on a failed lookup")
 			}
 		})
 	}

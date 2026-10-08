@@ -1,0 +1,134 @@
+name: Diff against the event's base
+description: >
+  Resolve the commit a pull_request or merge_group run diffs against and list
+  the paths the run changes. Shared by the `changes` job of ci.yml, security.yml
+  and codeql.yml, each of which keeps its own path rules in its own detect step:
+  this action decides WHICH files changed, never what they mean.
+
+  The list crosses to the caller as a FILE under $RUNNER_TEMP, never as an
+  output or env value: one environment string is capped at 128 KiB on Linux,
+  and a mass move listed with both sides reaches that, so a detect step fed
+  the list through `env:` would fail to start.
+
+  An undetermined list — an event with no base, a base that cannot be fetched or
+  reached, a failed or empty diff, no file to hold it — is reported as an EMPTY
+  `files-path` output with the reason in `verdict`. Every caller reads a missing
+  or unreadable file as an empty list, and an empty list as "run everything",
+  so no failure here can clear a lane.
+
+  Needs a full-history checkout of HEAD first (the `...` diff walks to the merge
+  base).
+
+outputs:
+  base:
+    description: >
+      The commit-ish the diff was taken against. Empty whenever `files-path` is.
+    value: ${{ steps.diff.outputs.base }}
+  files-path:
+    description: >
+      Path of a file under $RUNNER_TEMP holding the changed paths one per line,
+      each exactly as stored — never C-quoted, since git is read with `-z` —
+      and with renames split into their two sides. Empty when undetermined,
+      which includes a diff with a path holding a newline: one line per path
+      cannot carry it.
+    value: ${{ steps.diff.outputs.files-path }}
+  verdict:
+    description: >
+      Why `files-path` is empty, when it is; empty when a list was produced.
+    value: ${{ steps.diff.outputs.verdict }}
+
+runs:
+  using: composite
+  steps:
+    - name: List the changed files
+      id: diff
+      shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        BASE_REF: ${{ github.event.pull_request.base.ref }}
+        QUEUE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+      run: |
+        # `shell: bash` runs this as `bash --noprofile --norc -eo pipefail`:
+        # errexit and pipefail are both on, so every command that may exit
+        # non-zero is guarded (`if`, `|| true`). This step must not fail — the
+        # callers' required jobs depend on the job running it — and every
+        # branch falls through to the single output write at the end.
+        base=""
+        list=""
+        verdict=""
+
+        case "$EVENT_NAME" in
+          pull_request)
+            if git fetch --no-tags origin "$BASE_REF"; then
+              base="origin/$BASE_REF"
+            else
+              verdict="base ref fetch failed"
+            fi
+            ;;
+          merge_group)
+            # HEAD is the queue branch carrying the batched commits; the base
+            # is the main commit the queue branched from.
+            base="$QUEUE_BASE_SHA"
+            if [ -z "$base" ]; then
+              verdict="no base commit in the merge_group payload"
+            elif ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+              echo "merge_group base commit $base absent after checkout: fetching it"
+              git fetch --no-tags origin "$base" || true
+              if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+                base=""
+                verdict="merge_group base commit unreachable"
+              fi
+            fi
+            ;;
+          *)
+            verdict="$EVENT_NAME carries no base to diff against"
+            ;;
+        esac
+
+        if [ -n "$base" ]; then
+          if [ -z "${RUNNER_TEMP:-}" ] || ! list="$(mktemp "$RUNNER_TEMP/changed-files.XXXXXX")"; then
+            list=""
+            verdict="no file under RUNNER_TEMP to hold the list"
+          # NUL-separated: without -z git C-quotes a non-ASCII path, and even
+          # with core.quotePath off one holding `"`, `\` or a control
+          # character ("web/src/js/t\tx.ts"), which then misses every anchored
+          # pattern a caller applies. No renames: a move must list its source
+          # side too.
+          elif ! git diff -z --no-renames --name-only "${base}...HEAD" > "$list.z"; then
+            verdict="git diff ${base}...HEAD failed"
+          elif [ ! -s "$list.z" ]; then
+            verdict="empty file list from ${base}...HEAD"
+          # -z output holds a newline only inside a path. One line per path
+          # cannot carry that path — it would read as two, either of which may
+          # be inert — so the list is undetermined.
+          elif [ "$(tr -cd '\n' < "$list.z" | wc -c)" -ne 0 ]; then
+            verdict="a changed path holds a newline, which a newline-separated list cannot carry"
+          elif ! tr '\0' '\n' < "$list.z" > "$list"; then
+            verdict="the NUL-separated list could not be converted"
+          else
+            # A path is attacker-chosen on a fork's pull request, and a line
+            # opening with `::` is a workflow command: the list is printed with
+            # commands stopped under a random token no path can know. Without
+            # a token the list goes unprinted: the log is for reading, and the
+            # list the callers read is the file.
+            if stop="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')" && [ "${#stop}" -eq 32 ]; then
+              echo "Changed files against ${base}:"
+              echo "::stop-commands::${stop}"
+              cat "$list" || true
+              echo "::${stop}::"
+            else
+              echo "Changed files against ${base}: not printed, no random token to stop workflow commands under."
+            fi
+          fi
+        fi
+        if [ -n "$verdict" ]; then
+          base=""
+          list=""
+          echo "no file list (${verdict}): every caller runs everything."
+        fi
+
+        {
+          echo "base=$base"
+          echo "verdict=$verdict"
+          echo "files-path=$list"
+        } >> "$GITHUB_OUTPUT"

@@ -43,26 +43,54 @@ type Options struct {
 	LogoutAttempts *AttemptLimit
 	// AuditLogEnabled gates the per-action security-event audit stream.
 	AuditLogEnabled bool
+	// OutboundDeliveryEnabled says whether this instance runs the built-in
+	// reminder pass at all (REMINDER_SCHEDULER_ENABLED, off by default). It is
+	// wired here rather than read where it is rendered so the settings surface
+	// receives a DOMAIN fact and not a configuration lookup: on a default
+	// instance every webhook column is inert, and a surface that called such a
+	// row "armed" would claim a capability the process does not have.
+	OutboundDeliveryEnabled bool
 }
 
-// i18nDisclaimerProvider adapts the i18n Manager to services.DisclaimerProvider:
-// it returns the localized medical-safety disclaimer (i18n key
-// dashboard.prediction_disclaimer) for a language, falling back to the manager's
-// default language (Messages merges the default over the target). It is the seam
-// the request-free webhook notify pass uses so every payload carries the
-// owner-localized "estimates, not medical advice or a method of contraception"
-// string without importing the whole Manager into internal/services.
+// i18nDisclaimerProvider adapts the i18n Manager to services.NotifyCopyProvider:
+// it answers any catalogue key for a language, and names the medical-safety
+// disclaimer (i18n key medical.disclaimer — the single catalogue entry every
+// predictive surface renders) through its own method, falling back to the
+// manager's default language (Messages merges the default over the target). It
+// is the seam the request-free egress passes use so every payload carries
+// owner-localized copy — the reminder headline and sentence as well as the
+// "estimates, not medical advice or a method of contraception" string — without
+// importing the whole Manager into internal/services.
 type i18nDisclaimerProvider struct {
 	manager *i18n.Manager
 }
 
-const disclaimerMessageKey = "dashboard.prediction_disclaimer"
+const disclaimerMessageKey = "medical.disclaimer"
 
 func (provider i18nDisclaimerProvider) Disclaimer(language string) string {
+	return provider.Message(language, disclaimerMessageKey)
+}
+
+// Message returns the catalogue entry for key at language. A nil manager (never
+// production, only a partially wired test) yields the empty string rather than
+// panicking, matching Disclaimer's original behavior.
+func (provider i18nDisclaimerProvider) Message(language string, key string) string {
 	if provider.manager == nil {
 		return ""
 	}
-	return provider.manager.Messages(language)[disclaimerMessageKey]
+	return provider.manager.Messages(language)[key]
+}
+
+// VerifySchemaInvariants checks the schema facts the application relies on but
+// must never re-establish itself, and returns an error naming the first one that
+// does not hold. The boot calls it once the migrations have applied and before
+// any boot pass or listener: a missing idx_users_email_normalized can only have
+// been dropped out of band or lost in a restore, it never comes back on its own,
+// and without it a registration race can create two accounts on one address.
+// Nothing here repairs: re-creating an index at boot would bypass the migration
+// that first checks the table for rows the index cannot cover.
+func VerifySchemaInvariants(ctx context.Context, repositories *db.Repositories) error {
+	return repositories.Health.VerifyNormalizedEmailIndex(ctx)
 }
 
 // BuildNotifyService assembles the request-free webhook notify pass (issue #124,
@@ -112,22 +140,52 @@ func BuildDependencies(repositories *db.Repositories, secretKey []byte, i18nMana
 	viewerService := services.NewViewerService(dayService, symptomService)
 	statsService := services.NewStatsService(dayService, symptomService)
 	calendarViewService := services.NewCalendarViewService(dayService, statsService)
-	calendarFeedService := services.NewCalendarFeedService(repositories.Users, dayService, i18nDisclaimerProvider{manager: i18nManager})
-	calendarFeedSettingsService := services.NewCalendarFeedSettingsService(repositories.Users)
+	calendarFeedService := services.NewCalendarFeedService(repositories.Users, dayService, i18nDisclaimerProvider{manager: i18nManager}, secretKey)
+	calendarFeedSettingsService := services.NewCalendarFeedSettingsService(repositories.Users, secretKey)
 	dashboardViewService := services.NewDashboardViewService(statsService, viewerService, dayService)
 	exportService := services.NewExportService(dayService, symptomService)
 	importService := services.NewImportService(dailyLogs, repositories.Users, symptomService, dayLogTxRunner)
 	settingsService := services.NewSettingsService(repositories.Users)
+	// A Settings start move removes the old start's fill days only while the
+	// owner's logs still show it opening the newest cycle.
+	settingsService.AttachDayLogReader(dayService)
+	// Attach the shared limiter and the secret key so the re-auth budget keys on
+	// (client, account) like the other auth policies rather than on the client
+	// alone. The budget itself is not operator-tunable: unlike the edge limiters
+	// it guards a credential check. It is the account's one password re-auth
+	// budget: the 2FA disable confirmation draws it too.
+	settingsService.ConfigureReauthAttempts(
+		secretKey,
+		attemptLimiter,
+		services.DefaultSettingsReauthAttemptsLimit,
+		services.DefaultSettingsReauthAttemptsWindow,
+	)
 	webhookSettingsService := services.NewWebhookSettingsService(repositories.Users, secretKey)
+	egressLedgerService := services.NewEgressLedgerService(webhookSettingsService, calendarFeedSettingsService, opts.OutboundDeliveryEnabled)
 	totpService := services.NewTOTPService(repositories.Users, secretKey, attemptLimiter)
+	// The enrollment-code budget (totp.enroll) books every wrong code a signed-in
+	// owner submits while confirming 2FA. Like settings.reauth above it is not
+	// operator-tunable, and its default matches settings.reauth's.
+	totpService.ConfigureEnrollAttempts(
+		services.DefaultTOTPEnrollAttemptsLimit,
+		services.DefaultTOTPEnrollAttemptsWindow,
+	)
+	// Every session-issuing path consults the same derived TOTP-verifiability
+	// predicate instead of the raw TOTPEnabled column (see TOTPFactorVerifier,
+	// internal/services/totp_service.go): wire it onto the local login service
+	// and onto the concrete OIDC login service below, before the latter is
+	// boxed into the apideps.OIDCWorkflowService interface.
+	loginService.SetTOTPVerifier(totpService)
 	oidcLogoutStateService := services.NewOIDCLogoutStateService(repositories.OIDCLogout)
 
-	var oidcService apideps.OIDCWorkflowService = services.NewOIDCLoginService(
+	oidcLoginService := services.NewOIDCLoginService(
 		security.NewOIDCClient(opts.OIDCConfig),
 		repositories.OIDCIdentities,
 		repositories.Users,
 		registrationService,
 	)
+	oidcLoginService.SetTOTPVerifier(totpService)
+	var oidcService apideps.OIDCWorkflowService = oidcLoginService
 	if opts.OIDCServiceOverride != nil {
 		oidcService = opts.OIDCServiceOverride
 	}
@@ -151,11 +209,12 @@ func BuildDependencies(repositories *db.Repositories, secretKey []byte, i18nMana
 		ExportService:          exportService,
 		ImportService:          importService,
 		SettingsService:        settingsService,
-		SettingsViewService:    services.NewSettingsViewService(settingsService, exportService, symptomService, webhookSettingsService, calendarFeedSettingsService),
+		SettingsViewService:    services.NewSettingsViewService(settingsService, exportService, symptomService, egressLedgerService),
 		WebhookSettingsService: webhookSettingsService,
 		OnboardingService:      services.NewOnboardingService(repositories.Users),
 		SetupService:           services.NewSetupService(repositories.Users),
 		TOTPService:            totpService,
+		ReadinessService:       services.NewReadinessService(repositories.Health),
 		RegisterPickupTokens:   repositories.RegisterPickupTokens,
 	}
 }

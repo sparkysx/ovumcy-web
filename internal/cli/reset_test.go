@@ -16,16 +16,17 @@ import (
 )
 
 func TestRunResetPasswordCommandUpdatesPasswordFromSecurePromptWithoutLeakingPlaintext(t *testing.T) {
-	t.Parallel()
-
 	databasePath := createCLIResetDatabase(t)
 	createCLIResetUser(t, databasePath, "cli-reset@example.com", "StrongPass1")
+	fencePath := armOperatorFence(t, databasePath)
+	beforeReset := loadCLIResetUser(t, databasePath, "cli-reset@example.com")
 	plaintextPassword := "EvenStronger2"
 	var output bytes.Buffer
 
 	err := runResetPasswordCommand(
 		db.Config{Driver: db.DriverSQLite, SQLitePath: databasePath},
-		"cli-reset@example.com",
+		[]string{"cli-reset@example.com"},
+		fencePath,
 		func() ([]byte, error) {
 			return []byte(plaintextPassword), nil
 		},
@@ -56,6 +57,12 @@ func TestRunResetPasswordCommandUpdatesPasswordFromSecurePromptWithoutLeakingPla
 	if bcrypt.CompareHashAndPassword([]byte(updatedUser.PasswordHash), []byte(plaintextPassword)) != nil {
 		t.Fatalf("expected cli reset to store hash for prompted password")
 	}
+	// The session-invalidation half of the same claim: the operator-forced
+	// reset must revoke every issued auth cookie, which the middleware reads
+	// as a higher auth_session_version than the one a cookie was minted with.
+	if updatedUser.AuthSessionVersion <= beforeReset.AuthSessionVersion {
+		t.Fatalf("expected the forced reset to bump auth_session_version past %d, got %d", beforeReset.AuthSessionVersion, updatedUser.AuthSessionVersion)
+	}
 }
 
 func TestRunResetPasswordCommandReturnsPromptError(t *testing.T) {
@@ -66,7 +73,8 @@ func TestRunResetPasswordCommandReturnsPromptError(t *testing.T) {
 
 	err := runResetPasswordCommand(
 		db.Config{Driver: db.DriverSQLite, SQLitePath: databasePath},
-		"cli-reset-prompt-error@example.com",
+		[]string{"cli-reset-prompt-error@example.com"},
+		"",
 		func() ([]byte, error) {
 			return nil, errors.New("prompt failed")
 		},
@@ -128,7 +136,7 @@ func createCLIResetDatabase(t *testing.T) string {
 	t.Helper()
 
 	databasePath := filepath.Join(t.TempDir(), "cli-reset-test.db")
-	database, err := db.OpenSQLite(databasePath)
+	database, err := db.OpenDatabase(db.Config{Driver: db.DriverSQLite, SQLitePath: databasePath})
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
@@ -145,7 +153,7 @@ func createCLIResetDatabase(t *testing.T) string {
 func createCLIResetUser(t *testing.T, databasePath string, email string, password string) {
 	t.Helper()
 
-	database, err := db.OpenSQLite(databasePath)
+	database, err := db.OpenDatabase(db.Config{Driver: db.DriverSQLite, SQLitePath: databasePath})
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
@@ -178,7 +186,7 @@ func createCLIResetUser(t *testing.T, databasePath string, email string, passwor
 func loadCLIResetUser(t *testing.T, databasePath string, email string) models.User {
 	t.Helper()
 
-	database, err := db.OpenSQLite(databasePath)
+	database, err := db.OpenDatabase(db.Config{Driver: db.DriverSQLite, SQLitePath: databasePath})
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}

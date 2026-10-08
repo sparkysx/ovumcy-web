@@ -1,11 +1,9 @@
 package api
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -21,9 +19,16 @@ import (
 )
 
 type stubOIDCWorkflowService struct {
-	enabled                bool
+	enabled bool
+	// providerLogoutDisabled stands for OIDC_LOGOUT_MODE=local on an instance
+	// whose OIDC is otherwise on: the write-time mode and the read-time mode
+	// are the same predicate, so a test that switches it observes what a
+	// stored row is worth after the switch.
+	providerLogoutDisabled bool
 	localPublicAuthEnabled bool
 	responseMode           security.OIDCResponseMode
+	issuerURL              string
+	postLogoutRedirectURL  string
 	authURL                string
 	startErr               error
 	result                 services.OIDCLoginResult
@@ -48,8 +53,39 @@ type stubOIDCWorkflowService struct {
 	lastReauthUserID       uint
 	lastReauthMaxAge       time.Duration
 	confirmLinkErr         error
+	unlinkErr              error
+	unlinkCalls            int
+	lastUnlinkUserID       uint
+	lastUnlinkIdentityID   uint
+	linkedIdentities       []services.LinkedOIDCIdentity
+	listLinkedErr          error
 	lastConfirmLinkUserID  uint
 	lastConfirmLinkClaims  security.OIDCClaims
+
+	// Identity-link step-up (Settings). identityLinkReauthErr, when set, is
+	// returned by CompleteIdentityLinkReauth directly (simulating an exchange
+	// or freshness failure) without ever reaching ConfirmAndLinkIdentity.
+	// Otherwise the stub records the call and falls through to confirmLinkErr,
+	// mirroring the real method's "exchange, then ConfirmAndLinkIdentity" shape.
+	identityLinkReauthErr        error
+	identityLinkClaims           security.OIDCClaims
+	lastIdentityLinkCode         string
+	lastIdentityLinkCodeVerifier string
+	lastIdentityLinkNonce        string
+	lastIdentityLinkUserID       uint
+	lastIdentityLinkMaxAge       time.Duration
+
+	lastIdentityLinkSessionVersion int
+
+	// afterIdentityLinkConfirm, when set, runs once ConfirmAndLinkIdentity's
+	// stand-in has recorded the call and right before the stub returns — the
+	// same point the real service method hands control back to
+	// completeOIDCIdentityLinkStepup, just before it re-issues the session. A
+	// test uses this to mutate the account's row (e.g. flip its role)
+	// in the gap between the handler's own authenticateRequest read and
+	// reissueSessionAfterIdentityChange's later FindByID, which is otherwise
+	// unreachable from outside a single synchronous handler call.
+	afterIdentityLinkConfirm func()
 }
 
 func (stub *stubOIDCWorkflowService) Enabled() bool {
@@ -71,6 +107,26 @@ func (stub *stubOIDCWorkflowService) ResponseMode() security.OIDCResponseMode {
 		return security.OIDCResponseModeFormPost
 	}
 	return stub.responseMode
+}
+
+// IssuerURL is the origin stored provider-logout state is pinned to; a test
+// that drives a valid logout state names the issuer its endpoint sits on.
+func (stub *stubOIDCWorkflowService) IssuerURL() string {
+	return stub.issuerURL
+}
+
+// PostLogoutRedirectURL is the configured post-logout return address the
+// provider redirect is composed from.
+func (stub *stubOIDCWorkflowService) PostLogoutRedirectURL() string {
+	return stub.postLogoutRedirectURL
+}
+
+// ProviderLogoutEnabled is the mode in force at sign-out time. An enabled stub
+// reports provider logout on unless a test turns it off, which is what the
+// tests around the bridge assume; a disabled stub reports it off, exactly as
+// the real service does when OIDC is off.
+func (stub *stubOIDCWorkflowService) ProviderLogoutEnabled() bool {
+	return stub.enabled && !stub.providerLogoutDisabled
 }
 
 func (stub *stubOIDCWorkflowService) StartAuth(ctx context.Context, state string, nonce string, codeVerifier string) (string, error) {
@@ -129,10 +185,86 @@ func (stub *stubOIDCWorkflowService) ValidateReauthExchange(_ context.Context, c
 	return stub.reauthErr
 }
 
-func (stub *stubOIDCWorkflowService) ConfirmAndLinkIdentity(ctx context.Context, targetUserID uint, claims security.OIDCClaims, _ time.Time) error {
+// UnlinkIdentity records what the handler asked for and answers unlinkErr.
+// The handler's own gates (password, id parse) are what the api tests pin;
+// the service rules live in internal/services. The stub writes nothing, so the
+// session version it reports is the one the account still holds.
+func (stub *stubOIDCWorkflowService) UnlinkIdentity(_ context.Context, user models.User, identityID uint) (int, error) {
+	stub.unlinkCalls++
+	stub.lastUnlinkUserID = user.ID
+	stub.lastUnlinkIdentityID = identityID
+	if stub.unlinkErr != nil {
+		return 0, stub.unlinkErr
+	}
+	return services.NormalizeAuthSessionVersion(user.AuthSessionVersion), nil
+}
+
+// assertStepupExchangeMatchesStart pins that a step-up completion validated
+// the provider answer against the values ITS OWN start minted: the code the
+// callback carried, the PKCE verifier and nonce the start handed to StartReauth
+// (read back from the sealed state cookie), and a non-zero max-age. A handler
+// that validated with a blank or a different verifier/nonce — or dropped the
+// max-age — would still reach its success path against the stub, so the
+// comparison has to be made here, on every step-up purpose.
+func assertStepupExchangeMatchesStart(t *testing.T, stub *stubOIDCWorkflowService, wantCode string, gotCode string, gotVerifier string, gotNonce string, gotMaxAge time.Duration) {
+	t.Helper()
+	if strings.TrimSpace(stub.lastReauthVerifier) == "" || strings.TrimSpace(stub.lastReauthNonce) == "" {
+		t.Fatalf("expected the step-up start to mint a verifier and a nonce, got verifier=%q nonce=%q", stub.lastReauthVerifier, stub.lastReauthNonce)
+	}
+	if gotCode != wantCode {
+		t.Fatalf("expected the exchange to use the callback code %q, got %q", wantCode, gotCode)
+	}
+	if gotVerifier != stub.lastReauthVerifier {
+		t.Fatalf("expected the exchange to use the start's PKCE verifier %q, got %q", stub.lastReauthVerifier, gotVerifier)
+	}
+	if gotNonce != stub.lastReauthNonce {
+		t.Fatalf("expected the exchange to check the start's nonce %q, got %q", stub.lastReauthNonce, gotNonce)
+	}
+	if gotMaxAge <= 0 {
+		t.Fatalf("expected a positive max-age to bound the provider re-authentication, got %s", gotMaxAge)
+	}
+}
+
+// assertReauthExchangeMatchesStart is the ValidateReauthExchange half
+// (local-password setup, clear-data, account deletion).
+func (stub *stubOIDCWorkflowService) assertReauthExchangeMatchesStart(t *testing.T, wantCode string) {
+	t.Helper()
+	assertStepupExchangeMatchesStart(t, stub, wantCode, stub.lastReauthCode, stub.lastReauthCodeVerifier, stub.lastReauthNonceCheck, stub.lastReauthMaxAge)
+}
+
+// assertIdentityLinkExchangeMatchesStart is the CompleteIdentityLinkReauth half.
+func (stub *stubOIDCWorkflowService) assertIdentityLinkExchangeMatchesStart(t *testing.T, wantCode string) {
+	t.Helper()
+	assertStepupExchangeMatchesStart(t, stub, wantCode, stub.lastIdentityLinkCode, stub.lastIdentityLinkCodeVerifier, stub.lastIdentityLinkNonce, stub.lastIdentityLinkMaxAge)
+}
+
+// ListLinkedIdentities answers the stub's configured rows unchanged.
+func (stub *stubOIDCWorkflowService) ListLinkedIdentities(_ context.Context, _ uint) ([]services.LinkedOIDCIdentity, error) {
+	return stub.linkedIdentities, stub.listLinkedErr
+}
+
+// CompleteIdentityLinkReauth records the exchange and answers like
+// ConfirmAndLinkIdentity's stand-in: it writes nothing, so the session version
+// it reports is the one the step-up started from.
+func (stub *stubOIDCWorkflowService) CompleteIdentityLinkReauth(_ context.Context, code string, codeVerifier string, expectedNonce string, targetUserID uint, expectedSessionVersion int, maxAuthAge time.Duration, _ time.Time) (int, error) {
+	stub.lastIdentityLinkSessionVersion = expectedSessionVersion
+	stub.lastIdentityLinkCode = code
+	stub.lastIdentityLinkCodeVerifier = codeVerifier
+	stub.lastIdentityLinkNonce = expectedNonce
+	stub.lastIdentityLinkUserID = targetUserID
+	stub.lastIdentityLinkMaxAge = maxAuthAge
+	if stub.identityLinkReauthErr != nil {
+		return 0, stub.identityLinkReauthErr
+	}
 	stub.lastConfirmLinkUserID = targetUserID
-	stub.lastConfirmLinkClaims = claims
-	return stub.confirmLinkErr
+	stub.lastConfirmLinkClaims = stub.identityLinkClaims
+	if stub.afterIdentityLinkConfirm != nil {
+		stub.afterIdentityLinkConfirm()
+	}
+	if stub.confirmLinkErr != nil {
+		return 0, stub.confirmLinkErr
+	}
+	return services.NormalizeAuthSessionVersion(expectedSessionVersion), nil
 }
 
 func TestLoginPageWithOIDCEnabledShowsSSOButton(t *testing.T) {
@@ -150,8 +282,9 @@ func TestLoginPageWithOIDCEnabledShowsSSOButton(t *testing.T) {
 
 	rendered := mustReadBodyString(t, response.Body)
 	assertBodyContainsAll(t, rendered,
+		// Structural hook only — the rendered SSO caption is Playwright's
+		// subject (e2e/auth-oidc.spec.ts), sourced from the catalogue.
 		bodyStringMatch{fragment: "data-auth-sso-cta", message: "expected SSO CTA marker in login page"},
-		bodyStringMatch{fragment: "Sign in with SSO", message: "expected localized SSO CTA copy"},
 	)
 }
 
@@ -220,9 +353,12 @@ func TestOIDCStartFailureClearsStateCookieAndFlashesLoginError(t *testing.T) {
 	if stateCookie.Value != "" {
 		t.Fatalf("expected cleared OIDC state cookie, got %q", stateCookie.Value)
 	}
-	flashCookie := responseCookie(response.Cookies(), flashCookieName)
+	// /auth/oidc/start is an unguarded GET, no CSRF token possible on a safe
+	// method: its own AuthError write goes through the exempt channel
+	// (WEB-40), never the shared page slot.
+	flashCookie := responseCookie(response.Cookies(), exemptFlashCookieName)
 	if flashCookie == nil || strings.TrimSpace(flashCookie.Value) == "" {
-		t.Fatal("expected flash cookie on OIDC start failure")
+		t.Fatal("expected exempt-channel flash cookie on OIDC start failure")
 	}
 }
 
@@ -246,8 +382,11 @@ func TestOIDCCallbackSkipsCSRFAndFallsBackToStateValidation(t *testing.T) {
 	if location := response.Header.Get("Location"); location != "/login" {
 		t.Fatalf("expected redirect to /login, got %q", location)
 	}
-	if flashValue := responseCookieValue(response.Cookies(), flashCookieName); flashValue == "" {
-		t.Fatal("expected flash cookie for invalid OIDC callback")
+	// POST /auth/oidc/callback is the sole CSRF exemption: its state-mismatch
+	// refusal goes through the exempt channel (WEB-40), never the shared page
+	// slot a pending same-origin flash occupies.
+	if flashValue := responseCookieValue(response.Cookies(), exemptFlashCookieName); flashValue == "" {
+		t.Fatal("expected exempt-channel flash cookie for invalid OIDC callback")
 	}
 }
 
@@ -316,6 +455,165 @@ func TestOIDCCallbackSuccessIssuesLocalAuthCookie(t *testing.T) {
 	}
 }
 
+// The sign-in half of "a transit cookie is spent only for a callback that
+// answers its own flow". The callback path is reachable by any site that can
+// cause a navigation to it, so a request whose state does not match must leave
+// the one-time cookie where it is — otherwise a stranger cancels a sign-in the
+// owner is in the middle of, and the step-up half of the same rule
+// (TestCrossSiteStepupCallbackRefusesAStateThatDoesNotMatchWithoutSpendingTheCookie)
+// would be the only half anything holds to.
+func TestOIDCCallbackMismatchingStateLeavesTheStateCookieForTheRealReturn(t *testing.T) {
+	t.Parallel()
+
+	stub := newStubOIDCWorkflowService(true)
+	stub.authURL = "https://id.example.com/authorize"
+	stub.result = services.OIDCLoginResult{
+		User: models.User{
+			ID:                  12,
+			Role:                models.RoleOwner,
+			AuthSessionVersion:  1,
+			OnboardingCompleted: true,
+		},
+	}
+	app, _ := newOnboardingTestAppWithOptions(t, onboardingTestAppOptions{
+		cookieSecure: true,
+		oidcService:  stub,
+	})
+
+	startResponse := mustAppResponse(t, app, httptest.NewRequest(http.MethodGet, "/auth/oidc/start", nil))
+	assertStatusCode(t, startResponse, http.StatusTemporaryRedirect)
+	stateCookie := responseCookie(startResponse.Cookies(), oidcStateCookieName)
+	if stateCookie == nil {
+		t.Fatal("expected OIDC state cookie from start flow")
+	}
+
+	postCallback := func(state string, code string) *http.Response {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodPost, security.OIDCCallbackPath, strings.NewReader(url.Values{
+			"state": {state},
+			"code":  {code},
+		}.Encode()))
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		request.Header.Set("Cookie", stateCookie.String())
+		return mustAppResponse(t, app, request)
+	}
+
+	stray := postCallback("not-the-sealed-state", "stranger-code")
+	assertStatusCode(t, stray, http.StatusSeeOther)
+	if location := stray.Header.Get("Location"); location != "/login" {
+		t.Fatalf("expected the refusal to land on /login, got %q", location)
+	}
+	if retracted := responseCookie(stray.Cookies(), oidcStateCookieName); retracted != nil && strings.TrimSpace(retracted.Value) == "" {
+		t.Fatal("a mismatching callback must not expire the sign-in state cookie")
+	}
+	if stub.lastAuthCode != "" {
+		t.Fatalf("a mismatching callback must not reach the token exchange, got code %q", stub.lastAuthCode)
+	}
+
+	// And the owner's real return trip still completes, which is what proves
+	// the cookie above survived rather than merely not being re-sent.
+	real := postCallback(stub.lastStartState, "provider-code")
+	assertStatusCode(t, real, http.StatusSeeOther)
+	if location := real.Header.Get("Location"); location != "/dashboard" {
+		t.Fatalf("expected the real callback to sign in, got %q", location)
+	}
+	if authCookie := responseCookie(real.Cookies(), authCookieName); authCookie == nil || strings.TrimSpace(authCookie.Value) == "" {
+		t.Fatal("expected the real callback to issue the session cookie")
+	}
+}
+
+// TestSSOSignInStartDropsAnAbandonedStepup is the other half of "spend the
+// step-up cookie only on a state match". Not spending it is what keeps a
+// stranger from cancelling a step-up in progress — but the callback also
+// DISPATCHES on that cookie's presence, so one the owner abandoned at the
+// provider outranks the sign-in that comes next: the login state never
+// matches it, the refusal returns before the sign-in branch is reached, and
+// it flashes on the settings channel, which /login does not render. Every
+// attempt fails silently for the cookie's whole ten minutes. Starting a
+// sign-in therefore drops it, the mirror of what the three step-up starts
+// already do to the login state cookie.
+func TestSSOSignInStartDropsAnAbandonedStepup(t *testing.T) {
+	t.Parallel()
+
+	fixture := newOIDCStepupFixture(t, "abandoned-stepup-blocks-signin@example.com")
+	fixture.oidcStub.authURL = "https://id.example.com/authorize"
+
+	startResponse := fixture.postStart(t, "EvenStronger2", "EvenStronger2")
+	defer func() { _ = startResponse.Body.Close() }()
+	stepupCookie := readStepupCookie(t, startResponse)
+
+	// The owner leaves the provider without finishing, and later starts an
+	// ordinary sign-in with that cookie still riding.
+	request := httptest.NewRequest(http.MethodGet, "/auth/oidc/start", nil)
+	request.Header.Set("Cookie", stepupCookie)
+	signInStart := mustAppResponse(t, fixture.app, request)
+	defer func() { _ = signInStart.Body.Close() }()
+	assertStatusCode(t, signInStart, http.StatusTemporaryRedirect)
+
+	retracted := responseCookie(signInStart.Cookies(), oidcStepupCookieName)
+	if retracted == nil || strings.TrimSpace(retracted.Value) != "" {
+		t.Fatal("expected the sign-in start to retract the abandoned step-up cookie")
+	}
+	stateCookie := responseCookie(signInStart.Cookies(), oidcStateCookieName)
+	if stateCookie == nil || strings.TrimSpace(stateCookie.Value) == "" {
+		t.Fatal("expected the sign-in start to mint a state cookie")
+	}
+
+	// What the browser has left is the state cookie alone, so the provider's
+	// return reaches the sign-in branch instead of being answered by a
+	// step-up that is no longer in flight.
+	callback := httptest.NewRequest(http.MethodPost, security.OIDCCallbackPath, strings.NewReader(url.Values{
+		"state": {fixture.oidcStub.lastStartState},
+		"code":  {"provider-code"},
+	}.Encode()))
+	callback.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	callback.Header.Set("Cookie", cookiePair(stateCookie))
+	completed := mustAppResponse(t, fixture.app, callback)
+	defer func() { _ = completed.Body.Close() }()
+	if location := completed.Header.Get("Location"); location == "/settings" {
+		t.Fatal("the sign-in return was answered by the step-up branch: the abandoned cookie still decides")
+	}
+}
+
+// TestSSOSignInStartDropsAnAbandonedStepupContinuation is the same rule for the
+// step-up's other carrier. The hand-off a cross-site return parks seals the
+// whole step-up plus an authorization code nobody has spent. Unlike the step-up
+// cookie it cannot capture this callback — it is scoped to the continue route —
+// but it can outlive the session that started it: a session that lapsed rather
+// than being signed out never passed through clearSessionEndCookies, so without
+// this the next sign-in leaves a restored tab everything it needs to finish the
+// erasure the previous session abandoned.
+func TestSSOSignInStartDropsAnAbandonedStepupContinuation(t *testing.T) {
+	t.Parallel()
+
+	fixture := newOIDCStepupFixture(t, "abandoned-continuation-outlives-session@example.com")
+	fixture.oidcStub.reauthErr = nil
+	fixture.oidcStub.authURL = "https://id.example.com/authorize"
+
+	startResponse := postOIDCIdentityLinkStepupStart(t, fixture)
+	defer func() { _ = startResponse.Body.Close() }()
+	stepupCookie := readStepupCookie(t, startResponse)
+	state := extractStepupCallbackState(t, fixture)
+
+	bounce := crossSiteStepupCallback(t, fixture, stepupCookie, state, "callback-code")
+	defer func() { _ = bounce.Body.Close() }()
+	continuation := continuationFromBounce(t, bounce)
+
+	// The owner never follows the hand-off document. The tab sits there, the
+	// session lapses, and the next thing the browser does is start a sign-in
+	// with the continuation still riding.
+	request := httptest.NewRequest(http.MethodGet, "/auth/oidc/start", nil)
+	request.Header.Set("Cookie", cookiePair(continuation))
+	signInStart := mustAppResponse(t, fixture.app, request)
+	defer func() { _ = signInStart.Body.Close() }()
+	assertStatusCode(t, signInStart, http.StatusTemporaryRedirect)
+
+	retracted := responseCookie(signInStart.Cookies(), oidcStepupContinuationCookieName)
+	if retracted == nil || strings.TrimSpace(retracted.Value) != "" {
+		t.Fatal("expected the sign-in start to retract the abandoned step-up continuation")
+	}
+}
+
 func TestOIDCCallbackProviderErrorRedirectsToLoginWithoutLeakingProviderError(t *testing.T) {
 	t.Parallel()
 
@@ -352,9 +650,9 @@ func TestOIDCCallbackProviderErrorRedirectsToLoginWithoutLeakingProviderError(t 
 		t.Fatalf("did not expect OIDC authenticate call on provider error, got %q", stub.lastAuthCode)
 	}
 
-	flashCookie := responseCookie(callbackResponse.Cookies(), flashCookieName)
+	flashCookie := responseCookie(callbackResponse.Cookies(), exemptFlashCookieName)
 	if flashCookie == nil || strings.TrimSpace(flashCookie.Value) == "" {
-		t.Fatal("expected flash cookie on OIDC provider error")
+		t.Fatal("expected exempt-channel flash cookie on OIDC provider error")
 	}
 	if strings.Contains(flashCookie.Value, "access_denied") || strings.Contains(flashCookie.Value, "operator rejected sign-in") {
 		t.Fatalf("did not expect provider error details in flash cookie: %q", flashCookie.Value)
@@ -395,9 +693,9 @@ func TestOIDCCallbackAccountUnavailableRedirectsToLogin(t *testing.T) {
 	if authCookie := responseCookie(callbackResponse.Cookies(), authCookieName); authCookie != nil && strings.TrimSpace(authCookie.Value) != "" {
 		t.Fatal("did not expect auth cookie on unavailable OIDC account")
 	}
-	flashCookie := responseCookie(callbackResponse.Cookies(), flashCookieName)
+	flashCookie := responseCookie(callbackResponse.Cookies(), exemptFlashCookieName)
 	if flashCookie == nil || strings.TrimSpace(flashCookie.Value) == "" {
-		t.Fatal("expected flash cookie on unavailable OIDC account")
+		t.Fatal("expected exempt-channel flash cookie on unavailable OIDC account")
 	}
 }
 
@@ -414,6 +712,12 @@ func TestOIDCCallbackResetRequiredRedirectsToResetPassword(t *testing.T) {
 			PasswordHash:       "$2a$10$0123456789abcdef01234uVwxyzABCD0123456789abcdef01234",
 			MustChangePassword: true,
 		},
+		// The stub bypasses OIDCLoginService.Authenticate's own computation,
+		// so RequiresPasswordReset is set here exactly as the real service
+		// would derive it for a MustChangePassword account — the handler
+		// branch under test consumes this field, not the raw
+		// User.MustChangePassword.
+		RequiresPasswordReset: true,
 	}
 	app, _ := newOnboardingTestAppWithOptions(t, onboardingTestAppOptions{
 		cookieSecure: true,
@@ -449,10 +753,265 @@ func TestOIDCCallbackResetRequiredRedirectsToResetPassword(t *testing.T) {
 	}
 }
 
+// TestOIDCCallbackForLinkedTOTPAccountGatesOnTheSecondFactor pins session
+// issuance parity (docs/security/oidc-and-sessions.md) between the OIDC login
+// path and the local login path: an OIDC callback that resolves to an
+// already-linked identity whose account has TOTP enabled must NOT mint an
+// ovumcy_auth cookie directly off the exchange. It has to set the same
+// pending-TOTP cookie the local login path sets (RequiresTOTP, mirroring
+// LoginResult) and land on /auth/2fa; only completing that challenge may
+// issue the session. Before this fix CompleteOIDCLogin fell straight through
+// to setAuthCookie with no TOTP check anywhere on the path.
+func TestOIDCCallbackForLinkedTOTPAccountGatesOnTheSecondFactor(t *testing.T) {
+	t.Parallel()
+
+	stub := newStubOIDCWorkflowService(true)
+	stub.authURL = "https://id.example.com/authorize"
+
+	secretKey := []byte(testHandlerSecretKey)
+	app, database := newOnboardingTestAppWithOptions(t, onboardingTestAppOptions{
+		cookieSecure: true,
+		oidcService:  stub,
+	})
+	user := createOnboardingTestUser(t, database, "oidc-totp@example.com", "StrongPass1", true)
+	rawSecret := setupTOTPForUser(t, database, user.ID, secretKey)
+
+	var linked models.User
+	if err := database.First(&linked, user.ID).Error; err != nil {
+		t.Fatalf("reload user: %v", err)
+	}
+	if !linked.TOTPEnabled {
+		t.Fatal("expected TOTP enabled on the account after setup")
+	}
+
+	// The stub bypasses OIDCLoginService.Authenticate's own computation, so the
+	// result carries RequiresTOTP exactly as the real service would derive it
+	// for this account (TOTP enabled, MustChangePassword false) — the handler
+	// gate under test is what consumes this field, not what computes it. Logout
+	// is also populated, as buildLogoutState would for a provider with
+	// end-session support, so the callback has to stage it under an opaque id
+	// rather than discard it — the parity this test exists to pin.
+	stub.result = services.OIDCLoginResult{
+		User:         linked,
+		RequiresTOTP: true,
+		Logout: &services.OIDCLogoutState{
+			UserID:                linked.ID,
+			EndSessionEndpoint:    testOIDCIssuerURL + "/logout",
+			IDTokenHint:           "eyJhbGciOiJSUzI1NiJ9.header.signature",
+			PostLogoutRedirectURL: "https://app.example.com/",
+		},
+	}
+
+	startResponse := mustAppResponse(t, app, httptest.NewRequest(http.MethodGet, "/auth/oidc/start", nil))
+	stateCookie := responseCookie(startResponse.Cookies(), oidcStateCookieName)
+	if stateCookie == nil {
+		t.Fatal("expected OIDC state cookie from start flow")
+	}
+
+	callbackRequest := httptest.NewRequest(http.MethodPost, security.OIDCCallbackPath, strings.NewReader(url.Values{
+		"state": {stub.lastStartState},
+		"code":  {"provider-code"},
+	}.Encode()))
+	callbackRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	callbackRequest.Header.Set("Cookie", stateCookie.String())
+
+	callbackResponse := mustAppResponse(t, app, callbackRequest)
+	assertStatusCode(t, callbackResponse, http.StatusSeeOther)
+	if location := callbackResponse.Header.Get("Location"); location != "/auth/2fa" {
+		t.Fatalf("expected redirect to /auth/2fa, got %q", location)
+	}
+	if authCookie := responseCookie(callbackResponse.Cookies(), authCookieName); authCookie != nil && strings.TrimSpace(authCookie.Value) != "" {
+		t.Fatal("did not expect an auth cookie before the TOTP challenge is completed")
+	}
+	pendingCookie := responseCookie(callbackResponse.Cookies(), totpPendingCookieName)
+	if pendingCookie == nil || strings.TrimSpace(pendingCookie.Value) == "" {
+		t.Fatal("expected a TOTP pending cookie from the OIDC callback")
+	}
+
+	codec, err := newSecureCookieCodec(secretKey)
+	if err != nil {
+		t.Fatalf("newSecureCookieCodec: %v", err)
+	}
+	decoded, err := codec.open(totpPendingCookieName, pendingCookie.Value)
+	if err != nil {
+		t.Fatalf("open pending cookie: %v", err)
+	}
+	var pendingPayload totpPendingCookiePayload
+	if err := json.Unmarshal(decoded, &pendingPayload); err != nil {
+		t.Fatalf("unmarshal pending payload: %v", err)
+	}
+	if pendingPayload.UserID != linked.ID {
+		t.Fatalf("pending cookie user_id = %d, want %d", pendingPayload.UserID, linked.ID)
+	}
+	pendingLogoutStateID := strings.TrimSpace(pendingPayload.OIDCLogoutStateID)
+	if pendingLogoutStateID == "" {
+		t.Fatal("expected the pending cookie to carry an opaque OIDC logout-state id, since the stubbed result carries provider-logout material")
+	}
+
+	logoutStateSvc := services.NewOIDCLogoutStateService(db.NewRepositories(database).OIDCLogout)
+	stagedState, stagedFound, err := logoutStateSvc.Load(context.Background(), pendingLogoutStateID, linked.ID, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("load staged logout state: %v", err)
+	}
+	if !stagedFound || stagedState.EndSessionEndpoint != stub.result.Logout.EndSessionEndpoint {
+		t.Fatalf("expected the callback to stage the provider-logout material under the opaque id, got found=%v state=%#v", stagedFound, stagedState)
+	}
+
+	// Completing the challenge with a valid code is what may issue the
+	// session — never the callback itself.
+	code, err := totp.GenerateCode(rawSecret, time.Now())
+	if err != nil {
+		t.Fatalf("GenerateCode: %v", err)
+	}
+	challengeRequest := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/2fa-challenge", strings.NewReader(url.Values{
+		"code": {code},
+	}.Encode()))
+	challengeRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	challengeRequest.Header.Set("Cookie", totpPendingCookieName+"="+pendingCookie.Value)
+
+	challengeResponse := mustAppResponse(t, app, challengeRequest)
+	assertStatusCode(t, challengeResponse, http.StatusSeeOther)
+	sessionCookie := responseCookie(challengeResponse.Cookies(), authCookieName)
+	if sessionCookie == nil || strings.TrimSpace(sessionCookie.Value) == "" {
+		t.Fatal("expected an auth cookie after completing the TOTP challenge")
+	}
+
+	// The provider-logout material must have followed the session onto its
+	// real id — the whole point of staging it under the opaque id above — and
+	// the staging row itself must be gone rather than left behind as a second,
+	// orphaned copy.
+	newSessionID := mustExtractAuthSessionIDFromCookieHeader(t, sessionCookie.Name+"="+sessionCookie.Value)
+	movedState, movedFound, err := logoutStateSvc.Load(context.Background(), newSessionID, linked.ID, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("load relocated logout state: %v", err)
+	}
+	if !movedFound || movedState.EndSessionEndpoint != stub.result.Logout.EndSessionEndpoint {
+		t.Fatalf("expected the TOTP challenge to relocate the logout state onto the new session id, got found=%v state=%#v", movedFound, movedState)
+	}
+	_, stillStaged, err := logoutStateSvc.Load(context.Background(), pendingLogoutStateID, linked.ID, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("load staging row after relocation: %v", err)
+	}
+	if stillStaged {
+		t.Fatal("expected the opaque staging row to be deleted once its state moved to the real session id")
+	}
+}
+
+// TestOIDCCallbackForLinkedTOTPAccountWithNoLogoutStateCompletesChallengeCleanly
+// covers the other half of the same parity: when the OIDC result carries no
+// provider-logout material at all (Logout == nil — no end_session_endpoint,
+// or provider logout disabled), the pending cookie carries no logout-state id,
+// completing the challenge mints the session with no OIDC logout row attached
+// to it, and the bridge cookie is cleared exactly as the direct, non-gated
+// OIDC success path clears it.
+func TestOIDCCallbackForLinkedTOTPAccountWithNoLogoutStateCompletesChallengeCleanly(t *testing.T) {
+	t.Parallel()
+
+	stub := newStubOIDCWorkflowService(true)
+	stub.authURL = "https://id.example.com/authorize"
+
+	secretKey := []byte(testHandlerSecretKey)
+	app, database := newOnboardingTestAppWithOptions(t, onboardingTestAppOptions{
+		cookieSecure: true,
+		oidcService:  stub,
+	})
+	user := createOnboardingTestUser(t, database, "oidc-totp-no-logout@example.com", "StrongPass1", true)
+	rawSecret := setupTOTPForUser(t, database, user.ID, secretKey)
+
+	var linked models.User
+	if err := database.First(&linked, user.ID).Error; err != nil {
+		t.Fatalf("reload user: %v", err)
+	}
+
+	stub.result = services.OIDCLoginResult{
+		User:         linked,
+		RequiresTOTP: true,
+		Logout:       nil,
+	}
+
+	startResponse := mustAppResponse(t, app, httptest.NewRequest(http.MethodGet, "/auth/oidc/start", nil))
+	stateCookie := responseCookie(startResponse.Cookies(), oidcStateCookieName)
+	if stateCookie == nil {
+		t.Fatal("expected OIDC state cookie from start flow")
+	}
+	callbackRequest := httptest.NewRequest(http.MethodPost, security.OIDCCallbackPath, strings.NewReader(url.Values{
+		"state": {stub.lastStartState},
+		"code":  {"provider-code"},
+	}.Encode()))
+	callbackRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	callbackRequest.Header.Set("Cookie", stateCookie.String())
+	callbackResponse := mustAppResponse(t, app, callbackRequest)
+	assertStatusCode(t, callbackResponse, http.StatusSeeOther)
+
+	pendingCookie := responseCookie(callbackResponse.Cookies(), totpPendingCookieName)
+	if pendingCookie == nil || strings.TrimSpace(pendingCookie.Value) == "" {
+		t.Fatal("expected a TOTP pending cookie from the OIDC callback")
+	}
+	codec, err := newSecureCookieCodec(secretKey)
+	if err != nil {
+		t.Fatalf("newSecureCookieCodec: %v", err)
+	}
+	decoded, err := codec.open(totpPendingCookieName, pendingCookie.Value)
+	if err != nil {
+		t.Fatalf("open pending cookie: %v", err)
+	}
+	var pendingPayload totpPendingCookiePayload
+	if err := json.Unmarshal(decoded, &pendingPayload); err != nil {
+		t.Fatalf("unmarshal pending payload: %v", err)
+	}
+	if strings.TrimSpace(pendingPayload.OIDCLogoutStateID) != "" {
+		t.Fatalf("expected no OIDC logout-state id when the result carries no logout material, got %q", pendingPayload.OIDCLogoutStateID)
+	}
+
+	code, err := totp.GenerateCode(rawSecret, time.Now())
+	if err != nil {
+		t.Fatalf("GenerateCode: %v", err)
+	}
+	challengeRequest := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/2fa-challenge", strings.NewReader(url.Values{
+		"code": {code},
+	}.Encode()))
+	challengeRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	challengeRequest.Header.Set("Cookie", totpPendingCookieName+"="+pendingCookie.Value)
+	challengeResponse := mustAppResponse(t, app, challengeRequest)
+	assertStatusCode(t, challengeResponse, http.StatusSeeOther)
+
+	sessionCookie := responseCookie(challengeResponse.Cookies(), authCookieName)
+	if sessionCookie == nil || strings.TrimSpace(sessionCookie.Value) == "" {
+		t.Fatal("expected an auth cookie after completing the TOTP challenge")
+	}
+	newSessionID := mustExtractAuthSessionIDFromCookieHeader(t, sessionCookie.Name+"="+sessionCookie.Value)
+
+	logoutStateSvc := services.NewOIDCLogoutStateService(db.NewRepositories(database).OIDCLogout)
+	_, found, err := logoutStateSvc.Load(context.Background(), newSessionID, linked.ID, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("load logout state for new session: %v", err)
+	}
+	if found {
+		t.Fatal("expected no OIDC logout state attached to a session minted with no logout material to carry")
+	}
+
+	bridgeCookie := responseCookie(challengeResponse.Cookies(), oidcLogoutBridgeCookieName)
+	if bridgeCookie == nil || strings.TrimSpace(bridgeCookie.Value) != "" {
+		t.Fatal("expected the TOTP challenge to clear the OIDC logout bridge cookie, same as every other session-mint path")
+	}
+}
+
+// testOIDCIssuerURL is the issuer the stub and the default test wiring report.
+// Stored provider-logout state is pinned to the issuer origin, so a fixture
+// whose end-session endpoint must survive that pin sits on this origin.
+const testOIDCIssuerURL = "https://id.example.com"
+
+// testOIDCPostLogoutRedirectURL is the post-logout return address the stub and
+// the default test wiring resolve. The provider redirect is composed from it,
+// never from the address stored with the logout state.
+const testOIDCPostLogoutRedirectURL = "https://ovumcy.example.com/login"
+
 func newStubOIDCWorkflowService(enabled bool) *stubOIDCWorkflowService {
 	return &stubOIDCWorkflowService{
 		enabled:                enabled,
 		localPublicAuthEnabled: true,
+		issuerURL:              testOIDCIssuerURL,
+		postLogoutRedirectURL:  testOIDCPostLogoutRedirectURL,
 	}
 }
 
@@ -535,7 +1094,7 @@ func TestOIDCCallbackPersistsProviderLogoutStateOnSuccessfulLogin(t *testing.T) 
 	// err == nil path the mutant inverts.
 	newSessionID := mustExtractAuthSessionIDFromCookieHeader(t, authCookie.Name+"="+authCookie.Value)
 	stateService := services.NewOIDCLogoutStateService(db.NewRepositories(database).OIDCLogout)
-	saved, found, err := stateService.Load(context.Background(), newSessionID, time.Now().UTC())
+	saved, found, err := stateService.Load(context.Background(), newSessionID, result.User.ID, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("load persisted logout state: %v", err)
 	}
@@ -547,33 +1106,7 @@ func TestOIDCCallbackPersistsProviderLogoutStateOnSuccessfulLogin(t *testing.T) 
 	}
 }
 
-// OIDC link-confirm handler regressions. These exercise the password-gated
-// first-time-link flow added in commit d1def85 (security(auth/oidc): gate
-// first-time link to existing email behind password confirmation). The
-// link-pending cookie itself is covered for AAD/tamper/rotation in
-// oidc_link_pending_cookie_test.go; these tests assert the routes that
-// consume it: startOIDCLinkConfirmation (dispatched from CompleteOIDCLogin),
-// ShowOIDCLinkConfirmPage (GET), CompleteOIDCLinkConfirmation (POST), and
-// the error mapper that translates ConfirmAndLinkIdentity failures.
-
 const testHandlerSecretKey = "test-secret-key"
-
-func sealLinkPendingCookieForTest(t *testing.T, payload oidcLinkPendingPayload) string {
-	t.Helper()
-	codec, err := newSecureCookieCodec([]byte(testHandlerSecretKey))
-	if err != nil {
-		t.Fatalf("newSecureCookieCodec: %v", err)
-	}
-	serialized, err := json.Marshal(payload)
-	if err != nil {
-		t.Fatalf("marshal link-pending payload: %v", err)
-	}
-	sealed, err := codec.seal(oidcLinkPendingCookieName, serialized)
-	if err != nil {
-		t.Fatalf("seal link-pending cookie: %v", err)
-	}
-	return sealed
-}
 
 func decodeFlashCookieForTest(t *testing.T, sealed string) FlashPayload {
 	t.Helper()
@@ -592,12 +1125,37 @@ func decodeFlashCookieForTest(t *testing.T, sealed string) FlashPayload {
 	return payload
 }
 
-// TestOIDCCallbackPendingLinkSealsCookieAndRedirectsToConfirmPage proves the
-// hand-off path: when service.Authenticate returns
-// ErrOIDCLinkRequiresConfirmation with a target local user, the callback must
-// seal the link-pending cookie and redirect to /auth/oidc/link-confirm — not
-// silently link or issue an auth session.
-func TestOIDCCallbackPendingLinkSealsCookieAndRedirectsToConfirmPage(t *testing.T) {
+// decodeExemptFlashCookieForTest is decodeFlashCookieForTest's twin for the
+// WEB-40 exempt channel: the cookie name is bound into the sealed envelope, so
+// a value sealed under exemptFlashCookieName does not open under
+// flashCookieName.
+func decodeExemptFlashCookieForTest(t *testing.T, sealed string) FlashPayload {
+	t.Helper()
+	codec, err := newSecureCookieCodec([]byte(testHandlerSecretKey))
+	if err != nil {
+		t.Fatalf("newSecureCookieCodec: %v", err)
+	}
+	decoded, err := codec.open(exemptFlashCookieName, sealed)
+	if err != nil {
+		t.Fatalf("open exempt flash cookie: %v", err)
+	}
+	payload := FlashPayload{}
+	if err := json.Unmarshal(decoded, &payload); err != nil {
+		t.Fatalf("unmarshal exempt flash payload: %v", err)
+	}
+	return payload
+}
+
+// TestOIDCCallbackPendingLinkNeverMintsPendingCookieAndRedirectsToLogin pins
+// the fail-closed handoff WEB-77 left in place after removing the public
+// link-confirm route for good (issue #701 had already made it unreachable):
+// when service.Authenticate returns ErrOIDCLinkRequiresConfirmation for a
+// target local user (including one with a usable local password — the case
+// the old password-confirmation page used to handle), the callback must NOT
+// seal a link-pending cookie and must redirect straight to /login. The only
+// ways to complete this link are the authenticated Settings step-up and the
+// operator CLI.
+func TestOIDCCallbackPendingLinkNeverMintsPendingCookieAndRedirectsToLogin(t *testing.T) {
 	t.Parallel()
 
 	stub := newStubOIDCWorkflowService(true)
@@ -637,79 +1195,41 @@ func TestOIDCCallbackPendingLinkSealsCookieAndRedirectsToConfirmPage(t *testing.
 
 	response := mustAppResponse(t, app, callbackRequest)
 	assertStatusCode(t, response, http.StatusSeeOther)
-	if location := response.Header.Get("Location"); location != oidcLinkConfirmPath {
-		t.Fatalf("expected redirect to link-confirm page, got %q", location)
-	}
-	linkCookie := responseCookie(response.Cookies(), oidcLinkPendingCookieName)
-	if linkCookie == nil || strings.TrimSpace(linkCookie.Value) == "" {
-		t.Fatal("expected sealed link-pending cookie on confirmation hand-off")
+	if location := response.Header.Get("Location"); location != "/login" {
+		t.Fatalf("expected redirect to /login (link-confirm route removed for good), got %q", location)
 	}
 	if authCookie := responseCookie(response.Cookies(), authCookieName); authCookie != nil && strings.TrimSpace(authCookie.Value) != "" {
-		t.Fatalf("did not expect auth cookie to be issued before password challenge, got %q", authCookie.Value)
+		t.Fatalf("did not expect auth cookie to be issued, got %q", authCookie.Value)
 	}
-}
-
-// TestOIDCCallbackPendingLinkForOIDCOnlyUserRefusesWithoutCookie locks the
-// rule that pending-link confirmation requires a usable local password. If
-// the target account has LocalAuthEnabled=false, the password challenge
-// could never succeed; the handler must refuse rather than strand the user.
-func TestOIDCCallbackPendingLinkForOIDCOnlyUserRefusesWithoutCookie(t *testing.T) {
-	t.Parallel()
-
-	stub := newStubOIDCWorkflowService(true)
-	stub.authURL = "https://id.example.com/authorize"
-	stub.result = services.OIDCLoginResult{
-		User: models.User{
-			ID:                 31,
-			Role:               models.RoleOwner,
-			AuthSessionVersion: 1,
-			LocalAuthEnabled:   false,
-			Email:              "oidc-only@example.com",
-		},
-		PendingLinkClaims: &security.OIDCClaims{
-			Issuer:  "https://idp.example",
-			Subject: "subject-only",
-			Email:   "oidc-only@example.com",
-		},
-	}
-	stub.authErr = services.ErrOIDCLinkRequiresConfirmation
-	app, _ := newOnboardingTestAppWithOptions(t, onboardingTestAppOptions{
-		cookieSecure: true,
-		oidcService:  stub,
-	})
-
-	startResponse := mustAppResponse(t, app, httptest.NewRequest(http.MethodGet, "/auth/oidc/start", nil))
-	stateCookie := responseCookie(startResponse.Cookies(), oidcStateCookieName)
-	if stateCookie == nil {
-		t.Fatal("expected OIDC state cookie from start flow")
-	}
-
-	callbackRequest := httptest.NewRequest(http.MethodPost, security.OIDCCallbackPath, strings.NewReader(url.Values{
-		"state": {stub.lastStartState},
-		"code":  {"provider-code"},
-	}.Encode()))
-	callbackRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	callbackRequest.Header.Set("Cookie", stateCookie.String())
-
-	response := mustAppResponse(t, app, callbackRequest)
-	assertStatusCode(t, response, http.StatusSeeOther)
-	if location := response.Header.Get("Location"); location != "/login" {
-		t.Fatalf("expected redirect to /login for OIDC-only target, got %q", location)
-	}
-	if linkCookie := responseCookie(response.Cookies(), oidcLinkPendingCookieName); linkCookie != nil && strings.TrimSpace(linkCookie.Value) != "" {
-		t.Fatalf("did not expect link-pending cookie to be issued for OIDC-only target, got %q", linkCookie.Value)
-	}
-	flashCookie := responseCookie(response.Cookies(), flashCookieName)
+	flashCookie := responseCookie(response.Cookies(), exemptFlashCookieName)
 	if flashCookie == nil || strings.TrimSpace(flashCookie.Value) == "" {
-		t.Fatal("expected flash cookie explaining the refusal")
+		t.Fatal("expected exempt-channel flash cookie explaining the refusal")
 	}
-	payload := decodeFlashCookieForTest(t, flashCookie.Value)
+	payload := decodeExemptFlashCookieForTest(t, flashCookie.Value)
 	if payload.AuthError != authOIDCLinkConfirmUnavailableErrorSpec().Key {
 		t.Fatalf("expected flash auth_error %q, got %q", authOIDCLinkConfirmUnavailableErrorSpec().Key, payload.AuthError)
 	}
+	// The refusal must mint no pending-link cookie — the property #701 already
+	// established and this handoff must not regress: the response sets nothing
+	// beyond the flash and the state cookie's clear (never the sealed
+	// "ovumcy_oidc_link_pending" cookie the retired link-confirm handler read).
+	if pending := responseCookie(response.Cookies(), "ovumcy_oidc_link_pending"); pending != nil {
+		t.Fatalf("expected no ovumcy_oidc_link_pending cookie, got %q", pending.Value)
+	}
+	for _, cookie := range response.Cookies() {
+		if cookie.Name != exemptFlashCookieName && cookie.Name != oidcStateCookieName {
+			t.Fatalf("expected only the exempt flash cookie and the state cookie's clear, got unexpected cookie %q", cookie.Name)
+		}
+	}
 }
 
-func TestShowOIDCLinkConfirmPageWithoutCookieRedirectsToLogin(t *testing.T) {
+// TestOIDCLinkConfirmRouteIsRemoved is WEB-77's direct pin on the removal
+// itself, distinct from the handoff test above: issue #701 had already made
+// the route unreachable (no pending-link cookie was ever minted for it), but
+// GET/POST /auth/oidc/link-confirm still matched a registered route and ran
+// CSRF + the handler's own gates before ever finding that out. Neither method
+// may match a route any longer — both must fall through to the ordinary 404.
+func TestOIDCLinkConfirmRouteIsRemoved(t *testing.T) {
 	t.Parallel()
 
 	app, _ := newOnboardingTestAppWithOptions(t, onboardingTestAppOptions{
@@ -717,354 +1237,15 @@ func TestShowOIDCLinkConfirmPageWithoutCookieRedirectsToLogin(t *testing.T) {
 		oidcService:  newStubOIDCWorkflowService(true),
 	})
 
-	response := mustAppResponse(t, app, httptest.NewRequest(http.MethodGet, oidcLinkConfirmPath, nil))
-	assertStatusCode(t, response, http.StatusSeeOther)
-	if location := response.Header.Get("Location"); location != "/login" {
-		t.Fatalf("expected redirect to /login when no link-pending cookie, got %q", location)
-	}
-}
+	getResponse := mustAppResponse(t, app, httptest.NewRequest(http.MethodGet, "/auth/oidc/link-confirm", nil))
+	assertStatusCode(t, getResponse, http.StatusNotFound)
 
-func TestShowOIDCLinkConfirmPageWithSealedCookieRendersForm(t *testing.T) {
-	t.Parallel()
-
-	app, _ := newOnboardingTestAppWithOptions(t, onboardingTestAppOptions{
-		cookieSecure: true,
-		oidcService:  newStubOIDCWorkflowService(true),
-	})
-
-	payload, err := newOIDCLinkPendingPayload(time.Now().UTC(), 41, "https://idp.example", "subject-form", "owner-form@example.com")
-	if err != nil {
-		t.Fatalf("newOIDCLinkPendingPayload: %v", err)
-	}
-	cookie := sealLinkPendingCookieForTest(t, payload)
-
-	request := httptest.NewRequest(http.MethodGet, oidcLinkConfirmPath, nil)
-	request.Header.Set("Cookie", oidcLinkPendingCookieName+"="+cookie)
-	response := mustAppResponse(t, app, request)
-	assertStatusCode(t, response, http.StatusOK)
-
-	body := mustReadBodyString(t, response.Body)
-	if !strings.Contains(body, "owner-form@example.com") {
-		t.Fatalf("expected rendered confirm page to expose target email, got body without it")
-	}
-}
-
-func TestCompleteOIDCLinkConfirmationWithoutCookieRedirectsToLoginWithExpiredKey(t *testing.T) {
-	t.Parallel()
-
-	app, _ := newOnboardingTestAppWithOptions(t, onboardingTestAppOptions{
-		cookieSecure: true,
-		oidcService:  newStubOIDCWorkflowService(true),
-	})
-
-	postRequest := httptest.NewRequest(http.MethodPost, oidcLinkConfirmPath, strings.NewReader(url.Values{
-		"password": {"anything"},
-	}.Encode()))
-	postRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	response := mustAppResponse(t, app, postRequest)
-	assertStatusCode(t, response, http.StatusSeeOther)
-	if location := response.Header.Get("Location"); location != "/login" {
-		t.Fatalf("expected redirect to /login without link-pending cookie, got %q", location)
-	}
-	flashCookie := responseCookie(response.Cookies(), flashCookieName)
-	if flashCookie == nil || strings.TrimSpace(flashCookie.Value) == "" {
-		t.Fatal("expected flash cookie with expiration error")
-	}
-	payload := decodeFlashCookieForTest(t, flashCookie.Value)
-	if payload.AuthError != authOIDCLinkConfirmExpiredErrorSpec().Key {
-		t.Fatalf("expected flash auth_error %q, got %q", authOIDCLinkConfirmExpiredErrorSpec().Key, payload.AuthError)
-	}
-}
-
-// TestCompleteOIDCLinkConfirmationKeepsCookieOnWrongPassword locks the
-// retry-within-TTL behavior: a single wrong-password attempt must keep the
-// sealed cookie so the user can retry inside the 5-minute window. Clearing
-// after the first wrong attempt would prevent the rate-limited retry the
-// per-IP /auth/oidc/* limiter is sized for.
-func TestCompleteOIDCLinkConfirmationKeepsCookieOnWrongPassword(t *testing.T) {
-	t.Parallel()
-
-	app, database := newOnboardingTestAppWithOptions(t, onboardingTestAppOptions{
-		cookieSecure: true,
-		oidcService:  newStubOIDCWorkflowService(true),
-	})
-	user := createOnboardingTestUser(t, database, "link-wrong@example.com", "StrongPass1", true)
-
-	pendingPayload, err := newOIDCLinkPendingPayload(time.Now().UTC(), user.ID, "https://idp.example", "subject-wrong", user.Email)
-	if err != nil {
-		t.Fatalf("newOIDCLinkPendingPayload: %v", err)
-	}
-	cookie := sealLinkPendingCookieForTest(t, pendingPayload)
-
-	postRequest := httptest.NewRequest(http.MethodPost, oidcLinkConfirmPath, strings.NewReader(url.Values{
-		"password": {"WrongPass2"},
-	}.Encode()))
-	postRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	postRequest.Header.Set("Cookie", oidcLinkPendingCookieName+"="+cookie)
-
-	response := mustAppResponse(t, app, postRequest)
-	assertStatusCode(t, response, http.StatusSeeOther)
-	if location := response.Header.Get("Location"); location != oidcLinkConfirmPath {
-		t.Fatalf("expected redirect back to link-confirm on wrong password, got %q", location)
-	}
-	if cleared := responseCookie(response.Cookies(), oidcLinkPendingCookieName); cleared != nil && cleared.Value == "" {
-		t.Fatal("expected link-pending cookie to remain sealed after wrong password (retry-within-TTL)")
-	}
-	if authCookie := responseCookie(response.Cookies(), authCookieName); authCookie != nil && strings.TrimSpace(authCookie.Value) != "" {
-		t.Fatal("did not expect auth cookie on wrong-password attempt")
-	}
-	flashCookie := responseCookie(response.Cookies(), flashCookieName)
-	if flashCookie == nil || strings.TrimSpace(flashCookie.Value) == "" {
-		t.Fatal("expected flash cookie with invalid-password error")
-	}
-	payload := decodeFlashCookieForTest(t, flashCookie.Value)
-	if payload.AuthError != authOIDCLinkConfirmInvalidPasswordErrorSpec().Key {
-		t.Fatalf("expected flash auth_error %q, got %q", authOIDCLinkConfirmInvalidPasswordErrorSpec().Key, payload.AuthError)
-	}
-}
-
-func TestCompleteOIDCLinkConfirmationWithEmptyPasswordFlashesInvalidPassword(t *testing.T) {
-	t.Parallel()
-
-	app, database := newOnboardingTestAppWithOptions(t, onboardingTestAppOptions{
-		cookieSecure: true,
-		oidcService:  newStubOIDCWorkflowService(true),
-	})
-	user := createOnboardingTestUser(t, database, "link-empty@example.com", "StrongPass1", true)
-
-	pendingPayload, err := newOIDCLinkPendingPayload(time.Now().UTC(), user.ID, "https://idp.example", "subject-empty", user.Email)
-	if err != nil {
-		t.Fatalf("newOIDCLinkPendingPayload: %v", err)
-	}
-	cookie := sealLinkPendingCookieForTest(t, pendingPayload)
-
-	postRequest := httptest.NewRequest(http.MethodPost, oidcLinkConfirmPath, strings.NewReader(url.Values{
-		"password": {"   "},
-	}.Encode()))
-	postRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	postRequest.Header.Set("Cookie", oidcLinkPendingCookieName+"="+cookie)
-
-	response := mustAppResponse(t, app, postRequest)
-	assertStatusCode(t, response, http.StatusSeeOther)
-	if location := response.Header.Get("Location"); location != oidcLinkConfirmPath {
-		t.Fatalf("expected redirect back to link-confirm on empty password, got %q", location)
-	}
-	flashCookie := responseCookie(response.Cookies(), flashCookieName)
-	if flashCookie == nil {
-		t.Fatal("expected flash cookie on empty password")
-	}
-	payload := decodeFlashCookieForTest(t, flashCookie.Value)
-	if payload.AuthError != authOIDCLinkConfirmInvalidPasswordErrorSpec().Key {
-		t.Fatalf("expected flash auth_error %q, got %q", authOIDCLinkConfirmInvalidPasswordErrorSpec().Key, payload.AuthError)
-	}
-}
-
-func TestCompleteOIDCLinkConfirmationWithCorrectPasswordLinksAndIssuesAuthCookie(t *testing.T) {
-	t.Parallel()
-
-	stub := newStubOIDCWorkflowService(true)
-	app, database := newOnboardingTestAppWithOptions(t, onboardingTestAppOptions{
-		cookieSecure: true,
-		oidcService:  stub,
-	})
-	user := createOnboardingTestUser(t, database, "link-ok@example.com", "StrongPass1", true)
-
-	pendingPayload, err := newOIDCLinkPendingPayload(time.Now().UTC(), user.ID, "https://idp.example", "subject-ok", user.Email)
-	if err != nil {
-		t.Fatalf("newOIDCLinkPendingPayload: %v", err)
-	}
-	cookie := sealLinkPendingCookieForTest(t, pendingPayload)
-
-	postRequest := httptest.NewRequest(http.MethodPost, oidcLinkConfirmPath, strings.NewReader(url.Values{
+	postRequest := httptest.NewRequest(http.MethodPost, "/auth/oidc/link-confirm", strings.NewReader(url.Values{
 		"password": {"StrongPass1"},
 	}.Encode()))
 	postRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	postRequest.Header.Set("Cookie", oidcLinkPendingCookieName+"="+cookie)
-
-	response := mustAppResponse(t, app, postRequest)
-	assertStatusCode(t, response, http.StatusSeeOther)
-	if location := response.Header.Get("Location"); location != "/dashboard" {
-		t.Fatalf("expected owner redirect to /dashboard after successful link, got %q", location)
-	}
-	if stub.lastConfirmLinkUserID != user.ID {
-		t.Fatalf("expected ConfirmAndLinkIdentity to receive user id %d, got %d", user.ID, stub.lastConfirmLinkUserID)
-	}
-	if stub.lastConfirmLinkClaims.Issuer != "https://idp.example" || stub.lastConfirmLinkClaims.Subject != "subject-ok" {
-		t.Fatalf("expected ConfirmAndLinkIdentity to receive sealed claims, got %+v", stub.lastConfirmLinkClaims)
-	}
-	authCookie := responseCookie(response.Cookies(), authCookieName)
-	if authCookie == nil || strings.TrimSpace(authCookie.Value) == "" {
-		t.Fatal("expected auth cookie after successful password challenge")
-	}
-	clearedLinkCookie := responseCookie(response.Cookies(), oidcLinkPendingCookieName)
-	if clearedLinkCookie == nil {
-		t.Fatal("expected link-pending cookie to be cleared on success")
-	}
-	if clearedLinkCookie.Value != "" {
-		t.Fatalf("expected link-pending cookie to be cleared, got %q", clearedLinkCookie.Value)
-	}
-}
-
-// TestCompleteOIDCLinkConfirmationRoutesMustChangePasswordToReset locks that
-// when the target user has MustChangePassword set, the link-confirm path
-// must hand off to /reset-password with a reset-password cookie and must
-// NOT issue a regular auth cookie. Otherwise a forced-rotation user could
-// skip the rotation by linking an OIDC identity.
-func TestCompleteOIDCLinkConfirmationRoutesMustChangePasswordToReset(t *testing.T) {
-	t.Parallel()
-
-	stub := newStubOIDCWorkflowService(true)
-	app, database := newOnboardingTestAppWithOptions(t, onboardingTestAppOptions{
-		cookieSecure: true,
-		oidcService:  stub,
-	})
-	user := createOnboardingTestUser(t, database, "link-reset@example.com", "StrongPass1", true)
-	if err := database.Model(&user).Update("must_change_password", true).Error; err != nil {
-		t.Fatalf("set must_change_password: %v", err)
-	}
-
-	pendingPayload, err := newOIDCLinkPendingPayload(time.Now().UTC(), user.ID, "https://idp.example", "subject-reset", user.Email)
-	if err != nil {
-		t.Fatalf("newOIDCLinkPendingPayload: %v", err)
-	}
-	cookie := sealLinkPendingCookieForTest(t, pendingPayload)
-
-	postRequest := httptest.NewRequest(http.MethodPost, oidcLinkConfirmPath, strings.NewReader(url.Values{
-		"password": {"StrongPass1"},
-	}.Encode()))
-	postRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	postRequest.Header.Set("Cookie", oidcLinkPendingCookieName+"="+cookie)
-
-	response := mustAppResponse(t, app, postRequest)
-	assertStatusCode(t, response, http.StatusSeeOther)
-	if location := response.Header.Get("Location"); location != "/reset-password" {
-		t.Fatalf("expected redirect to /reset-password for forced rotation, got %q", location)
-	}
-	resetCookie := responseCookie(response.Cookies(), resetPasswordCookieName)
-	if resetCookie == nil || strings.TrimSpace(resetCookie.Value) == "" {
-		t.Fatal("expected reset-password cookie for forced rotation path")
-	}
-	if authCookie := responseCookie(response.Cookies(), authCookieName); authCookie != nil && strings.TrimSpace(authCookie.Value) != "" {
-		t.Fatal("did not expect auth cookie on forced-rotation link path")
-	}
-}
-
-func TestCompleteOIDCLinkConfirmationWithLocalAuthDisabledRefusesUnavailable(t *testing.T) {
-	t.Parallel()
-
-	app, database := newOnboardingTestAppWithOptions(t, onboardingTestAppOptions{
-		cookieSecure: true,
-		oidcService:  newStubOIDCWorkflowService(true),
-	})
-	user := createOnboardingTestUser(t, database, "link-disabled@example.com", "StrongPass1", true)
-	if err := database.Model(&user).Update("local_auth_enabled", false).Error; err != nil {
-		t.Fatalf("disable local auth: %v", err)
-	}
-
-	pendingPayload, err := newOIDCLinkPendingPayload(time.Now().UTC(), user.ID, "https://idp.example", "subject-disabled", user.Email)
-	if err != nil {
-		t.Fatalf("newOIDCLinkPendingPayload: %v", err)
-	}
-	cookie := sealLinkPendingCookieForTest(t, pendingPayload)
-
-	postRequest := httptest.NewRequest(http.MethodPost, oidcLinkConfirmPath, strings.NewReader(url.Values{
-		"password": {"StrongPass1"},
-	}.Encode()))
-	postRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	postRequest.Header.Set("Cookie", oidcLinkPendingCookieName+"="+cookie)
-
-	response := mustAppResponse(t, app, postRequest)
-	assertStatusCode(t, response, http.StatusSeeOther)
-	if location := response.Header.Get("Location"); location != "/login" {
-		t.Fatalf("expected redirect to /login when local auth disabled mid-flow, got %q", location)
-	}
-	if authCookie := responseCookie(response.Cookies(), authCookieName); authCookie != nil && strings.TrimSpace(authCookie.Value) != "" {
-		t.Fatal("did not expect auth cookie when local auth disabled mid-flow")
-	}
-	flashCookie := responseCookie(response.Cookies(), flashCookieName)
-	if flashCookie == nil {
-		t.Fatal("expected flash cookie explaining the refusal")
-	}
-	payload := decodeFlashCookieForTest(t, flashCookie.Value)
-	if payload.AuthError != authOIDCLinkConfirmUnavailableErrorSpec().Key {
-		t.Fatalf("expected flash auth_error %q, got %q", authOIDCLinkConfirmUnavailableErrorSpec().Key, payload.AuthError)
-	}
-}
-
-// TestCompleteOIDCLinkConfirmationConfirmLinkErrorMappingClearsCookie locks
-// that when ConfirmAndLinkIdentity fails (provider/storage errors), the
-// pending cookie is cleared and the user lands back on /login. Keeping the
-// cookie alive would let another submission re-trigger the failing link.
-func TestCompleteOIDCLinkConfirmationConfirmLinkErrorMappingClearsCookie(t *testing.T) {
-	t.Parallel()
-
-	stub := newStubOIDCWorkflowService(true)
-	stub.confirmLinkErr = services.ErrOIDCUnavailable
-	app, database := newOnboardingTestAppWithOptions(t, onboardingTestAppOptions{
-		cookieSecure: true,
-		oidcService:  stub,
-	})
-	user := createOnboardingTestUser(t, database, "link-fail@example.com", "StrongPass1", true)
-
-	pendingPayload, err := newOIDCLinkPendingPayload(time.Now().UTC(), user.ID, "https://idp.example", "subject-fail", user.Email)
-	if err != nil {
-		t.Fatalf("newOIDCLinkPendingPayload: %v", err)
-	}
-	cookie := sealLinkPendingCookieForTest(t, pendingPayload)
-
-	postRequest := httptest.NewRequest(http.MethodPost, oidcLinkConfirmPath, strings.NewReader(url.Values{
-		"password": {"StrongPass1"},
-	}.Encode()))
-	postRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	postRequest.Header.Set("Cookie", oidcLinkPendingCookieName+"="+cookie)
-
-	response := mustAppResponse(t, app, postRequest)
-	assertStatusCode(t, response, http.StatusSeeOther)
-	if location := response.Header.Get("Location"); location != "/login" {
-		t.Fatalf("expected redirect to /login on confirm-link failure, got %q", location)
-	}
-	clearedLinkCookie := responseCookie(response.Cookies(), oidcLinkPendingCookieName)
-	if clearedLinkCookie == nil {
-		t.Fatal("expected link-pending cookie to be cleared on confirm-link failure")
-	}
-	if clearedLinkCookie.Value != "" {
-		t.Fatalf("expected link-pending cookie to be cleared, got %q", clearedLinkCookie.Value)
-	}
-}
-
-// TestMapOIDCLinkConfirmError locks the contract from
-// ConfirmAndLinkIdentity-failure -> APIErrorSpec. The handler relies on this
-// mapping to pick the correct flash key/status; if the mapping drifts an
-// unrelated user-facing error message could surface and undermine the
-// post-confirmation UX.
-func TestMapOIDCLinkConfirmError(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		err  error
-		want APIErrorSpec
-	}{
-		{name: "link failed maps to unavailable", err: services.ErrOIDCLinkFailed, want: authOIDCUnavailableErrorSpec()},
-		{name: "identity resolve failed maps to unavailable", err: services.ErrOIDCIdentityResolveFailed, want: authOIDCUnavailableErrorSpec()},
-		{name: "oidc disabled maps to unavailable", err: services.ErrOIDCDisabled, want: authOIDCUnavailableErrorSpec()},
-		{name: "oidc unavailable maps to unavailable", err: services.ErrOIDCUnavailable, want: authOIDCUnavailableErrorSpec()},
-		{name: "unknown error falls back to authentication failed", err: errors.New("unmapped storage error"), want: authOIDCAuthenticationFailedErrorSpec()},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			got := mapOIDCLinkConfirmError(tt.err)
-			if got.Key != tt.want.Key {
-				t.Fatalf("expected error key %q, got %q", tt.want.Key, got.Key)
-			}
-			if got.Status != tt.want.Status {
-				t.Fatalf("expected status %d, got %d", tt.want.Status, got.Status)
-			}
-		})
-	}
+	postResponse := mustAppResponse(t, app, postRequest)
+	assertStatusCode(t, postResponse, http.StatusNotFound)
 }
 
 // TestMapAuthOIDCError locks the OIDCService-failure -> APIErrorSpec contract
@@ -1100,351 +1281,5 @@ func TestMapAuthOIDCError(t *testing.T) {
 				t.Fatalf("unexpected mapped error: got %#v want %#v", got, tt.want)
 			}
 		})
-	}
-}
-
-// Step-up 2FA gate on /auth/oidc/link-confirm. Audit finding HIGH-1: handler
-// was issuing an auth cookie after the password challenge without ever
-// running the TOTP factor, while the canonical Login path (LoginService.
-// Authenticate → setTOTPPendingCookie → /auth/2fa) gates session issuance
-// behind TOTP for TOTPEnabled users. Attacker with the victim's password
-// plus a malicious / sloppy upstream IdP could obtain a session and a
-// persistent linked OIDC identity bypassing 2FA. These tests lock the
-// closure of that bypass: TOTP-enabled targets MUST present a valid 6-digit
-// code together with the password before the link is persisted and a
-// session is issued.
-
-func TestCompleteOIDCLinkConfirmationWithTOTPEnabledRequiresValidCode(t *testing.T) {
-	t.Parallel()
-
-	stub := newStubOIDCWorkflowService(true)
-	app, database := newOnboardingTestAppWithOptions(t, onboardingTestAppOptions{
-		cookieSecure: true,
-		oidcService:  stub,
-	})
-	user := createOnboardingTestUser(t, database, "link-totp-valid@example.com", "StrongPass1", true)
-	rawSecret := setupTOTPForUser(t, database, user.ID, []byte(testHandlerSecretKey))
-
-	pendingPayload, err := newOIDCLinkPendingPayload(time.Now().UTC(), user.ID, "https://idp.example", "subject-totp-valid", user.Email)
-	if err != nil {
-		t.Fatalf("newOIDCLinkPendingPayload: %v", err)
-	}
-	cookie := sealLinkPendingCookieForTest(t, pendingPayload)
-
-	code, err := totp.GenerateCode(rawSecret, time.Now())
-	if err != nil {
-		t.Fatalf("GenerateCode: %v", err)
-	}
-
-	postRequest := httptest.NewRequest(http.MethodPost, oidcLinkConfirmPath, strings.NewReader(url.Values{
-		"password":  {"StrongPass1"},
-		"totp_code": {code},
-	}.Encode()))
-	postRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	postRequest.Header.Set("Cookie", oidcLinkPendingCookieName+"="+cookie)
-
-	response := mustAppResponse(t, app, postRequest)
-	assertStatusCode(t, response, http.StatusSeeOther)
-	if location := response.Header.Get("Location"); location != "/dashboard" {
-		t.Fatalf("expected /dashboard after valid password+TOTP, got %q", location)
-	}
-	if stub.lastConfirmLinkUserID != user.ID {
-		t.Fatalf("expected ConfirmAndLinkIdentity to receive user id %d, got %d", user.ID, stub.lastConfirmLinkUserID)
-	}
-	authCookie := responseCookie(response.Cookies(), authCookieName)
-	if authCookie == nil || strings.TrimSpace(authCookie.Value) == "" {
-		t.Fatal("expected auth cookie after valid password+TOTP")
-	}
-}
-
-// TestCompleteOIDCLinkConfirmationWithTOTPEnabledRefusesMissingCode is the
-// direct anti-regression for HIGH-1: same shape as before (sealed pending
-// cookie + correct password) but no totp_code field. The handler MUST NOT
-// invoke ConfirmAndLinkIdentity and MUST NOT issue an auth cookie.
-func TestCompleteOIDCLinkConfirmationWithTOTPEnabledRefusesMissingCode(t *testing.T) {
-	t.Parallel()
-
-	stub := newStubOIDCWorkflowService(true)
-	app, database := newOnboardingTestAppWithOptions(t, onboardingTestAppOptions{
-		cookieSecure: true,
-		oidcService:  stub,
-	})
-	user := createOnboardingTestUser(t, database, "link-totp-missing@example.com", "StrongPass1", true)
-	_ = setupTOTPForUser(t, database, user.ID, []byte(testHandlerSecretKey))
-
-	pendingPayload, err := newOIDCLinkPendingPayload(time.Now().UTC(), user.ID, "https://idp.example", "subject-totp-missing", user.Email)
-	if err != nil {
-		t.Fatalf("newOIDCLinkPendingPayload: %v", err)
-	}
-	cookie := sealLinkPendingCookieForTest(t, pendingPayload)
-
-	postRequest := httptest.NewRequest(http.MethodPost, oidcLinkConfirmPath, strings.NewReader(url.Values{
-		"password": {"StrongPass1"},
-		// no totp_code field
-	}.Encode()))
-	postRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	postRequest.Header.Set("Cookie", oidcLinkPendingCookieName+"="+cookie)
-
-	response := mustAppResponse(t, app, postRequest)
-	assertStatusCode(t, response, http.StatusSeeOther)
-	if location := response.Header.Get("Location"); location != oidcLinkConfirmPath {
-		t.Fatalf("expected redirect back to link-confirm on missing TOTP, got %q", location)
-	}
-	if stub.lastConfirmLinkUserID != 0 {
-		t.Fatalf("did not expect ConfirmAndLinkIdentity to fire without TOTP, got user id %d", stub.lastConfirmLinkUserID)
-	}
-	if authCookie := responseCookie(response.Cookies(), authCookieName); authCookie != nil && strings.TrimSpace(authCookie.Value) != "" {
-		t.Fatal("AUDIT-CRITICAL: link-confirm issued auth cookie without TOTP for TOTPEnabled user")
-	}
-	flashCookie := responseCookie(response.Cookies(), flashCookieName)
-	if flashCookie == nil {
-		t.Fatal("expected flash cookie with TOTP error")
-	}
-	payload := decodeFlashCookieForTest(t, flashCookie.Value)
-	if payload.AuthError != totpInvalidCodeErrorSpec().Key {
-		t.Fatalf("expected flash auth_error %q, got %q", totpInvalidCodeErrorSpec().Key, payload.AuthError)
-	}
-}
-
-func TestCompleteOIDCLinkConfirmationWithTOTPEnabledRefusesWrongCode(t *testing.T) {
-	t.Parallel()
-
-	stub := newStubOIDCWorkflowService(true)
-	app, database := newOnboardingTestAppWithOptions(t, onboardingTestAppOptions{
-		cookieSecure: true,
-		oidcService:  stub,
-	})
-	user := createOnboardingTestUser(t, database, "link-totp-wrong@example.com", "StrongPass1", true)
-	_ = setupTOTPForUser(t, database, user.ID, []byte(testHandlerSecretKey))
-
-	pendingPayload, err := newOIDCLinkPendingPayload(time.Now().UTC(), user.ID, "https://idp.example", "subject-totp-wrong", user.Email)
-	if err != nil {
-		t.Fatalf("newOIDCLinkPendingPayload: %v", err)
-	}
-	cookie := sealLinkPendingCookieForTest(t, pendingPayload)
-
-	postRequest := httptest.NewRequest(http.MethodPost, oidcLinkConfirmPath, strings.NewReader(url.Values{
-		"password":  {"StrongPass1"},
-		"totp_code": {"000000"},
-	}.Encode()))
-	postRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	postRequest.Header.Set("Cookie", oidcLinkPendingCookieName+"="+cookie)
-
-	response := mustAppResponse(t, app, postRequest)
-	assertStatusCode(t, response, http.StatusSeeOther)
-	if location := response.Header.Get("Location"); location != oidcLinkConfirmPath {
-		t.Fatalf("expected redirect back to link-confirm on wrong TOTP, got %q", location)
-	}
-	if stub.lastConfirmLinkUserID != 0 {
-		t.Fatalf("did not expect ConfirmAndLinkIdentity to fire with wrong TOTP, got user id %d", stub.lastConfirmLinkUserID)
-	}
-	if authCookie := responseCookie(response.Cookies(), authCookieName); authCookie != nil && strings.TrimSpace(authCookie.Value) != "" {
-		t.Fatal("AUDIT-CRITICAL: link-confirm issued auth cookie with wrong TOTP")
-	}
-}
-
-// TestShowOIDCLinkConfirmPageRendersTOTPFieldForTOTPEnabledTarget locks the
-// page-render contract: the TOTP input must appear only when the target
-// account actually has TOTP enabled. Otherwise the handler-level enforcement
-// is unreachable from the UI for legitimate users.
-func TestShowOIDCLinkConfirmPageRendersTOTPFieldForTOTPEnabledTarget(t *testing.T) {
-	t.Parallel()
-
-	app, database := newOnboardingTestAppWithOptions(t, onboardingTestAppOptions{
-		cookieSecure: true,
-		oidcService:  newStubOIDCWorkflowService(true),
-	})
-	user := createOnboardingTestUser(t, database, "link-totp-render@example.com", "StrongPass1", true)
-	_ = setupTOTPForUser(t, database, user.ID, []byte(testHandlerSecretKey))
-
-	payload, err := newOIDCLinkPendingPayload(time.Now().UTC(), user.ID, "https://idp.example", "subject-render", user.Email)
-	if err != nil {
-		t.Fatalf("newOIDCLinkPendingPayload: %v", err)
-	}
-	cookie := sealLinkPendingCookieForTest(t, payload)
-
-	request := httptest.NewRequest(http.MethodGet, oidcLinkConfirmPath, nil)
-	request.Header.Set("Cookie", oidcLinkPendingCookieName+"="+cookie)
-	response := mustAppResponse(t, app, request)
-	assertStatusCode(t, response, http.StatusOK)
-
-	body := mustReadBodyString(t, response.Body)
-	if !strings.Contains(body, `data-link-confirm-totp`) {
-		t.Fatalf("expected TOTP input wrapper for TOTPEnabled target, got body without data-link-confirm-totp")
-	}
-	if !strings.Contains(body, `name="totp_code"`) {
-		t.Fatalf("expected totp_code field on link-confirm form for TOTPEnabled target")
-	}
-}
-
-// TestShowOIDCLinkConfirmPageHidesTOTPFieldForNonTOTPTarget guards against
-// the inverse mistake: the TOTP input must not appear for accounts that did
-// not enable TOTP, otherwise the form would block legitimate confirmations.
-func TestShowOIDCLinkConfirmPageHidesTOTPFieldForNonTOTPTarget(t *testing.T) {
-	t.Parallel()
-
-	app, database := newOnboardingTestAppWithOptions(t, onboardingTestAppOptions{
-		cookieSecure: true,
-		oidcService:  newStubOIDCWorkflowService(true),
-	})
-	user := createOnboardingTestUser(t, database, "link-no-totp-render@example.com", "StrongPass1", true)
-
-	payload, err := newOIDCLinkPendingPayload(time.Now().UTC(), user.ID, "https://idp.example", "subject-render-no-totp", user.Email)
-	if err != nil {
-		t.Fatalf("newOIDCLinkPendingPayload: %v", err)
-	}
-	cookie := sealLinkPendingCookieForTest(t, payload)
-
-	request := httptest.NewRequest(http.MethodGet, oidcLinkConfirmPath, nil)
-	request.Header.Set("Cookie", oidcLinkPendingCookieName+"="+cookie)
-	response := mustAppResponse(t, app, request)
-	assertStatusCode(t, response, http.StatusOK)
-
-	body := mustReadBodyString(t, response.Body)
-	if strings.Contains(body, `data-link-confirm-totp`) {
-		t.Fatalf("did not expect TOTP input wrapper for non-TOTPEnabled target, got %q", body)
-	}
-}
-
-// TestCompleteOIDCLinkConfirmationEmitsAuditLogOnSuccess locks the audit
-// emission contract from SECURITY.md "Logging Constraints": every
-// auth-link-confirm success/failure transitions through
-// handler.logSecurityEvent / logSecurityError. Without this regression a
-// future refactor that swallows the "linked" event would leave the
-// post-incident audit trail silently incomplete.
-func TestCompleteOIDCLinkConfirmationEmitsAuditLogOnSuccess(t *testing.T) {
-	originalWriter := log.Writer()
-	defer log.SetOutput(originalWriter)
-
-	var output bytes.Buffer
-	log.SetOutput(&output)
-
-	stub := newStubOIDCWorkflowService(true)
-	app, database := newOnboardingTestAppWithOptions(t, onboardingTestAppOptions{
-		cookieSecure:    true,
-		oidcService:     stub,
-		auditLogEnabled: true,
-	})
-	user := createOnboardingTestUser(t, database, "link-audit@example.com", "StrongPass1", true)
-
-	pendingPayload, err := newOIDCLinkPendingPayload(time.Now().UTC(), user.ID, "https://idp.example", "subject-audit", user.Email)
-	if err != nil {
-		t.Fatalf("newOIDCLinkPendingPayload: %v", err)
-	}
-	cookie := sealLinkPendingCookieForTest(t, pendingPayload)
-
-	postRequest := httptest.NewRequest(http.MethodPost, oidcLinkConfirmPath, strings.NewReader(url.Values{
-		"password": {"StrongPass1"},
-	}.Encode()))
-	postRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	postRequest.Header.Set("Cookie", oidcLinkPendingCookieName+"="+cookie)
-
-	response := mustAppResponse(t, app, postRequest)
-	assertStatusCode(t, response, http.StatusSeeOther)
-
-	logged := output.String()
-	if !strings.Contains(logged, `action="auth.oidc_link_confirm"`) {
-		t.Fatalf("expected auth.oidc_link_confirm action in audit log, got %q", logged)
-	}
-	if !strings.Contains(logged, `outcome="linked"`) {
-		t.Fatalf("expected outcome=linked in audit log after successful link, got %q", logged)
-	}
-}
-
-// TestCompleteOIDCLinkConfirmationRejectsRequestWithoutCSRFToken closes the
-// security.md "every state-mutating endpoint MUST be CSRF-protected at the
-// middleware layer and have a regression confirming 403 when the csrf_token
-// form field is missing" invariant for /auth/oidc/link-confirm. The other
-// link-confirm handler regressions run on a no-CSRF app and only cover
-// handler-level behavior; this test is the route-level lock.
-func TestCompleteOIDCLinkConfirmationRejectsRequestWithoutCSRFToken(t *testing.T) {
-	app, _ := newOnboardingTestAppWithCSRF(t)
-
-	request := httptest.NewRequest(http.MethodPost, oidcLinkConfirmPath, strings.NewReader(url.Values{
-		"password": {"StrongPass1"},
-	}.Encode()))
-	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	response := mustAppResponse(t, app, request)
-	if response.StatusCode != http.StatusForbidden {
-		t.Fatalf("expected csrf middleware to reject link-confirm POST without csrf_token (403), got %d", response.StatusCode)
-	}
-}
-
-// TestMapOIDCLinkConfirmPasswordError pins the password-verification error
-// contract of the link-confirm step: rate-limited maps to 429 with the
-// shared too-many-attempts key, reset-token issuance failures map to the
-// reset-token spec, and every other failure (wrong password, unknown error)
-// collapses into the generic invalid-password response.
-func TestMapOIDCLinkConfirmPasswordError(t *testing.T) {
-	t.Parallel()
-
-	if got := mapOIDCLinkConfirmPasswordError(services.ErrAuthLoginRateLimited); got != authOIDCLinkConfirmRateLimitedErrorSpec() {
-		t.Fatalf("rate-limited error mapped to %+v", got)
-	}
-	if got := mapOIDCLinkConfirmPasswordError(services.ErrLoginResetTokenIssue); got != authResetTokenCreateErrorSpec() {
-		t.Fatalf("reset-token issue mapped to %+v", got)
-	}
-	if got := mapOIDCLinkConfirmPasswordError(services.ErrAuthInvalidCreds); got != authOIDCLinkConfirmInvalidPasswordErrorSpec() {
-		t.Fatalf("invalid password mapped to %+v", got)
-	}
-	if got := mapOIDCLinkConfirmPasswordError(errors.New("boom")); got != authOIDCLinkConfirmInvalidPasswordErrorSpec() {
-		t.Fatalf("unknown error mapped to %+v", got)
-	}
-}
-
-// TestCompleteOIDCLinkConfirmationRateLimitsPasswordAttempts pins the
-// link-confirm password throttle: the endpoint verifies credentials through
-// the same LoginService attempt policy as the login form, so once the
-// per-(client, identity) failure budget is exhausted even the CORRECT
-// password is refused with the rate-limited error and no session is issued.
-// Without this, link-confirm was a faster password oracle than login,
-// bounded only by the per-IP HTTP limiter.
-func TestCompleteOIDCLinkConfirmationRateLimitsPasswordAttempts(t *testing.T) {
-	t.Parallel()
-
-	app, database := newOnboardingTestAppWithOptions(t, onboardingTestAppOptions{
-		cookieSecure: true,
-		oidcService:  newStubOIDCWorkflowService(true),
-	})
-	user := createOnboardingTestUser(t, database, "link-throttle@example.com", "StrongPass1", true)
-
-	pendingPayload, err := newOIDCLinkPendingPayload(time.Now().UTC(), user.ID, "https://idp.example", "subject-throttle", user.Email)
-	if err != nil {
-		t.Fatalf("newOIDCLinkPendingPayload: %v", err)
-	}
-	cookie := sealLinkPendingCookieForTest(t, pendingPayload)
-
-	postWithPassword := func(password string) *http.Response {
-		request := httptest.NewRequest(http.MethodPost, oidcLinkConfirmPath, strings.NewReader(url.Values{
-			"password": {password},
-		}.Encode()))
-		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		request.Header.Set("Cookie", oidcLinkPendingCookieName+"="+cookie)
-		return mustAppResponse(t, app, request)
-	}
-
-	// Exhaust the shared login failure budget with wrong passwords.
-	for range services.DefaultLoginAttemptsLimit {
-		response := postWithPassword("WrongPass2")
-		assertStatusCode(t, response, http.StatusSeeOther)
-	}
-
-	// The correct password must now be refused with the rate-limited error.
-	response := postWithPassword("StrongPass1")
-	assertStatusCode(t, response, http.StatusSeeOther)
-	if location := response.Header.Get("Location"); location != oidcLinkConfirmPath {
-		t.Fatalf("expected redirect back to link-confirm when rate limited, got %q", location)
-	}
-	if authCookie := responseCookie(response.Cookies(), authCookieName); authCookie != nil && strings.TrimSpace(authCookie.Value) != "" {
-		t.Fatal("did not expect auth cookie while rate limited")
-	}
-	flashCookie := responseCookie(response.Cookies(), flashCookieName)
-	if flashCookie == nil || strings.TrimSpace(flashCookie.Value) == "" {
-		t.Fatal("expected flash cookie with rate-limited error")
-	}
-	payload := decodeFlashCookieForTest(t, flashCookie.Value)
-	if payload.AuthError != authOIDCLinkConfirmRateLimitedErrorSpec().Key {
-		t.Fatalf("expected flash auth_error %q, got %q", authOIDCLinkConfirmRateLimitedErrorSpec().Key, payload.AuthError)
 	}
 }

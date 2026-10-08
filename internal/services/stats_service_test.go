@@ -9,58 +9,93 @@ import (
 	"github.com/ovumcy/ovumcy-web/internal/models"
 )
 
+// The stats doubles observe the owner operand of every read they serve. All
+// four reads are owner-scoped in production — the ranged logs, all logs, the
+// frequency calculation and the symptom catalogue — and while the doubles
+// discarded the id, each of those call sites could be re-pointed at a constant
+// owner with the whole stats selection still green. The *ByOwner maps let a
+// test serve different data per owner so the rendered page, not just the
+// recorded id, tells the two apart.
 type stubStatsDayReader struct {
 	logsForRange   []models.DailyLog
 	logsForAll     []models.DailyLog
+	logsByOwner    map[uint][]models.DailyLog
 	rangeErr       error
 	allErr         error
 	fetchAllCalled bool
 	gotFrom        time.Time
 	gotTo          time.Time
+	gotRangeOwner  uint
+	gotAllOwner    uint
 }
 
-func (stub *stubStatsDayReader) FetchLogsForUser(ctx context.Context, _ uint, from time.Time, to time.Time, _ *time.Location) ([]models.DailyLog, error) {
+func (stub *stubStatsDayReader) FetchLogsForUser(ctx context.Context, userID uint, from time.Time, to time.Time, _ *time.Location) ([]models.DailyLog, error) {
+	stub.gotRangeOwner = userID
 	stub.gotFrom = from
 	stub.gotTo = to
 	if stub.rangeErr != nil {
 		return nil, stub.rangeErr
 	}
-	result := make([]models.DailyLog, len(stub.logsForRange))
-	copy(result, stub.logsForRange)
-	return result, nil
+	return copyDailyLogsForOwner(stub.logsByOwner, userID, stub.logsForRange), nil
 }
 
-func (stub *stubStatsDayReader) FetchAllLogsForUser(context.Context, uint) ([]models.DailyLog, error) {
+func (stub *stubStatsDayReader) FetchAllLogsForUser(_ context.Context, userID uint) ([]models.DailyLog, error) {
+	stub.gotAllOwner = userID
 	stub.fetchAllCalled = true
 	if stub.allErr != nil {
 		return nil, stub.allErr
 	}
-	result := make([]models.DailyLog, len(stub.logsForAll))
-	copy(result, stub.logsForAll)
-	return result, nil
+	return copyDailyLogsForOwner(stub.logsByOwner, userID, stub.logsForAll), nil
+}
+
+// copyDailyLogsForOwner serves the owner's own rows when the test supplied a
+// per-owner map, and the flat slice otherwise. It always copies: a double that
+// hands out its own backing array lets the subject mutate the fixture.
+func copyDailyLogsForOwner(byOwner map[uint][]models.DailyLog, userID uint, fallback []models.DailyLog) []models.DailyLog {
+	source := fallback
+	if byOwner != nil {
+		source = byOwner[userID]
+	}
+	result := make([]models.DailyLog, len(source))
+	copy(result, source)
+	return result
 }
 
 type stubStatsSymptomReader struct {
-	frequencies []SymptomFrequency
-	symptoms    []models.SymptomType
-	err         error
+	frequencies        []SymptomFrequency
+	frequenciesByOwner map[uint][]SymptomFrequency
+	symptoms           []models.SymptomType
+	symptomsByOwner    map[uint][]models.SymptomType
+	err                error
+	gotFrequencyOwner  uint
+	gotSymptomOwner    uint
 }
 
-func (stub *stubStatsSymptomReader) CalculateFrequencies(context.Context, uint, []models.DailyLog) ([]SymptomFrequency, error) {
+func (stub *stubStatsSymptomReader) CalculateFrequencies(_ context.Context, userID uint, _ []models.DailyLog) ([]SymptomFrequency, error) {
+	stub.gotFrequencyOwner = userID
 	if stub.err != nil {
 		return nil, stub.err
 	}
-	result := make([]SymptomFrequency, len(stub.frequencies))
-	copy(result, stub.frequencies)
+	source := stub.frequencies
+	if stub.frequenciesByOwner != nil {
+		source = stub.frequenciesByOwner[userID]
+	}
+	result := make([]SymptomFrequency, len(source))
+	copy(result, source)
 	return result, nil
 }
 
-func (stub *stubStatsSymptomReader) FetchSymptoms(context.Context, uint) ([]models.SymptomType, error) {
+func (stub *stubStatsSymptomReader) FetchSymptoms(_ context.Context, userID uint) ([]models.SymptomType, error) {
+	stub.gotSymptomOwner = userID
 	if stub.err != nil {
 		return nil, stub.err
 	}
-	result := make([]models.SymptomType, len(stub.symptoms))
-	copy(result, stub.symptoms)
+	source := stub.symptoms
+	if stub.symptomsByOwner != nil {
+		source = stub.symptomsByOwner[userID]
+	}
+	result := make([]models.SymptomType, len(source))
+	copy(result, source)
 	return result, nil
 }
 
@@ -79,7 +114,7 @@ func TestTrimTrailingCycleTrendLengths(t *testing.T) {
 
 func TestBuildCycleStatsForRangeAppliesOwnerBaseline(t *testing.T) {
 	logs := []models.DailyLog{
-		{Date: mustParseStatsServiceDay(t, "2026-02-10"), IsPeriod: true},
+		{Date: mustParseStatsServiceDay(t, "2026-02-10"), IsPeriod: true, CycleStart: true},
 	}
 	service := NewStatsService(&stubStatsDayReader{logsForRange: logs}, &stubStatsSymptomReader{})
 	userStart := mustParseStatsServiceDay(t, "2026-02-10")
@@ -155,14 +190,14 @@ func TestStatsOverviewRange(t *testing.T) {
 func TestBuildOverviewStatsUsesOverviewRange(t *testing.T) {
 	dayReader := &stubStatsDayReader{
 		logsForRange: []models.DailyLog{
-			{Date: mustParseStatsServiceDay(t, "2026-02-10"), IsPeriod: true},
+			{Date: mustParseStatsServiceDay(t, "2026-02-10"), IsPeriod: true, CycleStart: true},
 		},
 	}
 	service := NewStatsService(dayReader, &stubStatsSymptomReader{})
 	user := &models.User{ID: 3, Role: models.RoleOwner, CycleLength: 28}
 	now := mustParseStatsServiceDay(t, "2026-03-02")
 
-	if _, err := service.BuildOverviewStats(context.Background(), user, now, time.UTC); err != nil {
+	if _, _, err := service.BuildOverviewStats(context.Background(), user, now, time.UTC); err != nil {
 		t.Fatalf("BuildOverviewStats() unexpected error: %v", err)
 	}
 
@@ -177,10 +212,10 @@ func TestBuildOverviewStatsUsesOverviewRange(t *testing.T) {
 
 func TestBuildTrendAndFlags(t *testing.T) {
 	logs := []models.DailyLog{
-		{Date: mustParseStatsServiceDay(t, "2026-01-01"), IsPeriod: true},
-		{Date: mustParseStatsServiceDay(t, "2026-01-29"), IsPeriod: true},
-		{Date: mustParseStatsServiceDay(t, "2026-02-26"), IsPeriod: true},
-		{Date: mustParseStatsServiceDay(t, "2026-03-26"), IsPeriod: true},
+		{Date: mustParseStatsServiceDay(t, "2026-01-01"), IsPeriod: true, CycleStart: true},
+		{Date: mustParseStatsServiceDay(t, "2026-01-29"), IsPeriod: true, CycleStart: true},
+		{Date: mustParseStatsServiceDay(t, "2026-02-26"), IsPeriod: true, CycleStart: true},
+		{Date: mustParseStatsServiceDay(t, "2026-03-26"), IsPeriod: true, CycleStart: true},
 	}
 	service := NewStatsService(&stubStatsDayReader{}, &stubStatsSymptomReader{})
 	user := &models.User{Role: models.RoleOwner, CycleLength: 28}
@@ -215,8 +250,8 @@ func TestBuildTrendAndFlags(t *testing.T) {
 
 func TestBuildFlagsKeepsInsightsLockedUntilTwoCompletedCycles(t *testing.T) {
 	logs := []models.DailyLog{
-		{Date: mustParseStatsServiceDay(t, "2026-01-01"), IsPeriod: true},
-		{Date: mustParseStatsServiceDay(t, "2026-01-29"), IsPeriod: true},
+		{Date: mustParseStatsServiceDay(t, "2026-01-01"), IsPeriod: true, CycleStart: true},
+		{Date: mustParseStatsServiceDay(t, "2026-01-29"), IsPeriod: true, CycleStart: true},
 	}
 	service := NewStatsService(&stubStatsDayReader{}, &stubStatsSymptomReader{})
 	user := &models.User{Role: models.RoleOwner, CycleLength: 28}
@@ -289,6 +324,46 @@ func TestBuildSymptomFrequenciesForUserPropagatesErrors(t *testing.T) {
 
 	if _, err := service.BuildSymptomFrequenciesForUser(context.Background(), owner); err == nil {
 		t.Fatalf("expected error when logs loading fails")
+	}
+}
+
+// TestStatsServiceBuildCycleStatsFromLogsIsThePackageFunction pins that the
+// method the dashboard's interface seam depends on adds nothing to the
+// package-level derivation. The repository-free callers (the webhook decision
+// pass, the .ics feed) now call the function directly; a method that started
+// computing something of its own would silently give the dashboard a different
+// prediction from the two egress surfaces.
+//
+// It also pins that the function needs no service at all — it is called here on
+// a receiver-less path, which is the "consults no repositories" property the
+// egress callers used to assert in a comment and buy with NewStatsService(nil,
+// nil).
+func TestStatsServiceBuildCycleStatsFromLogsIsThePackageFunction(t *testing.T) {
+	// The fixture drives all three steps of the derivation, so agreeing on it is
+	// not the same as agreeing on raw BuildCycleStats: the owner's non-default
+	// luteal phase only reaches the stats through ApplyUserCycleBaseline, and the
+	// pregnancy flag only through ResolvePregnancyPause.
+	logs := []models.DailyLog{
+		{Date: mustParseStatsServiceDay(t, "2026-01-01"), IsPeriod: true, CycleStart: true},
+		{Date: mustParseStatsServiceDay(t, "2026-01-29"), IsPeriod: true, CycleStart: true},
+		{Date: mustParseStatsServiceDay(t, "2026-02-26"), IsPeriod: true, CycleStart: true},
+		{Date: mustParseStatsServiceDay(t, "2026-03-08"), PregnancyTest: models.PregnancyTestPositive},
+	}
+	user := &models.User{ID: 9, Role: models.RoleOwner, CycleLength: 28, LutealPhase: 11}
+	now := mustParseStatsServiceDay(t, "2026-03-10")
+
+	direct := BuildCycleStatsFromLogs(user, logs, now, time.UTC)
+	raw := BuildCycleStats(logs, now, BoundaryContext{})
+	if direct == raw {
+		t.Fatalf("anchor: the fixture must exercise the baseline and pause steps, got the raw derivation %+v", raw)
+	}
+	if !direct.PregnancyPaused || direct.LutealPhase != 11 {
+		t.Fatalf("anchor: expected the pause flag and the owner's luteal phase, got %+v", direct)
+	}
+
+	viaMethod := NewStatsService(&stubStatsDayReader{}, &stubStatsSymptomReader{}).BuildCycleStatsFromLogs(user, logs, now, time.UTC)
+	if viaMethod != direct {
+		t.Fatalf("method result %+v differs from the package function's %+v", viaMethod, direct)
 	}
 }
 

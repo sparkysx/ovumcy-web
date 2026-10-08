@@ -1,8 +1,6 @@
 package api
 
 import (
-	"strings"
-
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/csrf"
 	"github.com/ovumcy/ovumcy-web/internal/httpx"
@@ -33,7 +31,7 @@ func hasJSONBody(c fiber.Ctx) bool {
 }
 
 func responseFormat(c fiber.Ctx) httpx.ResponseFormat {
-	return httpx.NegotiateResponseFormat(c, httpx.JSONModeAcceptOrContentType)
+	return httpx.NegotiateResponseFormat(c)
 }
 
 // csrfToken returns the per-request CSRF token the middleware stored in the
@@ -46,8 +44,8 @@ func csrfToken(c fiber.Ctx) string {
 }
 
 func localizedPageTitle(messages map[string]string, key string, fallback string) string {
-	title := translateMessage(messages, key)
-	if title == key || strings.TrimSpace(title) == "" {
+	title, translated := lookupMessage(messages, key)
+	if !translated {
 		return fallback
 	}
 	return title

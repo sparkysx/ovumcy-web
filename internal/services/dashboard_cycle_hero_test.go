@@ -19,7 +19,7 @@ func TestBuildDashboardCycleHeroBuildsSegmentedOverview(t *testing.T) {
 		DisplayOvulationExact: true,
 	}
 
-	hero := BuildDashboardCycleHero(user, stats, cycleContext)
+	hero := BuildDashboardCycleHero(user, stats, cycleContext, dashboardCycleHeroInput{})
 	if !hero.Visible {
 		t.Fatal("expected cycle hero to be visible")
 	}
@@ -39,11 +39,11 @@ func TestBuildDashboardCycleHeroBuildsSegmentedOverview(t *testing.T) {
 	expectCardRange(t, hero.PhaseCards[1], "follicular", 6, 13, false)
 	expectCardRange(t, hero.PhaseCards[2], "ovulation", 14, 14, false)
 	expectCardRange(t, hero.PhaseCards[3], "luteal", 15, 28, false)
-	if len(hero.Segments) != 4 {
-		t.Fatalf("expected 4 hero ring segments, got %d", len(hero.Segments))
+	if hero.AxisDays != 28 || len(hero.Days) != 28 {
+		t.Fatalf("expected a 28-day ribbon, got axis %d over %d cells", hero.AxisDays, len(hero.Days))
 	}
-	if !hero.ShowCurrentDayMarker {
-		t.Fatal("expected current-day marker")
+	if !hero.Days[2].IsToday {
+		t.Fatal("expected cycle day 3 to be marked as today")
 	}
 }
 
@@ -60,7 +60,7 @@ func TestBuildDashboardCycleHeroMarksRangeBasedViewsApproximate(t *testing.T) {
 		DisplayOvulationUseRange:  true,
 	}
 
-	hero := BuildDashboardCycleHero(user, stats, cycleContext)
+	hero := BuildDashboardCycleHero(user, stats, cycleContext, dashboardCycleHeroInput{})
 	if !hero.Visible {
 		t.Fatal("expected cycle hero to stay visible for range-based predictions")
 	}
@@ -85,16 +85,162 @@ func TestBuildDashboardCycleHeroSkipsSparseOrDisabledPredictionStates(t *testing
 	sparse := BuildDashboardCycleHero(user, stats, DashboardCycleContext{
 		DisplayNextPeriodNeedsData: true,
 		DisplayOvulationNeedsData:  true,
-	})
+	}, dashboardCycleHeroInput{})
 	if sparse.Visible {
 		t.Fatal("did not expect sparse irregular state to render segmented cycle hero")
 	}
 
 	disabled := BuildDashboardCycleHero(user, stats, DashboardCycleContext{
 		PredictionDisabled: true,
-	})
+	}, dashboardCycleHeroInput{})
 	if disabled.Visible {
 		t.Fatal("did not expect unpredictable mode to render segmented cycle hero")
+	}
+}
+
+// TestDashboardCycleHeroIgnoresUnconfirmedOvulationDateOutsideTheAverageWindow
+// is the unconfirmed counterpart of TestDashboardHeroOvulationCardSitsOnTheConfirmedPeak:
+// stats.OvulationDate is a MEDIAN-driven projection (here cycle day 32, from a
+// 45-day median), while the ribbon's own geometry is keyed to
+// DashboardCycleReferenceLength — the AVERAGE (28 here). Without a confirmed
+// shift, dashboardCycleHeroOvulationDay must not anchor on that median-driven
+// date: doing so pushes the "ovulation" card past the average cycle length and
+// the whole hero disappears for an account that never recorded a thermal
+// shift. The card must instead sit where CalcOvulationDay(cycleLength,
+// LutealPhase) always put it before the confirmed-shift anchoring existed.
+func TestDashboardCycleHeroIgnoresUnconfirmedOvulationDateOutsideTheAverageWindow(t *testing.T) {
+	user := &models.User{Role: models.RoleOwner, CycleLength: 28}
+	lastPeriodStart := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	stats := CycleStats{
+		CurrentCycleDay:     20,
+		CurrentPhase:        "luteal",
+		AveragePeriodLength: 5,
+		LutealPhase:         14,
+		AverageCycleLength:  28,
+		MedianCycleLength:   45,
+		LastPeriodStart:     lastPeriodStart,
+		// A median-first projection for a 45-day cycle: cycle day 32, well past
+		// the 28-day average the ribbon renders against.
+		OvulationDate: AddCalendarDays(lastPeriodStart, 31, time.UTC),
+	}
+
+	hero := BuildDashboardCycleHero(user, stats, DashboardCycleContext{}, dashboardCycleHeroInput{})
+	if !hero.Visible {
+		t.Fatal("the hero must render for an unconfirmed account even when stats.OvulationDate falls outside the average cycle length")
+	}
+
+	var ovulationCard DashboardCycleHeroPhaseCard
+	for _, card := range hero.PhaseCards {
+		if card.Phase == "ovulation" {
+			ovulationCard = card
+		}
+	}
+	wantDay, ok := CalcOvulationDay(28, stats.LutealPhase)
+	if !ok {
+		t.Fatal("fixture: CalcOvulationDay must succeed for a 28-day cycle")
+	}
+	if ovulationCard.StartDay != wantDay || ovulationCard.EndDay != wantDay {
+		t.Fatalf(`the "ovulation" card must sit on CalcOvulationDay's day %d, got %d-%d`, wantDay, ovulationCard.StartDay, ovulationCard.EndDay)
+	}
+}
+
+// TestDashboardCycleHeroConfirmedDayNarrowsThePeriodBandInsteadOfHiding is F2:
+// the minimum confirmed ovulation day the shared "3-over-6" detector can ever
+// name is cycle day 6, and a projected periodLength of 5 makes the OLD guard
+// (`ovulationDay <= periodLength+1`) read `6 <= 6` and hide the whole hero —
+// ribbon, phase cards, "today" marker — for the very cohort whose confirmed
+// day is the most accurate signal available. The confirmed day is an
+// OBSERVATION and periodLength is a PROJECTION of the average; the
+// observation must narrow the projected band, not be hidden by it.
+func TestDashboardCycleHeroConfirmedDayNarrowsThePeriodBandInsteadOfHiding(t *testing.T) {
+	lastPeriodStart := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	user := &models.User{Role: models.RoleOwner, CycleLength: 28}
+	stats := CycleStats{
+		CurrentCycleDay:     6,
+		CurrentPhase:        "ovulation",
+		AveragePeriodLength: 5,
+		AverageCycleLength:  28,
+		LutealPhase:         14,
+		LastPeriodStart:     lastPeriodStart,
+		// Confirmed cycle day 6: LastPeriodStart + 5 days.
+		OvulationDate: AddCalendarDays(lastPeriodStart, 5, time.UTC),
+	}
+	cycleContext := DashboardCycleContext{DisplayOvulationConfirmed: true}
+
+	hero := BuildDashboardCycleHero(user, stats, cycleContext, dashboardCycleHeroInput{})
+	if !hero.Visible {
+		t.Fatal("the hero must render for a confirmed day at the detector's own earliest floor (cycle day 6)")
+	}
+
+	var menstrualCard, follicularCard, ovulationCard DashboardCycleHeroPhaseCard
+	for _, card := range hero.PhaseCards {
+		switch card.Phase {
+		case "menstrual":
+			menstrualCard = card
+		case "follicular":
+			follicularCard = card
+		case "ovulation":
+			ovulationCard = card
+		}
+	}
+	if menstrualCard.StartDay != 1 || menstrualCard.EndDay != 5 {
+		t.Fatalf(`the "menstrual" card must stay 1-5 (the projected periodLength), got %d-%d`, menstrualCard.StartDay, menstrualCard.EndDay)
+	}
+	if follicularCard.EndDay >= follicularCard.StartDay {
+		t.Fatalf(`the "follicular" card must be empty when periodLength borders the confirmed day, got %d-%d`, follicularCard.StartDay, follicularCard.EndDay)
+	}
+	if ovulationCard.StartDay != 6 || ovulationCard.EndDay != 6 {
+		t.Fatalf(`the "ovulation" card must sit on the confirmed cycle day 6, got %d-%d`, ovulationCard.StartDay, ovulationCard.EndDay)
+	}
+}
+
+// TestDashboardCycleHeroConfirmedDayClampsALongerProjectedPeriodBand is F2's
+// second case: a confirmed day of 6 sits BEFORE the projected period band ends
+// (AveragePeriodLength 7), so the observation must clamp the published
+// menstrual band down to 5 days everywhere that band is read — the phase
+// cards and dashboardCycleHeroCurrentPhase's own fallback — or the ribbon and
+// the cards disagree with each other about how long the period was.
+func TestDashboardCycleHeroConfirmedDayClampsALongerProjectedPeriodBand(t *testing.T) {
+	lastPeriodStart := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	user := &models.User{Role: models.RoleOwner, CycleLength: 28}
+	stats := CycleStats{
+		CurrentCycleDay:     6,
+		CurrentPhase:        "ovulation",
+		AveragePeriodLength: 7,
+		AverageCycleLength:  28,
+		LutealPhase:         14,
+		LastPeriodStart:     lastPeriodStart,
+		OvulationDate:       AddCalendarDays(lastPeriodStart, 5, time.UTC),
+	}
+	cycleContext := DashboardCycleContext{DisplayOvulationConfirmed: true}
+
+	hero := BuildDashboardCycleHero(user, stats, cycleContext, dashboardCycleHeroInput{})
+	if !hero.Visible {
+		t.Fatal("the hero must render when the confirmed day precedes the projected period band")
+	}
+
+	var menstrualCard DashboardCycleHeroPhaseCard
+	for _, card := range hero.PhaseCards {
+		if card.Phase == "menstrual" {
+			menstrualCard = card
+		}
+	}
+	if menstrualCard.StartDay != 1 || menstrualCard.EndDay != 5 {
+		t.Fatalf(`the "menstrual" card must be clamped to 1-5 (confirmed day - 1), not the projected 7 days, got %d-%d`, menstrualCard.StartDay, menstrualCard.EndDay)
+	}
+
+	menstrualDays := 0
+	predictedFlowDays := 0
+	for _, day := range hero.Days {
+		if day.Phase == "menstrual" {
+			menstrualDays++
+		}
+		if day.IsPredictedFlow {
+			predictedFlowDays++
+		}
+	}
+	if menstrualDays != 5 {
+		t.Fatalf("the ribbon must show 5 menstrual days, not the projected 7, got %d", menstrualDays)
 	}
 }
 
@@ -108,5 +254,110 @@ func expectCardRange(t *testing.T, card DashboardCycleHeroPhaseCard, phase strin
 	}
 	if card.IsCurrent != isCurrent {
 		t.Fatalf("expected current=%v for %s, got %v", isCurrent, phase, card.IsCurrent)
+	}
+}
+
+// TestDashboardCycleHeroWithheldStatusIsSuppressionOnly is the negative control
+// for the withheld status: an unsuppressed account must reach neither the card
+// nor the label, or the status would be reporting something other than the
+// fertility gate. Both halves are asserted because they are two functions: a
+// mutant that drops the fertilitySuppressed guard in either one alone is red
+// here and green in the other's test.
+func TestDashboardCycleHeroWithheldStatusIsSuppressionOnly(t *testing.T) {
+	cards := dashboardCycleHeroPhaseCards("follicular", 5, 14, 28, false, 0)
+	if len(cards) != 4 {
+		t.Fatalf("expected the four named phase cards without suppression, got %#v", cards)
+	}
+	for _, card := range cards {
+		if card.Phase == "withheld" {
+			t.Errorf("unsuppressed breakdown carries a withheld card (days %d-%d)", card.StartDay, card.EndDay)
+		}
+	}
+
+	if got := dashboardCycleHeroCurrentPhase("", 9, 5, 14, 28, false); got != "follicular" {
+		t.Errorf("unsuppressed current phase is %q, want the resolved phase itself", got)
+	}
+	if got := dashboardCycleHeroCurrentPhase("", 9, 5, 14, 28, true); got != "withheld" {
+		t.Errorf("suppressed current phase is %q, want withheld", got)
+	}
+
+	// The menstrual block is read off recorded bleeding, so suppression must not
+	// swallow it into the withheld run.
+	if got := dashboardCycleHeroCurrentPhase("", 3, 5, 14, 28, true); got != "menstrual" {
+		t.Errorf("suppressed current phase on a period day is %q, want menstrual", got)
+	}
+}
+
+// TestDashboardCycleHeroSuppressedAxisStillEndsAtBeyond keeps the two statuses
+// apart at the boundary that separates them. The withheld run stops at the
+// projected cycle length; the days after it exist only because the predicted
+// start window reaches them, and there the projection really has ended. A
+// mutant extending the withheld card to the axis instead of the cycle length
+// paints those days as a running cycle.
+func TestDashboardCycleHeroSuppressedAxisStillEndsAtBeyond(t *testing.T) {
+	const cycleLength, axisDays = 28, 32
+
+	cards := dashboardCycleHeroPhaseCards("withheld", 5, 14, cycleLength, true, 0)
+	days := dashboardCycleHeroDays(
+		axisDays,
+		14,
+		cards,
+		dashboardCycleHeroDaySpan{StartDay: 29, EndDay: axisDays, Present: true},
+		dashboardCycleHeroDaySpan{},
+		nil,
+		5,
+	)
+
+	for _, day := range days {
+		want := "withheld"
+		switch {
+		case day.Day <= 5:
+			want = "menstrual"
+		case day.Day > cycleLength:
+			want = phaseBeyondProjectedCycle
+		}
+		if day.Phase != want {
+			t.Errorf("ribbon day %d carries phase %q, want %q", day.Day, day.Phase, want)
+		}
+	}
+}
+
+// TestBuildDashboardCycleHeroRefusesAConfirmedDayPastTheAxis covers the
+// confirmed branch's only remaining refusal. The branch drops the projected
+// branch's periodLength+1 floor because an observation outranks a projection,
+// but a day past the ribbon's own axis is not something a clamp on periodLength
+// can fix: there is no cell to draw it in. The control below is the same
+// fixture with the day inside the axis, so a mutant that always refuses — or
+// one that widens the bound to >= cycleLength — is red on one half or the other.
+func TestBuildDashboardCycleHeroRefusesAConfirmedDayPastTheAxis(t *testing.T) {
+	cycleStart := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	today := cycleStart.AddDate(0, 0, 19)
+	user := &models.User{Role: models.RoleOwner, CycleLength: 28}
+	cycleContext := DashboardCycleContext{DisplayOvulationConfirmed: true, DisplayOvulationExact: true}
+
+	build := func(ovulation time.Time) DashboardCycleHero {
+		stats := CycleStats{
+			CurrentCycleDay:     20,
+			AveragePeriodLength: 5,
+			LutealPhase:         14,
+			LastPeriodStart:     cycleStart,
+			OvulationDate:       ovulation,
+		}
+		return BuildDashboardCycleHero(user, stats, cycleContext, dashboardCycleHeroInput{Today: today, Location: time.UTC})
+	}
+
+	// Cycle day 31 on a 28-day axis: past the last cell the ribbon has.
+	if hero := build(cycleStart.AddDate(0, 0, 30)); hero.Visible {
+		t.Errorf("hero rendered with a confirmed day past the axis: cycle length %d, cards %#v", hero.CycleLength, hero.PhaseCards)
+	}
+
+	// Control: the same fixture with the day on the axis renders, and renders
+	// the confirmed day as its ovulation card rather than a projection.
+	hero := build(cycleStart.AddDate(0, 0, 15))
+	if !hero.Visible {
+		t.Fatal("control: the hero must render when the confirmed day is inside the axis")
+	}
+	if len(hero.PhaseCards) != 4 || hero.PhaseCards[2].StartDay != 16 {
+		t.Errorf("control: expected the ovulation card on cycle day 16, got %#v", hero.PhaseCards)
 	}
 }

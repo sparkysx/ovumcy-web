@@ -31,6 +31,10 @@ func mapStatsBBTChartData(chart services.StatsBBTChartViewData, messages map[str
 		"labels": chart.Labels,
 		"values": chart.Values,
 	}
+	if dates, valueTexts := statsBBTChartPointColumns(chart); len(dates) > 0 {
+		payload["dates"] = dates
+		payload["valueTexts"] = valueTexts
+	}
 	if chart.Kind != "" {
 		payload["kind"] = chart.Kind
 	}
@@ -41,9 +45,38 @@ func mapStatsBBTChartData(chart services.StatsBBTChartViewData, messages map[str
 		payload["markerIndex"] = chart.MarkerIndex
 		if chart.MarkerLabelKey != "" {
 			payload["markerLabel"] = translateMessage(messages, chart.MarkerLabelKey)
+			// The rendered label rides along for the chart script, but a test
+			// asserting the marker is the ovulation marker must not have to
+			// re-type English copy that the catalogue owns and translation can
+			// change. The key is the stable half of that pair, exactly as the
+			// data-explainer-key attributes do for rendered notices.
+			payload["markerLabelKey"] = chart.MarkerLabelKey
 		}
 	}
 	return payload
+}
+
+// statsBBTChartPointColumns flattens the point list into the two per-index
+// columns the chart script reads for its crosshair: the calendar date the x
+// axis has no room for, and the reading already rendered as text. The readout
+// prints the server's string instead of re-rounding the float in the browser,
+// so it cannot disagree with the table twin printed underneath it. A day with
+// no reading carries an empty string and the readout says so.
+//
+// With no points there are no columns, and the keys stay off the payload
+// entirely rather than shipping a row of blanks.
+func statsBBTChartPointColumns(chart services.StatsBBTChartViewData) ([]string, []string) {
+	if len(chart.Points) == 0 {
+		return nil, nil
+	}
+
+	dates := make([]string, 0, len(chart.Points))
+	valueTexts := make([]string, 0, len(chart.Points))
+	for _, point := range chart.Points {
+		dates = append(dates, point.Date)
+		valueTexts = append(valueTexts, point.ValueText)
+	}
+	return dates, valueTexts
 }
 
 func buildStatsCycleChartSummary(messages map[string]string, viewData services.StatsPageViewData) string {
@@ -61,8 +94,8 @@ func buildStatsCycleChartSummary(messages map[string]string, viewData services.S
 	}
 
 	if viewData.ChartBaseline > 0 {
-		pattern := translateMessage(messages, "stats.cycle_chart_summary")
-		if pattern == "" || pattern == "stats.cycle_chart_summary" {
+		pattern, translated := lookupMessage(messages, "stats.cycle_chart_summary")
+		if !translated {
 			pattern = "%d completed cycles shown. Latest cycle %d %s. Average %d %s. Range %d to %d %s."
 		}
 		return fmt.Sprintf(
@@ -78,8 +111,8 @@ func buildStatsCycleChartSummary(messages map[string]string, viewData services.S
 		)
 	}
 
-	pattern := translateMessage(messages, "stats.cycle_chart_summary_no_baseline")
-	if pattern == "" || pattern == "stats.cycle_chart_summary_no_baseline" {
+	pattern, translated := lookupMessage(messages, "stats.cycle_chart_summary_no_baseline")
+	if !translated {
 		pattern = "%d completed cycles shown. Latest cycle %d %s. Range %d to %d %s."
 	}
 	return fmt.Sprintf(
@@ -105,32 +138,32 @@ func buildStatsBBTChartSummary(messages map[string]string, chart services.StatsB
 	}
 
 	if !chart.HasBaseline {
-		pattern := translateMessage(messages, "stats.bbt_chart_summary_no_shift")
-		if pattern == "" || pattern == "stats.bbt_chart_summary_no_shift" {
+		pattern, translated := lookupMessage(messages, "stats.bbt_chart_summary_no_shift")
+		if !translated {
 			pattern = "%d readings this cycle. No temperature shift detected yet."
 		}
 		return fmt.Sprintf(pattern, readingsCount)
 	}
 
-	unit := translateMessage(messages, "stats.bbt_unit")
+	unit := translateMessage(messages, chart.UnitLabelKey())
 	if chart.HasMarker && chart.MarkerLabelKey != "" {
-		pattern := translateMessage(messages, "stats.bbt_chart_summary_with_marker")
-		if pattern == "" || pattern == "stats.bbt_chart_summary_with_marker" {
+		pattern, translated := lookupMessage(messages, "stats.bbt_chart_summary_with_marker")
+		if !translated {
 			pattern = "%d readings this cycle. Coverline %.2f %s. Marker: %s."
 		}
 		return fmt.Sprintf(pattern, readingsCount, chart.Baseline, unit, translateMessage(messages, chart.MarkerLabelKey))
 	}
 
-	pattern := translateMessage(messages, "stats.bbt_chart_summary")
-	if pattern == "" || pattern == "stats.bbt_chart_summary" {
+	pattern, translated := lookupMessage(messages, "stats.bbt_chart_summary")
+	if !translated {
 		pattern = "%d readings this cycle. Coverline %.2f %s."
 	}
 	return fmt.Sprintf(pattern, readingsCount, chart.Baseline, unit)
 }
 
 func (handler *Handler) buildStatsPageData(ctx context.Context, user *models.User, language string, messages map[string]string, now time.Time, location *time.Location) (fiber.Map, error) {
-	cycleLabelPattern := translateMessage(messages, "stats.cycle_label")
-	if cycleLabelPattern == "stats.cycle_label" {
+	cycleLabelPattern, translated := lookupMessage(messages, "stats.cycle_label")
+	if !translated {
 		cycleLabelPattern = ""
 	}
 
@@ -147,8 +180,6 @@ func (handler *Handler) buildStatsPageData(ctx context.Context, user *models.Use
 		return nil, err
 	}
 
-	usageGoalLabelKey := services.UsageGoalTranslationKey(user.UsageGoal)
-	usageGoalSummaryKey := services.UsageGoalSummaryTranslationKey(user.UsageGoal)
 	cycleChartSummary := buildStatsCycleChartSummary(messages, viewData)
 	bbtChartSummary := buildStatsBBTChartSummary(messages, viewData.CurrentCycleBBTChart)
 
@@ -188,8 +219,13 @@ func (handler *Handler) buildStatsPageData(ctx context.Context, user *models.Use
 		"SymptomPatterns":                     viewData.SymptomPatterns,
 		"SymptomCounts":                       viewData.SymptomCounts,
 		"BBTChartData":                        mapStatsBBTChartData(viewData.CurrentCycleBBTChart, messages),
+		"BBTChartPoints":                      viewData.CurrentCycleBBTChart.Points,
+		"BBTUnitLabel":                        translateMessage(messages, viewData.CurrentCycleBBTChart.UnitLabelKey()),
+		"CycleRibbon":                         viewData.CycleRibbon,
 		"PhaseMoodInsights":                   viewData.PhaseMoodInsights,
 		"PhaseSymptomInsights":                viewData.PhaseSymptomInsights,
+		"Statements":                          viewData.Statements,
+		"HasStatements":                       viewData.HasStatements,
 		"HasLastCycleSymptoms":                viewData.HasLastCycleSymptoms,
 		"HasSymptomPatterns":                  viewData.HasSymptomPatterns,
 		"HasCurrentCycleBBTChart":             viewData.HasCurrentCycleBBTChart,
@@ -201,9 +237,8 @@ func (handler *Handler) buildStatsPageData(ctx context.Context, user *models.Use
 		"ShowLongCycleNotice":                 viewData.ShowLongCycleNotice,
 		"ShowPerimenopauseHint":               viewData.ShowPerimenopauseHint,
 		"PredictionDisabled":                  viewData.PredictionDisabled,
+		"ShowPredictionModeCard":              viewData.ShowPredictionModeCard,
 		"IsIrregularMode":                     viewData.IsIrregularMode,
-		"UsageGoalLabelKey":                   usageGoalLabelKey,
-		"UsageGoalSummaryKey":                 usageGoalSummaryKey,
 		"CycleChartSummary":                   cycleChartSummary,
 		"BBTChartSummary":                     bbtChartSummary,
 		"IsOwner":                             viewData.IsOwner,

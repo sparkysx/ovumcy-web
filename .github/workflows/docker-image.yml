@@ -2,20 +2,948 @@ name: Docker Image
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Must stay identical to security.yml's TRIVY_IMAGE. The pre-signing scan
+  # below applies the same gate as the required `trivy-image` check to every
+  # platform of the digest this job pushes, so the two must not drift apart.
+  TRIVY_IMAGE: aquasec/trivy:0.68.2@sha256:05d0126976bdedcd0782a0336f77832dbea1c81b9cc5e4b3a5ea5d2ec863aca7
 
+# A push to `main` no longer starts this workflow directly. It used to, which
+# meant the publish job raced the test, e2e and scan jobs triggered by the same
+# push and normally beat them: `:latest` was publicly pullable before anything
+# had judged that commit, and a CRITICAL found by `trivy-image` minutes later
+# was already live. `:latest` now follows `main` through ci.yml's
+# `publish-image` job, which calls this workflow only once that commit's own
+# checks have passed — `needs:` cannot cross workflow boundaries, so the gate
+# has to live in the workflow that owns those jobs.
+#
+# Publishing stays in one workflow rather than being copied into ci.yml so that
+# release tags and `:latest` are built, scanned, signed and attested by the same
+# job, and so both keep the `docker-image.yml` keyless-signing identity that
+# SECURITY.md tells operators to verify (a reusable workflow signs under its own
+# ref, not the caller's).
 on:
   push:
-    branches:
-      - main
     tags:
       - "v*"
-  workflow_dispatch:
+  workflow_call:
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: false
+      DOCKERHUB_TOKEN:
+        required: false
+      # A second, publish-only credential rather than write access added to the
+      # pull-auth pair above: that one is handed to security.yml, which runs on
+      # every pull request, while this one reaches a single step that runs only
+      # on a release tag or on main.
+      DOCKERHUB_PUBLISH_USERNAME:
+        required: false
+      DOCKERHUB_PUBLISH_TOKEN:
+        required: false
 
 permissions:
   contents: read
 
 jobs:
+  # The tag path had no gate at all. ci.yml's `push:` trigger is
+  # `branches: [main]`, so pushing `v1.2.3` starts NO CI run — no `test`, no
+  # `race`, no `e2e`, nothing — and the publish job below went straight to
+  # `docker build --push` with only its own pre-publish Trivy scan in the way.
+  # A tag on a branch that never merged, or on a commit whose checks went red,
+  # published a signed and attested release image regardless. ci.yml's
+  # `publish-image` deliberately excludes the release event because "release
+  # tags publish from their own tag push" — so this is where that gate is owed.
+  #
+  # `needs:` cannot cross workflow boundaries, so the gate cannot be an edge to
+  # ci.yml's jobs; it re-derives the same verdict from what those jobs left
+  # behind on the commit: it is contained in `main`, and its required checks
+  # concluded successfully.
+  #
+  # It FAILS the workflow, and there is no bypass input on purpose. A gate that
+  # publishes anyway while the operator remembers to look at a warning is the
+  # defect being closed, not a fix for it. If a tag is legitimately blocked,
+  # the remedy is to make the commit green — re-run the failed or stuck CI run
+  # on it, or merge it to `main` first — then delete and re-push the tag.
+  verify-release-tag:
+    # Tag path only. The `workflow_call` path from ci.yml already carries
+    # `needs: [test, race, e2e, e2e-postgres-smoke, image-smoke]`, so re-gating
+    # it here would be redundant, and a job named `test` on a commit whose
+    # `test` job is still running (it is the caller) could not conclude.
+    #
+    # The discriminator is the ref TYPE, not the event name: inside a called
+    # workflow `github.event_name` is the CALLER's event — `push` there too —
+    # while `github.ref` stays the caller's ref, `refs/heads/main`. The publish
+    # job below needs no such distinction any more: it promotes whatever tags
+    # the metadata step derived from the event, and the release tag and
+    # `:latest` differ only in that list.
+    if: ${{ github.ref_type == 'tag' }}
+    runs-on: ubuntu-latest
+    permissions:
+      # `actions: read` is the whole of the widening, and it lives here, not on
+      # the publish job below, which keeps exactly the permissions it had. It
+      # is what lets the step below ask which EVENT produced each run on the
+      # tagged commit, which workflow FILE, and which JOBS that run executed;
+      # without it the only discriminator left is `head_branch`, which cannot
+      # tell the push run on `main` from a scheduled or manually dispatched
+      # one, and can recognise the merge-queue run only by a ref-name
+      # convention. There is deliberately no `checks:` scope: the Checks API
+      # lists check runs, and a check run of any name can be created by a token
+      # holding `checks: write` against any commit, so nothing read from it is
+      # proof. The step reads nothing about a pull request: no pull request
+      # run is proof here. A test pins the two scopes of this job exactly.
+      actions: read
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The ancestry question is unanswerable on a shallow clone: with the
+          # default depth of 1 there is no history for merge-base to walk and
+          # the check would fail every tag, or worse, be "fixed" by weakening it
+          # into a string search.
+          fetch-depth: 0
+
+      - name: Assert the tagged commit is contained in main
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Dereference first: for an annotated tag the pushed object is the tag,
+          # not the commit, and merge-base wants a commit.
+          sha="$(git rev-parse "${GITHUB_SHA}^{commit}")"
+
+          # Explicit refspec rather than trusting the checkout's ref layout on a
+          # tag event. Every read below names the FULL ref: gitrevisions tries
+          # `refs/tags/<name>` before `refs/remotes/<name>`, and the checkout's
+          # `fetch-depth: 0` brings every remote tag, so a pushed tag named
+          # `origin/main` would otherwise stand in for main.
+          main_ref="refs/remotes/origin/main"
+          git fetch --no-tags --force origin "+refs/heads/main:${main_ref}"
+          main_sha="$(git rev-parse "$main_ref")"
+
+          # `--is-ancestor`, never a string search through `git log`: the
+          # question is reachability, and only the commit graph answers it.
+          if ! git merge-base --is-ancestor "$sha" "$main_ref"; then
+            echo "::error::tag ${GITHUB_REF_NAME} points at ${sha}, which is not contained in main (${main_sha}). Nothing on this repository's release path has judged that commit, and branch protection guards merges into main, not tags. Merge it to main first."
+            exit 1
+          fi
+
+          echo "tag ${GITHUB_REF_NAME} -> ${sha}, contained in main (${main_sha})."
+
+      - name: Assert the required checks passed on the tagged commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # The six ci.yml's `publish-image` requires before it lets `:latest`
+          # follow `main`, split by WHERE each one's verdict is real. The split
+          # is not a preference about which run to trust; it is ci.yml's own
+          # gating read back.
+          #
+          # `test`, `race` and `e2e` are thin gates over lanes that `changes`
+          # clears with `run_core`, and a `push` to `main` clears it
+          # UNCONDITIONALLY — "the merge queue already ran the core suite on
+          # this exact commit", ci.yml's own words where it does so. So in the
+          # push run all three report `success` in seconds with every lane
+          # beneath them skipped: measured at 4b3c01d7 at 4 s, 2 s and 4 s. That
+          # green carries no work, and it is that green on EVERY push, so
+          # nothing about a particular commit takes part in it. Their real
+          # verdict is in the `merge_group` run, which this rebase queue
+          # produces on the byte-identical SHA.
+          #
+          # `e2e-postgres-smoke` and `image-smoke` are the other half of the
+          # same sentence: they are exactly what the queue does NOT run.
+          # `image-smoke` gates on the event, so the queue run reports it
+          # `skipped`; `e2e-postgres-smoke`'s own `RUN_HEAVY` excludes
+          # `merge_group`, so it reports `success` there with every step gated
+          # off. Measured on 6a95d01d, whose two runs the listing below returns
+          # side by side: `image-smoke` `skipped` in the queue run and real in
+          # the one that ran on `main`. And for the Postgres lane, 2026-08-18, same commit: 3 s in queue run
+          # 32081210308 with every step gated off, 240 s in push run 32081716803
+          # doing the work. Their real verdict is in the push, release or
+          # dispatch run, which is `RUN_HEAVY`.
+          #
+          # Reading a lane off the run where its own gate never looked at the
+          # diff is what the split exists to stop. This step used to read the
+          # `main`-branch suite for all five and accept `skipped` from it for
+          # all five, which is both halves of one contradiction: it refused the
+          # queue's verdict as untrustworthy, and then accepted a push-run green
+          # whose only justification WAS that the queue had already run.
+          QUEUE_CHECKS: test race e2e
+          HEAVY_CHECKS: e2e-postgres-smoke image-smoke e2e-cross-browser
+          # `e2e-cross-browser` runs only on push/release/workflow_dispatch —
+          # the same event set as `HEAVY_CHECKS` above, never merge_group — so
+          # it joins that list, not `QUEUE_CHECKS`. REL-5 (owner decision,
+          # 2026-09-03): the prior version of this comment held it out because
+          # adding it here alone would have made a release tag stricter than
+          # `:latest`; it is added to both gates in the same change instead, so
+          # the two stay level. This gate mirrors exactly the six checks
+          # publish-image now requires — see ci.yml's `publish-image` job
+          # `needs:`.
+          #
+          # Neither half proves that any Go job ran. `test`, `race` and `e2e` in
+          # the merge-queue run are thin gates, and `changes` clears every lane
+          # beneath them — `run_core=false` — when the queued PR's head tree
+          # already ran ci.yml's `pull_request` suite to success on this exact
+          # tree (the proven-tree skip). Measured on 285d14c0: queue run
+          # 37046497163 reports test, race and e2e `success` with test-go-shard,
+          # test-go-rest and every race lane `skipped`; the work ran once, in the
+          # pull_request run of PR 962, which the two halves above never read.
+          # So a tag could be signed with no Go or race job executed in any run
+          # inspected. `WORK_CHECKS` names one real job per lane, as the job's
+          # own name carries it (`<job> (<matrix cell>)`, `|`-separated because
+          # the names hold spaces): each must have concluded `success` on this
+          # commit as a JOB of a run of ci.yml itself — the file, not a display
+          # name — started by the merge queue or by a push to `main`, read from
+          # that run's own list of jobs (`actions/runs/<id>/jobs`). A job is
+          # proof and a check run is not: the Checks API lists every check run
+          # on a commit by name, and any token holding `checks: write` can post
+          # one under any name, with any conclusion, to a check suite of the
+          # Actions app on any commit. So nothing is read from it, for these
+          # jobs or for the gates above; the jobs endpoint lists only what the
+          # run executed. Nothing else is proof: not a job of that name in any
+          # other workflow file, not a run started by hand or by a release, and
+          # not a `pull_request` run, even of ci.yml and even for the PR this
+          # commit came from. A pull request
+          # run executes the copy of ci.yml on the pull request's own branch,
+          # which whoever pushes to that branch wrote, so what it reports is not
+          # what the repository's workflow does; the queue and `main` run the
+          # copy that lands on `main`. `skipped` and `neutral` are not proof.
+          #
+          # A commit whose queue run skipped its lanes for a proven tree has no
+          # such run to point at, and neither has one whose diff is
+          # documentation only. Its Go inputs may be those of an earlier commit,
+          # though, and that commit's run did execute them. So a name still
+          # unproven after the read above is looked up on the first-parent
+          # ancestors, nearest first, for as long as the paths that differ
+          # between the ancestor and the tagged commit — compared directly,
+          # never step by step — are ones ci.yml's own detect step would not run
+          # the lane for: `run_race` for the race job, `run_unit` for the unit
+          # job. The step is the lane filter, so its `run:` text is cut out of
+          # the checked-out ci.yml and executed here as a pull_request over that
+          # path list, and what it answers is the answer: embedded SQL,
+          # templates and locale files reach the unit lane exactly as they reach
+          # it there, and this file carries no list of paths of its own. (The
+          # step clears the race lane for embedded data on the ground that data
+          # cannot introduce a race; the unit job still has to be proven for it,
+          # so the tag as a whole is refused.) The comparison is direct, so a
+          # commit in between that has no run on record costs nothing; a read
+          # that FAILS does: no evidence an ancestor's reads could not return is
+          # stepped over. Each ancestor is judged as the tagged commit is: a
+          # success on it, in a run that counts. A failure refuses outright.
+          # `ANCESTOR_WALK_BOUND` is how far the walk goes before it refuses.
+          # An ancestor's runs are filtered exactly as the tagged commit's are.
+          #
+          # What this settles for the release checklists that say "race from
+          # merge_group" (WEB-22 V7 item 6) or "CI green on the final SHA:
+          # merge_group `test`, `race`, `e2e`" (WEB-24 V2): that wording cannot
+          # be met literally, because a merge_group `test`/`race` is green with
+          # its lanes skipped whenever the proven-tree skip applied. The Go and
+          # race verdict for a tree is the `success` of a real job in a
+          # merge-queue or push run of ci.yml that executed it, and the queue's
+          # three gates say only that the queue was satisfied.
+          # `scripts/releasegate` holds this gate to exactly that reading.
+          #
+          # Why `HEAVY_CHECKS` is read from a release or dispatch run as well as
+          # a push while `WORK_CHECKS` is not: the heavy lanes execute under
+          # those three events and no other, so a run of any of them for this
+          # commit is the only place their verdict exists, and a dispatch is how
+          # an operator produces it when the push run was lost. A work job is
+          # proof only from the two runs of the copy of ci.yml that is on
+          # `main` (the queue, the push to `main`); a release or a dispatch can
+          # be started against another branch's copy, so it is not read for
+          # them, even when the queue skipped the job for a proven tree and the
+          # ancestor walk below is what looks for the proof instead.
+          WORK_CHECKS: test-go-shard (1)|race-db (1)
+          ANCESTOR_WALK_BOUND: 20
+        run: |
+          set -euo pipefail
+
+          sha="$(git rev-parse "${GITHUB_SHA}^{commit}")"
+
+          # WHICH RUNS A JOB MAY BE READ FROM. Every list of runs below is a list
+          # of rows (event, run id, head branch, workflow file), and a job is
+          # read only from the run of a row that passed both filters here. The
+          # jobs are the run's own, from `actions/runs/<id>/jobs` — never the
+          # commit's check runs, which any token holding `checks: write` can
+          # add to, by any name, whichever workflow it claims to belong to —
+          # and a job NAME proves nothing even there: any other workflow that
+          # triggers on the same commit can declare a job called
+          # `test-go-shard (1)` and have it succeed.
+          #
+          # The workflow is the file, `.github/workflows/ci.yml`, the same
+          # `path` ci.yml's own proven-tree skip selects its run by — never the
+          # display name, which any workflow file may copy. A row with no path is
+          # no match. `ci_runs_only` filters the rows, whatever the list is for.
+          #
+          # What counts as WORK is narrower than what ci.yml runs on: a
+          # merge-queue run, or a push to `main` — the two runs of the copy of
+          # the workflow that is on `main`, and the only ones a change reaches
+          # `main` through. A pull request run executes the copy on the pull
+          # request's branch; a run started by hand (`workflow_dispatch`) or by
+          # a release can be started against any branch whose tip is this
+          # commit, with whatever that branch's copy declares. None of the three
+          # is proof. `proof_run_ids` keeps the ids of the rows that qualify;
+          # nothing is proof that does not come through it.
+          ci_workflow_path=".github/workflows/ci.yml"
+
+          ci_runs_only() {
+            awk -F'\t' -v want="$ci_workflow_path" '$4 == want'
+          }
+
+          proof_run_ids() {
+            awk -F'\t' '$1 == "merge_group" || ($1 == "push" && $3 == "main") { print $2 }' | sort -u
+          }
+
+          # Which runs exist for this commit, and under which EVENT. The event
+          # is the discriminator, not `head_branch`: a scheduled run and a
+          # manually dispatched one both carry `head_branch: main`, and a queue
+          # run is otherwise recognisable only by a ref-name convention.
+          #
+          # It is asked HERE, of the runs, and carried down by the run's `id`,
+          # which is what the jobs of that run are listed by. This is what
+          # `actions: read` on the job above buys.
+          workflow_runs="$(
+            gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${sha}&per_page=100" \
+              --jq '.workflow_runs[] | [.event, (.id | tostring), (.head_branch // ""), (.path // "")] | @tsv' |
+              ci_runs_only
+          )"
+
+          echo "ci.yml runs on ${sha} (event, run id, head branch, workflow file):"
+          printf '%s\n' "$workflow_runs"
+
+          run_ids_for_events() {
+            printf '%s\n' "$workflow_runs" | awk -F'\t' -v want="$1" '
+              BEGIN { n = split(want, a, " "); for (i = 1; i <= n; i++) keep[a[i]] = 1 }
+              keep[$1] { print $2 }
+            ' | sort -u
+          }
+
+          # `RUN_HEAVY` spelled out: the three events under which the image
+          # lanes actually execute. Keeping all three rather than `push` alone
+          # is what leaves an operator a way to produce that evidence for a
+          # commit whose push run was lost — dispatch CI on `main` and the lanes
+          # run, because an event carrying no base to diff against leaves
+          # `run_e2e` in the running direction.
+          #
+          # The event is the whole filter, and the `head_branch == "main"` test
+          # this step used to carry is deliberately gone rather than kept beside
+          # it. That test existed to exclude the queue's suite, which the event
+          # now names outright; as a second condition it would be wrong, since a
+          # `release` run's head_branch is the tag. And it would add nothing: a
+          # run selected here already has this commit as its head_sha, so it ran
+          # on this exact tree, and for all three events `changes` finds no base
+          # to diff against and leaves `run_e2e` true whatever ref carried it.
+          queue_run_ids="$(run_ids_for_events "merge_group")"
+          heavy_run_ids="$(run_ids_for_events "push release workflow_dispatch")"
+
+          if [ -z "$queue_run_ids" ]; then
+            echo "::error::no merge-queue run exists for ${sha}. \`${QUEUE_CHECKS}\` are the lanes the push to \`main\` clears unconditionally, so the queue run is the only place their verdict is real, and this commit has none — nothing has run those lanes against its own diff. There is nothing to wait for and no run to start: a \`merge_group\` run exists only for a commit the queue built, so tag one that reached \`main\` through the queue."
+            exit 1
+          fi
+
+          if [ -z "$heavy_run_ids" ]; then
+            echo "::error::no push, release or workflow_dispatch run exists for ${sha}. \`${HEAVY_CHECKS}\` are exactly the lanes the merge queue does not run, so those events are the only place their verdict is real. Wait for the push run to finish, or dispatch CI on \`main\` for this commit, then re-push the tag."
+            exit 1
+          fi
+
+          # The JOBS of the given runs, one row each (run id, name, conclusion).
+          # `filter=all` lists every attempt of a run, and only the newest
+          # attempt of a name speaks for it: a re-run that is still pending
+          # must not be answered by the attempt-one `success` it replaced, and
+          # a failure that a re-run has since cleared must not stand. A job a
+          # re-run of the failed jobs did not repeat keeps its attempt-one row,
+          # which is then its newest. Two rows of one name in one attempt are
+          # both kept and both judged. A read that fails fails the call, and
+          # every caller handles that itself: errexit is off in a `if`.
+          jobs_of_runs() {
+            jobs_rows=""
+            for jobs_run in $1; do
+              jobs_page="$(
+                gh api --paginate \
+                  "repos/${GITHUB_REPOSITORY}/actions/runs/${jobs_run}/jobs?filter=all&per_page=100" \
+                  --jq '.jobs[] | [(.run_id | tostring), .name, (.conclusion // "pending"), ((.run_attempt // 1) | tostring)] | @tsv'
+              )" || return 1
+              jobs_rows="${jobs_rows}${jobs_page}"$'\n'
+            done
+            printf '%s' "$jobs_rows" | awk -F'\t' '
+              NF >= 4 {
+                n++
+                key[n] = $1 SUBSEP $2
+                attempt[n] = $4 + 0
+                row[n] = $1 "\t" $2 "\t" $3
+                if (!(key[n] in newest) || attempt[n] > newest[key[n]]) newest[key[n]] = attempt[n]
+              }
+              END { for (i = 1; i <= n; i++) if (attempt[i] == newest[key[i]]) print row[i] }
+            '
+          }
+
+          # Queue and heavy runs together cover every run proof is read from:
+          # the proof runs are the queue's and the pushes among the heavy ones.
+          judged_run_ids="$(printf '%s\n%s\n' "$queue_run_ids" "$heavy_run_ids" | sort -u)"
+          if ! run_jobs="$(jobs_of_runs "$judged_run_ids")"; then
+            echo "::error::the jobs of the ci.yml runs on ${sha} could not be read, so nothing proves what ran there."
+            exit 1
+          fi
+
+          # Printed whole, and before any judgement: the errors below name one
+          # job at a time, and a refusal is only diagnosable next to what the
+          # runs actually carried — a renamed job and an absent one read
+          # identically otherwise. The run column joins to the run listing
+          # above, which is where the event for each run is. Every row is
+          # judged, never the first: taking the first would make the verdict
+          # depend on the order the API happened to return.
+          echo "jobs of those runs on ${sha} (run id, name, conclusion):"
+          printf '%s\n' "$run_jobs"
+
+          # The conclusions of one name across the given runs, out of the given
+          # rows (run id, name, conclusion): the tagged commit's own, or an
+          # ancestor's in the walk below.
+          conclusions_of() {
+            printf '%s\n' "$1" | awk -F'\t' -v ids="$(printf '%s ' $2)" -v want="$3" '
+              BEGIN { n = split(ids, a, " "); for (i = 1; i <= n; i++) if (a[i] != "") keep[a[i]] = 1 }
+              keep[$1] && $2 == want { print $3 }
+            '
+          }
+
+          conclusions_in() {
+            conclusions_of "$run_jobs" "$1" "$2"
+          }
+
+          failed=0
+
+          # `success` and nothing else, in the run where the lane ran. `skipped`
+          # is refused here even where the lane may legitimately have been
+          # cleared for the diff: a release image is being signed off, the
+          # cleared lane is one of the six that hold `:latest` back, and this
+          # gate cannot tell a lane cleared by `changes` from one skipped
+          # because its run was cancelled. `pending` is not `skipped` either —
+          # a queued or still-running check is no verdict at all.
+          judge() {
+            judge_conclusions="$(conclusions_in "$1" "$2")"
+
+            if [ -z "$judge_conclusions" ]; then
+              echo "::error::no \`$2\` job exists for ${sha} in $3. A tag push starts no CI run of its own, so this commit's checks must already have run there."
+              failed=1
+              return
+            fi
+
+            while IFS= read -r conclusion; do
+              [ -n "$conclusion" ] || continue
+              if [ "$conclusion" != "success" ]; then
+                echo "::error::a \`$2\` job in $3 for ${sha} concluded \"${conclusion}\", and only \`success\` clears a release tag."
+                failed=1
+              fi
+            done <<< "$judge_conclusions"
+          }
+
+          for name in $QUEUE_CHECKS; do
+            judge "$queue_run_ids" "$name" "the merge-queue run"
+          done
+
+          for name in $HEAVY_CHECKS; do
+            judge "$heavy_run_ids" "$name" "the push, release or dispatch run"
+          done
+
+          # The push run's verdict for the queue-judged three is vacuous, not
+          # meaningless. Every lane under them is cleared there, so `success` is
+          # the only shape it can take, and `skipped` the only other one a
+          # cancelled run can leave. Anything else means a lane that was
+          # supposed to be cleared ran and failed, and this gate does not walk
+          # past that just because it reads the real verdict elsewhere.
+          for name in $QUEUE_CHECKS; do
+            while IFS= read -r conclusion; do
+              [ -n "$conclusion" ] || continue
+              case "$conclusion" in
+                success|skipped) ;;
+                *)
+                  echo "::error::a \`${name}\` job in the push, release or dispatch run for ${sha} concluded \"${conclusion}\" — every lane beneath it is cleared on that event, so nothing there should have been able to fail."
+                  failed=1
+                  ;;
+              esac
+            done <<< "$(conclusions_in "$heavy_run_ids" "$name")"
+          done
+
+          # Proof that work ran, which no verdict above carries. A queue-run
+          # `test`/`race` is `success` both when its lanes ran and when
+          # `changes` cleared them for a tree its pull request already tested,
+          # so the gates alone cannot tell a tested commit from an untested
+          # one. A real job can: `success` on it means it executed. A row that
+          # failed, was cancelled or is still pending refuses; `skipped` and
+          # `neutral` are neither proof nor refusal.
+          proof_ids="$(printf '%s\n' "$workflow_runs" | proof_run_ids)"
+
+          # Sets `work_proven` (some row concluded success) and `work_bad` (the
+          # last row that was neither success nor skipped/neutral).
+          work_verdict() {
+            work_proven=""
+            work_bad=""
+            while IFS= read -r conclusion; do
+              [ -n "$conclusion" ] || continue
+              case "$conclusion" in
+                success) work_proven=1 ;;
+                skipped|neutral) ;;
+                *) work_bad="$conclusion" ;;
+              esac
+            done <<< "$(conclusions_of "$1" "$2" "$3")"
+          }
+
+          # The `run:` block of ci.yml's detect step, cut out of the checked-out
+          # file (the step's own text, ten spaces of indentation removed) into
+          # the file named by `$1`. Exactly one step of that name with a block
+          # is expected; anything else is an error, so a step that moved or was
+          # renamed refuses the walk rather than being judged by nothing.
+          cut_detect_step() {
+            awk '
+              /^      - name: Detect whether browser e2e is needed$/ { found++; instep = 1; next }
+              instep && !inrun && /^        run: \|$/ { inrun = 1; next }
+              instep && !inrun && /^      - / { instep = 0 }
+              inrun && /^          / { print substr($0, 11); next }
+              inrun && /^[[:space:]]*$/ { print ""; next }
+              inrun { inrun = 0; instep = 0 }
+              END { if (found != 1) exit 3 }
+            ' .github/workflows/ci.yml > "$1" && [ -s "$1" ]
+          }
+
+          # Whether ci.yml's detect step would run the lane for what changed
+          # between the commit `$1` and the tagged commit, compared directly. The
+          # step is the lane filter itself: its text runs here, as it runs for a
+          # pull_request, with the list of the changed paths as its input and
+          # the two outputs it writes as its answer, so the paths each lane runs
+          # for are whatever that step says, with no list of them in this file.
+          # Sets `lane_state` — `clear` (the lane would not run), `runs`, or
+          # `unknown` — and `lane_why`. Nothing but a clean `false` is `clear`.
+          lane_state_between() {
+            lane_state="unknown"
+            lane_why=""
+            if ! git diff -z --no-renames --name-only "$1" "$sha" > "$work_dir/paths.z"; then
+              lane_why="the paths changed between ${1} and ${sha} could not be listed"
+              return 0
+            fi
+            if [ ! -s "$work_dir/paths.z" ]; then
+              lane_state="clear"
+              return 0
+            fi
+            # -z output holds a newline only inside a path, and the list the
+            # detect step reads has one path per line: such a path cannot be
+            # listed, so the lane is not judged.
+            if [ "$(tr -cd '\n' < "$work_dir/paths.z" | wc -c)" -ne 0 ]; then
+              lane_why="a path changed between ${1} and ${sha} holds a newline, which the detect step's list cannot carry"
+              return 0
+            fi
+            if ! tr '\0' '\n' < "$work_dir/paths.z" > "$work_dir/paths"; then
+              lane_why="the paths changed between ${1} and ${sha} could not be converted to a list"
+              return 0
+            fi
+            : > "$work_dir/outputs"
+            # `env -i`: the step gets its six inputs, the output file and a PATH
+            # and HOME, and nothing else from this job's environment (the token,
+            # the repository, the event payload), so it cannot read what the
+            # gate has and a lane's answer cannot depend on it.
+            if ! env -i PATH="$PATH" HOME="$HOME" EVENT_NAME=pull_request CHANGED_FILES_PATH="$work_dir/paths" DIFF_VERDICT="" QUEUE_BASE_SHA="" MERGE_GROUP_HEAD_REF="" GH_TOKEN="" GITHUB_OUTPUT="$work_dir/outputs" bash -e "$detect_script" > "$work_dir/detect.log" 2>&1; then
+              lane_why="ci.yml's detect step failed on the paths changed between ${1} and ${sha}: $(tail -n 3 "$work_dir/detect.log" | tr '\n' ' ' | cut -c1-200)"
+              return 0
+            fi
+            lane_value="$(sed -n "s/^${lane_output}=//p" "$work_dir/outputs" | tail -n1)"
+            case "$lane_value" in
+              false) lane_state="clear" ;;
+              true)
+                lane_state="runs"
+                lane_why="ci.yml's detect step sets ${lane_output} for what changed between ${1} and ${sha} ($(tr '\n' ' ' < "$work_dir/paths" | cut -c1-160)), so a run on ${1} says nothing about it"
+                ;;
+              *) lane_why="ci.yml's detect step wrote ${lane_output} as '${lane_value}' for what changed between ${1} and ${sha}, neither true nor false" ;;
+            esac
+          }
+
+          # Looks for proof that the lane `$1` ran on an earlier commit that
+          # differs from the tagged commit in nothing ci.yml's detect step would
+          # run the lane for. Runs in a subshell (command substitution): prints
+          # one line, the proof on success or why there is none, and every
+          # failure is handled here, not by errexit, which a conditional call
+          # switches off.
+          walk_ancestors() {
+            walk_name="$1"
+            case "$walk_name" in
+              test-go-shard*) lane_output="run_unit" ;;
+              race-db*) lane_output="run_race" ;;
+              *)
+                echo "no output of ci.yml's detect step is known for \`${walk_name}\`, so no earlier commit can stand in for it"
+                return 1
+                ;;
+            esac
+
+            work_dir="$(mktemp -d)"
+            trap 'rm -rf "$work_dir"' EXIT
+            detect_script="$work_dir/detect.sh"
+            if ! cut_detect_step "$detect_script"; then
+              echo "the detect step of .github/workflows/ci.yml could not be cut out (one step named \"Detect whether browser e2e is needed\" with a \`run: |\` block is expected), so what it runs a lane for cannot be derived"
+              return 1
+            fi
+
+            # The tagged commit first, then up to the bound of its first-parent
+            # ancestors, nearest first.
+            if ! listed="$(git rev-list --first-parent --max-count=$((ANCESTOR_WALK_BOUND + 1)) "$sha")"; then
+              echo "the first-parent history of ${sha} could not be listed"
+              return 1
+            fi
+            ancestors="$(printf '%s\n' "$listed" | tail -n +2)"
+
+            walked=0
+            for ancestor in $ancestors; do
+              walked=$((walked + 1))
+
+              lane_state_between "$ancestor"
+              if [ "$lane_state" != "clear" ]; then
+                echo "$lane_why"
+                return 1
+              fi
+
+              if ! ancestor_runs="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${ancestor}&per_page=100" --jq '.workflow_runs[] | [.event, (.id | tostring), (.head_branch // ""), (.path // "")] | @tsv' | ci_runs_only)"; then
+                echo "the runs of ${ancestor} could not be read"
+                return 1
+              fi
+              ancestor_proof_ids="$(printf '%s\n' "$ancestor_runs" | proof_run_ids)"
+              if ! ancestor_jobs="$(jobs_of_runs "$ancestor_proof_ids")"; then
+                echo "the runs of ${ancestor} could not be read: the jobs of its proof runs are not listed"
+                return 1
+              fi
+
+              work_verdict "$ancestor_jobs" "$ancestor_proof_ids" "$walk_name"
+              if [ -n "$work_bad" ]; then
+                echo "a \`${walk_name}\` job on ${ancestor}, whose inputs for this lane are ${sha}'s, concluded \"${work_bad}\""
+                return 1
+              fi
+              if [ -n "$work_proven" ]; then
+                echo "\`${walk_name}\` concluded success on ${ancestor}, whose inputs for this lane are ${sha}'s (${walked} first-parent commit(s) back)."
+                return 0
+              fi
+            done
+
+            if [ "$walked" -ge "$ANCESTOR_WALK_BOUND" ]; then
+              echo "the ${walked} nearest first-parent ancestors all carry this lane's inputs unchanged and none of them has a run of it on record, and the walk stops at ${ANCESTOR_WALK_BOUND}"
+            else
+              echo "history ends after ${walked} first-parent ancestor(s) with none of them holding a run of it"
+            fi
+            return 1
+          }
+
+          IFS='|' read -r -a work_names <<< "$WORK_CHECKS"
+          for name in "${work_names[@]}"; do
+            work_verdict "$run_jobs" "$proof_ids" "$name"
+            if [ -n "$work_bad" ]; then
+              echo "::error::a \`${name}\` job on ${sha} concluded \"${work_bad}\", and only \`success\` is proof the lane ran."
+              failed=1
+              continue
+            fi
+            if [ -n "$work_proven" ]; then
+              echo "\`${name}\` concluded success on ${sha}."
+              continue
+            fi
+
+            # No run of this commit proves it. A commit whose queue run skipped
+            # its lanes for a proven tree, or that only adds documentation, runs
+            # no such lane of its own, so ask whether an earlier commit with the
+            # same inputs ran it. In a subshell: the walk keeps its own
+            # variables and must not overwrite this loop's.
+            if walk_result="$(walk_ancestors "$name")"; then
+              echo "$walk_result"
+              continue
+            fi
+            echo "::error::no \`${name}\` job concluded success on ${sha} in a merge-queue run or a push run on main of ci.yml, and no earlier commit stands in for it: ${walk_result}. \`test\`, \`race\` and \`e2e\` report success in the merge-queue run when \`changes\` cleared every lane beneath them for an already-tested tree, so that green is not evidence a Go job ran. Only a run of ci.yml started by the merge queue or a push to main counts: a job of that name in another workflow, in a pull request run, or in a run started by hand or by a release, does not. Tag a commit that one of those runs executed this job for."
+            failed=1
+          done
+
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::refusing to publish a release image for ${GITHUB_REF_NAME}: the required checks on ${sha} are not green in the run where their verdict is real, or no job proving the Go lanes ran is on record."
+            exit 1
+          fi
+
+          echo "every required check passed where its verdict is real: ${QUEUE_CHECKS} in the merge-queue run, ${HEAVY_CHECKS} in the push, release or dispatch run; real jobs (${WORK_CHECKS}) succeeded on this tree."
+
+      # The step above reads ci.yml only. The scanner workflows (Security,
+      # CodeQL, Gitleaks) hold their own required checks, and a release tag
+      # started none of them, so a commit whose scan went red could still be
+      # signed. They are read the same way as ci.yml's work jobs: as JOBS of a
+      # run of that workflow file, started by the merge queue or by a push to
+      # `main`, never as check runs (any token holding `checks: write` can post
+      # one under any name). Each scanner job carries the `changes` job's path
+      # gate, so `skipped` is a lane cleared for the diff and is accepted and
+      # printed; a failed, cancelled or still-running job refuses, and so does a
+      # job that is absent (a renamed lane reads as no verdict), a run that did
+      # not conclude `success`, or no qualifying run at all.
+      #
+      # WHICH RUN SPEAKS. The merge-queue run's head SHA is byte-for-byte the
+      # commit that becomes `main`, so it is the authoritative test of the
+      # commit that lands: when one exists for a workflow, only merge-queue runs
+      # are judged (all must be `success`, jobs read from them alone). A push
+      # run on `main` is a duplicate re-test, and these workflows use a per-ref
+      # concurrency group, so a newer push cancels an older pending one; judging
+      # it would block tagging a commit whose queue run was green. Push runs on
+      # `main` are the fallback only when no queue run of that file exists.
+      - name: Assert the scanners passed on the tagged commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Job names as the check context carries them, `|`-separated because
+          # CodeQL's hold spaces. `trivy-image-arm64` is not a ruleset context
+          # but is the other half of the image scan, so it is read too.
+          SECURITY_JOBS: gosec|govulncheck|trivy-fs|trivy-image|trivy-image-arm64
+          CODEQL_JOBS: Analyze (actions)|Analyze (go)|Analyze (javascript-typescript)
+          GITLEAKS_JOBS: gitleaks
+        run: |
+          set -euo pipefail
+
+          sha="$(git rev-parse "${GITHUB_SHA}^{commit}")"
+          failed=0
+
+          if ! all_runs="$(
+            gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${sha}&per_page=100" \
+              --jq '.workflow_runs[] | [.event, (.id | tostring), (.head_branch // ""), (.path // ""), (.conclusion // "pending")] | @tsv'
+          )"; then
+            echo "::error::the workflow runs on ${sha} could not be read, so nothing proves the scanners ran."
+            exit 1
+          fi
+
+          # The newest attempt of a job name speaks for it, as in the step above.
+          jobs_of_runs() {
+            jobs_rows=""
+            for jobs_run in $1; do
+              jobs_page="$(
+                gh api --paginate \
+                  "repos/${GITHUB_REPOSITORY}/actions/runs/${jobs_run}/jobs?filter=all&per_page=100" \
+                  --jq '.jobs[] | [(.run_id | tostring), .name, (.conclusion // "pending"), ((.run_attempt // 1) | tostring)] | @tsv'
+              )" || return 1
+              jobs_rows="${jobs_rows}${jobs_page}"$'\n'
+            done
+            printf '%s' "$jobs_rows" | awk -F'\t' '
+              NF >= 4 {
+                n++
+                key[n] = $1 SUBSEP $2
+                attempt[n] = $4 + 0
+                row[n] = $1 "\t" $2 "\t" $3
+                if (!(key[n] in newest) || attempt[n] > newest[key[n]]) newest[key[n]] = attempt[n]
+              }
+              END { for (i = 1; i <= n; i++) if (attempt[i] == newest[key[i]]) print row[i] }
+            '
+          }
+
+          judge_workflow() {
+            wf_file=".github/workflows/$1"
+            wf_names="$2"
+
+            # The workflow is the file, never the display name; the runs are the
+            # merge queue's and pushes to `main`, the two that run the copy of
+            # the workflow that is on `main`. The merge-queue run is judged
+            # alone when one exists: its head SHA is the commit that lands, and
+            # the push run is a duplicate re-test that a newer push can cancel.
+            wf_runs="$(printf '%s\n' "$all_runs" | awk -F'\t' -v want="$wf_file" '$4 == want && $1 == "merge_group"')"
+            if [ -z "$wf_runs" ]; then
+              wf_runs="$(printf '%s\n' "$all_runs" | awk -F'\t' -v want="$wf_file" '$4 == want && $1 == "push" && $3 == "main"')"
+            fi
+            if [ -z "$wf_runs" ]; then
+              echo "::error::no merge-queue run and no push run on main of ${wf_file} exists for ${sha}, so no scan verdict is on record for it."
+              failed=1
+              return
+            fi
+
+            while IFS=$'\t' read -r wf_event wf_id _ _ wf_conclusion; do
+              [ -n "$wf_id" ] || continue
+              if [ "$wf_conclusion" != "success" ]; then
+                echo "::error::the ${wf_event} run ${wf_id} of ${wf_file} for ${sha} concluded \"${wf_conclusion}\", and only \`success\` clears a release tag."
+                failed=1
+              fi
+            done <<< "$wf_runs"
+
+            wf_ids="$(printf '%s\n' "$wf_runs" | awk -F'\t' '{ print $2 }' | sort -u)"
+            if ! wf_jobs="$(jobs_of_runs "$wf_ids")"; then
+              echo "::error::the jobs of the ${wf_file} runs on ${sha} could not be read, so nothing proves the scanners ran."
+              failed=1
+              return
+            fi
+
+            IFS='|' read -r -a wf_job_names <<< "$wf_names"
+            for wf_name in "${wf_job_names[@]}"; do
+              wf_conclusions="$(printf '%s\n' "$wf_jobs" | awk -F'\t' -v want="$wf_name" '$2 == want { print $3 }')"
+              if [ -z "$wf_conclusions" ]; then
+                echo "::error::no \`${wf_name}\` job exists in the ${wf_file} runs on ${sha}: a renamed or dropped scanner lane is no verdict."
+                failed=1
+                continue
+              fi
+              wf_ran=""
+              while IFS= read -r wf_conclusion; do
+                [ -n "$wf_conclusion" ] || continue
+                case "$wf_conclusion" in
+                  success) wf_ran=1 ;;
+                  skipped) ;;
+                  *)
+                    echo "::error::a \`${wf_name}\` job in ${wf_file} for ${sha} concluded \"${wf_conclusion}\", and only \`success\` or a lane cleared for the diff (\`skipped\`) lets a release tag through."
+                    failed=1
+                    ;;
+                esac
+              done <<< "$wf_conclusions"
+              if [ -z "$wf_ran" ]; then
+                echo "::notice::\`${wf_name}\` was skipped in every ${wf_file} run on ${sha}: its path gate cleared the lane for that diff, so no scan of it ran there."
+              else
+                echo "\`${wf_name}\` concluded success on ${sha}."
+              fi
+            done
+          }
+
+          judge_workflow security.yml "$SECURITY_JOBS"
+          judge_workflow codeql.yml "$CODEQL_JOBS"
+          judge_workflow gitleaks.yml "$GITLEAKS_JOBS"
+
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::refusing to publish a release image for ${GITHUB_REF_NAME}: the Security, CodeQL or Gitleaks verdict on ${sha} is not green."
+            exit 1
+          fi
+
+          echo "every scanner job passed or was cleared for the diff on ${sha}."
+
+  confirm-main-tip:
+    # The alias path only: a release tag moves no alias, so it has no tip to be
+    # the newest of.
+    #
+    # WHY THIS IS A JOB AND NOT A STEP OF `publish`. `publish` holds one
+    # concurrency group per alias set, and GitHub keeps at most ONE pending job
+    # per group: a job that arrives while another waits CANCELS the waiting one.
+    # Publish jobs do not arrive in commit order — a descendant's CI can finish
+    # minutes before its ancestor's (runs 36783421026 and 36782607690) — so with
+    # X publishing and B, the newest commit, waiting, a late arrival A with
+    # X < A < B cancels B. A then promotes and B never publishes: the aliases sit
+    # on A, older than the tip, with nothing to repair them until the next push.
+    # A step inside `publish` runs only after the group has been entered, so
+    # it cannot stop that replacement; this job runs before it, outside the
+    # group, and a publish for a commit that is no longer the newest on `main`
+    # never reaches the group at all.
+    #
+    # Only positive evidence stops a run: `main`'s tip is strictly ahead of this
+    # commit, so a newer commit exists whose own publish owns the aliases. Every
+    # other answer — this commit is the tip, or GitHub reports it identical,
+    # behind or diverged — lets the run on, where the step `Refuse to move the
+    # public aliases backwards` judges it against what is live. A tip that
+    # cannot be read FAILS this job, and `publish` runs only over this job's
+    # `success`, so an API that does not answer publishes nothing.
+    #
+    # The trade, stated: when the newer commit's own checks fail, its publish
+    # never happens and this older, green commit's does not either — the aliases
+    # stay on what they served until a green commit follows. That is the same
+    # "`:latest` stays put when a gate fails" outcome ci.yml's `publish-image`
+    # already accepts, applied to the commit that is `main`'s tip.
+    #
+    # The residual, stated: this job reads the tip before `publish` queues, so
+    # a commit can pass here as the tip, lose that status to a newer push in
+    # the seconds before its `publish` queues, and still cancel that newer
+    # commit's waiting publish. The aliases then land on this commit, green
+    # and signed but behind the tip, until the next push. A second read
+    # inside the group cannot undo it: GitHub cancels the waiting job when
+    # this one queues, before any step runs, so skipping there would only
+    # leave the aliases further behind.
+    if: ${{ github.ref_type != 'tag' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      is_tip: ${{ steps.tip.outputs.is_tip }}
+    steps:
+      - name: Stop when a newer commit is already on main
+        id: tip
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # The full ref path, never `commits/main`: a tag named `main` would
+          # answer the short form.
+          tip=""
+          for attempt in 1 2 3; do
+            if tip="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')" && [[ "$tip" =~ ^[0-9a-f]{40}$ ]]; then
+              break
+            fi
+            tip=""
+            sleep $(( attempt * 2 ))
+          done
+          if [ -z "$tip" ]; then
+            echo "::error::the tip of main could not be read, so there is no way to tell whether a newer commit owns the aliases and nothing is published."
+            exit 1
+          fi
+
+          if [ "$tip" = "${GITHUB_SHA}" ]; then
+            echo "${GITHUB_SHA} is the tip of main."
+            echo "is_tip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # `compare/<base>...<head>`: `ahead` means HEAD descends from BASE, so
+          # the tip being `ahead` of this commit is a newer commit on main.
+          if ! relation="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${GITHUB_SHA}...${tip}" --jq '.status')"; then
+            echo "::error::GitHub could not compare ${GITHUB_SHA} with the tip of main (${tip}), so there is no way to tell whether a newer commit owns the aliases and nothing is published."
+            exit 1
+          fi
+
+          if [ "$relation" = "ahead" ]; then
+            echo "::notice::${GITHUB_SHA} is not the newest commit on main: the tip ${tip} descends from it, and that commit's publish owns the aliases. Nothing is published for this one."
+            echo "is_tip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "main's tip ${tip} is '${relation}' relative to ${GITHUB_SHA}, not a newer commit, so this run goes on to the publish job's own freshness check."
+          echo "is_tip=true" >> "$GITHUB_OUTPUT"
+
   publish:
+    needs:
+      - verify-release-tag
+      - confirm-main-tip
+    # A skipped `needs:` dependency blocks the dependent job unless its own `if`
+    # says otherwise, and on the `workflow_call` path the gate above is skipped
+    # by design — without this, `:latest` would simply stop publishing.
+    #
+    # Written in the fail-safe direction: the gate's `success` is the only thing
+    # that lets a TAG through, and `skipped` is accepted only where it is
+    # expected, off the tag path. A gate that somehow skipped on a tag push
+    # therefore blocks the publish rather than waving it past.
+    #
+    # The second conjunct is the same shape for `confirm-main-tip`, which is
+    # skipped on a tag by design: off the tag path the publish needs that job's
+    # `success` AND its answer `true`, so a job that failed, was cancelled or
+    # answered nothing never publishes, and a commit that is no longer the
+    # newest on `main` is skipped before it can replace a waiting newer one.
+    if: ${{ !cancelled() && (needs.verify-release-tag.result == 'success' || (needs.verify-release-tag.result == 'skipped' && github.ref_type != 'tag')) && (github.ref_type == 'tag' || (needs.confirm-main-tip.result == 'success' && needs.confirm-main-tip.outputs.is_tip == 'true')) }}
+    # ONE PUBLISH AT A TIME PER ALIAS SET. ci.yml gives every push to `main`
+    # its own concurrency group so that no push run is ever cancelled, and this
+    # job had none, so two commits' publishes ran side by side and each wrote
+    # `:latest`, `:main` and the Docker Hub mirror's aliases unconditionally.
+    # Whichever finished LAST won, not whichever commit was newer: run
+    # 36783421026 (22956b83) promoted at 22:21:11Z and run 36782607690, for its
+    # ancestor 64e4361c, promoted at 22:24:14Z and mirrored at 22:24:17-47Z, so
+    # both registries served the older build until the next push.
+    #
+    # The group serialises the alias writes, which is what lets the step
+    # `Refuse to move the public aliases backwards` read what is live and have
+    # that answer still hold when the promotion writes. It does not order them:
+    # an older commit that reaches this job second is refused by that step, not
+    # by the queue. `cancel-in-progress` stays false so a publish that already
+    # started is never cut off half-promoted; the cost is that GitHub keeps one
+    # PENDING job per group, so a third publish replaces a waiting second one,
+    # which is cancelled. That is a loss unless the replacement is for the
+    # newer commit, and arrival order does not guarantee it — an older commit's
+    # job can reach the group after a newer one is already waiting. What makes
+    # the replacement safe is the job `confirm-main-tip` this one needs: it
+    # runs before the group and lets only a commit that is still `main`'s tip,
+    # as far as it can read, into it, so a job that arrives late for an older
+    # commit never replaces a waiting newer one.
+    #
+    # A release tag moves no alias (`vX.Y.Z` and `sha-…` name one commit), so it
+    # gets a group of its own, per tag: sharing `main`'s would let a later
+    # `main` publish cancel a release waiting its turn, and a release is the
+    # one publish nothing replaces. Inside this called workflow `github.ref` is
+    # the caller's ref, `refs/heads/main` on the `:latest` path.
+    concurrency:
+      group: publish-${{ github.ref_type == 'tag' && github.ref || 'main' }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       artifact-metadata: write
@@ -25,54 +953,132 @@ jobs:
       packages: write
     env:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_PUBLISH_USERNAME: ${{ secrets.DOCKERHUB_PUBLISH_USERNAME }}
+      # Every registry step below has to ask for, and declare, the same
+      # manifest media types: the promotion writes the tag under the type its
+      # read-back returned, and both public checks resolve that tag under the
+      # same set. A type in one list and not the others splits those steps'
+      # view of one manifest, so the list is declared once, for the job.
+      MANIFEST_ACCEPT: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json
+      # The platforms the push builds and the scan walks, declared once: a
+      # platform added to the push and not to the scan would be signed and
+      # published unscanned.
+      IMAGE_PLATFORMS: linux/amd64,linux/arm64
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # No `if:` on this step, on purpose: the condition is in the script, so a
+      # runner-side skip cannot pass it. The mirror steps below skip when the
+      # publishing username is empty, which is right for `:latest` and wrong for
+      # a release: a tag reaches here only after verify-release-tag, and
+      # publishing it to GHCR alone while the Docker Hub mirror is silently
+      # absent leaves a release that every operator pulling from Docker Hub
+      # cannot get. Refuse before anything is pushed.
+      - name: Require the Docker Hub mirror credential on a release tag
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+
+          if [ "$REF_TYPE" = "tag" ] && [ -z "${DOCKERHUB_PUBLISH_USERNAME:-}" ]; then
+            echo "::error::DOCKERHUB_PUBLISH_USERNAME is empty on a release tag, so the Docker Hub mirror would be skipped silently. Set the DOCKERHUB_PUBLISH_USERNAME and DOCKERHUB_PUBLISH_TOKEN secrets, then re-run; nothing has been published."
+            exit 1
+          fi
+
+          echo "ref type ${REF_TYPE}: the Docker Hub mirror credential requirement holds."
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to Docker Hub
         # Authenticated base-image pulls avoid the anonymous rate limit that causes
         # intermittent "i/o timeout" failures when resolving docker.io images.
         # Skipped if the secret is absent, so the build still works without it.
         if: ${{ env.DOCKERHUB_USERNAME != '' }}
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Log in to GHCR
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Resolve the registry image name
+        # GHCR refuses an uppercase path. `docker/metadata-action` lowercases
+        # the name it is handed; a raw `github.repository` written into an
+        # `outputs:` line does not. Under an owner with capitals the two would
+        # disagree, and they are compared: the push would be refused outright,
+        # and the promotion's own `<image>:` prefix check would then reject
+        # every tag the metadata step derived, reporting it as a reference from
+        # another repository. Lowercased once here and read everywhere.
+        #
+        # The certificate identity is deliberately NOT taken from here. The OIDC
+        # subject carries the repository in its canonical case, so the identity
+        # check below stays on `GITHUB_REPOSITORY`.
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          path="${GITHUB_REPOSITORY,,}"
+          {
+            echo "path=${path}"
+            echo "name=ghcr.io/${path}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ steps.image.outputs.name }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
             type=ref,event=tag
             type=sha
 
-      - name: Build and push Docker image
+      # NOTHING PUBLIC EXISTS UNTIL THE SIGNATURE DOES. The push used to carry
+      # `steps.meta.outputs.tags` — `vX.Y.Z`, `latest`, `main`, `sha-…` — so the
+      # public aliases were created by the push itself, and `Install Cosign`,
+      # `Sign Docker image` and `Attest build provenance` all ran AFTER it. A
+      # failure in any of them turned the workflow red with the release already
+      # anonymously pullable under its own version tag, unsigned and with no
+      # provenance, which is precisely what README.md tells an operator every
+      # published image carries. A red workflow is not a retraction: nothing
+      # removes a tag that is already resolvable.
+      #
+      # `push-by-digest=true` pushes the index and gives it no tag at all, so
+      # what exists after this step is addressable only by a digest nobody has
+      # been handed. The tags are added at the end, from the manifest bytes that
+      # already hash to that digest, and only once the signature and the
+      # provenance attestation on it have been verified. A failure before those
+      # writes leaves an untagged manifest and no public alias at all; one
+      # during them can leave the aliases written before it, and every alias
+      # that exists points at the signed digest — which is the guarantee, and
+      # it holds either way.
+      #
+      # That untagged manifest is left in the package on purpose, not cleaned
+      # up: the reason is written where operators read the verification steps,
+      # in README.md.
+      - name: Push the image by digest, under no public tag
         id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: Dockerfile
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: ${{ env.IMAGE_PLATFORMS }}
           labels: ${{ steps.meta.outputs.labels }}
           # Stamp the commit sha into the binary (main.buildVersion) so the
           # published image serves a per-release asset cache-bust token.
@@ -81,39 +1087,495 @@ jobs:
           sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # `name-canonical` is what `push-by-digest` requires to know the
+          # repository it is pushing into without a tag to read it from. `tags:`
+          # and `push:` are deliberately absent: either one would put a public
+          # alias back in front of the signature.
+          outputs: type=image,name=${{ steps.image.outputs.name }},push-by-digest=true,name-canonical=true,push=true
 
-      - name: Select public image reference
-        id: public_ref
+      - name: Pull Trivy image
+        uses: ./.github/actions/docker-pull-retry
+        with:
+          image: ${{ env.TRIVY_IMAGE }}
+
+      - name: Scan every platform of the pushed digest before signing it
+        # Same gate as security.yml's required `trivy-image` check — same
+        # scanner, severity threshold and `--exit-code 1`; no `--ignore-unfixed`
+        # here either — so an unfixed CRITICAL holds the release back the same
+        # way it holds the required check back. That check lives in another
+        # workflow and cannot be a `needs:` of this job. Output is a table, not
+        # SARIF: the Security tab entry for this commit already comes from
+        # `trivy-image`, and a second upload under that category would only
+        # overwrite it.
+        #
+        # What is scanned is the digest the next steps sign, one platform at a
+        # time. This used to be a separate `load: true` build: linux/amd64 only,
+        # and bytes that merely shared a GHA cache with the push, which proves
+        # nothing about the digest that gets signed. Trivy resolves each
+        # platform's manifest out of the pushed index itself, so a platform the
+        # index lacks is an error, not a skipped scan. Scanning after the push
+        # tags nothing: the digest carries no tag until the promotion, and a
+        # refusal here leaves it untagged and unsigned, as a failed signature
+        # would — but still pullable by digest from the public package, and
+        # that digest is printed in this job's log.
+        #
+        # The registry is read with the job's registry login, mounted
+        # read-only; the Docker socket the old local scan needed is no longer
+        # handed in.
         shell: bash
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
 
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          if [[ ! "${IMAGE_REF}" =~ @sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::the push reported no digest (${IMAGE_REF}), so there is nothing this scan could be bound to."
+            exit 1
+          fi
+
+          if [ -z "${IMAGE_PLATFORMS}" ]; then
+            echo "::error::IMAGE_PLATFORMS names no platform, so this scan would judge nothing."
+            exit 1
+          fi
+          # The whole list is matched, not its split: `read -a` drops a
+          # trailing empty entry, which a per-entry check would never see.
+          entry='[a-z0-9]+/[a-z0-9]+(/[a-z0-9]+)?'
+          if [[ ! "${IMAGE_PLATFORMS}" =~ ^${entry}(,${entry})*$ ]]; then
+            echo "::error::IMAGE_PLATFORMS is '${IMAGE_PLATFORMS}', not a comma-separated list of os/arch[/variant] platforms, so the push and this scan could disagree on what ships."
+            exit 1
+          fi
+          IFS=',' read -r -a platforms <<< "${IMAGE_PLATFORMS}"
+
+          docker_config="${DOCKER_CONFIG:-${HOME}/.docker}/config.json"
+          if [ ! -f "${docker_config}" ]; then
+            echo "::error::no registry login at ${docker_config}, so the pushed digest cannot be read."
+            exit 1
+          fi
+
+          # One cache for every run, so the vulnerability DB is fetched once
+          # rather than once per platform.
+          mkdir -p "${RUNNER_TEMP}/trivy-cache"
+          for platform in "${platforms[@]}"; do
+            echo "::group::${platform} of ${IMAGE_REF}"
+            # One line: the guard against `--ignore-unfixed` reads Trivy calls line by line.
+            docker run --rm -v "${docker_config}:/root/.docker/config.json:ro" -v "${RUNNER_TEMP}/trivy-cache:/root/.cache/trivy" "${TRIVY_IMAGE}" image --image-src remote --platform "${platform}" --scanners vuln --skip-version-check --severity HIGH,CRITICAL --format table --exit-code 1 "${IMAGE_REF}"
+            echo "::endgroup::"
+          done
+
+      - name: Install Cosign
+        # The cosign version is pinned here rather than left to the action's
+        # own default, because the mirror at the end of this job runs `cosign
+        # copy`, and that command carries a deprecation marker as of v3.0.6,
+        # naming `oras copy -r` and `cosign save`/`cosign load` as what
+        # replaces it. Left to the default, a bump of the action's SHA would
+        # change the cosign version as a side effect, and a release where
+        # `copy` has been removed fails AFTER the GHCR release is public, on a
+        # job no required check covers. Bumping this line is where that
+        # question gets asked — and where the second question is asked with
+        # it: WHERE this version attaches a signature. v3 moved that to a
+        # Sigstore bundle under the referrers API, which is why the mirror
+        # signs in place instead of expecting `copy` to carry one across.
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.0.6
+
+      - name: Sign the pushed digest
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "$IMAGE_DIGEST"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify the signature and provenance before promoting
+        id: verify
+        # Signing and attesting are two API calls that reported success; this is
+        # the first step that reads back what an operator would read. It runs
+        # BEFORE the tags exist, so a signature that does not verify costs a red
+        # workflow and an untagged manifest rather than a release.
+        #
+        # The identity is matched by prefix rather than by ref, because this
+        # workflow signs under two of them: `refs/tags/vX.Y.Z` on a release and
+        # `refs/heads/main` when ci.yml calls it for `:latest`. README.md pins
+        # the tag form, which is the stricter question an operator asks about a
+        # release; this is the workflow asserting its own identity.
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          # The repository is spliced into a REGULAR EXPRESSION, and every
+          # literal dot around it is escaped for exactly the reason one inside
+          # it must be: GitHub allows `.` in a repository name, and an
+          # unescaped dot matches any character — in the one field this check
+          # exists to pin. A name carrying anything the substitution below
+          # cannot reach is refused rather than matched loosely.
+          case "$GITHUB_REPOSITORY" in
+            *[!A-Za-z0-9._/-]*)
+              echo "::error::the repository name ${GITHUB_REPOSITORY} carries a character this identity pattern cannot escape, so the signer identity cannot be pinned."
+              exit 1
+              ;;
+          esac
+          repository_pattern="${GITHUB_REPOSITORY//./[.]}"
+
+          # Built once and handed on as a step output rather than spelled a
+          # second time at the mirror. The escaping above is the whole subject
+          # of this block, and a pattern rebuilt elsewhere is a second place
+          # for a dot to stay unescaped — in the one field these checks exist
+          # to pin. The mirror's check reads `steps.verify.outputs`.
+          identity_regexp="^https://github\.com/${repository_pattern}/\.github/workflows/docker-image\.yml@"
+          printf 'identity_regexp=%s\n' "$identity_regexp" >> "$GITHUB_OUTPUT"
+
+          cosign verify \
+            --certificate-identity-regexp "$identity_regexp" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$IMAGE_DIGEST"
+
+          gh attestation verify "oci://${IMAGE_DIGEST}" --repo "${GITHUB_REPOSITORY}"
+
+          echo "signature and provenance verified on ${IMAGE_DIGEST}, which may now be promoted."
+
+      - name: Refuse to move the public aliases backwards
+        # `latest`, `main` and the Docker Hub mirror's copies of them are
+        # rewritten unconditionally by the steps below, so a run for an OLDER
+        # commit that reaches them after a newer one has published puts the
+        # older build back, and every later check compares an alias to this
+        # run's own digest and agrees. The concurrency group on this job holds
+        # the live aliases still while this step reads them and the promotion
+        # writes; what is read is the commit the live image was built from, its
+        # `org.opencontainers.image.revision` label, and this run may proceed
+        # only if that commit is this one or an ancestor of it.
+        #
+        # The question is NOT whether this commit is contained in `main` —
+        # every commit published from here is, the older run's included — but
+        # whether the commit currently served descends from it, so the answer
+        # comes from comparing the two commits, never from `main`'s tip. The
+        # comparison asks GitHub rather than walking a clone because this job
+        # checks out one commit and no history.
+        #
+        # Unreadable is refused, not waved through: a registry or API that does
+        # not answer leaves nothing to say the alias would move forward. The one
+        # absence that is an answer is no `main` tag at all, the first publish.
+        # A release tag publishes names for one commit and moves no alias, so
+        # it is not asked. The refusal fails the job on purpose: the digest this
+        # run pushed stays untagged, nothing is promoted or mirrored, and the
+        # newer commit's publish owns the aliases.
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_PATH: ${{ steps.image.outputs.path }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "a release tag names one commit and moves no alias, so there is no live alias for this run to fall behind."
             exit 0
           fi
 
-          echo "value=latest" >> "$GITHUB_OUTPUT"
+          document="$(mktemp)"
+          token_body="$(mktemp)"
+          credential="$(mktemp)"
+          trap 'rm -f "$document" "$token_body" "$credential"' EXIT
 
-      - name: Verify anonymous GHCR pull access
+          printf 'user = "%s:%s"\n' "${REGISTRY_USER}" "${REGISTRY_PASSWORD}" > "$credential"
+
+          token_status="$(
+            curl -sSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 2 --retry-all-errors \
+              -o "$token_body" -w '%{http_code}' -K "$credential" \
+              "https://ghcr.io/token?service=ghcr.io&scope=repository:${IMAGE_PATH}:pull"
+          )"
+          if [ "$token_status" != "200" ]; then
+            echo "::error::GHCR returned HTTP ${token_status} for a pull token on ${IMAGE_PATH}, so the commit the live aliases serve cannot be read and nothing is promoted."
+            exit 1
+          fi
+
+          token="$(
+            python3 -c 'import json, pathlib, sys; body = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")); print(body.get("token", ""))' "$token_body"
+          )"
+          if [ -z "$token" ]; then
+            echo "::error::GHCR returned no pull token for ${IMAGE_PATH}, so the commit the live aliases serve cannot be read and nothing is promoted."
+            exit 1
+          fi
+
+          # One read, into the same file each time: $1 is a path under the
+          # repository's registry namespace, and the HTTP status is the answer.
+          fetch() {
+            curl -sSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 2 --retry-all-errors \
+              -o "$document" -w '%{http_code}' \
+              -H "Authorization: Bearer ${token}" \
+              -H "Accept: ${MANIFEST_ACCEPT}" \
+              "https://ghcr.io/v2/${IMAGE_PATH}/$1"
+          }
+
+          main_status="$(fetch manifests/main)"
+          case "$main_status" in
+            200) ;;
+            404)
+              echo "there is no \`main\` tag on ${IMAGE_PATH} yet, so nothing is live for this run to move backwards."
+              exit 0
+              ;;
+            *)
+              echo "::error::reading the live \`main\` manifest returned HTTP ${main_status}, so there is no way to tell whether this run would move it backwards, and nothing is promoted."
+              exit 1
+              ;;
+          esac
+
+          # `main` is an index. The revision label lives in the image config of
+          # a platform manifest, behind two more reads; the index's attestation
+          # manifests carry no platform, so the first `linux` entry is the image.
+          # A tag that is already a single image manifest has no `manifests`.
+          platform_digest="$(
+            python3 -c 'import json, pathlib, sys; doc = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")); print(next((m.get("digest", "") for m in doc.get("manifests", []) if (m.get("platform") or {}).get("os") == "linux"), ""))' "$document"
+          )"
+          if [ -n "$platform_digest" ]; then
+            if [[ ! "$platform_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::the live \`main\` index lists a platform manifest named '${platform_digest}', which is not a digest, so nothing is promoted."
+              exit 1
+            fi
+            platform_status="$(fetch "manifests/${platform_digest}")"
+            if [ "$platform_status" != "200" ]; then
+              echo "::error::reading the live platform manifest ${platform_digest} returned HTTP ${platform_status}, so nothing is promoted."
+              exit 1
+            fi
+          fi
+
+          config_digest="$(
+            python3 -c 'import json, pathlib, sys; doc = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")); print((doc.get("config") or {}).get("digest", ""))' "$document"
+          )"
+          if [[ ! "$config_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::the live \`main\` image names its config as '${config_digest}', which is not a digest, so nothing is promoted."
+            exit 1
+          fi
+          config_status="$(fetch "blobs/${config_digest}")"
+          if [ "$config_status" != "200" ]; then
+            echo "::error::reading the live image config ${config_digest} returned HTTP ${config_status}, so nothing is promoted."
+            exit 1
+          fi
+
+          live_sha="$(
+            python3 -c 'import json, pathlib, sys; doc = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")); print(((doc.get("config") or {}).get("Labels") or {}).get("org.opencontainers.image.revision", ""))' "$document"
+          )"
+          if [[ ! "$live_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::the live \`main\` image carries no usable org.opencontainers.image.revision label (read as '${live_sha:-<none>}'), so there is no commit to compare this run's against and nothing is promoted."
+            exit 1
+          fi
+
+          # `compare/<base>...<head>` reports where HEAD stands relative to BASE:
+          # `ahead` and `identical` are this commit descending from (or being)
+          # the live one; `behind` is this commit being an ancestor of it.
+          if ! relation="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${live_sha}...${GITHUB_SHA}" --jq '.status')"; then
+            echo "::error::GitHub could not compare the live commit ${live_sha} with ${GITHUB_SHA}, so there is no way to tell whether this run would move the aliases backwards and nothing is promoted."
+            exit 1
+          fi
+
+          case "$relation" in
+            ahead|identical)
+              echo "${GITHUB_SHA} is '${relation}' relative to ${live_sha}, the commit the live aliases serve, so promoting it moves them forward."
+              ;;
+            behind)
+              echo "::error::this run publishes ${GITHUB_SHA}, an ancestor of ${live_sha}, the commit \`main\` and \`latest\` already serve. Promoting it would put an older build back on both registries, so nothing is promoted or mirrored: the digest pushed above stays untagged and the newer commit's publish owns the aliases."
+              exit 1
+              ;;
+            *)
+              echo "::error::GitHub reports ${GITHUB_SHA} as '${relation}' relative to ${live_sha}, the commit the live aliases serve. Only a commit that descends from it may replace it, so nothing is promoted."
+              exit 1
+              ;;
+          esac
+
+      - name: Promote the signed digest to its public tags
+        # The promotion is a registry tag write and nothing else: the manifest
+        # bytes fetched by digest are PUT back under each tag unchanged, so a
+        # tag cannot come to point at anything but the digest that was just
+        # signed. Rebuilding the index here — `imagetools create`, a second
+        # `build-push-action` with `tags:` — would reopen the hole from the
+        # other side, since a re-created index need not hash to the digest the
+        # signature covers.
         shell: bash
         env:
-          IMAGE_NAME: ghcr.io/${{ github.repository }}
-          IMAGE_REF: ${{ steps.public_ref.outputs.value }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAG_REFS: ${{ steps.meta.outputs.tags }}
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          IMAGE_PATH: ${{ steps.image.outputs.path }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
-          token_body="$(mktemp)"
-          manifest_body="$(mktemp)"
-          trap 'rm -f "$token_body" "$manifest_body"' EXIT
+          if [ -z "$(printf '%s' "${TAG_REFS}" | tr -d '[:space:]')" ]; then
+            echo "::error::the metadata step produced no tag to promote, so this run would publish a digest nothing points at. Check the \`docker/metadata-action\` step's \`tags:\` for the event that started this run."
+            exit 1
+          fi
 
+          manifest="$(mktemp)"
+          headers="$(mktemp)"
+          token_body="$(mktemp)"
+          # The registry credential goes in a curl config file rather than on
+          # the command line: an argument is readable in the process table for
+          # the life of the request, and this token carries `packages: write`.
+          credential="$(mktemp)"
+          trap 'rm -f "$manifest" "$headers" "$token_body" "$credential"' EXIT
+
+          printf 'user = "%s:%s"\n' "${REGISTRY_USER}" "${REGISTRY_PASSWORD}" > "$credential"
+
+          # Every registry call below is bounded and retried. Unbounded, a stall
+          # runs to the JOB timeout, which GitHub reports as `cancelled` rather
+          # than `failed` — a red check with no failed step in it — and here it
+          # would strand the release half promoted. The PUT is retried like the
+          # reads because writing the same bytes under the same tag twice is the
+          # same registry state as writing them once.
           token_status="$(
-            curl -sSLo "$token_body" -w '%{http_code}' \
-              "https://ghcr.io/token?service=ghcr.io&scope=repository:${GITHUB_REPOSITORY}:pull"
+            curl -sSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 2 --retry-all-errors \
+              -o "$token_body" -w '%{http_code}' -K "$credential" \
+              "https://ghcr.io/token?service=ghcr.io&scope=repository:${IMAGE_PATH}:pull,push"
           )"
 
-          if [[ "$token_status" != "200" ]]; then
-            echo "::error::Anonymous GHCR token request for ${IMAGE_NAME}:${IMAGE_REF} returned HTTP ${token_status}. Ensure the package is linked to ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY} and that the package visibility is set to public."
+          if [ "$token_status" != "200" ]; then
+            echo "::error::GHCR returned HTTP ${token_status} for a push token on ${IMAGE_NAME}. The digest is pushed and signed but carries no public tag; nothing was published."
+            exit 1
+          fi
+
+          token="$(
+            python3 -c 'import json, pathlib, sys; body = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")); print(body.get("token", ""))' "$token_body"
+          )"
+
+          if [ -z "$token" ]; then
+            echo "::error::GHCR returned no push token for ${IMAGE_NAME}. The digest is pushed and signed but carries no public tag; nothing was published."
+            exit 1
+          fi
+
+          manifest_status="$(
+            curl -sSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 2 --retry-all-errors \
+              -o "$manifest" -D "$headers" -w '%{http_code}' \
+              -H "Authorization: Bearer ${token}" \
+              -H "Accept: ${MANIFEST_ACCEPT}" \
+              "https://ghcr.io/v2/${IMAGE_PATH}/manifests/${DIGEST}"
+          )"
+
+          if [ "$manifest_status" != "200" ]; then
+            echo "::error::reading the signed manifest ${DIGEST} back returned HTTP ${manifest_status}."
+            cat "$manifest"
+            exit 1
+          fi
+
+          # The tag write must declare the same media type the manifest was
+          # stored under, or the registry stores a different object and the
+          # digest changes with it. Parameters are dropped: a `Content-Type` may
+          # carry one (`; charset=utf-8`), the registry stores the object under
+          # the media type alone, and a tag written with a parameter attached
+          # names something else at another digest — the very failure this line
+          # exists to prevent. The header name is split on its colon rather than
+          # read as a field, so a server that omits the space after it is read
+          # rather than refused.
+          content_type="$(
+            tr -d '\r' < "$headers" \
+              | awk 'tolower($0) ~ /^content-type:/ { sub(/^[^:]*:[ \t]*/, ""); sub(/[ \t]*;.*$/, ""); sub(/[ \t]+$/, ""); print }' \
+              | tail -1
+          )"
+
+          if [ -z "$content_type" ]; then
+            echo "::error::GHCR returned the signed manifest with no Content-Type, so the tag write has no media type to declare."
+            exit 1
+          fi
+
+          # Every reference the metadata step emits must live in the repository
+          # that was just signed, and the WHOLE list is judged before the first
+          # write. Caught inside the write loop instead, a foreign entry in
+          # second place would leave the first tag published and the run red —
+          # a half-published release, which is the state this whole ordering
+          # exists to make impossible. The empty-list check above runs up front
+          # for the same reason.
+          tags=""
+          while IFS= read -r ref; do
+            [ -n "$ref" ] || continue
+
+            case "$ref" in
+              "${IMAGE_NAME}:"*) ;;
+              *)
+                echo "::error::the metadata step produced ${ref}, which is not a tag of ${IMAGE_NAME}. Nothing outside the repository this run signed is promoted, and nothing at all is promoted from a list carrying one."
+                exit 1
+                ;;
+            esac
+
+            # The two passes must agree on how many tags there are. This
+            # prefix matches a reference with nothing after the colon, which
+            # yields an empty tag that the write loop's own blank-line guard
+            # would then drop in silence — publishing fewer aliases than this
+            # run goes on to report.
+            tag="${ref##*:}"
+            if [ -z "$tag" ]; then
+              echo "::error::the metadata step produced ${ref}, which names this image and no tag."
+              exit 1
+            fi
+
+            printf -v tags '%s%s\n' "${tags}" "${tag}"
+          done <<< "${TAG_REFS}"
+
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+
+            put_status="$(
+              curl -sS --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 --retry-all-errors \
+                -o /dev/null -w '%{http_code}' -X PUT \
+                -H "Authorization: Bearer ${token}" \
+                -H "Content-Type: ${content_type}" \
+                --data-binary "@${manifest}" \
+                "https://ghcr.io/v2/${IMAGE_PATH}/manifests/${tag}"
+            )"
+
+            if [ "$put_status" != "201" ]; then
+              echo "::error::promoting ${DIGEST} to ${IMAGE_NAME}:${tag} returned HTTP ${put_status}. Earlier tags in this run may already point at the signed digest; the tags that failed do not exist."
+              exit 1
+            fi
+
+            echo "${IMAGE_NAME}:${tag} -> ${DIGEST}"
+          done <<< "${tags}"
+
+      - name: Verify every public tag anonymously and against the signed digest
+        # Two questions, and the release is not published until both answer.
+        # Anonymous reachability is the older one: a package that is not linked
+        # to this repository, or whose visibility is private, leaves a release
+        # nobody outside can pull. The digest comparison is the one this
+        # ordering exists for — it is what says the alias an operator resolves
+        # is the artifact the signature and the provenance were issued against,
+        # rather than something that merely got there afterwards.
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAG_REFS: ${{ steps.meta.outputs.tags }}
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          IMAGE_PATH: ${{ steps.image.outputs.path }}
+        run: |
+          set -euo pipefail
+
+          # The promotion refuses an empty list before it writes anything,
+          # and this step does not rely on that having happened: handed one, it
+          # would loop zero times and report a release verified having resolved
+          # no alias at all.
+          if [ -z "$(printf '%s' "${TAG_REFS}" | tr -d '[:space:]')" ]; then
+            echo "::error::there is no public tag to verify, so nothing here would be checked and the release would be reported published regardless."
+            exit 1
+          fi
+
+          token_body="$(mktemp)"
+          manifest_headers="$(mktemp)"
+          trap 'rm -f "$token_body" "$manifest_headers"' EXIT
+
+          token_status="$(
+            curl -sSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 2 --retry-all-errors \
+              -o "$token_body" -w '%{http_code}' \
+              "https://ghcr.io/token?service=ghcr.io&scope=repository:${IMAGE_PATH}:pull"
+          )"
+
+          if [ "$token_status" != "200" ]; then
+            echo "::error::Anonymous GHCR token request for ${IMAGE_NAME} returned HTTP ${token_status}. Ensure the package is linked to ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY} and that the package visibility is set to public."
             cat "$token_body"
             exit 1
           fi
@@ -122,34 +1584,510 @@ jobs:
             python3 -c 'import json, pathlib, sys; body = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")); print(body.get("token", ""))' "$token_body"
           )"
 
-          if [[ -z "$token" ]]; then
-            echo "::error::Anonymous GHCR token response for ${IMAGE_NAME}:${IMAGE_REF} did not include a bearer token."
+          if [ -z "$token" ]; then
+            echo "::error::Anonymous GHCR token response for ${IMAGE_NAME} did not include a bearer token."
             cat "$token_body"
             exit 1
           fi
 
-          manifest_status="$(
-            curl -sSLo "$manifest_body" -w '%{http_code}' \
-              -H "Authorization: Bearer ${token}" \
-              -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" \
-              "https://ghcr.io/v2/${GITHUB_REPOSITORY}/manifests/${IMAGE_REF}"
-          )"
+          while IFS= read -r ref; do
+            [ -n "$ref" ] || continue
 
-          if [[ "$manifest_status" != "200" ]]; then
-            echo "::error::Anonymous GHCR manifest request for ${IMAGE_NAME}:${IMAGE_REF} returned HTTP ${manifest_status}. Ensure the package is publicly pullable before considering this release published."
-            cat "$manifest_body"
+            # The promotion refuses a reference outside this image before it
+            # writes anything, so nothing foreign reaches here today. That is a
+            # reason about the step before this one: asked on its own, this
+            # check would otherwise report on a tag of the signed image while
+            # the metadata step had named someone else's registry.
+            case "$ref" in
+              "${IMAGE_NAME}:"*) tag="${ref##*:}" ;;
+              *)
+                echo "::error::the metadata step produced ${ref}, which is not a tag of ${IMAGE_NAME}. This check reports on tags of the image this run signed and on nothing else."
+                exit 1
+                ;;
+            esac
+
+            head_status="$(
+              curl -sS --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 2 --retry-all-errors \
+                -o /dev/null -D "$manifest_headers" -w '%{http_code}' -I \
+                -H "Authorization: Bearer ${token}" \
+                -H "Accept: ${MANIFEST_ACCEPT}" \
+                "https://ghcr.io/v2/${IMAGE_PATH}/manifests/${tag}"
+            )"
+
+            if [ "$head_status" != "200" ]; then
+              echo "::error::Anonymous GHCR manifest request for ${ref} returned HTTP ${head_status}. Ensure the package is publicly pullable before considering this release published."
+              exit 1
+            fi
+
+            # Read the same way the promotion reads its own header, and for
+            # the same reason: the name is split on its colon, so a server that
+            # omits the space after it is read rather than refused. There is no
+            # parameter to drop here — a digest header carries none — which is
+            # the one line of that rule this one does not need.
+            published="$(
+              tr -d '\r' < "$manifest_headers" \
+                | awk 'tolower($0) ~ /^docker-content-digest:/ { sub(/^[^:]*:[ \t]*/, ""); sub(/[ \t]+$/, ""); print }' \
+                | tail -1
+            )"
+
+            if [ "$published" != "$DIGEST" ]; then
+              echo "::error::${ref} resolves to ${published:-nothing}, not to the signed digest ${DIGEST}. The signature and the provenance attestation cover the digest, so an alias pointing anywhere else is an unsigned release however green this run is."
+              exit 1
+            fi
+
+            echo "${ref} is anonymously pullable and resolves to ${DIGEST}."
+          done <<< "${TAG_REFS}"
+
+      # THE MIRROR BEGINS WHERE THE GHCR RELEASE ENDS. Everything above has
+      # already settled the digest: it is signed, attested, both were read back
+      # from the registry, and every public GHCR tag was resolved anonymously
+      # and found to be that digest. Only then does a second registry receive
+      # anything, so Docker Hub cannot come to hold a release that this job's
+      # own checks would have refused.
+      #
+      # The mirror is a `cosign copy` of content-addressed bytes, never a
+      # second build and never a `docker push` of a re-assembled index: either
+      # would produce a different digest and leave the Docker Hub copy outside
+      # the signature this run issued, while looking identical in a tag list.
+      # Copying cannot, and the check below is what says so rather than
+      # assuming it.
+      #
+      # The copy moves the manifest and nothing else. A cosign v3 signature is
+      # a Sigstore bundle attached through the OCI 1.1 referrers API — on a
+      # registry without that API, GHCR among them, under the fallback tag
+      # `sha256-<hex>` — and `cosign copy` walks the pre-v3 `sha256-<hex>.sig`
+      # layout that this version no longer writes. So the mirror is SIGNED
+      # where it lands, over the digest GHCR already signed and under the same
+      # keyless identity, rather than expected to carry a signature across.
+      # Two Rekor entries for one digest is the cost, and it is what makes the
+      # `cosign verify docker.io/…` command SECURITY.md gives an operator
+      # answer at all.
+      #
+      # Absent the publishing credential all four steps skip and GHCR
+      # publishes exactly as before on the `:latest` path. On a release tag
+      # that skip is refused instead, by the step right after checkout, before
+      # anything is pushed: a release is the one publish nothing replaces, and
+      # a mirror that is missing from it must be an error, not a quiet gap. The credential is deliberately NOT the
+      # `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` pair above: that one exists for
+      # authenticated base-image pulls and security.yml hands it to jobs that
+      # run on every pull request, so write access to a public registry must
+      # not be inside it.
+      - name: Log in to Docker Hub for the mirror
+        if: ${{ env.DOCKERHUB_PUBLISH_USERNAME != '' }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_PUBLISH_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PUBLISH_TOKEN }}
+
+      - name: Report Docker Hub's rate-limit view of the mirror login
+        # Runs 36512010639 and 36512597460 were refused with Docker Hub's
+        # "unauthenticated pull rate limit" although the login above had
+        # succeeded and cosign's pushes with it were accepted. cosign v3.0.6
+        # reads that login through go-containerregistry's DefaultKeychain and
+        # sends it on every read, so which quota Docker Hub charges is taken
+        # from Docker Hub's own answer: `docker-ratelimit-source` is the
+        # runner's IP for an anonymous pull and the account for an
+        # authenticated one. Asked with HEAD, which the quota does not count,
+        # of the mirror's own repository under a pull-only token, which is
+        # the scope cosign's reads there ask for: a token restricted to that
+        # repository would be refused anywhere else and answer nothing.
+        #
+        # Informational: it never fails the job. The credential reaches curl
+        # on stdin only — never as an argument, never in the log.
+        if: ${{ env.DOCKERHUB_PUBLISH_USERNAME != '' }}
+        shell: bash
+        env:
+          MIRROR_PATH: ${{ steps.image.outputs.path }}
+        run: |
+          # `shell: bash` runs this under `-eo pipefail`; errexit is turned
+          # off because no answer here may end the step.
+          set +e
+          set -u
+          config="${DOCKER_CONFIG:-$HOME/.docker}/config.json"
+          key='https://index.docker.io/v1/'
+          token_url="https://auth.docker.io/token?service=registry.docker.io&scope=repository:${MIRROR_PATH}:pull"
+          probe="https://registry-1.docker.io/v2/${MIRROR_PATH}/manifests/latest"
+          token_body="$(mktemp)"
+          trap 'rm -f "$token_body"' EXIT
+
+          if [ ! -f "$config" ]; then
+            echo "::warning::no docker config at ${config}, so cosign reads Docker Hub anonymously."
+            exit 0
+          fi
+          python3 -c 'import json, pathlib, sys; c = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")); k = sys.argv[2]; h = c.get("credHelpers") or {}; print("credsStore set:", "credsStore" in c); print("credHelpers entry for Docker Hub:", any(n in h for n in (k, "docker.io", "index.docker.io"))); print("inline auth under " + k + ":", bool((c.get("auths") or {}).get(k, {}).get("auth")))' "$config" "$key"
+
+          # $1 labels the reading; stdin carries the token request's
+          # Authorization header, or nothing for an anonymous one.
+          # A refused credential is the most telling answer here, so the
+          # token request's status is reported rather than folded into a
+          # transport failure.
+          rate_limit_view() {
+            local status token
+            if ! status="$(curl -sS --max-time 20 -o "$token_body" -w '%{http_code}' -H @- "$token_url")"; then
+              echo "$1: the token request got no answer"
+              return 0
+            fi
+            if [ "$status" != 200 ]; then
+              echo "$1: the token request was answered HTTP ${status}"
+              return 0
+            fi
+            # The one token parse every registry step in this job uses.
+            token="$(
+              python3 -c 'import json, pathlib, sys; body = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")); print(body.get("token", ""))' "$token_body"
+            )"
+            if [ -z "$token" ]; then
+              echo "$1: the token response carried no token"
+              return 0
+            fi
+            printf 'Authorization: Bearer %s\n' "$token" \
+              | curl -sS --max-time 20 -I -H "Accept: ${MANIFEST_ACCEPT}" -H @- "$probe" \
+              | tr -d '\r' \
+              | grep -iE '^(HTTP/|ratelimit-limit:|ratelimit-remaining:|docker-ratelimit-source:)' \
+              | sed "s/^/$1: /"
+            return 0
+          }
+
+          rate_limit_view anonymous < /dev/null
+          auth="$(python3 -c 'import json, pathlib, sys; c = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")); print((c.get("auths") or {}).get(sys.argv[2], {}).get("auth", ""))' "$config" "$key")"
+          if [ -n "$auth" ]; then
+            printf 'Authorization: Basic %s\n' "$auth" | rate_limit_view mirror-login
+          else
+            echo "mirror-login: no inline auth under ${key} to read with"
+          fi
+          exit 0
+
+      - name: Mirror the signed digest to Docker Hub
+        # `VERIFY_ATTEMPTS`/`VERIFY_DELAY_SECONDS` bound how long the read-back
+        # waits for Docker Hub's referrers listing to catch up with the
+        # signature just pushed to it; the comment at that line carries the
+        # measurement. They are literal constants rather than expressions for
+        # two reasons: `scripts/publishorder` runs this script for real and has
+        # to drive the delay to zero, and it reads these two off the block
+        # below to hold the SHIPPED budget to more than one attempt — which a
+        # fixture supplying its own number cannot do.
+        #
+        # `RATE_LIMIT_ATTEMPTS`/`RATE_LIMIT_DELAY_SECONDS` bound the same kind
+        # of wait for every cosign call here, and for one verdict only: a
+        # registry's 429. Runs
+        # 36512010639 and 36512597460 were refused with it 8 minutes apart,
+        # during a merge burst, AFTER the login below had succeeded and, in the
+        # first, after the same step's pushes to Docker Hub had been accepted:
+        # the credential reached cosign, and the throttle still answered.
+        # `scripts/releasegate` reads these two off the block as well.
+        if: ${{ env.DOCKERHUB_PUBLISH_USERNAME != '' }}
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAG_REFS: ${{ steps.meta.outputs.tags }}
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          MIRROR_NAME: docker.io/${{ steps.image.outputs.path }}
+          IDENTITY_REGEXP: ${{ steps.verify.outputs.identity_regexp }}
+          VERIFY_ATTEMPTS: 6
+          VERIFY_DELAY_SECONDS: 10
+          RATE_LIMIT_ATTEMPTS: 4
+          RATE_LIMIT_DELAY_SECONDS: 30
+        run: |
+          set -euo pipefail
+
+          if [ -z "$(printf '%s' "${TAG_REFS}" | tr -d '[:space:]')" ]; then
+            echo "::error::the metadata step produced no tag to mirror, so this run would copy a digest nothing points at."
             exit 1
           fi
 
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+          # Judged here with the tag list rather than beside the `cosign
+          # verify` that consumes it: it is an INPUT to this step, knowable
+          # before a byte moves, and an input checked after the copy and the
+          # signing call has already cost a full cross-registry transfer and a
+          # public transparency-log entry by the time it refuses. An empty
+          # pattern is not a loose check but no check — cosign matches every
+          # certificate identity against it.
+          if [ -z "${IDENTITY_REGEXP}" ]; then
+            echo "::error::the signer identity pattern reached this step empty, and an empty --certificate-identity-regexp accepts any signer. It comes from the \`Verify the signature and provenance before promoting\` step's outputs."
+            exit 1
+          fi
 
-      - name: Sign Docker image
-        run: cosign sign --yes ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+          # The WHOLE list is judged before the first copy, for the reason the
+          # promotion judges its own: a foreign reference found halfway leaves
+          # the registry holding the tags written before it.
+          tags=()
+          while IFS= read -r ref; do
+            [ -n "$ref" ] || continue
 
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
-        with:
-          subject-name: ghcr.io/${{ github.repository }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
+            case "$ref" in
+              "${IMAGE_NAME}:"*) ;;
+              *)
+                echo "::error::the metadata step produced ${ref}, which is not a tag of ${IMAGE_NAME}. Nothing outside the repository this run signed is mirrored, and nothing at all is mirrored from a list carrying one."
+                exit 1
+                ;;
+            esac
+
+            # Same empty-tag case the promotion step guards against: a
+            # reference with nothing after the colon matches the prefix above
+            # and would otherwise queue a blank tag, landing a dangling
+            # `${MIRROR_NAME}:` copy destination below.
+            tag="${ref##*:}"
+            if [ -z "$tag" ]; then
+              echo "::error::the metadata step produced ${ref}, which names this image and no tag."
+              exit 1
+            fi
+            tags+=("$tag")
+          done <<< "${TAG_REFS}"
+
+          # THE MIRROR REPEATS THE ORDER THE GHCR RELEASE ABOVE FOLLOWS, and
+          # for the same reason: a red run retracts no tag. The bytes cross
+          # first UNDER NO TAG AT ALL — the destination is a digest, so Docker
+          # Hub holds the manifest with nothing pointing at it — then the
+          # mirror is signed and that signature is read back, and only then is
+          # a public alias written. Signing after the aliases would leave
+          # `latest` on a public registry that no operator can verify whenever
+          # the signing call failed, which is the defect `scripts/publishorder`
+          # exists to refuse; that it would be the mirror rather than GHCR
+          # does not make it a different defect.
+          #
+          # Every cosign call goes through rate_limited, which asks again on
+          # ONE verdict: a registry's rate limit (Docker Hub's, or GHCR's on
+          # the source read), matched by its words and never by a bare `429`,
+          # which a digest in any other error can contain. Any other refusal
+          # goes back to the caller, which judges it on the first attempt; a
+          # limit still standing after the last ends the step. Nothing is
+          # passed over. Asking again is safe because every call is idempotent
+          # where it lands: a copy moves content-addressed bytes, to a digest
+          # or to an alias `--force` rewrites to that same digest; a read-back
+          # changes nothing; and a signing call refused partway leaves at most
+          # one extra Rekor entry and bundle per repeated attempt, all for the
+          # same digest and identity, which the read-back accepts like the
+          # first.
+          call_log="$(mktemp)"
+          trap 'rm -f "$call_log"' EXIT
+
+          rate_limited() {
+            local what="$1" attempt=1
+            shift
+            while true; do
+              if "$@" > "$call_log" 2>&1; then
+                cat "$call_log"
+                return 0
+              fi
+              cat "$call_log"
+
+              if ! grep -qE 'TOOMANYREQUESTS|429 Too Many Requests' "$call_log"; then
+                return 1
+              fi
+
+              if [ "${attempt}" -ge "${RATE_LIMIT_ATTEMPTS}" ]; then
+                echo "::error::${what} was refused by a registry's rate limit on all ${RATE_LIMIT_ATTEMPTS} attempts. The mirror is incomplete and this run fails."
+                exit 1
+              fi
+
+              echo "attempt ${attempt} of ${RATE_LIMIT_ATTEMPTS} ${what} hit a registry's rate limit; waiting $(( attempt * RATE_LIMIT_DELAY_SECONDS ))s."
+              sleep "$(( attempt * RATE_LIMIT_DELAY_SECONDS ))"
+              attempt=$(( attempt + 1 ))
+            done
+          }
+
+          mirror_copy() {
+            if ! rate_limited "copying $1 to $2" cosign copy --force "$1" "$2"; then
+              echo "::error::copying $1 to $2 failed, and not on a registry's rate limit — the cosign output above says what it is. The mirror is incomplete and this run fails."
+              exit 1
+            fi
+          }
+
+          mirror_copy "${IMAGE_NAME}@${DIGEST}" "${MIRROR_NAME}@${DIGEST}"
+
+          # The signature does not travel with those bytes — the section
+          # comment above says why — so it is issued here, against the mirror's
+          # own name and the digest just copied. Nothing about the image is
+          # re-derived: the same content, the same digest, the same OIDC
+          # identity that signed it on GHCR.
+          if ! rate_limited "signing ${MIRROR_NAME}@${DIGEST}" cosign sign --yes "${MIRROR_NAME}@${DIGEST}"; then
+            echo "::error::signing ${MIRROR_NAME}@${DIGEST} failed, and not on a registry's rate limit — the cosign output above says what it is. No Docker Hub alias is written, so nothing is published there this run."
+            exit 1
+          fi
+
+          # Read back before any alias exists, exactly as `Verify the signature
+          # and provenance before promoting` reads GHCR's back: signing is an
+          # API call that reported success, and this is what an operator
+          # following SECURITY.md actually runs. The pattern is built once, by
+          # that step, and handed here — rebuilding it would be a second place
+          # for a dot to go unescaped in the field it exists to pin.
+          #
+          # ASKED REPEATEDLY, because the registry answers this question later
+          # than it accepts the signature. Run 35606394489 signed the mirror at
+          # 13:53:05Z and failed `no signatures found` at 13:53:06Z; the same
+          # digest's `/v2/<path>/referrers/<digest>` served the bundle, with
+          # `artifactType: application/vnd.dev.sigstore.bundle.v0.3+json`,
+          # when queried afterwards. cosign reads that endpoint (`GetBundles`
+          # → `remote.Referrers`) and consults the `sha256-<hex>` fallback tag
+          # ONLY when it does not answer 200 with an index content type, which
+          # Docker Hub does — so the tag `cosign copy` overwrites below is not
+          # what is being waited for here, and a one-shot check was simply
+          # asking before the listing existed.
+          #
+          # Waiting is the whole of the change: a signature that never appears
+          # still fails this step, and no alias is written when it does.
+          attempt=1
+          while true; do
+            if rate_limited "reading back the signature on ${MIRROR_NAME}@${DIGEST}" cosign verify \
+              --certificate-identity-regexp "${IDENTITY_REGEXP}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "${MIRROR_NAME}@${DIGEST}"; then
+              break
+            fi
+
+            # ONE verdict is worth asking again about. `no signatures found`
+            # is cosign saying the referrers listing holds nothing for this
+            # digest YET. Every other refusal is an answer — an identity that
+            # does not match, a certificate issued to someone else, a
+            # transport error — and retrying it would spend the whole budget
+            # and then report an absence, which is not what was found. A
+            # mirror signed by a stranger must not read like a slow registry,
+            # and a slow registry must not read like a stranger: a rate limit
+            # never reaches this point, because rate_limited has either asked
+            # again past it or ended the step naming it.
+            if ! grep -q 'no signatures found' "$call_log"; then
+              echo "::error::${MIRROR_NAME}@${DIGEST} did not verify against this repository's signer identity, and the refusal is not a missing signature — the cosign output above says what it is. No Docker Hub alias is written, so nothing is published there this run."
+              exit 1
+            fi
+
+            if [ "${attempt}" -ge "${VERIFY_ATTEMPTS}" ]; then
+              echo "::error::${MIRROR_NAME}@${DIGEST} carries no signature this repository issued, over ${VERIFY_ATTEMPTS} attempts spanning $(( (VERIFY_ATTEMPTS - 1) * VERIFY_DELAY_SECONDS ))s. No Docker Hub alias is written, so nothing is published there this run."
+              exit 1
+            fi
+
+            echo "attempt ${attempt} of ${VERIFY_ATTEMPTS} found no signature listed for ${MIRROR_NAME}@${DIGEST}; waiting ${VERIFY_DELAY_SECONDS}s."
+            attempt=$(( attempt + 1 ))
+            sleep "${VERIFY_DELAY_SECONDS}"
+          done
+
+          # The SOURCE is a digest throughout, never a tag. A tag is a
+          # mutable pointer: resolving one here would mirror whatever it names
+          # by the time this step runs, which is not necessarily what was
+          # signed. `--force` is what lets a moving alias — `latest`, `main` —
+          # be rewritten on a later release rather than failing the run.
+          #
+          # Every alias is copied from GHCR's digest — the same bytes, which
+          # the first copy already landed, so Docker Hub answers each blob as
+          # present and receives only the manifest under the tag. The source is
+          # GHCR rather than the mirror because a copy's reads are its cost on
+          # Docker Hub's pull quota: one alias is up to ~14 manifest GETs (the
+          # index, each platform, and a sig/att/sbom tag probe per entity, most
+          # of which answer 404), and runs
+          # 36512010639 and 36512597460 were refused on that quota. Read from
+          # GHCR, the aliases cost Docker Hub only writes
+          # and the HEADs that precede them, which the quota does not count.
+          #
+          # These copies run AFTER the signature and do not disturb it, but
+          # only because Docker Hub serves the referrers API: `cosign copy`
+          # writes the copied manifest under `sha256-<hex>` as well as under
+          # the destination, and that is the tag a registry WITHOUT that API
+          # keeps its referrers index at — the copy would overwrite the
+          # signature's index with the image's own manifest. Moving this
+          # mirror to a registry that answers `/v2/<path>/referrers/<digest>`
+          # with a 404 means the aliases can no longer be written by `cosign
+          # copy` after the signature.
+          for tag in "${tags[@]}"; do
+            mirror_copy "${IMAGE_NAME}@${DIGEST}" "${MIRROR_NAME}:${tag}"
+            echo "${MIRROR_NAME}:${tag} <- ${IMAGE_NAME}@${DIGEST}"
+          done
+
+      - name: Verify every mirrored tag anonymously and against the signed digest
+        # The same question the GHCR alias check asks, asked of the other
+        # registry, because an answer from GHCR is not an answer about Docker
+        # Hub: every alias resolving anonymously, and resolving to the digest
+        # this run signed.
+        #
+        # The signature is NOT asked for here. The mirror step signs the
+        # digest and reads that signature back before it writes the first
+        # alias, which is the order GHCR's own release follows — a check
+        # placed after the aliases exist could only report on a mirror already
+        # public.
+        #
+        # The provenance attestation is not re-verified here either. It is served by
+        # GitHub against the DIGEST and the repository, not by the registry the
+        # image is read from, and the digest is the one this step proves
+        # identical — so `gh attestation verify` on the mirror would
+        # interrogate the record `Verify the signature and provenance before
+        # promoting` has already read back.
+        if: ${{ env.DOCKERHUB_PUBLISH_USERNAME != '' }}
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAG_REFS: ${{ steps.meta.outputs.tags }}
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          IMAGE_PATH: ${{ steps.image.outputs.path }}
+          MIRROR_NAME: docker.io/${{ steps.image.outputs.path }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$(printf '%s' "${TAG_REFS}" | tr -d '[:space:]')" ]; then
+            echo "::error::there is no mirrored tag to verify, so nothing here would be checked and the mirror would be reported published regardless."
+            exit 1
+          fi
+
+          token_body="$(mktemp)"
+          manifest_headers="$(mktemp)"
+          trap 'rm -f "$token_body" "$manifest_headers"' EXIT
+
+          token_status="$(
+            curl -sSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 2 --retry-all-errors \
+              -o "$token_body" -w '%{http_code}' \
+              "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${IMAGE_PATH}:pull"
+          )"
+
+          if [ "$token_status" != "200" ]; then
+            echo "::error::Anonymous Docker Hub token request for ${MIRROR_NAME} returned HTTP ${token_status}. Ensure the repository exists and is public."
+            cat "$token_body"
+            exit 1
+          fi
+
+          # Parsed the way the GHCR steps parse theirs, and held to that one
+          # spelling on purpose: three registry steps reading a bearer token
+          # out of a JSON body three ways is three chances for one of them to
+          # read an empty string as success.
+          token="$(
+            python3 -c 'import json, pathlib, sys; body = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")); print(body.get("token", ""))' "$token_body"
+          )"
+
+          if [ -z "$token" ]; then
+            echo "::error::Anonymous Docker Hub token response for ${MIRROR_NAME} did not include a bearer token."
+            cat "$token_body"
+            exit 1
+          fi
+
+          while IFS= read -r ref; do
+            [ -n "$ref" ] || continue
+
+            case "$ref" in
+              "${IMAGE_NAME}:"*) tag="${ref##*:}" ;;
+              *)
+                echo "::error::the metadata step produced ${ref}, which is not a tag of ${IMAGE_NAME}. This check reports on tags of the image this run signed and on nothing else."
+                exit 1
+                ;;
+            esac
+
+            head_status="$(
+              curl -sS --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 2 --retry-all-errors \
+                -o /dev/null -D "$manifest_headers" -w '%{http_code}' -I \
+                -H "Authorization: Bearer ${token}" \
+                -H "Accept: ${MANIFEST_ACCEPT}" \
+                "https://registry-1.docker.io/v2/${IMAGE_PATH}/manifests/${tag}"
+            )"
+
+            if [ "$head_status" != "200" ]; then
+              echo "::error::Anonymous Docker Hub manifest request for ${MIRROR_NAME}:${tag} returned HTTP ${head_status}. Ensure the repository is publicly pullable before considering this mirror published."
+              exit 1
+            fi
+
+            published="$(
+              tr -d '\r' < "$manifest_headers" \
+                | awk 'tolower($0) ~ /^docker-content-digest:/ { sub(/^[^:]*:[ \t]*/, ""); sub(/[ \t]+$/, ""); print }' \
+                | tail -1
+            )"
+
+            if [ "$published" != "$DIGEST" ]; then
+              echo "::error::${MIRROR_NAME}:${tag} resolves to ${published:-nothing}, not to the signed digest ${DIGEST}. A mirrored alias pointing anywhere else is an unsigned release however green this run is."
+              exit 1
+            fi
+
+            echo "${MIRROR_NAME}:${tag} is anonymously pullable and resolves to ${DIGEST}."
+          done <<< "${TAG_REFS}"

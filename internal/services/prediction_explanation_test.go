@@ -70,14 +70,18 @@ func TestBuildOwnerPredictionExplanation(t *testing.T) {
 		}
 	})
 
-	t.Run("regular user with data-driven range gets the variability explainer", func(t *testing.T) {
+	// A regular owner whose prediction renders as a range no longer gets an
+	// explainer sentence: the range itself, plus the next-period line naming
+	// the start window, is the affordance. Only an irregular owner keeps a
+	// range explainer, which the subtest above pins.
+	t.Run("regular user with data-driven range gets no explainer", func(t *testing.T) {
 		explanation := BuildOwnerPredictionExplanation(
 			&models.User{Role: models.RoleOwner},
 			DashboardCycleContext{DisplayNextPeriodUseRange: true},
 			false,
 		)
-		if explanation.PrimaryKey != "prediction.explainer.variable_ranges" {
-			t.Fatalf("expected variable_ranges primary key, got %#v", explanation)
+		if explanation.PrimaryKey != "" {
+			t.Fatalf("expected no primary key for a regular owner in range mode, got %#v", explanation)
 		}
 	})
 
@@ -94,4 +98,53 @@ func TestBuildOwnerPredictionExplanation(t *testing.T) {
 			t.Fatalf("expected no factor secondary hint while paused, got %#v", explanation)
 		}
 	})
+}
+
+// TestBuildOwnerPredictionExplanationNamesTheFirstCycleFloor pins the line the
+// cohort with no completed cycle had none of. It also pins the ORDER, and the
+// order is that the new sentence YIELDS: an irregular account in the sparse
+// tier has no completed cycle either, and its own sentence names the number of
+// cycles the rest of that screen counts to, so the general answer must not
+// displace the specific one. What the floor claims is the owner the switch used
+// to fall through to the empty default for.
+func TestBuildOwnerPredictionExplanationNamesTheFirstCycleFloor(t *testing.T) {
+	owner := &models.User{Role: models.RoleOwner}
+
+	explanation := BuildOwnerPredictionExplanation(owner, DashboardCycleContext{AwaitingFirstCycle: true}, false)
+	if explanation.PrimaryKey != "prediction.explainer.awaiting_first_cycle" {
+		t.Fatalf("expected the first-cycle explainer, got %#v", explanation)
+	}
+
+	// An irregular owner in the sparse tier is in the first-cycle floor too, and
+	// keeps the sentence that names the cycle count. A mutant moving the floor
+	// above these branches takes that sentence away from every freshly onboarded
+	// irregular account — which is what it did before this order was fixed.
+	irregular := &models.User{Role: models.RoleOwner, IrregularCycle: true}
+	sparse := BuildOwnerPredictionExplanation(
+		irregular,
+		DashboardCycleContext{AwaitingFirstCycle: true, DisplayNextPeriodNeedsData: true},
+		false,
+	)
+	if sparse.PrimaryKey != "prediction.explainer.irregular_sparse" {
+		t.Fatalf("expected the sparse irregular sentence to survive the first-cycle floor, got %#v", sparse)
+	}
+	withRanges := BuildOwnerPredictionExplanation(
+		irregular,
+		DashboardCycleContext{AwaitingFirstCycle: true, DisplayNextPeriodUseRange: true},
+		false,
+	)
+	if withRanges.PrimaryKey != "prediction.explainer.irregular_ranges" {
+		t.Fatalf("expected the irregular-range branch to survive the first-cycle floor, got %#v", withRanges)
+	}
+
+	// Negative control: without the floor the same account keeps the branch it
+	// had before, so the new case is not swallowing the ones under it.
+	paused := BuildOwnerPredictionExplanation(owner, DashboardCycleContext{PregnancyPaused: true, AwaitingFirstCycle: true}, false)
+	if paused.PrimaryKey != "prediction.explainer.pregnancy_paused" {
+		t.Fatalf("expected the pregnancy pause to still outrank the first-cycle floor, got %#v", paused)
+	}
+	settled := BuildOwnerPredictionExplanation(irregular, DashboardCycleContext{DisplayNextPeriodUseRange: true}, false)
+	if settled.PrimaryKey != "prediction.explainer.irregular_ranges" {
+		t.Fatalf("expected the irregular-range branch once the first cycle is behind, got %#v", settled)
+	}
 }

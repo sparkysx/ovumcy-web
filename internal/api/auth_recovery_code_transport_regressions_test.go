@@ -2,15 +2,48 @@ package api
 
 import (
 	"encoding/json"
+	"go/parser"
+	"go/token"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/ovumcy/ovumcy-web/internal/services"
 	"golang.org/x/net/html"
 )
+
+// TestTransportLayerDoesNotImportBcrypt sweeps every non-test file in the
+// package for a golang.org/x/crypto/bcrypt import. Credential and
+// recovery-code verification decisions belong to the services layer; the
+// register-pickup handler carried the one bcrypt comparison living in
+// transport until it moved behind AuthService.VerifyStoredRecoveryCode. No
+// allowlist: a future import fails here by file name.
+func TestTransportLayerDoesNotImportBcrypt(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
+	}
+	fileSet := token.NewFileSet()
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		parsed, err := parser.ParseFile(fileSet, name, nil, parser.ImportsOnly)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		for _, imported := range parsed.Imports {
+			if strings.Trim(imported.Path.Value, `"`) == "golang.org/x/crypto/bcrypt" {
+				t.Errorf("%s imports golang.org/x/crypto/bcrypt: credential verification belongs in internal/services", name)
+			}
+		}
+	}
+}
 
 func TestRegisterJSONSuccessDoesNotExposeRecoveryCode(t *testing.T) {
 	app, _ := newOnboardingTestApp(t)
@@ -67,6 +100,7 @@ func TestResetPasswordJSONSuccessDoesNotExposeRecoveryCode(t *testing.T) {
 	startResetRequest := httptest.NewRequest(http.MethodPost, "/api/v1/password-resets", strings.NewReader(url.Values{
 		"email":         {user.Email},
 		"recovery_code": {recoveryCode},
+		"password":      {"StrongPass1"},
 	}.Encode()))
 	startResetRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	startResetResponse := mustAppResponse(t, app, startResetRequest)
@@ -124,6 +158,7 @@ func TestRegenerateRecoveryCodeRedirectsToDedicatedRecoveryPage(t *testing.T) {
 	assertRecoveryCodeSurface(t, recoveryPage, recoveryCodeSurfaceExpectations{
 		expectedAction: "/settings",
 		expectedTarget: recoveryCodeContinueTargetSettings,
+		expectedCode:   expectedRecoveryCodeFromSealedCookie(t, recoveryCookie),
 	})
 }
 
@@ -306,6 +341,7 @@ func stringValue(value any) string {
 type recoveryCodeSurfaceExpectations struct {
 	expectedAction string
 	expectedTarget string
+	expectedCode   string
 	inline         bool
 }
 
@@ -314,8 +350,35 @@ func assertRecoveryCodeSurface(t *testing.T, markup string, expectations recover
 
 	document := mustParseHTMLDocument(t, markup)
 	panel := requireRecoveryCodeSurfacePanel(t, document, expectations.inline)
-	assertRenderedRecoveryCodeValue(t, panel)
+	assertRenderedRecoveryCodeValue(t, panel, expectations.expectedCode)
 	assertRecoveryCodeConfirmFormSurface(t, panel, expectations.expectedAction, expectations.expectedTarget)
+}
+
+// expectedRecoveryCodeFromSealedCookie opens the sealed recovery-code page
+// cookie under the shared test app's secret and returns the code it carries.
+// A surface assertion compares the rendered value against what the server
+// actually sealed, rather than merely checking non-emptiness — a rendered
+// code that differs from the sealed one, or that is malformed, must fail.
+func expectedRecoveryCodeFromSealedCookie(t *testing.T, sealed string) string {
+	t.Helper()
+
+	codec, err := newSecureCookieCodec([]byte(testAppSecretKey))
+	if err != nil {
+		t.Fatalf("init secure cookie codec: %v", err)
+	}
+	decoded, err := codec.open(recoveryCodeCookieName, sealed)
+	if err != nil {
+		t.Fatalf("open recovery-code cookie: %v", err)
+	}
+	payload := recoveryCodePagePayload{}
+	if err := json.Unmarshal(decoded, &payload); err != nil {
+		t.Fatalf("decode recovery-code cookie payload: %v", err)
+	}
+	code := strings.TrimSpace(payload.RecoveryCode)
+	if code == "" {
+		t.Fatal("expected a recovery code in the sealed cookie payload")
+	}
+	return code
 }
 
 func requireRecoveryCodeSurfacePanel(t *testing.T, document *html.Node, inline bool) *html.Node {
@@ -336,15 +399,22 @@ func requireRecoveryCodeSurfacePanel(t *testing.T, document *html.Node, inline b
 	return panel
 }
 
-func assertRenderedRecoveryCodeValue(t *testing.T, panel *html.Node) {
+func assertRenderedRecoveryCodeValue(t *testing.T, panel *html.Node, expectedCode string) {
 	t.Helper()
 
 	recoveryCode := htmlElementByID(panel, "recovery-code")
 	if recoveryCode == nil {
 		t.Fatal("expected rendered recovery code")
 	}
-	if normalizeHTMLText(htmlNodeText(recoveryCode)) == "" {
-		t.Fatal("expected non-empty recovery code text")
+	rendered := normalizeHTMLText(htmlNodeText(recoveryCode))
+	if err := services.ValidateRecoveryCodeFormat(rendered); err != nil {
+		t.Fatalf("expected rendered recovery code to match the %s-XXXX-XXXX-XXXX format, got %q", "OVUM", rendered)
+	}
+	if expectedCode == "" {
+		t.Fatal("assertRenderedRecoveryCodeValue requires an expected code to compare against")
+	}
+	if rendered != expectedCode {
+		t.Fatalf("expected rendered recovery code %q, got %q", expectedCode, rendered)
 	}
 }
 

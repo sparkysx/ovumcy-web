@@ -16,9 +16,38 @@ import (
 )
 
 const (
-	recoveryCodePrefix        = "OVUM"
-	passwordResetTokenPurpose = "password_reset"
+	recoveryCodePrefix = "OVUM"
+
+	// PasswordResetTokenPurposeRecovery marks a token minted by the email +
+	// recovery-code flow (ForgotPassword/StartRecovery). It is the only
+	// purpose ForgotPassword itself gates on the instance-wide local-sign-in
+	// toggle, so its redeem must be gated identically.
+	PasswordResetTokenPurposeRecovery = "password_reset_recovery"
+	// PasswordResetTokenPurposeForcedOIDC marks a token minted after an OIDC
+	// sign-in resolves to an account carrying MustChangePassword. An
+	// oidc_only instance legitimately mints and redeems these with local
+	// sign-in switched off.
+	PasswordResetTokenPurposeForcedOIDC = "password_reset_forced_oidc"
+	// PasswordResetTokenPurposeForcedLocal marks a token minted after a LOCAL
+	// password authenticates successfully against an account carrying
+	// MustChangePassword — the plain login route is LoginService.Authenticate's
+	// sole caller since WEB-77 removed the only other one, OIDC link-confirm's
+	// own password challenge. Unlike the OIDC purpose, this one must NOT
+	// survive the instance toggle being off: the factor that produced it is
+	// exactly the one the operator disabled.
+	PasswordResetTokenPurposeForcedLocal = "password_reset_forced_local"
 )
+
+// passwordResetTokenAllowedPurposes is the redeem-time allow-list: an
+// unrecognised or legacy Purpose (including the single pre-migration value
+// every reset token carried before this split) refuses here rather than
+// being reinterpreted as one of the three current values. BuildPasswordResetToken
+// mints only members of this set.
+var passwordResetTokenAllowedPurposes = map[string]bool{
+	PasswordResetTokenPurposeRecovery:    true,
+	PasswordResetTokenPurposeForcedOIDC:  true,
+	PasswordResetTokenPurposeForcedLocal: true,
+}
 
 var (
 	ErrPasswordResetTokenMissing              = errors.New("missing reset token")
@@ -27,16 +56,36 @@ var (
 	ErrPasswordResetTokenExpired              = errors.New("expired reset token")
 	ErrPasswordResetTokenInvalidUserID        = errors.New("invalid reset token user id")
 	ErrPasswordResetTokenInvalidPasswordState = errors.New("invalid reset token password state")
+	ErrPasswordResetTokenInvalidSessionEpoch  = errors.New("invalid reset token session epoch")
 )
 
 type PasswordResetClaims struct {
 	UserID        uint   `json:"uid"`
 	Purpose       string `json:"purpose"`
 	PasswordState string `json:"password_state"`
+	// SessionVersion is the account's auth_session_version when the grant was
+	// minted. Every credential or posture change — password change or reset,
+	// recovery-code regeneration, forced operator reset, TOTP enable/disable,
+	// session revocation — bumps that column in the same write, so a grant
+	// minted before any of them is refused at redeem
+	// (ResolveUserByResetToken). The password fingerprint alone does not see a
+	// recovery-code rotation: a grant proven with the old code would otherwise
+	// still rewrite the password after the owner had rotated it away.
+	SessionVersion int `json:"sv"`
 	jwt.RegisteredClaims
 }
 
-func BuildPasswordResetToken(secretKey []byte, userID uint, passwordHash string, ttl time.Duration, now time.Time) (string, error) {
+// BuildPasswordResetToken mints the reset token. storedHash is the account's
+// bcrypt hash as read from the row — never a raw password; the caller has one
+// only in the shape it already persists. sessionVersion is the same row's
+// auth_session_version (see PasswordResetClaims.SessionVersion). purpose must
+// be one of the three PasswordResetTokenPurpose* constants — it is what
+// ParsePasswordResetToken's redeem-time allow-list decides on, not any
+// out-of-band signal such as a cookie-carried bool.
+func BuildPasswordResetToken(secretKey []byte, userID uint, storedHash string, sessionVersion int, purpose string, ttl time.Duration, now time.Time) (string, error) {
+	if !passwordResetTokenAllowedPurposes[purpose] {
+		return "", ErrPasswordResetTokenInvalidPurpose
+	}
 	if ttl <= 0 {
 		ttl = 30 * time.Minute
 	}
@@ -44,15 +93,16 @@ func BuildPasswordResetToken(secretKey []byte, userID uint, passwordHash string,
 		now = time.Now()
 	}
 
-	passwordState := PasswordStateFingerprint(passwordHash)
+	passwordState := PasswordStateFingerprint(storedHash)
 	if passwordState == "" {
 		return "", ErrPasswordResetTokenInvalidPasswordState
 	}
 
 	claims := PasswordResetClaims{
-		UserID:        userID,
-		Purpose:       passwordResetTokenPurpose,
-		PasswordState: passwordState,
+		UserID:         userID,
+		Purpose:        purpose,
+		PasswordState:  passwordState,
+		SessionVersion: NormalizeAuthSessionVersion(sessionVersion),
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   strconv.FormatUint(uint64(userID), 10),
 			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
@@ -60,8 +110,9 @@ func BuildPasswordResetToken(secretKey []byte, userID uint, passwordHash string,
 		},
 	}
 
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString(secretKey)
+	// Signed under the password-reset key domain (its own HKDF-derived key,
+	// `aud` and `typ`), never under SECRET_KEY itself: see authTokenDomain.
+	return signPasswordResetClaims(secretKey, &claims)
 }
 
 func ParsePasswordResetToken(secretKey []byte, rawToken string, now time.Time) (*PasswordResetClaims, error) {
@@ -73,16 +124,7 @@ func ParsePasswordResetToken(secretKey []byte, rawToken string, now time.Time) (
 	}
 
 	claims := &PasswordResetClaims{}
-	parser := jwt.NewParser(
-		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
-		jwt.WithTimeFunc(func() time.Time { return now }),
-	)
-	token, err := parser.ParseWithClaims(rawToken, claims, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method")
-		}
-		return secretKey, nil
-	})
+	token, err := passwordResetTokenDomain.parse(secretKey, rawToken, claims, now)
 	if err != nil {
 		if errors.Is(err, jwt.ErrTokenExpired) {
 			return nil, ErrPasswordResetTokenExpired
@@ -92,7 +134,7 @@ func ParsePasswordResetToken(secretKey []byte, rawToken string, now time.Time) (
 	if !token.Valid {
 		return nil, ErrPasswordResetTokenInvalid
 	}
-	if claims.Purpose != passwordResetTokenPurpose {
+	if !passwordResetTokenAllowedPurposes[claims.Purpose] {
 		return nil, ErrPasswordResetTokenInvalidPurpose
 	}
 	if claims.ExpiresAt == nil || claims.ExpiresAt.Before(now) {
@@ -104,11 +146,63 @@ func ParsePasswordResetToken(secretKey []byte, rawToken string, now time.Time) (
 	if strings.TrimSpace(claims.PasswordState) == "" {
 		return nil, ErrPasswordResetTokenInvalidPasswordState
 	}
+	// A grant with no epoch is refused, never normalized to 1: that would bind
+	// it to every account still at version 1.
+	if claims.SessionVersion < 1 {
+		return nil, ErrPasswordResetTokenInvalidSessionEpoch
+	}
 	return claims, nil
 }
 
-func PasswordStateFingerprint(passwordHash string) string {
-	normalizedHash := strings.TrimSpace(passwordHash)
+// PasswordResetTokenRefusedByLocalAuthGate reports whether the
+// instance-wide local-sign-in toggle (localPublicAuthEnabled) is the correct
+// reason to refuse rawToken right now. It answers true only when the token
+// parses successfully — valid signature, not expired — and its SIGNED
+// purpose is recovery or forced-from-LOCAL: the two purposes produced by (or
+// gated identically to) a local password, which is exactly the factor the
+// operator disabled. A forced-from-OIDC token answers false: an oidc_only
+// instance legitimately mints and must keep redeeming those with local
+// sign-in switched off.
+//
+// A token that fails to parse for ANY reason — expired, malformed, wrong
+// signature, or an unrecognised/legacy purpose — also answers false. That is
+// deliberate: such a token is invalid on its own terms, and the caller must
+// let the ordinary invalid-token path (ResolveUserByResetToken/CompleteReset,
+// or IsResetPasswordTokenValid on the page) say so. Collapsing every parse
+// failure into "the instance toggle refused this" mislabels routine expiry —
+// the default outcome of every forced-from-OIDC reset a user takes longer
+// than the 30-minute TTL to complete — as an operator-configuration refusal,
+// and floods the security log with a local-recovery-disabled entry that
+// never happened. The actual security property does not depend on which of
+// the two refusal paths answers: a token that fails to parse here still
+// fails to parse in CompleteReset, so redemption is refused either way — only
+// the message and the logged reason change.
+func PasswordResetTokenRefusedByLocalAuthGate(secretKey []byte, rawToken string, now time.Time) bool {
+	claims, err := ParsePasswordResetToken(secretKey, rawToken, now)
+	if err != nil {
+		return false
+	}
+	return claims.Purpose != PasswordResetTokenPurposeForcedOIDC
+}
+
+// PasswordStateFingerprint reduces an account's ALREADY-HASHED credential to a
+// short change-detection value carried inside a reset token.
+//
+// storedHash is the bcrypt hash read from `users.password_hash`. A raw password
+// never reaches this function and must never be passed to it: the only callers
+// read the column, and the raw secret a request carries is spent exclusively on
+// `bcrypt.CompareHashAndPassword`. The SHA-256 below is therefore **not**
+// password hashing and must not be read as such — it fingerprints a value that
+// is already a slow, salted hash, so that a token dies the moment the
+// credential behind it changes. `ResolveUserByResetToken` recomputes this over
+// the current row and refuses a token whose fingerprint no longer matches,
+// which is what makes a reset token effectively one-time.
+//
+// A password KDF would be the wrong primitive here and buy nothing: the input
+// is not low-entropy, it is not a secret an attacker can test candidates
+// against, and the comparison must be cheap enough to run on every redeem.
+func PasswordStateFingerprint(storedHash string) string {
+	normalizedHash := strings.TrimSpace(storedHash)
 	if normalizedHash == "" {
 		return ""
 	}
@@ -117,8 +211,11 @@ func PasswordStateFingerprint(passwordHash string) string {
 	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
-func IsPasswordStateFingerprintMatch(expected string, passwordHash string) bool {
-	actual := PasswordStateFingerprint(passwordHash)
+// IsPasswordStateFingerprintMatch compares a token's carried fingerprint with
+// one recomputed over storedHash — again the bcrypt hash from the row, never a
+// raw password. See PasswordStateFingerprint.
+func IsPasswordStateFingerprintMatch(expected string, storedHash string) bool {
+	actual := PasswordStateFingerprint(storedHash)
 	if strings.TrimSpace(expected) == "" || strings.TrimSpace(actual) == "" {
 		return false
 	}

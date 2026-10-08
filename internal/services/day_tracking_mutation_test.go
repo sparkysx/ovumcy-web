@@ -20,6 +20,22 @@ func TestIsValidDayBBTAcceptsUpperBoundCelsius(t *testing.T) {
 	}
 }
 
+// TestIsValidDayBBTRejectsOutsideThePhysiologicalRange is the rejecting half of
+// the range check. Both endpoints were accepted by their own anchors and the
+// only refusal anywhere was an above-maximum stored value, so removing
+// `*value >= MinDayBBTCelsius` left every BBT test green: nothing submitted a
+// reading below the range, which is what a Fahrenheit value entered on a
+// Celsius form looks like.
+func TestIsValidDayBBTRejectsOutsideThePhysiologicalRange(t *testing.T) {
+	t.Parallel()
+
+	for _, value := range []float64{MinDayBBTCelsius - 0.1, 20.0, MaxDayBBTCelsius + 0.1, 200.0} {
+		if IsValidDayBBT(bbtPtr(value)) {
+			t.Fatalf("expected IsValidDayBBT(%.2f) = false outside [%.2f, %.2f], got true", value, MinDayBBTCelsius, MaxDayBBTCelsius)
+		}
+	}
+}
+
 func TestIsValidDayBBTNilIsUnmeasured(t *testing.T) {
 	t.Parallel()
 
@@ -38,20 +54,25 @@ func TestFormatDayBBTForInputReturnsEmptyForUnsetValue(t *testing.T) {
 	}
 }
 
-func TestParseDayBBTRawWithUnitNormalizesNonPositiveToNil(t *testing.T) {
+// TestFormatDayBBTForInputRendersALegacyZeroAsNotMeasured pins the floor that
+// normalizeStoredDayBBT's `*value <= 0` guard is: migration 024 rewrote every
+// stored 0 to NULL and no writer can produce another one, so nothing in a
+// current database reaches it — and a row that arrives from outside those
+// writers, out of a backup taken before 024 or a database edited by hand, still
+// has to render as an empty field rather than as a measurement of zero. The
+// CONDITIONALS_BOUNDARY mutant (`*value < 0`) lets the 0 through and prints
+// "0.00" °C — or "32.00" °F — into the input the owner is about to save back.
+//
+// It used to be written against ParseDayBBTRawWithUnit, which no longer reaches
+// this guard: the parse path reads the sentinel one call earlier, in the
+// owner's unit (ConvertDayBBTToStorage), and that boundary is covered by
+// TestConvertDayBBTToStorageJudgesTheSentinelInTheInputUnit.
+func TestFormatDayBBTForInputRendersALegacyZeroAsNotMeasured(t *testing.T) {
 	t.Parallel()
 
-	// A non-positive parsed value (including "-0" and "0") is not a physiological
-	// reading; normalizeStoredDayBBT's `*value <= 0` guard must collapse it to nil
-	// (not measured). The CONDITIONALS_BOUNDARY mutant (`*value < 0`) would let a
-	// parsed 0 through as a pointer to 0.0 instead of nil.
-	for _, raw := range []string{"-0", "0"} {
-		got, err := ParseDayBBTRawWithUnit(raw, TemperatureUnitCelsius)
-		if err != nil {
-			t.Fatalf("ParseDayBBTRawWithUnit(%q): unexpected error %v", raw, err)
-		}
-		if got != nil {
-			t.Fatalf("expected nil (not measured) for %q, got %v", raw, *got)
+	for _, unit := range []string{TemperatureUnitCelsius, TemperatureUnitFahrenheit} {
+		if got := FormatDayBBTForInput(bbtPtr(0), unit); got != "" {
+			t.Fatalf("a legacy stored 0 in %s must render as an empty field (not measured), got %q", TemperatureUnitSymbol(unit), got)
 		}
 	}
 }

@@ -1,14 +1,60 @@
 package api
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/gofiber/fiber/v3"
 )
+
+// TestFlashCookieWriteFailureIsReported drives the one path the flash carrier
+// used to lose: the sealed write fails, the handler redirects anyway, and the
+// user lands on a page with no explanation of the error that sent them there.
+// Nothing propagated and nothing was logged, so an operator had no way to
+// learn that the error carrier itself had stopped working — every redirecting
+// auth and settings error path assumes its flash was persisted.
+//
+// The codec is broken the way the composition root could break it (no secret),
+// which is the failure class the discarded error stood for.
+func TestFlashCookieWriteFailureIsReported(t *testing.T) {
+	originalWriter := log.Writer()
+	defer log.SetOutput(originalWriter)
+
+	handler := &Handler{}
+	app := fiber.New()
+	app.Get("/probe", func(c fiber.Ctx) error {
+		handler.setFlashCookie(c, FlashPayload{AuthError: "auth.invalid_credentials"})
+		return c.SendStatus(fiber.StatusOK)
+	})
+
+	var output bytes.Buffer
+	log.SetOutput(&output)
+
+	response := mustAppResponse(t, app, httptest.NewRequest(http.MethodGet, "/probe", nil))
+	assertStatusCode(t, response, http.StatusOK)
+
+	// The anchor: the write really did fail, so the assertion below is about a
+	// lost error rather than about a cookie that was written fine.
+	if cookie := responseCookie(response.Cookies(), flashCookieName); cookie != nil && strings.TrimSpace(cookie.Value) != "" {
+		t.Fatalf("expected no flash cookie from a handler with no secret, got %q", cookie.Value)
+	}
+
+	logged := output.String()
+	if !strings.Contains(logged, "flash cookie") {
+		t.Fatalf("the flash write failed and nothing said so; the redirect that follows would carry no explanation. Log was:\n%s", logged)
+	}
+	if strings.Contains(logged, "auth.invalid_credentials") {
+		t.Fatalf("the diagnostic must name the failure, never the payload it was carrying; got:\n%s", logged)
+	}
+}
 
 func TestFlashCookieUsesSealedTransport(t *testing.T) {
 	app, database := newOnboardingTestApp(t)
@@ -31,12 +77,230 @@ func TestFlashCookieUsesSealedTransport(t *testing.T) {
 		t.Fatalf("did not expect flash cookie to expose email in plaintext: %q", flashCookie.Value)
 	}
 
-	decoded, err := base64.RawURLEncoding.DecodeString(flashCookie.Value)
-	if err == nil {
-		payload := FlashPayload{}
-		if json.Unmarshal(decoded, &payload) == nil {
-			t.Fatalf("expected flash cookie to be sealed; got plaintext payload: %#v", payload)
-		}
+	assertSealedCookieEnvelope(t, flashCookie.Value, &FlashPayload{})
+}
+
+// TestHeadDoesNotPopTheFlashCookie pins the property popFlashCookie's HEAD
+// guard exists for: registerHEADTwins runs ShowLoginPage's full chain on HEAD
+// before any owner GET arrives, and the flash cookie is single-use, so an
+// uptime monitor's or a link preview's HEAD must not be the request that
+// spends it — the HEAD response discards its body on the wire regardless, so
+// nothing would ever have been shown for that read.
+func TestHeadDoesNotPopTheFlashCookie(t *testing.T) {
+	app, _ := newOnboardingTestApp(t)
+
+	serialized, err := json.Marshal(FlashPayload{AuthError: "invalid credentials", ExpiresAt: time.Now().Add(flashCookieTTL)})
+	if err != nil {
+		t.Fatalf("marshal flash payload: %v", err)
+	}
+	sealed := sealCookieForTestApp(t, flashCookieName, serialized)
+
+	headRequest := httptest.NewRequest(http.MethodHead, "/login", nil)
+	headRequest.Header.Set("Accept-Language", "en")
+	headRequest.Header.Set("Cookie", flashCookieName+"="+sealed)
+	headResponse := mustAppResponse(t, app, headRequest)
+	if headResponse.StatusCode != http.StatusOK {
+		t.Fatalf("expected HEAD /login to answer like its GET, got %d", headResponse.StatusCode)
+	}
+	if retracted := responseCookie(headResponse.Cookies(), flashCookieName); retracted != nil {
+		t.Fatalf("expected a HEAD request to leave the flash cookie untouched, got Set-Cookie %#v", retracted)
+	}
+
+	// The anchor: the owner's own GET, presented with the very same sealed
+	// value the HEAD above left alone, still renders the flash it carries.
+	getResponse := loginPageWithFlashCookie(t, app, sealed)
+	body := mustReadBodyString(t, getResponse.Body)
+	if htmlAuthErrorByKey(mustParseHTMLDocument(t, body), "auth.error.invalid_credentials") == nil {
+		t.Fatal("expected the owner's own GET, after a HEAD on the same cookie, to still render the flash")
+	}
+}
+
+// TestFlashPayloadWithoutALiveBoundIsIgnored pins the flash's server-side
+// bound: a sealed value under the app's own key still renders nothing once its
+// ExpiresAt has passed, or when it carries none (a value minted before the
+// bound existed). The live payload is the positive anchor proving the page has
+// a rendering path to lose; each refused value is also retracted.
+func TestFlashPayloadWithoutALiveBoundIsIgnored(t *testing.T) {
+	app, _ := newOnboardingTestApp(t)
+
+	cases := []struct {
+		name      string
+		expiresAt time.Time
+		honoured  bool
+	}{
+		{name: "live_bound", expiresAt: time.Now().Add(flashCookieTTL), honoured: true},
+		{name: "past_bound", expiresAt: time.Now().Add(-time.Minute)},
+		{name: "no_bound"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			serialized, err := json.Marshal(FlashPayload{
+				AuthError:   "invalid credentials",
+				ForgotEmail: "kept-flash@example.com",
+				ExpiresAt:   tc.expiresAt,
+			})
+			if err != nil {
+				t.Fatalf("marshal flash payload: %v", err)
+			}
+			response := loginPageWithFlashCookie(t, app, sealCookieForTestApp(t, flashCookieName, serialized))
+			body := mustReadBodyString(t, response.Body)
+			rendered := htmlAuthErrorByKey(mustParseHTMLDocument(t, body), "auth.error.invalid_credentials") != nil
+			if rendered != tc.honoured {
+				t.Fatalf("expected flash honoured=%v, got rendered=%v", tc.honoured, rendered)
+			}
+			cleared := responseCookie(response.Cookies(), flashCookieName)
+			if cleared == nil || cleared.Value != "" {
+				t.Fatalf("expected the read flash cookie to be retracted, got %#v", cleared)
+			}
+		})
+	}
+}
+
+// TestLogoutRetractsThePendingFlash pins that a flash still riding when the
+// owner signs out (a settings message, a ForgotEmail prefill) ends with the
+// session instead of surfacing on the next visitor's login page.
+func TestLogoutRetractsThePendingFlash(t *testing.T) {
+	app, authCookie, csrfCookie, csrfToken := prepareAuthenticatedLogoutCSRFContext(t)
+
+	serialized, err := json.Marshal(FlashPayload{SettingsSuccess: "settings.success.saved", ExpiresAt: time.Now().Add(flashCookieTTL)})
+	if err != nil {
+		t.Fatalf("marshal flash payload: %v", err)
+	}
+	form := url.Values{"csrf_token": {csrfToken}}
+	request := httptest.NewRequest(http.MethodDelete, "/api/v1/sessions/current", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Cookie", joinCookieHeader(
+		authCookie,
+		cookiePair(csrfCookie),
+		flashCookieName+"="+sealCookieForTestApp(t, flashCookieName, serialized),
+	))
+
+	response := mustAppResponse(t, app, request)
+	assertStatusCode(t, response, http.StatusSeeOther)
+
+	cleared := responseCookie(response.Cookies(), flashCookieName)
+	if cleared == nil {
+		t.Fatalf("expected logout to retract %s", flashCookieName)
+	}
+	if strings.TrimSpace(cleared.Value) != "" || !cleared.Expires.Before(time.Now()) {
+		t.Fatalf("expected %s retracted with an empty value and a past expiry, got %#v", flashCookieName, cleared)
+	}
+}
+
+// TestLogoutRetractsTheExemptFlash pins clearSessionEndCookies' other half
+// (WEB-40): a message a token-less writer sealed into the exempt channel
+// before the session it named ever ends belongs to that ended session exactly
+// as much as a page-slot flash does, so logout must retract it too.
+func TestLogoutRetractsTheExemptFlash(t *testing.T) {
+	app, authCookie, csrfCookie, csrfToken := prepareAuthenticatedLogoutCSRFContext(t)
+
+	serialized, err := json.Marshal(FlashPayload{AuthError: "auth.invalid_credentials", ExpiresAt: time.Now().Add(flashCookieTTL)})
+	if err != nil {
+		t.Fatalf("marshal exempt flash payload: %v", err)
+	}
+	form := url.Values{"csrf_token": {csrfToken}}
+	request := httptest.NewRequest(http.MethodDelete, "/api/v1/sessions/current", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Cookie", joinCookieHeader(
+		authCookie,
+		cookiePair(csrfCookie),
+		exemptFlashCookieName+"="+sealCookieForTestApp(t, exemptFlashCookieName, serialized),
+	))
+
+	response := mustAppResponse(t, app, request)
+	assertStatusCode(t, response, http.StatusSeeOther)
+
+	cleared := responseCookie(response.Cookies(), exemptFlashCookieName)
+	if cleared == nil {
+		t.Fatalf("expected logout to retract %s", exemptFlashCookieName)
+	}
+	if strings.TrimSpace(cleared.Value) != "" || !cleared.Expires.Before(time.Now()) {
+		t.Fatalf("expected %s retracted with an empty value and a past expiry, got %#v", exemptFlashCookieName, cleared)
+	}
+}
+
+// TestSealedEnvelopeAroundPlaintextFlashPayloadIsRefused pins the half of the
+// "sealed cookies" invariant that a shape check on the response cannot reach: a
+// value wearing the v2 envelope over base64url(plaintext JSON) is not a sealed
+// cookie, and the login page must refuse it. The same payload bytes are
+// presented twice — once sealed under the app's own key, once merely encoded —
+// so the seal is the only difference between the two requests, and the sealed
+// one is the positive anchor proving the page has a rendering path to lose.
+func TestSealedEnvelopeAroundPlaintextFlashPayloadIsRefused(t *testing.T) {
+	app, _ := newOnboardingTestApp(t)
+
+	serialized, err := json.Marshal(FlashPayload{
+		AuthError:   "invalid credentials",
+		ForgotEmail: "forged-flash@example.com",
+		ExpiresAt:   time.Now().Add(flashCookieTTL),
+	})
+	if err != nil {
+		t.Fatalf("marshal flash payload: %v", err)
+	}
+
+	// Positive anchor: sealed, the very same payload renders its error.
+	sealedResponse := loginPageWithFlashCookie(t, app, sealCookieForTestApp(t, flashCookieName, serialized))
+	sealedBody := mustReadBodyString(t, sealedResponse.Body)
+	if htmlAuthErrorByKey(mustParseHTMLDocument(t, sealedBody), "auth.error.invalid_credentials") == nil {
+		t.Fatal("expected a sealed flash payload to surface its auth error via data-error-key")
+	}
+
+	// The forgery: same bytes, same envelope, no seal.
+	forged := secureCookieVersion + "." + base64.RawURLEncoding.EncodeToString(serialized)
+	forgedResponse := loginPageWithFlashCookie(t, app, forged)
+	forgedBody := mustReadBodyString(t, forgedResponse.Body)
+	if htmlAuthErrorByKey(mustParseHTMLDocument(t, forgedBody), "auth.error.invalid_credentials") != nil {
+		t.Fatal("a plaintext flash payload behind the version envelope must not be honored")
+	}
+	assertBodyNotContainsAll(t, forgedBody,
+		bodyStringMatch{fragment: "forged-flash@example.com", message: "did not expect a forged flash email to reach the page"},
+	)
+
+	cleared := responseCookie(forgedResponse.Cookies(), flashCookieName)
+	if cleared == nil || cleared.Value != "" {
+		t.Fatalf("expected the refused flash cookie to be cleared, got %#v", cleared)
+	}
+}
+
+func loginPageWithFlashCookie(t *testing.T, app *fiber.App, flashValue string) *http.Response {
+	t.Helper()
+
+	request := httptest.NewRequest(http.MethodGet, "/login", nil)
+	request.Header.Set("Accept-Language", "en")
+	request.Header.Set("Cookie", flashCookieName+"="+flashValue)
+
+	response := mustAppResponse(t, app, request)
+	assertStatusCode(t, response, http.StatusOK)
+	return response
+}
+
+// assertSealedCookieEnvelope is the shared sealing assertion for cookie values
+// carried in the "<version>.<base64url payload>" envelope that
+// secureCookieCodec.seal writes. It decodes the payload only: decoding the whole
+// value fails unconditionally on the "." separator, which is what left the
+// earlier form of this check — a plaintext test nested under `if err == nil` —
+// permanently unexecuted. plaintextTarget is a pointer to the struct the cookie
+// would carry in the clear; a payload that parses into it is not ciphertext.
+func assertSealedCookieEnvelope(t *testing.T, rawValue string, plaintextTarget any) {
+	t.Helper()
+
+	version, encodedPayload, found := strings.Cut(strings.TrimSpace(rawValue), ".")
+	if !found {
+		t.Fatalf("expected a %q version envelope in cookie value, got %q", secureCookieVersion+".", rawValue)
+	}
+	if version != secureCookieVersion {
+		t.Fatalf("expected cookie envelope version %q, got %q", secureCookieVersion, version)
+	}
+
+	payload, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(encodedPayload))
+	if err != nil {
+		t.Fatalf("expected a base64url sealed payload, got %q: %v", encodedPayload, err)
+	}
+	if len(payload) == 0 {
+		t.Fatal("expected a non-empty sealed payload")
+	}
+	if json.Unmarshal(payload, plaintextTarget) == nil {
+		t.Fatalf("expected the cookie payload to be sealed ciphertext; it parsed as plaintext %T: %#v", plaintextTarget, plaintextTarget)
 	}
 }
 

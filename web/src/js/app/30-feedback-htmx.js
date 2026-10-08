@@ -1,3 +1,42 @@
+  // The status island is not always the swap target. A settings section that
+  // replaces itself (hx-swap="outerHTML" onto the card) targets the card, and the
+  // island lives inside it — so every handler below resolves the container rather
+  // than testing the target's own class. Before this, a card-level swap silently
+  // skipped the toast, the auto-clear AND the error rendering: the request
+  // succeeded or failed and the page said nothing either way.
+  function statusContainerFor(target) {
+    if (!target || !target.classList) {
+      return null;
+    }
+    if (target.classList.contains("save-status")) {
+      return target;
+    }
+    // Otherwise the island belongs to the nearest element that DECLARES itself
+    // its host — the element itself when it is one, else the closest such
+    // ancestor. Both directions are needed: a card that replaces itself is the
+    // swap target on success, while an error carries whichever element htmx
+    // resolved for the request, which can be inside the card. Walking ancestors
+    // rather than searching the document is what keeps a webhook error out of
+    // the symptoms card: the settings page carries several islands and a bare
+    // descendant search would return whichever came first.
+    //
+    // The host attribute is deliberately not data-success-toast. That one is an
+    // opt-in to a toast, declared on the island itself; a card borrowing it to
+    // be findable made one name mean two things, and the borrowed meaning was
+    // the silent one — the card declared "toast me" and no toast could fire,
+    // because the resolved island did not carry the attribute the toast reads.
+    var surface =
+      target.hasAttribute && target.hasAttribute("data-status-island-host")
+        ? target
+        : target.closest
+          ? target.closest("[data-status-island-host]")
+          : null;
+    if (!surface || !surface.querySelector) {
+      return null;
+    }
+    return surface.querySelector(".save-status");
+  }
+
   function renderErrorStatus(target, text) {
     target.textContent = "";
     var block = document.createElement("div");
@@ -177,6 +216,13 @@
       successStatusClearTimers.delete(successNode);
     }
 
+    // A status the server declares persistent carries safety guidance — the
+    // prediction pause with its red-flag line — and stays until the owner
+    // dismisses it. The server states the kind; nothing here reads the copy.
+    if (successNode.getAttribute("data-status-kind") === "persistent") {
+      return;
+    }
+
     var timer = window.setTimeout(function () {
       if (!target.contains(successNode)) {
         successStatusClearTimers.delete(successNode);
@@ -196,6 +242,59 @@
     successStatusClearTimers.set(successNode, timer);
   }
 
+  // Take down the success status a region holds, with its pending clear: a later
+  // save whose answer says nothing new must not leave an earlier answer standing.
+  // A failure notice in the same region is not a success status and stays.
+  function withdrawSuccessStatus(target) {
+    var successNode = target && target.querySelector ? target.querySelector(".status-ok") : null;
+    var timer;
+    while (successNode) {
+      timer = successStatusClearTimers.get(successNode);
+      if (timer) {
+        window.clearTimeout(timer);
+        successStatusClearTimers.delete(successNode);
+      }
+      successNode.remove();
+      successNode = target.querySelector(".status-ok");
+    }
+    clearStatusTargetIfEmpty(target);
+  }
+
+  // The message each island last raised, remembered by the island's id. The node
+  // is not stable: a card that replaces itself brings a NEW island element on
+  // every swap, so a key stored on the element resets exactly when the repeat it
+  // exists to suppress arrives. An island with no id keeps the per-node key,
+  // which is all that can be said about an element nothing can address twice.
+  //
+  // The registry hangs off window rather than off this closure so that it is one
+  // registry per page, not one per evaluation of this bundle.
+  function lastToastRegistry() {
+    if (!window.__ovumcyLastToastByIsland) {
+      window.__ovumcyLastToastByIsland = {};
+    }
+    return window.__ovumcyLastToastByIsland;
+  }
+
+  function lastToastFor(island) {
+    return island.id ? lastToastRegistry()[island.id] : island.dataset.toastShown;
+  }
+
+  function rememberToastFor(island, identity) {
+    if (island.id) {
+      lastToastRegistry()[island.id] = identity;
+      return;
+    }
+    island.dataset.toastShown = identity;
+  }
+
+  // What the repeat is judged by. The flash key names the message the server
+  // chose and survives everything done to the rendered node afterwards — the
+  // dismiss button appended below is already enough to change the node's text,
+  // so text alone identifies a message only until something decorates it.
+  function toastIdentity(successNode, message) {
+    return successNode.getAttribute("data-flash-key") || message;
+  }
+
   function maybeShowSuccessToast(target) {
     var successNode;
     var message;
@@ -209,11 +308,11 @@
     }
 
     message = String(successNode.textContent || "").trim();
-    if (!message || target.dataset.toastShown === message) {
+    if (!message || lastToastFor(target) === toastIdentity(successNode, message)) {
       return;
     }
 
-    target.dataset.toastShown = message;
+    rememberToastFor(target, toastIdentity(successNode, message));
     window.showToast(message, "ok");
   }
 
@@ -250,6 +349,126 @@
     }
   }
 
+  // Parses a server error response into the message the client may show. The
+  // fragment is parsed with DOMParser and only its TEXT is adopted: server
+  // templates already escape user-supplied values, so today this is purely
+  // defense-in-depth — any future regression that lets unescaped HTML into an
+  // error response would otherwise become an instant DOM-XSS through
+  // `target.innerHTML = responseText`.
+  function parseServerStatusError(responseText) {
+    if (!responseText || responseText.indexOf("status-error") === -1) {
+      return null;
+    }
+
+    var doc = new DOMParser().parseFromString(responseText, "text/html");
+    var fragment = doc.querySelector(".status-error");
+    return {
+      text: fragment ? fragment.textContent : responseText,
+      key: fragment ? fragment.getAttribute("data-flash-key") || "" : ""
+    };
+  }
+
+  // A day entry lives only in the form the owner typed it into: no draft is
+  // written to storage, no offline cache, no service worker. That live form is
+  // the whole recovery mechanism, so a save that does not land must leave every
+  // field untouched and hand back a control that resubmits the same node.
+  //
+  // A self-hosted instance is regularly unreachable — the owner is off the home
+  // network — so a failed save is a transport event, not a finding about the
+  // owner's body. It is rendered on the neutral status-notice surface rather
+  // than the red status-error one, inside the existing aria-live="polite"
+  // container, and never as a success.
+  //
+  // Both day forms answer to it: the calendar editor, which saves on an
+  // explicit press, and the dashboard journal, which saves itself. Two failure
+  // surfaces for one kind of event would drift apart, so the selector below is
+  // the single membership test — widened rather than duplicated.
+  var DAY_SAVE_FORM_SELECTOR = "[data-day-editor-form], [data-dashboard-save-form]";
+
+  function dayEditorFormFromEvent(event) {
+    var form = getSaveFeedbackFormFromEvent(event);
+    if (!form || !form.matches || !form.matches(DAY_SAVE_FORM_SELECTOR)) {
+      return null;
+    }
+    return form;
+  }
+
+  function renderDaySaveFailure(form, message, origin, messageKey) {
+    var target = form && form.querySelector ? form.querySelector(".save-status") : null;
+    if (!target || !message) {
+      return false;
+    }
+
+    var notice = document.createElement("div");
+    notice.className = "status-notice";
+    notice.setAttribute("data-day-save-failed", origin);
+
+    var text = document.createElement("span");
+    text.className = "status-notice-message";
+    text.textContent = message;
+    if (messageKey) {
+      text.setAttribute("data-notice-key", messageKey);
+    }
+    notice.appendChild(text);
+
+    var retry = document.createElement("button");
+    // Explicitly type="button": the status container sits inside the form, and
+    // a default submit button here would fire a second save on every click that
+    // reaches it.
+    retry.type = "button";
+    retry.className = "status-notice-action";
+    retry.setAttribute("data-day-save-retry", "true");
+    retry.textContent = form.getAttribute("data-day-save-retry-label") || "Try again";
+    notice.appendChild(retry);
+
+    target.replaceChildren(notice);
+    return true;
+  }
+
+  function renderDaySaveUnreachable(form) {
+    return renderDaySaveFailure(
+      form,
+      form.getAttribute("data-day-save-failed-text") || "Couldn't save. Your entry is still here.",
+      "unreachable",
+      ""
+    );
+  }
+
+  function handleDaySaveTransportFailure(event) {
+    var form = dayEditorFormFromEvent(event);
+    if (!form) {
+      return;
+    }
+    renderDaySaveUnreachable(form);
+    // htmx fires afterRequest before sendError, so the button is already back;
+    // re-assert it anyway, because a save button left disabled would take the
+    // retry with it.
+    setSaveButtonState(form, false);
+  }
+
+  function retryDaySave(form) {
+    // Resubmit the very same form node. Nothing was copied anywhere, so the
+    // retry carries exactly what is on screen.
+    //
+    // The dashboard journal has no submit button to fall back on: its saves go
+    // through the autosave runner, so the retry re-enters that runner instead
+    // of asking htmx for a second mechanism on the same form.
+    if (form.matches && form.matches("[data-dashboard-save-form]") && typeof window.__ovumcyRetryDashboardAutosave === "function") {
+      window.__ovumcyRetryDashboardAutosave(form);
+      return;
+    }
+
+    if (typeof form.requestSubmit === "function") {
+      form.requestSubmit();
+      return;
+    }
+
+    var saveButton = form.querySelector("[data-save-button]");
+    if (saveButton) {
+      saveButton.click();
+    }
+  }
+
   function initHTMXHooks() {
     document.body.addEventListener("htmx:configRequest", function (event) {
       var tokenMeta = document.querySelector('meta[name="csrf-token"]');
@@ -282,9 +501,9 @@
     });
 
     document.body.addEventListener("htmx:beforeRequest", function (event) {
-      var target = event && event.detail ? event.detail.target : null;
-      if (target && target.classList && target.classList.contains("save-status")) {
-        delete target.dataset.toastShown;
+      var statusTarget = statusContainerFor(event && event.detail ? event.detail.target : null);
+      if (statusTarget) {
+        delete statusTarget.dataset.toastShown;
       }
       setSaveButtonState(getSaveFeedbackFormFromEvent(event), true);
     });
@@ -295,13 +514,13 @@
       setSaveButtonState(form, false);
       showResponseNotice(xhr);
       if (form && form.matches && form.matches("[data-dashboard-save-form]") && typeof window.__ovumcyFinalizeDashboardManualSave === "function") {
-        window.__ovumcyFinalizeDashboardManualSave(form, !!(event && event.detail && event.detail.successful));
+        window.__ovumcyFinalizeDashboardManualSave(form);
       }
     });
 
     document.body.addEventListener("htmx:afterSwap", function (event) {
-      var target = event && event.detail ? event.detail.target : null;
-      if (!target || !target.classList || !target.classList.contains("save-status")) {
+      var target = statusContainerFor(event && event.detail ? event.detail.target : null);
+      if (!target) {
         return;
       }
 
@@ -316,8 +535,8 @@
     });
 
     document.body.addEventListener("htmx:afterSettle", function (event) {
-      var target = event && event.detail ? event.detail.target : null;
-      if (!target || !target.classList || !target.classList.contains("save-status")) {
+      var target = statusContainerFor(event && event.detail ? event.detail.target : null);
+      if (!target) {
         return;
       }
       scheduleClearSuccessStatus(target);
@@ -339,31 +558,64 @@
       clearStatusTargetIfEmpty(parent);
     });
 
+    document.body.addEventListener("htmx:sendError", handleDaySaveTransportFailure);
+    document.body.addEventListener("htmx:sendAbort", handleDaySaveTransportFailure);
+    document.body.addEventListener("htmx:timeout", handleDaySaveTransportFailure);
+
+    document.body.addEventListener("click", function (event) {
+      var retryButton = closestFromEvent(event, "[data-day-save-retry]");
+      if (!retryButton) {
+        return;
+      }
+
+      var form = retryButton.closest("form[data-day-editor-form], form[data-dashboard-save-form]");
+      if (!form) {
+        return;
+      }
+
+      event.preventDefault();
+      retryDaySave(form);
+    });
+
     document.body.addEventListener("htmx:responseError", function (event) {
       var target = event && event.detail ? event.detail.target : null;
       var form = getSaveFeedbackFormFromEvent(event);
-      if (!target || !target.classList || !target.classList.contains("save-status")) {
+      var dayForm = dayEditorFormFromEvent(event);
+
+      if (dayForm) {
+        // The server answered, but not with a save. Keep its own message when
+        // it sent one — it is more specific than any generic copy — and fall
+        // back to the neutral "could not save" line otherwise. Either way the
+        // owner gets the retry, and the typed entry is left alone.
+        var dayXHR = event.detail ? event.detail.xhr : null;
+        var serverError = parseServerStatusError(
+          dayXHR && typeof dayXHR.responseText === "string" ? dayXHR.responseText : ""
+        );
+        var serverMessage = serverError ? String(serverError.text || "").trim() : "";
+        var rendered = serverMessage
+          ? renderDaySaveFailure(dayForm, serverMessage, "rejected", serverError.key)
+          : renderDaySaveUnreachable(dayForm);
+        if (rendered) {
+          return;
+        }
+      }
+      target = statusContainerFor(target);
+      if (!target) {
         if (form && form.matches && form.matches("[data-dashboard-save-form]") && typeof window.__ovumcyFinalizeDashboardManualSave === "function") {
-          window.__ovumcyFinalizeDashboardManualSave(form, false);
+          window.__ovumcyFinalizeDashboardManualSave(form);
         }
         return;
       }
 
       var xhr = event.detail.xhr;
       var responseText = xhr && typeof xhr.responseText === "string" ? xhr.responseText : "";
-      if (responseText && responseText.indexOf("status-error") !== -1) {
-        // Safe-by-construction swap: parse the server's status-error
-        // fragment, but only adopt its text content. Server templates
-        // already escape user-supplied values, so today this is purely
-        // defense-in-depth — any future regression that lets unescaped
-        // HTML into an error response would otherwise become an instant
-        // DOM-XSS through `target.innerHTML = responseText`.
-        var doc = new DOMParser().parseFromString(responseText, "text/html");
-        var fragment = doc.querySelector(".status-error");
-        var messageText = fragment ? fragment.textContent : responseText;
+      var parsedError = parseServerStatusError(responseText);
+      if (parsedError) {
+        // Safe-by-construction swap: only the parsed fragment's text is
+        // adopted (see parseServerStatusError).
         var safeContainer = document.createElement("div");
         safeContainer.className = "status-error";
-        safeContainer.textContent = messageText;
+        safeContainer.textContent = parsedError.text;
         target.replaceChildren(safeContainer);
         return;
       }
@@ -371,7 +623,7 @@
       var fallback = document.body.getAttribute("data-request-failed") || "Request failed. Please try again.";
       renderErrorStatus(target, fallback);
       if (form && form.matches && form.matches("[data-dashboard-save-form]") && typeof window.__ovumcyFinalizeDashboardManualSave === "function") {
-        window.__ovumcyFinalizeDashboardManualSave(form, false);
+        window.__ovumcyFinalizeDashboardManualSave(form);
       }
     });
   }

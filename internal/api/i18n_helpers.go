@@ -4,16 +4,35 @@ import (
 	"strings"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/ovumcy/ovumcy-web/internal/services"
 )
 
-func translateMessage(messages map[string]string, key string) string {
-	if key == "" {
-		return ""
+// lookupMessage answers the catalogue entry for key together with whether the
+// catalogue had one. A caller that carries its own fallback reads the second
+// value: translateMessage signals a miss by returning the key itself, which is
+// a value indistinguishable from a legitimate translation, so re-deriving the
+// miss by comparing the result to the key restates the convention at every
+// call site — and half of those restatements spell the key a second time, where
+// renaming it in the catalogue disables the fallback silently instead of
+// breaking the build. A blank entry counts as a miss: a catalogue that carries
+// the key with empty text is as unrenderable as one that lacks it.
+func lookupMessage(messages map[string]string, key string) (string, bool) {
+	if key == "" || messages == nil {
+		return "", false
 	}
-	if messages != nil {
-		if value, ok := messages[key]; ok && strings.TrimSpace(value) != "" {
-			return value
-		}
+	value, ok := messages[key]
+	if !ok || strings.TrimSpace(value) == "" {
+		return "", false
+	}
+	return value, true
+}
+
+// translateMessage is the fallback-free form: a miss renders as the key, which
+// is what a template wants when no better text exists. Anything that would
+// rather substitute its own text calls lookupMessage.
+func translateMessage(messages map[string]string, key string) string {
+	if value, ok := lookupMessage(messages, key); ok {
+		return value
 	}
 	return key
 }
@@ -80,8 +99,8 @@ func (handler *Handler) withTemplateDefaults(c fiber.Ctx, data fiber.Map) fiber.
 	}
 
 	if _, ok := data["NoDataLabel"]; !ok {
-		noData := translateMessage(messages, "common.not_available")
-		if noData == "common.not_available" {
+		noData, translated := lookupMessage(messages, "common.not_available")
+		if !translated {
 			noData = "-"
 		}
 		data["NoDataLabel"] = noData
@@ -90,8 +109,12 @@ func (handler *Handler) withTemplateDefaults(c fiber.Ctx, data fiber.Map) fiber.
 	return data
 }
 
+// currentPathWithQuery is the address the shared layout renders back into the
+// page — the language switcher's `next` field and the outgoing privacy link —
+// so the caller-supplied query is filtered down to the parameters the pages
+// actually read before it can reach the markup.
 func currentPathWithQuery(c fiber.Ctx) string {
-	path := string(c.Request().URI().RequestURI())
+	path := services.SanitizeCurrentPathQuery(string(c.Request().URI().RequestURI()))
 	if path == "" {
 		return c.Path()
 	}

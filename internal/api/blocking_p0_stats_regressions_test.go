@@ -86,8 +86,8 @@ func TestStatsPageKeepsMetricGridHiddenAfterOneCompletedCycle(t *testing.T) {
 
 	today := services.DateAtLocation(time.Now().In(time.UTC), time.UTC)
 	logs := []models.DailyLog{
-		{UserID: user.ID, Date: today.AddDate(0, 0, -56), IsPeriod: true, Flow: models.FlowMedium},
-		{UserID: user.ID, Date: today.AddDate(0, 0, -28), IsPeriod: true, Flow: models.FlowMedium},
+		{UserID: user.ID, Date: today.AddDate(0, 0, -56), IsPeriod: true, CycleStart: true, Flow: models.FlowMedium},
+		{UserID: user.ID, Date: today.AddDate(0, 0, -28), IsPeriod: true, CycleStart: true, Flow: models.FlowMedium},
 	}
 	if err := database.Create(&logs).Error; err != nil {
 		t.Fatalf("create period logs: %v", err)
@@ -119,7 +119,7 @@ func TestStatsPageKeepsMetricGridHiddenAfterOneCompletedCycle(t *testing.T) {
 	if htmlElementByID(document, "cycle-chart") != nil {
 		t.Fatalf("did not expect cycle chart before two completed cycles")
 	}
-	if htmlElementByTagAndClass(document, "article", "stat-card") != nil {
+	if htmlElementByTagAndClass(document, "article", "card-dense") != nil {
 		t.Fatalf("did not expect metric cards before two completed cycles")
 	}
 }

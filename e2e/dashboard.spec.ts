@@ -1,5 +1,6 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Locator, type Page } from './support/fixtures';
 import {
+  apiOriginHeader,
   completeOnboardingIfPresent,
   continueFromRecoveryCode,
   createCredentials,
@@ -7,10 +8,18 @@ import {
   readRecoveryCode,
   registerOwnerViaUI,
 } from './support/auth-helpers';
+import { cancelConfirmDialog, mutatingRequestsDuring } from './support/confirm-dialog-helpers';
+import {
+  dashboardMoreDisclosure,
+  dashboardStatusLine,
+  openDashboardMoreFields,
+  saveDashboardEntry,
+} from './support/dashboard-helpers';
 import { expectElementAboveMobileTabbar } from './support/mobile-layout-helpers';
 import { ensureNotesFieldVisible } from './support/note-helpers';
 import { setRequestTimezoneFromBrowser } from './support/timezone-helpers';
 import { checkStyledControl } from './support/form-helpers';
+import { everyLocaleText, localeText } from './support/locale-helpers';
 
 async function registerOwnerOnDashboard(page: Page, prefix: string): Promise<void> {
   const creds = createCredentials(prefix);
@@ -27,9 +36,15 @@ async function registerOwnerOnDashboard(page: Page, prefix: string): Promise<voi
   await expect(page).toHaveURL(/\/dashboard$/);
 }
 
-async function saveToday(page: Page): Promise<void> {
-  await page.locator('button[data-save-button]').first().click();
-  await expect(page.locator('#save-status .status-ok')).toBeVisible();
+/**
+ * Makes the edits and lets the journal save itself.
+ *
+ * There is no save button any more: the dashboard is autosave-only, so a spec
+ * hands its field interactions to the shared helper, which binds the wait to the
+ * autosave request they trigger.
+ */
+async function saveToday(page: Page, edit: () => Promise<void>): Promise<void> {
+  await saveDashboardEntry(page, edit);
 }
 
 async function enableBBTTracking(page: Page): Promise<void> {
@@ -53,6 +68,42 @@ async function enableBBTTracking(page: Page): Promise<void> {
 
 function todaySaveForm(page: Page) {
   return page.locator('[data-dashboard-save-form]');
+}
+
+interface MoodStepState {
+  step: string | null;
+  key: string | null;
+  ariaLabel: string | null;
+  title: string | null;
+  nameText: string;
+  nameShown: boolean;
+  chipHeight: number;
+}
+
+/**
+ * Every mood step's naming and geometry, read in one round trip.
+ *
+ * Whether a step's name shows is a computed `display`, not Playwright's
+ * visibility heuristic: the caption band is CSS-driven — the chosen step's name
+ * replaces the scale ends — and `display` is the declaration that decides it.
+ */
+async function readMoodSteps(picker: Locator): Promise<MoodStepState[]> {
+  return picker.locator('label[data-mood-option]').evaluateAll((labels) =>
+    labels.map((label) => {
+      const input = label.querySelector('input[name="mood"]');
+      const chip = label.querySelector('.chip-round');
+      const name = label.querySelector('[data-mood-name-key]');
+      return {
+        step: label.getAttribute('data-mood-option'),
+        key: name ? name.getAttribute('data-mood-name-key') : null,
+        ariaLabel: input ? input.getAttribute('aria-label') : null,
+        title: chip ? chip.getAttribute('title') : null,
+        nameText: name && name.textContent ? name.textContent.trim() : '',
+        nameShown: name ? window.getComputedStyle(name).display !== 'none' : false,
+        chipHeight: chip ? chip.getBoundingClientRect().height : 0,
+      };
+    })
+  );
 }
 
 function manualCycleStartButton(page: Page) {
@@ -102,7 +153,7 @@ function symptomInputForOption(option: ReturnType<typeof todaySymptomOptions>) {
 }
 
 function symptomChipForOption(option: ReturnType<typeof todaySymptomOptions>) {
-  return option.locator('.check-chip');
+  return option.locator('.chip-lead');
 }
 
 function cycleFactorInput(page: Page, value: string) {
@@ -110,7 +161,7 @@ function cycleFactorInput(page: Page, value: string) {
 }
 
 function cycleFactorChip(page: Page, value: string) {
-  return page.locator(`label.choice-option:has(input[name="cycle_factor_keys"][value="${value}"]) .check-chip`);
+  return page.locator(`label.choice-option:has(input[name="cycle_factor_keys"][value="${value}"]) .chip-lead`);
 }
 
 async function openTodayNotes(page: Page): Promise<void> {
@@ -147,19 +198,31 @@ test.describe('Dashboard: today editor', () => {
     page,
   }) => {
     await registerOwnerOnDashboard(page, 'dashboard-note-disclosure');
+    // The note disclosure lives inside the journal's "More" disclosure.
+    await openDashboardMoreFields(page);
 
     const noteDisclosure = page.locator('details.note-disclosure');
     const noteSummary = noteDisclosure.locator('summary');
     const notes = page.locator('#today-notes');
     const notesCounter = page.locator('[data-dashboard-notes-field-group] [data-dashboard-notes-count]').first();
+    // The `open` attribute IS the state, and the disclosure declares both label
+    // variants as data attributes for the client script. Assert the rendered
+    // label against the declaration instead of a three-language regex whose
+    // alternation matched any of the three regardless of the page language.
+    const closedLabel = ((await noteDisclosure.getAttribute('data-note-empty-text')) ?? '').trim();
+    const openLabel = ((await noteDisclosure.getAttribute('data-note-open-text')) ?? '').trim();
+    expect(closedLabel, 'the note disclosure must declare data-note-empty-text').not.toBe('');
+    expect(openLabel, 'the note disclosure must declare data-note-open-text').not.toBe('');
+    expect(openLabel).not.toBe(closedLabel);
+
     await expect(noteDisclosure).toHaveCount(1);
     await expect(noteDisclosure).not.toHaveAttribute('open', '');
-    await expect(noteSummary).toContainText(/Add note|Добавить заметку|Agregar nota/);
+    await expect(noteSummary).toContainText(closedLabel);
     await expect(notes).toBeHidden();
 
     await noteSummary.click();
     await expect(noteDisclosure).toHaveAttribute('open', '');
-    await expect(noteSummary).toContainText(/Hide note|Скрыть заметку|Ocultar nota/);
+    await expect(noteSummary).toContainText(openLabel);
     await expect(notes).toBeVisible();
     await expect(notes).toHaveAttribute('rows', '2');
     await expect(notes).toHaveAttribute('maxlength', '2000');
@@ -167,16 +230,17 @@ test.describe('Dashboard: today editor', () => {
     await expect(notesCounter).toHaveText('0/2000');
 
     const noteText = Array.from({ length: 60 }, (_, index) => `toggle-note-${index}-${Date.now()}`).join('\n');
-    await notes.fill(noteText);
+    await saveToday(page, async () => {
+      await notes.fill(noteText);
+    });
     const filledNoteText = await notes.inputValue();
     await expect(notesCounter).toHaveText(`${Array.from(filledNoteText).length}/2000`);
     const notesHeight = await notes.evaluate((node) => Math.round(node.getBoundingClientRect().height));
     expect(notesHeight).toBeLessThanOrEqual(340);
-    await saveToday(page);
 
     await page.reload();
     await expect(noteDisclosure).toHaveAttribute('open', '');
-    await expect(noteSummary).toContainText(/Hide note|Скрыть заметку|Ocultar nota/);
+    await expect(noteSummary).toContainText(openLabel);
     await expect(page.locator('#today-notes')).toHaveValue(filledNoteText);
   });
 
@@ -184,6 +248,7 @@ test.describe('Dashboard: today editor', () => {
     await registerOwnerOnDashboard(page, 'dashboard-bbt-inline');
     await enableBBTTracking(page);
 
+    await openDashboardMoreFields(page);
     const bbtInput = page.locator('#dashboard-bbt');
     const autosaveIndicator = page.locator('[data-dashboard-autosave-indicator]');
 
@@ -198,11 +263,10 @@ test.describe('Dashboard: today editor', () => {
 
     await expect(autosaveIndicator).toHaveAttribute('data-autosave-state', 'invalid');
     const indicatorText = String((await autosaveIndicator.textContent()) || '').trim();
-    expect([
-      'Fix the form errors to save',
-      'Исправьте ошибки в форме для сохранения',
-      'Corrige los errores del formulario para guardar',
-    ]).toContain(indicatorText);
+    // The rendered language depends on the browser's Accept-Language, so the
+    // expectation is every catalogue's value for the key — read from the
+    // shipped catalogues, never re-typed here.
+    expect(everyLocaleText('dashboard.autosave_invalid')).toContain(indicatorText);
   });
 
   test('period/flow/symptoms/notes save and persist after reload; flow is single-select', async ({ page }) => {
@@ -217,16 +281,6 @@ test.describe('Dashboard: today editor', () => {
     const firstSymptom = todaySymptomOptions(page).nth(0);
     const secondSymptom = todaySymptomOptions(page).nth(1);
 
-    await periodToggle.check();
-    await expect(flowMedium).toBeEnabled();
-
-    await checkStyledControl(flowMedium);
-    await expect(flowMedium).toBeChecked();
-
-    await checkStyledControl(flowHeavy);
-    await expect(flowHeavy).toBeChecked();
-    await expect(flowMedium).not.toBeChecked();
-
     await expect(firstSymptom).toBeVisible();
     await expect(secondSymptom).toBeVisible();
     const firstSymptomValue = await symptomInputForOption(firstSymptom).getAttribute('value');
@@ -235,25 +289,37 @@ test.describe('Dashboard: today editor', () => {
     expect(firstSymptomValue).toBeTruthy();
     expect(secondSymptomValue).toBeTruthy();
 
-    await symptomChipForOption(firstSymptom).click();
-    await symptomChipForOption(secondSymptom).click();
-    await expect(symptomInputForOption(firstSymptom)).toBeChecked();
-    await expect(symptomInputForOption(secondSymptom)).toBeChecked();
-
-    await symptomChipForOption(secondSymptom).click();
-    await expect(symptomInputForOption(firstSymptom)).toBeChecked();
-    await expect(symptomInputForOption(secondSymptom)).not.toBeChecked();
-
-    await cycleFactorChip(page, 'stress').click();
-    await cycleFactorChip(page, 'travel').click();
-    await expect(stressFactor).toBeChecked();
-    await expect(travelFactor).toBeChecked();
-
     const noteText = `dashboard-note-${Date.now()}`;
-    await openTodayNotes(page);
-    await notes.fill(noteText);
+    // Cycle factors and notes live behind the journal's "More" disclosure.
+    await openDashboardMoreFields(page);
+    await saveToday(page, async () => {
+      await periodToggle.check();
+      await expect(flowMedium).toBeEnabled();
 
-    await saveToday(page);
+      await checkStyledControl(flowMedium);
+      await expect(flowMedium).toBeChecked();
+
+      await checkStyledControl(flowHeavy);
+      await expect(flowHeavy).toBeChecked();
+      await expect(flowMedium).not.toBeChecked();
+
+      await symptomChipForOption(firstSymptom).click();
+      await symptomChipForOption(secondSymptom).click();
+      await expect(symptomInputForOption(firstSymptom)).toBeChecked();
+      await expect(symptomInputForOption(secondSymptom)).toBeChecked();
+
+      await symptomChipForOption(secondSymptom).click();
+      await expect(symptomInputForOption(firstSymptom)).toBeChecked();
+      await expect(symptomInputForOption(secondSymptom)).not.toBeChecked();
+
+      await cycleFactorChip(page, 'stress').click();
+      await cycleFactorChip(page, 'travel').click();
+      await expect(stressFactor).toBeChecked();
+      await expect(travelFactor).toBeChecked();
+
+      await openTodayNotes(page);
+      await notes.fill(noteText);
+    });
 
     await page.reload();
     await expect(page).toHaveURL(/\/dashboard$/);
@@ -283,6 +349,197 @@ test.describe('Dashboard: today editor', () => {
     await expect(symptomInputForOption(lastSymptom)).toBeChecked();
   });
 
+  test('mobile symptom grid keeps two columns and real tap targets', async ({ page }) => {
+    await registerOwnerOnDashboard(page, 'dashboard-mobile-symptom-grid');
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.reload();
+    await expect(page).toHaveURL(/\/dashboard$/);
+
+    const grid = page.locator('fieldset[data-dashboard-section="symptoms"] .symptom-grid').first();
+    const columns = await grid.evaluate(
+      (node) => window.getComputedStyle(node).gridTemplateColumns.split(' ').filter(Boolean).length
+    );
+    expect(columns, 'the symptom grid must show two columns at 390px').toBe(2);
+
+    // Narrower chips must not buy their width from the tap target: the box
+    // grows and the label wraps instead.
+    const chips = await page
+      .locator('fieldset[data-dashboard-section="symptoms"] label.choice-option:visible .chip-lead')
+      .all();
+    expect(chips.length).toBeGreaterThan(1);
+    for (const chip of chips) {
+      const box = await chip.boundingBox();
+      expect(box, 'a visible symptom chip must have a box').not.toBeNull();
+      expect(box!.height, 'a symptom chip must stay at least 44px tall').toBeGreaterThanOrEqual(44);
+    }
+  });
+
+  test('the mood scale names its steps at 390px without giving up its tap targets', async ({
+    page,
+  }) => {
+    test.slow();
+    await registerOwnerOnDashboard(page, 'dashboard-mood-scale-names');
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.reload();
+    await expect(page).toHaveURL(/\/dashboard$/);
+
+    const picker = page.locator('[data-mood-picker]').first();
+    await expect(picker).toBeVisible();
+
+    const steps = await readMoodSteps(picker);
+    expect(steps.length, 'the picker must offer the whole mood scale').toBeGreaterThan(1);
+
+    // The expected copy is read from the catalogue through the key each step
+    // publishes, so the spec covers a step added later without being edited.
+    const expectedNames = steps.map((step) => {
+      expect(step.key, `mood step ${step.step} must publish its name key`).toBeTruthy();
+      return localeText('en', String(step.key));
+    });
+
+    steps.forEach((step, index) => {
+      // Named to assistive technology and on hover whether or not it is the
+      // chosen step: the caption is the visible half of a name that is always
+      // there.
+      expect(step.ariaLabel, `mood step ${step.step} names itself`).toBe(expectedNames[index]);
+      expect(step.title, `mood step ${step.step} names itself on hover`).toBe(expectedNames[index]);
+      expect(step.nameText, `mood step ${step.step} carries its visible name`).toBe(
+        expectedNames[index]
+      );
+      // The name is a caption under the row, so it may not buy its space from
+      // the tap target: the chip stays a real 44px control at 390px.
+      expect(
+        step.chipHeight,
+        `mood step ${step.step} must stay at least 44px tall`
+      ).toBeGreaterThanOrEqual(44);
+      expect(step.nameShown, `only the chosen step names itself in the caption`).toBe(false);
+    });
+
+    // Nothing chosen yet: the caption names the two ends, so the direction of
+    // the row is readable before the first tap.
+    const scaleEnds = picker.locator('[data-mood-scale-ends]');
+    await expect(scaleEnds).toBeVisible();
+    await expect(scaleEnds).toContainText(expectedNames[0]);
+    await expect(scaleEnds).toContainText(expectedNames[expectedNames.length - 1]);
+
+    const chosenIndex = Math.floor(steps.length / 2);
+    const chosenOption = picker.locator(`label[data-mood-option="${steps[chosenIndex].step}"]`);
+    // Tapped the way it is used: the chip is the affordance, and the row is
+    // centred first so the fixed mobile tabbar cannot be what receives the tap.
+    const chosenChip = chosenOption.locator('.chip-round');
+    await chosenChip.evaluate((node) => node.scrollIntoView({ block: 'center' }));
+    await saveToday(page, async () => {
+      await chosenChip.click();
+    });
+    await expect(chosenOption.locator('input[name="mood"]')).toBeChecked();
+
+    // The chosen step now names itself in the caption band, alone: the scale
+    // ends step aside and no other step's name shows.
+    await expect(picker.locator('[data-mood-scale-ends]')).toBeHidden();
+    const afterChoice = await readMoodSteps(picker);
+    afterChoice.forEach((step, index) => {
+      expect(step.nameShown, `step ${step.step} caption after choosing ${chosenIndex}`).toBe(
+        index === chosenIndex
+      );
+    });
+  });
+
+  test('rare journal fields wait behind More, which opens for a day that holds one', async ({
+    page,
+  }) => {
+    await registerOwnerOnDashboard(page, 'dashboard-more-disclosure');
+    await enableBBTTracking(page);
+
+    // Onboarding fills the current period, so today starts with data. Clear it:
+    // the closed state is a claim about a day holding none of these fields.
+    await clearTodayButton(page).click();
+    await expect(page.locator('#confirm-modal')).toBeVisible();
+    await page.locator('#confirm-modal-accept').click();
+    await expect(page).toHaveURL(/\/dashboard$/);
+
+    const more = dashboardMoreDisclosure(page);
+    await expect(more).toHaveCount(1);
+    await expect(more).not.toHaveAttribute('open', '');
+    await expect(more.locator('> summary')).toContainText(localeText('en', 'dashboard.more_fields'));
+
+    // The tier a day is usually logged with stays in the open; the rest waits.
+    await expect(page.locator('input[name="is_period"]')).toBeAttached();
+    await expect(todaySymptomOptions(page).first()).toBeVisible();
+    await expect(page.locator('#dashboard-bbt')).toBeHidden();
+
+    // An anchor into the disclosure must not land on nothing: the late-cycle
+    // actions link straight at the pregnancy test, which now lives inside it.
+    // Measured on a day that holds none of these fields, so the server is not
+    // the one opening it.
+    await page.goto('/dashboard#dashboard-pregnancy-test');
+    await expect(dashboardMoreDisclosure(page)).toHaveAttribute('open', '');
+    // The disclosure's `open` attribute settles before the dashboard's htmx
+    // lazy-loads do, so the assertion above is not evidence the page is idle.
+    // Navigating on top of an in-flight request aborts it and `goto` reports
+    // net::ERR_ABORTED — a failure of the navigation, not of the product, which
+    // passes on retry and reads as a flake.
+    await page.waitForLoadState('networkidle');
+    await page.goto('/dashboard');
+    await expect(dashboardMoreDisclosure(page)).not.toHaveAttribute('open', '');
+
+    await openDashboardMoreFields(page);
+    const bbtInput = page.locator('#dashboard-bbt');
+    await saveToday(page, async () => {
+      await bbtInput.fill('36.60');
+      await bbtInput.blur();
+    });
+
+    // Fields inside still save through the autosave, and what was recorded is
+    // never left behind a closed disclosure.
+    await page.reload();
+    await expect(dashboardMoreDisclosure(page)).toHaveAttribute('open', '');
+    await expect(page.locator('#dashboard-bbt')).toHaveValue('36.60');
+  });
+
+  test('a saved pregnancy result is removed by a button, not by a third radio', async ({
+    page,
+  }) => {
+    await registerOwnerOnDashboard(page, 'dashboard-pregnancy-remove');
+    await openDashboardMoreFields(page);
+
+    const field = page.locator('[data-pregnancy-test]');
+    await expect(field).toHaveAttribute('data-pregnancy-test-state', 'absent');
+    // The group offers the two results and nothing else — the unset value rides
+    // a hidden carrier, which is not in the accessibility tree.
+    await expect(field.getByRole('radio')).toHaveCount(2);
+    await expect(field.locator('[data-pregnancy-test-remove]')).toBeHidden();
+
+    await saveToday(page, async () => {
+      await field.locator('[data-pregnancy-test-option="negative"]').click();
+    });
+
+    await page.reload();
+    await expect(dashboardMoreDisclosure(page)).toHaveAttribute('open', '');
+
+    const savedField = page.locator('[data-pregnancy-test]');
+    await expect(savedField).toHaveAttribute('data-pregnancy-test-state', 'recorded');
+    await expect(savedField.getByRole('radio')).toHaveCount(2);
+    const remove = savedField.getByRole('button', {
+      name: localeText('en', 'dashboard.pregnancy_test.remove'),
+    });
+    await expect(remove).toHaveAttribute('type', 'button');
+
+    // There is no save button on this screen: the removal marks the journal
+    // dirty and the autosave carries it.
+    await saveToday(page, async () => {
+      await remove.click();
+    });
+    await expect(savedField).toHaveAttribute('data-pregnancy-test-state', 'absent');
+    await expect(remove).toBeHidden();
+    await expect(savedField.locator('[data-pregnancy-test-empty]')).toBeVisible();
+
+    await page.reload();
+    await expect(page.locator('input[name="pregnancy_test"][value="negative"]')).not.toBeChecked();
+    await expect(page.locator('[data-pregnancy-test]')).toHaveAttribute(
+      'data-pregnancy-test-state',
+      'absent'
+    );
+  });
+
   test('mobile dashboard keeps lower actions scrollable above the bottom tabbar', async ({ page }) => {
     await registerOwnerOnDashboard(page, 'dashboard-mobile-safe-area');
     await page.setViewportSize({ width: 390, height: 844 });
@@ -301,21 +558,22 @@ test.describe('Dashboard: today editor', () => {
     const flowLight = page.locator('input[name="flow"][value="light"]');
     const firstSymptom = todaySymptomOptions(page).nth(0);
 
-    await periodToggle.check();
-    await checkStyledControl(flowLight);
-    await symptomChipForOption(firstSymptom).click();
-    await expect(symptomInputForOption(firstSymptom)).toBeChecked();
-
-    await saveToday(page);
+    await saveToday(page, async () => {
+      await periodToggle.check();
+      await checkStyledControl(flowLight);
+      await symptomChipForOption(firstSymptom).click();
+      await expect(symptomInputForOption(firstSymptom)).toBeChecked();
+    });
     await page.reload();
 
     await expect(periodToggle).toBeChecked();
-    await periodToggle.uncheck();
+    await saveToday(page, async () => {
+      await periodToggle.uncheck();
+    });
 
     await expect(symptomInputForOption(firstSymptom)).toBeChecked();
     await expect(flowLight).toBeDisabled();
 
-    await saveToday(page);
     await page.reload();
 
     await expect(periodToggle).not.toBeChecked();
@@ -331,16 +589,25 @@ test.describe('Dashboard: today editor', () => {
     const firstSymptom = todaySymptomOptions(page).nth(0);
     const notes = page.locator('#today-notes');
 
-    await periodToggle.check();
-    await checkStyledControl(flowMedium);
-    await symptomChipForOption(firstSymptom).click();
-    await openTodayNotes(page);
-    await notes.fill(`to-clear-${Date.now()}`);
-    await saveToday(page);
+    const noteText = `to-clear-${Date.now()}`;
+
+    await saveToday(page, async () => {
+      await periodToggle.check();
+      await checkStyledControl(flowMedium);
+      await symptomChipForOption(firstSymptom).click();
+      await openTodayNotes(page);
+      await notes.fill(noteText);
+    });
 
     await page.reload();
 
-    await expect(manualCycleStartButton(page)).toContainText('cycle');
+    // Positive anchor: the entry really is populated after the save and the
+    // reload. Without it the post-clear assertions below pass on an editor that
+    // was never filled — an unsaved form and a cleared one look identical.
+    await expect(periodToggle).toBeChecked();
+    await expect(flowMedium).toBeChecked();
+    await expect(symptomInputForOption(firstSymptom)).toBeChecked();
+    await expect(notes).toHaveValue(noteText);
 
     const clearButton = clearTodayButton(page);
     await expect(clearButton).toBeVisible();
@@ -371,11 +638,12 @@ test.describe('Dashboard: today editor', () => {
     const notes = page.locator('#today-notes');
     const noteText = `dashboard-calendar-sync-${Date.now()}`;
 
-    await periodToggle.check();
-    await checkStyledControl(flowMedium);
-    await openTodayNotes(page);
-    await notes.fill(noteText);
-    await saveToday(page);
+    await saveToday(page, async () => {
+      await periodToggle.check();
+      await checkStyledControl(flowMedium);
+      await openTodayNotes(page);
+      await notes.fill(noteText);
+    });
 
     await page.goto(`/calendar?month=${month}&day=${todayISO}`);
     await expect(page.locator('#day-editor')).toContainText(noteText);
@@ -395,14 +663,22 @@ test.describe('Dashboard: today editor', () => {
     const moodFour = page.locator('input[name="mood"][value="4"]');
     const firstSymptom = todaySymptomOptions(page).nth(0);
     const firstSymptomValue = await symptomInputForOption(firstSymptom).getAttribute('value');
-    const firstSymptomLabel = await firstSymptom.locator('.check-chip').getAttribute('title');
+    const firstSymptomLabel = await firstSymptom.locator('.chip-lead').getAttribute('title');
 
     expect(firstSymptomValue).toBeTruthy();
     expect(firstSymptomLabel).toBeTruthy();
 
-    await checkStyledControl(moodFour);
-    await symptomChipForOption(firstSymptom).click();
-    await saveToday(page);
+    await saveToday(page, async () => {
+      await checkStyledControl(moodFour);
+      await symptomChipForOption(firstSymptom).click();
+    });
+
+    // What the fourth step is called, taken from the picker that saved it —
+    // the summary has to read the same mood back under the same name.
+    const moodFourKey = await page
+      .locator('label[data-mood-option="4"] [data-mood-name-key]')
+      .getAttribute('data-mood-name-key');
+    expect(moodFourKey, 'the picker must publish the name key of the step it saved').toBeTruthy();
 
     const todayAction = await todaySaveForm(page).first().getAttribute('hx-put');
     expect(todayAction).toMatch(/^\/api\/v1\/days\/\d{4}-\d{2}-\d{2}$/);
@@ -412,7 +688,12 @@ test.describe('Dashboard: today editor', () => {
     await page.goto(`/calendar?month=${month}&day=${todayISO}`);
 
     const daySummary = page.locator('#day-editor');
-    await expect(daySummary).toContainText('4/5');
+    // The summary reads the mood back by name, not as a face and a fraction.
+    await expect(daySummary.locator('[data-mood-name-key]')).toHaveAttribute(
+      'data-mood-name-key',
+      String(moodFourKey)
+    );
+    await expect(daySummary).toContainText(localeText('en', String(moodFourKey)));
     await expect(daySummary).toContainText(String(firstSymptomLabel));
 
     await page.locator(`[data-day-editor-open="${todayISO}"]`).click();
@@ -427,11 +708,23 @@ test.describe('Dashboard: today editor', () => {
 
     const manualStartButton = manualCycleStartButton(page);
     await expect(manualStartButton).toBeVisible();
-    await manualStartButton.click();
-    await expect(page.locator('#confirm-modal')).toBeVisible();
-    await page.locator('#confirm-modal-cancel').click();
-    await expect(page.locator('#confirm-modal')).toBeHidden();
-    await expect(page.locator('#save-status .status-error')).toHaveCount(0);
+
+    // Cancel must issue nothing at all. An empty #save-status .status-error is a
+    // weaker claim than it looks — it also holds when the POST fired and
+    // succeeded — so record the wire instead, and reload inside the window so any
+    // request the cancelled click was going to issue has had its chance.
+    const cancelledRequests = await mutatingRequestsDuring(
+      page,
+      (pathname) => pathname.endsWith('/cycle-start'),
+      async () => {
+        await manualStartButton.click();
+        await cancelConfirmDialog(page);
+
+        await page.reload();
+        await expect(manualStartButton).toBeVisible();
+      }
+    );
+    expect(cancelledRequests, 'cancelling the manual cycle start must issue no request').toEqual([]);
 
     const [request] = await Promise.all([
       page.waitForRequest(
@@ -499,6 +792,190 @@ test.describe('Dashboard: today editor', () => {
     await expect(notes).toHaveValue(noteText);
   });
 
+  test('the journal saves without a button and offers one step back', async ({ page }) => {
+    await registerOwnerOnDashboard(page, 'dashboard-autosave-undo');
+
+    const form = todaySaveForm(page).first();
+    const indicator = page.locator('[data-dashboard-autosave-indicator]');
+    const notes = page.locator('#today-notes');
+
+    // One save model on this screen: there is nothing to press.
+    await expect(form.locator('[data-save-button]')).toHaveCount(0);
+    // Idle says nothing at all.
+    await expect(indicator).toHaveAttribute('data-autosave-state', 'idle');
+    await expect(indicator).toHaveText('');
+
+    const savePath = await todaySavePath(page);
+    const firstNote = `undo-first-${Date.now()}`;
+    await saveToday(page, async () => {
+      await openTodayNotes(page);
+      await notes.fill(firstNote);
+    });
+
+    // "Saved" only after the server answered, and it comes with the way back.
+    await expect(indicator).toHaveAttribute('data-autosave-state', 'saved');
+    await expect(indicator).toContainText(localeText('en', 'dashboard.autosave_saved'));
+    const undo = indicator.locator('[data-dashboard-autosave-undo]');
+    await expect(undo).toBeVisible();
+    await expect(undo).toHaveText(localeText('en', 'dashboard.autosave_undo'));
+    await expect(undo).toHaveAttribute('type', 'button');
+
+    const secondNote = `undo-second-${Date.now()}`;
+    await saveToday(page, async () => {
+      await notes.fill(secondNote);
+    });
+
+    // Undo re-saves the state the server held before that save, through the
+    // same path — bind to its own request, not to the page settling.
+    const [undoRequest] = await Promise.all([
+      page.waitForRequest(
+        (candidate) => candidate.method() === 'PUT' && candidate.url().includes(savePath),
+      ),
+      indicator.locator('[data-dashboard-autosave-undo]').click(),
+    ]);
+    const undoResponse = await undoRequest.response();
+    expect(undoResponse, `expected a response for PUT ${savePath}`).not.toBeNull();
+    expect(undoResponse!.ok(), `the undo failed with ${undoResponse!.status()}`).toBeTruthy();
+    expect(undoRequest.postData() ?? '').toContain(`notes=${firstNote}`);
+
+    await expect(notes).toHaveValue(firstNote);
+    // Depth one: there is no undoing of an undo.
+    await expect(indicator.locator('[data-dashboard-autosave-undo]')).toHaveCount(0);
+
+    await page.reload();
+    await expect(page.locator('#today-notes')).toHaveValue(firstNote);
+  });
+
+  test('undoing the first save of an empty day clears the day again', async ({ page }) => {
+    await registerOwnerOnDashboard(page, 'dashboard-undo-clears-day');
+
+    // Onboarding auto-fills the current period, so today starts with data. Clear
+    // it first: the case under test is the first save of a day that holds none.
+    await clearTodayButton(page).click();
+    await expect(page.locator('#confirm-modal')).toBeVisible();
+    await page.locator('#confirm-modal-accept').click();
+    await expect(page).toHaveURL(/\/dashboard$/);
+    await expect(clearTodayButton(page)).toHaveCount(0);
+
+    const savePath = await todaySavePath(page);
+    await expect(todaySaveForm(page).first()).toHaveAttribute('data-today-entry-exists', 'false');
+
+    const periodToggle = page.locator('input[name="is_period"]');
+    await saveToday(page, async () => {
+      await periodToggle.check();
+    });
+
+    // An empty day is an absent entry, so the step back is the clear-today
+    // DELETE rather than an upsert of blank values.
+    const [deleteRequest] = await Promise.all([
+      page.waitForRequest(
+        (candidate) => candidate.method() === 'DELETE' && candidate.url().includes(savePath),
+      ),
+      page.locator('[data-dashboard-autosave-undo]').click(),
+    ]);
+    const deleteResponse = await deleteRequest.response();
+    expect(deleteResponse, `expected a response for DELETE ${savePath}`).not.toBeNull();
+    expect(deleteResponse!.ok(), `the undo failed with ${deleteResponse!.status()}`).toBeTruthy();
+
+    await expect(page).toHaveURL(/\/dashboard$/);
+    await expect(page.locator('input[name="is_period"]')).not.toBeChecked();
+    await expect(clearTodayButton(page)).toHaveCount(0);
+  });
+
+  test('usage-goal chips change the mode from the dashboard without visiting settings', async ({
+    page,
+  }) => {
+    await registerOwnerOnDashboard(page, 'dashboard-usage-goal-switch');
+
+    const summary = page.locator('[data-usage-goal-summary]');
+    const chip = page.locator('[data-usage-goal-chip]');
+    const quickSwitch = page.locator('[data-usage-goal-quick-switch]');
+    await expect(summary).toHaveAttribute('data-usage-goal-label-key', 'settings.goal.health');
+    // The header carries the mode as a chip; the two-mode switch is one click
+    // away, behind it.
+    await expect(chip).toContainText(localeText('en', 'settings.goal.health'));
+    await chip.click();
+    await expect(quickSwitch).toBeVisible();
+
+    // The mode already in force is not offered again; the other two are.
+    await expect(quickSwitch.locator('[data-usage-goal-choice="health"]')).toHaveCount(0);
+    const avoidChip = quickSwitch.locator('[data-usage-goal-choice="avoid_pregnancy"]');
+    await expect(avoidChip).toHaveText(localeText('en', 'settings.goal.avoid'));
+
+    await avoidChip.click();
+
+    // The server answers with a re-render, so the whole page speaks in the new
+    // mode: the summary, and the chips now offering the way back.
+    await expect(summary).toHaveAttribute('data-usage-goal-label-key', 'settings.goal.avoid');
+    await expect(summary).toHaveAttribute('data-usage-goal-summary-key', 'usage_goal.summary.avoid');
+    await expect(quickSwitch.locator('[data-usage-goal-choice="health"]')).toHaveCount(1);
+    await expect(quickSwitch.locator('[data-usage-goal-choice="avoid_pregnancy"]')).toHaveCount(0);
+
+    // It is a real save, not a client-side flip: it survives a reload and the
+    // settings form shows the same answer.
+    await page.reload();
+    await expect(summary).toHaveAttribute('data-usage-goal-label-key', 'settings.goal.avoid');
+
+    await page.goto('/settings');
+    await expect(
+      page.locator('#settings-cycle input[name="usage_goal"][value="avoid_pregnancy"]')
+    ).toBeChecked();
+  });
+
+  test('the goal about timing gets the first-cycle promise and the temperature in the open', async ({
+    page,
+  }) => {
+    await registerOwnerOnDashboard(page, 'dashboard-timing-frame');
+    await enableBBTTracking(page);
+
+    const statusLine = dashboardStatusLine(page);
+    const ovulation = statusLine.locator('[data-dashboard-ovulation]');
+    const bridge = statusLine.locator('[data-dashboard-first-cycle-bridge]');
+    const bbtInput = page.locator('#dashboard-bbt');
+
+    // The default goal is the neutral one: no timing line at all, temperature
+    // folded away with the other rare fields.
+    await expect(ovulation).toHaveCount(0);
+    await expect(bridge).toHaveCount(0);
+    await expect(bbtInput).toBeHidden();
+
+    await page.locator('[data-usage-goal-chip]').click();
+    await page.locator('[data-usage-goal-choice="trying_to_conceive"]').click();
+    await expect(page.locator('[data-usage-goal-summary]')).toHaveAttribute(
+      'data-usage-goal-label-key',
+      'settings.goal.trying'
+    );
+
+    // What the goal promised at onboarding, on the next load of the page. This
+    // account has completed no cycle yet, so the timing item is the one line
+    // naming when its fertile window arrives — an ovulation date here could only
+    // be the onboarding cycle length projected forward. The date itself, once a
+    // cycle has been observed, is pinned in the Go render regression
+    // (TestDashboardFramesTimingForTheGoalThatIsAboutIt).
+    await page.reload();
+    await expect(ovulation).toHaveCount(0);
+    await expect(bridge).toHaveCount(1);
+    await expect(bridge).toHaveAttribute(
+      'data-first-cycle-bridge-key',
+      'dashboard.fertile_window_after_first_cycle'
+    );
+    await expect(bridge).toHaveText(
+      localeText('en', 'dashboard.fertile_window_after_first_cycle')
+    );
+    await expect(bbtInput).toBeVisible();
+    await expect(dashboardMoreDisclosure(page).locator('#dashboard-bbt')).toHaveCount(0);
+
+    // A field in the visible tier still saves itself, and what was recorded
+    // reads back from the same place.
+    await saveToday(page, async () => {
+      await bbtInput.fill('36.60');
+      await bbtInput.blur();
+    });
+    await page.reload();
+    await expect(page.locator('#dashboard-bbt')).toHaveValue('36.60');
+    await expect(dashboardMoreDisclosure(page).locator('#dashboard-bbt')).toHaveCount(0);
+  });
+
   test('closing the page runs beforeunload autosave for dirty notes', async ({ page, context }) => {
     await registerOwnerOnDashboard(page, 'dashboard-autosave-beforeunload');
 
@@ -515,5 +992,61 @@ test.describe('Dashboard: today editor', () => {
       await replacementPage.reload();
       return replacementPage.locator('#today-notes').inputValue();
     }, { timeout: 5000 }).toBe(noteText);
+  });
+
+  test('a reload while the autosave is still on the wire keeps the edit', async ({ page }) => {
+    // Registration, the 2 s debounce and a read-back poll in one test.
+    test.slow();
+    await registerOwnerOnDashboard(page, 'dashboard-autosave-inflight-reload');
+
+    const noteText = `dashboard-inflight-${Date.now()}`;
+
+    // Hold the save the debounce opens, so the reload lands while it is still
+    // undelivered — a slow uplink, made deterministic.
+    let releaseSave = (): void => {};
+    const saveReleased = new Promise<void>((resolve) => {
+      releaseSave = resolve;
+    });
+    await page.route(/\/api\/v1\/days\/\d{4}-\d{2}-\d{2}(?:\?.*)?$/, async (route) => {
+      if (route.request().method() !== 'PUT') {
+        await route.fallback();
+        return;
+      }
+      await saveReleased;
+      // A request the reload cancelled cannot be continued; that is the loss
+      // the read-back below reports.
+      await route.continue().catch(() => undefined);
+    });
+    const dialogs: string[] = [];
+    page.on('dialog', (dialog) => {
+      dialogs.push(dialog.type());
+      void dialog.accept();
+    });
+
+    await openTodayNotes(page);
+    const heldSave = page.waitForRequest(
+      (candidate) => candidate.method() === 'PUT' && candidate.url().includes('/api/v1/days/')
+    );
+    await page.locator('#today-notes').fill(noteText);
+    const dayPath = new URL((await heldSave).url()).pathname;
+    await expect(page.locator('[data-dashboard-autosave-indicator]')).toHaveAttribute(
+      'data-autosave-state',
+      'saving'
+    );
+
+    await page.reload();
+    releaseSave();
+
+    // Read back what the server holds, not what a page renders.
+    await expect.poll(async () => {
+      const response = await page.request.get(dayPath, {
+        headers: { Accept: 'application/json', ...apiOriginHeader(page) },
+      });
+      if (!response.ok()) {
+        return `HTTP ${response.status()}`;
+      }
+      return ((await response.json()) as { notes?: string }).notes;
+    }, { message: 'the edit saved before the reload', timeout: 10000 }).toBe(noteText);
+    expect(dialogs, 'leaving while the save is open asks first').toContain('beforeunload');
   });
 });

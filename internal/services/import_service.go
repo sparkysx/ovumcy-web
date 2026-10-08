@@ -47,7 +47,7 @@ var importSymptomFlagGetters = map[string]func(ExportSymptomFlags) bool{
 	"cramps":            func(f ExportSymptomFlags) bool { return f.Cramps },
 	"headache":          func(f ExportSymptomFlags) bool { return f.Headache },
 	"acne":              func(f ExportSymptomFlags) bool { return f.Acne },
-	"mood":              func(f ExportSymptomFlags) bool { return f.Mood },
+	"mood_swings":       func(f ExportSymptomFlags) bool { return f.Mood },
 	"bloating":          func(f ExportSymptomFlags) bool { return f.Bloating },
 	"fatigue":           func(f ExportSymptomFlags) bool { return f.Fatigue },
 	"breast_tenderness": func(f ExportSymptomFlags) bool { return f.BreastTenderness },
@@ -116,6 +116,53 @@ type importPayload struct {
 	Entries []ExportJSONEntry `json:"entries"`
 }
 
+// importPayloadEnvelope mirrors importPayload but keeps each entry as raw JSON
+// instead of decoding it into ExportJSONEntry. ImportJSON uses it to count
+// entries — and refuse an over-cap payload with ErrImportTooLarge — from the
+// cheap top-level split alone, before paying for the per-entry typed decode
+// (one ExportJSONEntry, with its nested slices and struct, per entry) that
+// materialisation is. The body is already bounded to maxRequestBodyBytes
+// (cmd/ovumcy/server.go, 16 MiB) before this ever runs, but a crafted file of
+// many minimal entries can still pack far more than MaxImportEntries into that
+// ceiling, so the count still has to be checked before the expensive decode.
+type importPayloadEnvelope struct {
+	Entries []json.RawMessage `json:"entries"`
+	// LastPeriodStart is the export's additive, optional onboarding start. It is
+	// kept raw so a file from an older release (field absent) and a malformed
+	// value both leave the restore of the days untouched.
+	LastPeriodStart json.RawMessage `json:"last_period_start"`
+}
+
+// restoreOnboardingStart puts the exported onboarding start back as the
+// account's last_period_start. Like the day restore it only fills a gap: an
+// account that already holds a start keeps it, and an unreadable or future
+// value is ignored rather than failing the restore of the days.
+func (service *ImportService) restoreOnboardingStart(ctx context.Context, userID uint, raw json.RawMessage, now time.Time, location *time.Location) error {
+	var value string
+	if len(raw) == 0 || json.Unmarshal(raw, &value) != nil {
+		return nil
+	}
+	parsed, err := ParseDayDate(strings.TrimSpace(value), location)
+	if err != nil || service.users == nil {
+		return nil
+	}
+	owner, err := service.users.LoadSettingsByID(ctx, userID)
+	if err != nil {
+		return ErrImportWriteFailed
+	}
+	if owner.LastPeriodStart != nil && !owner.LastPeriodStart.IsZero() {
+		return nil
+	}
+	day := CalendarDay(parsed, time.UTC)
+	if CalendarDaysBetween(DateAtLocation(now, resolveOwnerLocation(owner.Timezone, location)), day) > 0 {
+		return nil
+	}
+	if err := service.users.UpdateByID(ctx, userID, map[string]any{"last_period_start": day}); err != nil {
+		return ErrImportWriteFailed
+	}
+	return nil
+}
+
 // plannedImportDay is a fully validated day held between the parse pass and the
 // atomic write pass. Symptom IDs are resolved only in the write pass, after any
 // missing custom symptoms have been created.
@@ -138,15 +185,22 @@ func (service *ImportService) ImportJSON(ctx context.Context, userID uint, raw [
 		location = time.UTC
 	}
 
-	var payload importPayload
-	if err := json.Unmarshal(raw, &payload); err != nil {
+	var envelope importPayloadEnvelope
+	if err := json.Unmarshal(raw, &envelope); err != nil {
 		return ImportResult{}, ErrImportMalformed
 	}
-	if len(payload.Entries) > MaxImportEntries {
+	if len(envelope.Entries) > MaxImportEntries {
 		return ImportResult{}, ErrImportTooLarge
 	}
 
-	planned, otherOriginals, rejected := service.planEntries(payload.Entries, location)
+	entries := make([]ExportJSONEntry, len(envelope.Entries))
+	for i, rawEntry := range envelope.Entries {
+		if err := json.Unmarshal(rawEntry, &entries[i]); err != nil {
+			return ImportResult{}, ErrImportMalformed
+		}
+	}
+
+	planned, otherOriginals, rejected := service.planEntries(entries, location)
 
 	catalogByKey, builtins, err := service.reconcileSymptoms(ctx, userID, otherOriginals)
 	if err != nil {
@@ -158,15 +212,29 @@ func (service *ImportService) ImportJSON(ctx context.Context, userID uint, raw [
 		return ImportResult{}, err
 	}
 
-	service.refreshDerivedCycleSettings(ctx, userID, location)
+	// A restore carries no instant of its own; the derived column must still be
+	// bounded at the owner's today, so the clock is read here rather than
+	// threaded through the import route for this one line.
+	now := time.Now()
+	if err := service.restoreOnboardingStart(ctx, userID, envelope.LastPeriodStart, now, location); err != nil {
+		return ImportResult{}, err
+	}
+	service.refreshDerivedCycleSettings(ctx, userID, now, location)
 
 	return ImportResult{Added: added, Skipped: skipped, Rejected: rejected}, nil
 }
 
 // planEntries validates every incoming record: it parses and canonicalizes the
 // date, rejects duplicate calendar days within the file, and normalizes every
-// field through NormalizeDayEntryInput. It also collects the first-seen spelling
-// of each custom symptom name so the reconciler can create the missing ones.
+// field through normalizeImportEntryInput. That normalization is deliberately
+// LENIENT where a day save is strict, and the two must not be read as the same
+// rules: a save REFUSES an out-of-vocabulary enum or an out-of-range reading
+// and hands the owner back their form, while a restore has no one to ask and
+// drops the offending field to its neutral value, keeping the rest of the day —
+// the file is restored, that one field is not. Pinned by
+// TestImportServiceSanitizesGarbageValues. It also collects the first-seen
+// spelling of each custom symptom name so the reconciler can create the missing
+// ones.
 func (service *ImportService) planEntries(entries []ExportJSONEntry, location *time.Location) ([]plannedImportDay, map[string]string, int) {
 	planned := make([]plannedImportDay, 0, len(entries))
 	otherOriginals := make(map[string]string)
@@ -227,11 +295,17 @@ func (service *ImportService) planEntries(entries []ExportJSONEntry, location *t
 func normalizeImportEntryInput(entry ExportJSONEntry) DayEntryInput {
 	cycleFactors, _ := NormalizeDayCycleFactorKeys(entry.CycleFactors)
 	input := DayEntryInput{
-		IsPeriod:        entry.Period,
-		Flow:            NormalizeDayFlow(entry.Flow),
-		Mood:            normalizeExportMood(entry.MoodRating),
-		SexActivity:     NormalizeDaySexActivity(entry.SexActivity),
-		BBT:             normalizeExportBBT(entry.BBT),
+		IsPeriod:    entry.Period,
+		Flow:        NormalizeDayFlow(entry.Flow),
+		Mood:        normalizeExportMood(entry.MoodRating),
+		SexActivity: NormalizeDaySexActivity(entry.SexActivity),
+		// Rounded onto the stored grid like a day save, so a restored file
+		// cannot put a reading off the grid the shift detector compares on.
+		// The export is always Celsius, so there is no unit to judge and no
+		// ConvertDayBBTToStorage here: a reading the range refuses becomes
+		// "not measured" (normalizeExportBBT) under the per-field leniency
+		// planEntries describes, where a day save would refuse the write.
+		BBT:             normalizeStoredDayBBT(normalizeExportBBT(entry.BBT)),
 		CervicalMucus:   NormalizeDayCervicalMucus(entry.CervicalMucus),
 		PregnancyTest:   NormalizeDayPregnancyTest(entry.PregnancyTest),
 		CycleFactorKeys: cycleFactors,
@@ -427,9 +501,13 @@ func resolveImportSymptomIDs(flags ExportSymptomFlags, otherNames []string, buil
 }
 
 // refreshDerivedCycleSettings recomputes the owner's luteal-phase estimate once
-// after a bulk restore. Mirrors DayService.refreshDerivedCycleSettings; kept as
-// a best-effort side effect (a failure here never fails the import).
-func (service *ImportService) refreshDerivedCycleSettings(ctx context.Context, userID uint, location *time.Location) {
+// after a bulk restore (the second of the derivation's three writers: day
+// save, bulk restore, boot recompute). Mirrors DayService.refreshDerivedCycleSettings,
+// including the owner-zone bound: `location` is only the fallback for an
+// owner with no captured timezone, resolveOwnerLocation prefers the persisted
+// one, same reasoning as the day-save family (day_service.go). Kept as a
+// best-effort side effect (a failure here never fails the import).
+func (service *ImportService) refreshDerivedCycleSettings(ctx context.Context, userID uint, now time.Time, location *time.Location) {
 	if service == nil || service.users == nil || service.logs == nil {
 		return
 	}
@@ -437,9 +515,11 @@ func (service *ImportService) refreshDerivedCycleSettings(ctx context.Context, u
 	if err != nil {
 		return
 	}
-	lutealPhase, ok := InferUserLutealPhase(logs, location)
-	if !ok {
-		lutealPhase = defaultLutealPhaseDays
+	ownerLocation := location
+	boundaryCtx := BoundaryContext{}
+	if userSettings, err := service.users.LoadSettingsByID(ctx, userID); err == nil {
+		ownerLocation = resolveOwnerLocation(userSettings.Timezone, location)
+		boundaryCtx = BoundaryContextFor(&userSettings, time.Time{})
 	}
-	_ = service.users.UpdateByID(ctx, userID, map[string]any{"luteal_phase": lutealPhase})
+	_ = service.users.UpdateByID(ctx, userID, map[string]any{"luteal_phase": deriveUserLutealPhase(logs, now, ownerLocation, boundaryCtx)})
 }

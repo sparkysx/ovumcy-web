@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -22,10 +23,12 @@ func TestRunUsersCommandUsageErrors(t *testing.T) {
 		args []string
 		want string
 	}{
-		{name: "missing subcommand", args: nil, want: "usage: ovumcy users <list|delete|create>"},
-		{name: "unknown subcommand", args: []string{"export"}, want: "usage: ovumcy users <list|delete|create>"},
+		{name: "missing subcommand", args: nil, want: "usage: ovumcy users <list|delete|create|set-email>"},
+		{name: "unknown subcommand", args: []string{"export"}, want: "usage: ovumcy users <list|delete|create|set-email>"},
 		{name: "list with extra arg", args: []string{"list", "extra"}, want: "usage: ovumcy users list"},
-		{name: "delete without email", args: []string{"delete"}, want: "usage: ovumcy users delete <email> [--yes]"},
+		{name: "delete without a handle", args: []string{"delete"}, want: usersDeleteUsage},
+		{name: "set-email without arguments", args: []string{"set-email"}, want: usersSetEmailUsage},
+		{name: "set-email without an address", args: []string{"set-email", "--id", "7"}, want: usersSetEmailUsage},
 		{name: "create without email", args: []string{"create"}, want: "usage: ovumcy users create <email> [--show-recovery-code] [--skip-if-exists]"},
 		{name: "create with unknown flag", args: []string{"create", "owner@example.com", "--oops"}, want: "usage: ovumcy users create <email> [--show-recovery-code] [--skip-if-exists]"},
 	}
@@ -35,11 +38,63 @@ func TestRunUsersCommandUsageErrors(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			err := runUsersCommand(db.Config{}, testCase.args, strings.NewReader(""), &bytes.Buffer{})
+			err := runUsersCommand(db.Config{}, testCase.args, "", strings.NewReader(""), &bytes.Buffer{})
 			if err == nil || err.Error() != testCase.want {
 				t.Fatalf("expected error %q, got %v", testCase.want, err)
 			}
 		})
+	}
+}
+
+// TestRunUsersCommandRejectsUsageBeforeReadingAnything covers the exported
+// entry point, which is otherwise reached only from main: it resolves the
+// fence path once, from the environment, and hands everything else to the
+// unexported runner — so a usage error must still come back unchanged, with
+// nothing read and no database opened.
+func TestRunUsersCommandRejectsUsageBeforeReadingAnything(t *testing.T) {
+	t.Parallel()
+
+	if err := RunUsersCommand(db.Config{}, nil); err == nil || !strings.Contains(err.Error(), "usage: ovumcy users") {
+		t.Fatalf("expected the usage error, got %v", err)
+	}
+}
+
+// TestRunUsersDeleteReportsAnUnresolvableTargetInTheSharedWording pins that
+// `users delete` answers an unknown handle the way its siblings do. It used to
+// return the service's own sentinel unmapped, so the operator read "operator
+// user not found" from one subcommand and a sentence from the next.
+func TestRunUsersDeleteReportsAnUnresolvableTargetInTheSharedWording(t *testing.T) {
+	t.Parallel()
+
+	databasePath := createCLIUsersDatabase(t)
+
+	err := runUsersCommand(
+		db.Config{Driver: db.DriverSQLite, SQLitePath: databasePath},
+		[]string{"delete", "--id", "999", "--yes"},
+		"",
+		strings.NewReader(""),
+		&bytes.Buffer{},
+	)
+	if err == nil || err.Error() != "no account carries id 999 (see ovumcy users list)" {
+		t.Fatalf("expected the shared unknown-id wording, got %v", err)
+	}
+}
+
+// TestMapUsersDeleteErrorSeparatesTheErasureFromTheLookup pins the one arm
+// this command adds to the shared mapper. Routing a failed erasure through the
+// lookup wording would report a storage failure as "look up account", which
+// points the operator at the handle they typed rather than at the write.
+func TestMapUsersDeleteErrorSeparatesTheErasureFromTheLookup(t *testing.T) {
+	t.Parallel()
+
+	erasure := mapUsersDeleteError(services.ErrOperatorUserDeleteFailed, 7, "")
+	if erasure == nil || !strings.HasPrefix(erasure.Error(), "delete account: ") {
+		t.Fatalf("expected the erasure failure to be named as one, got %v", erasure)
+	}
+
+	lookup := mapUsersDeleteError(services.ErrOperatorUserNotFound, 7, "")
+	if lookup == nil || lookup.Error() != "no account carries id 7 (see ovumcy users list)" {
+		t.Fatalf("expected the shared lookup wording, got %v", lookup)
 	}
 }
 
@@ -52,6 +107,7 @@ func TestRunUsersCommandListShowsEmptyState(t *testing.T) {
 	err := runUsersCommand(
 		db.Config{Driver: db.DriverSQLite, SQLitePath: databasePath},
 		[]string{"list"},
+		"",
 		strings.NewReader(""),
 		&output,
 	)
@@ -70,14 +126,25 @@ func TestParseUsersDeleteArgs(t *testing.T) {
 		name         string
 		args         []string
 		wantEmail    string
+		wantID       uint
 		wantSkip     bool
 		wantErrorMsg string
 	}{
 		{name: "email only", args: []string{"owner@example.com"}, wantEmail: "owner@example.com"},
 		{name: "email and yes", args: []string{"owner@example.com", "--yes"}, wantEmail: "owner@example.com", wantSkip: true},
 		{name: "yes before email", args: []string{"--yes", "owner@example.com"}, wantEmail: "owner@example.com", wantSkip: true},
-		{name: "missing email", args: []string{"--yes"}, wantErrorMsg: "usage: ovumcy users delete <email> [--yes]"},
-		{name: "multiple emails", args: []string{"one@example.com", "two@example.com"}, wantErrorMsg: "usage: ovumcy users delete <email> [--yes]"},
+		{name: "id form", args: []string{"--id", "7"}, wantID: 7},
+		{name: "blank argument between flags", args: []string{"", "--id", "7", ""}, wantID: 7},
+		{name: "id form with equals and yes", args: []string{"--id=7", "--yes"}, wantID: 7, wantSkip: true},
+		{name: "missing handle", args: []string{"--yes"}, wantErrorMsg: usersDeleteUsage},
+		{name: "multiple emails", args: []string{"one@example.com", "two@example.com"}, wantErrorMsg: usersDeleteUsage},
+		{name: "email and id together", args: []string{"owner@example.com", "--id", "7"}, wantErrorMsg: usersDeleteUsage},
+		{name: "two ids", args: []string{"--id", "7", "--id", "8"}, wantErrorMsg: usersDeleteUsage},
+		{name: "id without value", args: []string{"--id"}, wantErrorMsg: usersDeleteUsage},
+		{name: "unknown flag", args: []string{"owner@example.com", "--force"}, wantErrorMsg: usersDeleteUsage},
+		{name: "id zero", args: []string{"--id", "0"}, wantErrorMsg: `invalid account id "0" (see ovumcy users list)`},
+		{name: "id not a number", args: []string{"--id", "seven"}, wantErrorMsg: `invalid account id "seven" (see ovumcy users list)`},
+		{name: "id negative", args: []string{"--id", "-1"}, wantErrorMsg: `invalid account id "-1" (see ovumcy users list)`},
 	}
 
 	for _, testCase := range tests {
@@ -85,7 +152,7 @@ func TestParseUsersDeleteArgs(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			gotEmail, gotSkip, err := parseUsersDeleteArgs(testCase.args)
+			opts, err := parseUsersDeleteArgs(testCase.args)
 			if testCase.wantErrorMsg != "" {
 				if err == nil || err.Error() != testCase.wantErrorMsg {
 					t.Fatalf("expected error %q, got %v", testCase.wantErrorMsg, err)
@@ -95,11 +162,138 @@ func TestParseUsersDeleteArgs(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parseUsersDeleteArgs returned error: %v", err)
 			}
-			if gotEmail != testCase.wantEmail || gotSkip != testCase.wantSkip {
-				t.Fatalf("unexpected parsed args: email=%q skip=%t", gotEmail, gotSkip)
+			if opts.email != testCase.wantEmail || opts.userID != testCase.wantID || opts.skipConfirm != testCase.wantSkip {
+				t.Fatalf("unexpected parsed args: email=%q id=%d skip=%t", opts.email, opts.userID, opts.skipConfirm)
 			}
 		})
 	}
+}
+
+func TestParseUsersSetEmailArgs(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		args         []string
+		wantID       uint
+		wantEmail    string
+		wantErrorMsg string
+	}{
+		{name: "id then email", args: []string{"--id", "7", "owner@example.com"}, wantID: 7, wantEmail: "owner@example.com"},
+		{name: "blank argument between flags", args: []string{"", "--id", "7", "", "owner@example.com"}, wantID: 7, wantEmail: "owner@example.com"},
+		{name: "equals form", args: []string{"--id=7", "owner@example.com"}, wantID: 7, wantEmail: "owner@example.com"},
+		{name: "email then id", args: []string{"owner@example.com", "--id", "7"}, wantID: 7, wantEmail: "owner@example.com"},
+		{name: "missing id", args: []string{"owner@example.com"}, wantErrorMsg: usersSetEmailUsage},
+		{name: "missing email", args: []string{"--id", "7"}, wantErrorMsg: usersSetEmailUsage},
+		{name: "two emails", args: []string{"--id", "7", "a@example.com", "b@example.com"}, wantErrorMsg: usersSetEmailUsage},
+		{name: "two ids", args: []string{"--id", "7", "--id=8", "a@example.com"}, wantErrorMsg: usersSetEmailUsage},
+		{name: "unknown flag", args: []string{"--id", "7", "a@example.com", "--yes"}, wantErrorMsg: usersSetEmailUsage},
+		{name: "id not a number", args: []string{"--id", "x", "a@example.com"}, wantErrorMsg: `invalid account id "x" (see ovumcy users list)`},
+	}
+
+	for _, testCase := range tests {
+
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			opts, err := parseUsersSetEmailArgs(testCase.args)
+			if testCase.wantErrorMsg != "" {
+				if err == nil || err.Error() != testCase.wantErrorMsg {
+					t.Fatalf("expected error %q, got %v", testCase.wantErrorMsg, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseUsersSetEmailArgs returned error: %v", err)
+			}
+			if opts.userID != testCase.wantID || opts.email != testCase.wantEmail {
+				t.Fatalf("unexpected parsed args: id=%d email=%q", opts.userID, opts.email)
+			}
+		})
+	}
+}
+
+// TestMapUsersSetEmailError pins the operator-facing wording of every refusal
+// the repair can produce. Two of them the CLI's own parser makes unreachable —
+// an absent id and an empty address — and they are mapped anyway: the service
+// is the authority on its own preconditions, and a mapper that answers only
+// the errors today's parser lets through turns a later parser change into an
+// unreadable "set email: operator user ..." line.
+//
+// The two account-lookup refusals are asserted in the SHARED wording, not this
+// command's own: `set-email` used to answer an unknown id with "no account
+// carries this id", a third phrasing beside the two the other subcommands
+// already had, for the same failure the operator meets under three commands.
+func TestMapUsersSetEmailError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "missing id", err: services.ErrOperatorUserIDRequired, want: "an account id is required (see ovumcy users list)"},
+		{name: "unknown id", err: services.ErrOperatorUserNotFound, want: "no account carries id 7 (see ovumcy users list)"},
+		{name: "empty email", err: services.ErrOperatorUserEmailRequired, want: "email is required"},
+		{name: "decorated email", err: services.ErrOperatorUserEmailInvalid, want: "invalid email address: pass the bare address, with no display name or angle brackets"},
+		{name: "address taken", err: services.ErrOperatorUserEmailExists, want: "another account already answers to this email address"},
+		{name: "row moved", err: services.ErrOperatorUserChangedUnderRepair, want: "this account's email changed while the repair ran — re-read ovumcy users list and retry"},
+		{name: "storage failure", err: errors.New("db down"), want: "set email: db down"},
+	}
+
+	for _, testCase := range tests {
+
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := mapUsersSetEmailError(testCase.err, 7); got == nil || got.Error() != testCase.want {
+				t.Fatalf("expected %q, got %v", testCase.want, got)
+			}
+		})
+	}
+}
+
+// TestRunUsersSetEmailParsesItsOwnArgumentsAndDefaultsItsWriter covers the two
+// arms runUsersCommand hides: it validates the same arguments before opening
+// the database, and it always supplies a writer.
+func TestRunUsersSetEmailParsesItsOwnArgumentsAndDefaultsItsWriter(t *testing.T) {
+	t.Parallel()
+
+	// The parse runs before the service is touched, so a nil service here is
+	// an assertion in itself: reaching past it would panic.
+	if err := runUsersSetEmail(nil, []string{"--id", "7"}, &bytes.Buffer{}); err == nil || err.Error() != usersSetEmailUsage {
+		t.Fatalf("expected the usage error, got %v", err)
+	}
+
+	databasePath := createCLIUsersDatabase(t)
+	user := createCLIUsersUser(t, databasePath, "owner@example.com", "Owner", models.RoleOwner, true, time.Now().UTC())
+	service := operatorUserServiceForCLITest(t, databasePath)
+
+	// A nil writer means "the process's stdout", which is what the exported
+	// entry point passes; the write itself is proven by the row it moved.
+	if err := runUsersSetEmail(service, []string{"--id", strconv.FormatUint(uint64(user.ID), 10), "renamed@example.com"}, nil); err != nil {
+		t.Fatalf("runUsersSetEmail with a nil writer returned error: %v", err)
+	}
+	if got := loadCLIUsersRow(t, databasePath, user.ID).Email; got != "renamed@example.com" {
+		t.Fatalf("expected the repair to land, got %q", got)
+	}
+}
+
+func operatorUserServiceForCLITest(t *testing.T, databasePath string) *services.OperatorUserService {
+	t.Helper()
+
+	database, err := db.OpenDatabase(db.Config{Driver: db.DriverSQLite, SQLitePath: databasePath})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	sqlDB, err := database.DB()
+	if err != nil {
+		t.Fatalf("open sql db: %v", err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+
+	repositories, _ := buildRepositories(database, "")
+	return services.NewOperatorUserService(repositories.Users, services.NewAuthService(repositories.Users))
 }
 
 func TestReadDeleteConfirmation(t *testing.T) {
@@ -147,8 +341,12 @@ func TestRunUsersDeleteRequiresConfirmationInputWhenYesFlagIsAbsent(t *testing.T
 	user := createCLIUsersUser(t, databasePath, "needs-confirmation@example.com", "Owner", models.RoleOwner, true, nowUTC())
 	seedCLIUsersHealthData(t, databasePath, user.ID)
 
+	// The fence is never reached: readDeleteConfirmation fails first, so a
+	// blank path and a nil fence are safe here.
 	err := runUsersDelete(
 		mustCLIUsersService(t, databasePath),
+		"",
+		nil,
 		[]string{"needs-confirmation@example.com"},
 		nil,
 		&bytes.Buffer{},
@@ -161,7 +359,7 @@ func TestRunUsersDeleteRequiresConfirmationInputWhenYesFlagIsAbsent(t *testing.T
 func mustCLIUsersService(t *testing.T, databasePath string) *services.OperatorUserService {
 	t.Helper()
 
-	database, err := db.OpenSQLite(databasePath)
+	database, err := db.OpenDatabase(db.Config{Driver: db.DriverSQLite, SQLitePath: databasePath})
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
@@ -346,6 +544,7 @@ func TestRunUsersCommandReportsDatabaseInitFailure(t *testing.T) {
 	err := runUsersCommand(
 		db.Config{Driver: db.DriverSQLite, SQLitePath: t.TempDir()},
 		[]string{"list"},
+		"",
 		bytes.NewReader(nil),
 		io.Discard,
 	)

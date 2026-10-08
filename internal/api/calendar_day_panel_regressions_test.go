@@ -10,8 +10,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gofiber/fiber/v3"
 	"github.com/ovumcy/ovumcy-web/internal/models"
 	"github.com/ovumcy/ovumcy-web/internal/services"
+	"golang.org/x/net/html"
+	"gorm.io/gorm"
 )
 
 func TestCalendarDayPanelReadonlySummaryShowsSavedBBT(t *testing.T) {
@@ -27,7 +30,7 @@ func TestCalendarDayPanelReadonlySummaryShowsSavedBBT(t *testing.T) {
 	logEntry := models.DailyLog{
 		UserID: user.ID,
 		Date:   time.Date(2026, time.February, 17, 0, 0, 0, 0, time.UTC),
-		BBT:    models.NewBBT(36.75),
+		BBT:    new(36.75),
 		Notes:  "tracked",
 	}
 	if err := database.Create(&logEntry).Error; err != nil {
@@ -48,6 +51,177 @@ func TestCalendarDayPanelReadonlySummaryShowsSavedBBT(t *testing.T) {
 	}
 	if !strings.Contains(rendered, "36.75 °C") {
 		t.Fatalf("expected saved BBT value in calendar day summary, got %q", rendered)
+	}
+}
+
+// TestCalendarDaySummaryNamesTheLoggedMood is the read-back half of the mood
+// scale carrying names: a mood read back as a face and a fraction says as
+// little as the unnamed picker did. The saved step is displayed with the name
+// its key resolves to, and the face stays out of the accessibility tree beside
+// it — it decorates a value the text already carries.
+func TestCalendarDaySummaryNamesTheLoggedMood(t *testing.T) {
+	app, database := newOnboardingTestApp(t)
+	user := createOnboardingTestUser(t, database, "calendar-mood-summary@example.com", "StrongPass1", true)
+
+	saved := services.DayMoodScale().Highest
+	day := time.Date(2026, time.February, 17, 0, 0, 0, 0, time.UTC)
+	if err := database.Create(&models.DailyLog{
+		UserID: user.ID,
+		Date:   day,
+		Flow:   models.FlowNone,
+		Mood:   saved,
+	}).Error; err != nil {
+		t.Fatalf("create daily log: %v", err)
+	}
+
+	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
+	request := httptest.NewRequest(http.MethodGet, "/calendar/day/"+day.Format("2006-01-02"), nil)
+	request.Header.Set("Accept-Language", "en")
+	request.Header.Set("Cookie", authCookie)
+
+	response := mustAppResponse(t, app, request)
+	assertStatusCode(t, response, http.StatusOK)
+
+	document := mustParseHTMLDocument(t, mustReadBodyString(t, response.Body))
+	name := htmlFindElement(document, func(node *html.Node) bool {
+		return node.Type == html.ElementNode && htmlHasAttr(node, "data-mood-name-key")
+	})
+	if name == nil {
+		t.Fatal("expected the day summary to name the logged mood")
+	}
+	if got, want := htmlAttr(name, "data-mood-name-key"), services.MoodTranslationKey(saved); got != want {
+		t.Fatalf("summary name key %q, want %q", got, want)
+	}
+	rendered := strings.TrimSpace(htmlNodeText(name))
+	if rendered == "" || rendered == services.MoodTranslationKey(saved) {
+		t.Fatalf("expected a resolved mood name in the summary, got %q", rendered)
+	}
+}
+
+// mustMatchCalendarTag returns the single opening tag matching pattern, so an
+// assertion about one control's attributes cannot be satisfied by a different
+// element elsewhere in the page.
+func mustMatchCalendarTag(t *testing.T, rendered string, pattern string, subject string) string {
+	t.Helper()
+
+	matches := regexp.MustCompile(pattern).FindAllString(rendered, -1)
+	if len(matches) != 1 {
+		t.Fatalf("expected exactly one %s matching %s, got %d", subject, pattern, len(matches))
+	}
+	return matches[0]
+}
+
+// The calendar screen exists so a day can be edited, so the day panel's edit
+// action is the primary and "Today" is compact navigation beside the month
+// arrows. Both halves are pinned structurally: the weight each control
+// declares plus the button utility that paints it. Inverted (edit on
+// btn-secondary, Today on btn-primary) both assertions fail.
+func TestCalendarDayPanelEditActionCarriesThePrimaryWeight(t *testing.T) {
+	app, database := newOnboardingTestApp(t)
+	user := createOnboardingTestUser(t, database, "calendar-edit-weight@example.com", "StrongPass1", true)
+
+	if err := database.Create(&models.DailyLog{
+		UserID:   user.ID,
+		Date:     time.Date(2026, time.February, 17, 0, 0, 0, 0, time.UTC),
+		IsPeriod: true,
+		Flow:     models.FlowMedium,
+	}).Error; err != nil {
+		t.Fatalf("create daily log: %v", err)
+	}
+
+	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
+	request := httptest.NewRequest(http.MethodGet, "/calendar/day/2026-02-17", nil)
+	request.Header.Set("Accept-Language", "en")
+	request.Header.Set("Cookie", authCookie)
+
+	response := mustAppResponse(t, app, request)
+	assertStatusCode(t, response, http.StatusOK)
+	rendered := mustReadBodyString(t, response.Body)
+
+	editAction := mustMatchCalendarTag(
+		t,
+		rendered,
+		`<button[^>]*data-day-editor-open="2026-02-17"[^>]*>`,
+		"calendar day panel edit action",
+	)
+	if !strings.Contains(editAction, `data-action-weight="primary"`) {
+		t.Fatalf("expected the day panel edit action to declare the primary weight, got %q", editAction)
+	}
+	if !strings.Contains(editAction, `class="btn-primary"`) {
+		t.Fatalf("expected the day panel edit action to carry the primary fill, got %q", editAction)
+	}
+}
+
+func TestCalendarTodayControlCarriesTheCompactSecondaryWeight(t *testing.T) {
+	app, database := newOnboardingTestApp(t)
+	user := createOnboardingTestUser(t, database, "calendar-today-weight@example.com", "StrongPass1", true)
+	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
+
+	request := httptest.NewRequest(http.MethodGet, "/calendar", nil)
+	request.Header.Set("Accept-Language", "en")
+	request.Header.Set("Cookie", authCookie)
+
+	response := mustAppResponse(t, app, request)
+	assertStatusCode(t, response, http.StatusOK)
+	rendered := mustReadBodyString(t, response.Body)
+
+	// Named first so an inverted hierarchy reports the control that took the
+	// primary fill, not merely the absence of the navigation hook below.
+	if regexp.MustCompile(`<a[^>]*href="/calendar"[^>]*class="btn-primary"`).MatchString(rendered) {
+		t.Fatalf("expected no primary-filled month-navigation link on the calendar page")
+	}
+
+	todayControl := mustMatchCalendarTag(
+		t,
+		rendered,
+		`<a[^>]*data-calendar-today[^>]*>`,
+		"calendar today control",
+	)
+	if !strings.Contains(todayControl, `data-action-weight="secondary"`) {
+		t.Fatalf("expected the today control to declare the secondary weight, got %q", todayControl)
+	}
+	if !strings.Contains(todayControl, "btn-secondary") || !strings.Contains(todayControl, "btn-compact") {
+		t.Fatalf("expected the today control to render as compact secondary navigation, got %q", todayControl)
+	}
+	if strings.Contains(todayControl, "btn-primary") {
+		t.Fatalf("expected the today control to give up the primary fill, got %q", todayControl)
+	}
+}
+
+// The legend explains an encoding the reader is about to use, so it has to be
+// inside the grid panel and ahead of the first day cell: under the grid, at the
+// end of the panel, it was off screen exactly while the month was being read.
+func TestCalendarLegendLeadsTheGridInsideTheSamePanel(t *testing.T) {
+	app, database := newOnboardingTestApp(t)
+	user := createOnboardingTestUser(t, database, "calendar-legend-placement@example.com", "StrongPass1", true)
+	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
+
+	request := httptest.NewRequest(http.MethodGet, "/calendar", nil)
+	request.Header.Set("Accept-Language", "en")
+	request.Header.Set("Cookie", authCookie)
+
+	response := mustAppResponse(t, app, request)
+	assertStatusCode(t, response, http.StatusOK)
+
+	document := mustParseHTMLDocument(t, mustReadBodyString(t, response.Body))
+	panel := htmlFindElement(document, func(node *html.Node) bool {
+		return node.Type == html.ElementNode && htmlAttr(node, "id") == "calendar-grid-panel"
+	})
+	if panel == nil {
+		t.Fatalf("expected the calendar grid panel")
+	}
+
+	// Document order decides this, not a class: the first of the two hooks the
+	// walk meets inside the panel must be the legend.
+	first := htmlFindElement(panel, func(node *html.Node) bool {
+		return node.Type == html.ElementNode &&
+			(htmlHasAttr(node, "data-calendar-legend") || htmlHasAttr(node, "data-day"))
+	})
+	if first == nil {
+		t.Fatalf("expected the grid panel to render both the legend and the day cells")
+	}
+	if !htmlHasAttr(first, "data-calendar-legend") {
+		t.Fatalf("expected the legend to precede the day cells inside the grid panel")
 	}
 }
 
@@ -91,6 +265,81 @@ func TestCalendarDayPanelEditModeRendersDeleteActionForExistingEntry(t *testing.
 		bodyStringMatch{fragment: `data-day-delete-form`, message: "expected delete form affordance for existing calendar entry"},
 		bodyStringMatch{fragment: `data-day-delete-button`, message: "expected delete button affordance for existing calendar entry"},
 	)
+}
+
+// TestCalendarDayEditorPregnancyTestRemovalClearsTheSavedResult drives the
+// removal end to end on the second day-entry surface: the editor renders the
+// same shared control the dashboard journal does, its removal action posts the
+// unset value, and the cleared day comes back as absent data rather than as a
+// selected segment. Anything less would leave the unset state reachable only
+// by deleting the whole day entry.
+func TestCalendarDayEditorPregnancyTestRemovalClearsTheSavedResult(t *testing.T) {
+	app, database := newOnboardingTestApp(t)
+	user := createOnboardingTestUser(t, database, "calendar-pregnancy-removal@example.com", "StrongPass1", true)
+	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
+
+	day := time.Date(2026, time.February, 17, 0, 0, 0, 0, time.UTC)
+	if err := database.Create(&models.DailyLog{
+		UserID:        user.ID,
+		Date:          day,
+		Flow:          models.FlowNone,
+		PregnancyTest: models.PregnancyTestPositive,
+	}).Error; err != nil {
+		t.Fatalf("create daily log: %v", err)
+	}
+
+	field := pregnancyTestField(t, mustParseHTMLDocument(t, calendarDayEditorMarkup(t, app, authCookie)))
+	if got := htmlAttr(field, "data-pregnancy-test-state"); got != "recorded" {
+		t.Fatalf("expected the day editor to render the saved result, got state %q", got)
+	}
+	if !pregnancyTestShowsHook(field, "data-pregnancy-test-remove") {
+		t.Fatal("expected the day editor to offer the same removal action as the dashboard journal")
+	}
+
+	// What the removal action posts: the same day form, with the unset value.
+	form := url.Values{
+		"flow":           {models.FlowNone},
+		"pregnancy_test": {models.PregnancyTestNone},
+	}
+	saveRequest := httptest.NewRequest(http.MethodPut, "/api/v1/days/2026-02-17", strings.NewReader(form.Encode()))
+	saveRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	saveRequest.Header.Set("HX-Request", "true")
+	saveRequest.Header.Set("Accept-Language", "en")
+	saveRequest.Header.Set("Cookie", authCookie)
+
+	saveResponse := mustAppResponse(t, app, saveRequest)
+	assertStatusCode(t, saveResponse, http.StatusOK)
+
+	var updated models.DailyLog
+	if err := database.Where("user_id = ? AND date = ?", user.ID, day).First(&updated).Error; err != nil {
+		t.Fatalf("load updated log: %v", err)
+	}
+	if updated.PregnancyTest != models.PregnancyTestNone {
+		t.Fatalf("expected the removal to clear the field, got %q", updated.PregnancyTest)
+	}
+
+	cleared := pregnancyTestField(t, mustParseHTMLDocument(t, calendarDayEditorMarkup(t, app, authCookie)))
+	if got := htmlAttr(cleared, "data-pregnancy-test-state"); got != "absent" {
+		t.Fatalf("expected the cleared day to round-trip as absent data, got state %q", got)
+	}
+	if !pregnancyTestShowsHook(cleared, "data-pregnancy-test-empty") {
+		t.Fatal("expected the cleared day to render the empty state")
+	}
+	if pregnancyTestShowsHook(cleared, "data-pregnancy-test-remove") {
+		t.Fatal("expected no removal action once the result is gone")
+	}
+}
+
+func calendarDayEditorMarkup(t *testing.T, app *fiber.App, authCookie string) string {
+	t.Helper()
+
+	request := httptest.NewRequest(http.MethodGet, "/calendar/day/2026-02-17?mode=edit", nil)
+	request.Header.Set("Accept-Language", "en")
+	request.Header.Set("Cookie", authCookie)
+
+	response := mustAppResponse(t, app, request)
+	assertStatusCode(t, response, http.StatusOK)
+	return mustReadBodyString(t, response.Body)
 }
 
 func TestCalendarDayPanelEditModePreservesAndSavesPeriodToggle(t *testing.T) {
@@ -159,6 +408,134 @@ func TestCalendarDayPanelEditModePreservesAndSavesPeriodToggle(t *testing.T) {
 	}
 	if updated.IsPeriod {
 		t.Fatalf("expected unchecked edit-mode period toggle to persist as false")
+	}
+}
+
+// Period day and cycle start are one event for the person logging it, so the
+// day editor asks the question inline beside the period toggle instead of
+// sending the owner to the separate manual control. The hook must appear
+// exactly in the state the cycle-start policy suggests a new cycle in: seeded
+// here with an explicit cycle start 28 days back (suggestion state) against a
+// second owner whose previous start is 4 days back (not the suggestion state).
+func seedCycleStartAnchorForDayEditor(t *testing.T, database *gorm.DB, userID uint, daysBack int) time.Time {
+	t.Helper()
+
+	today := services.DateAtLocation(time.Now().In(time.UTC), time.UTC)
+	if err := database.Create(&models.DailyLog{
+		UserID:     userID,
+		Date:       today.AddDate(0, 0, -daysBack),
+		IsPeriod:   true,
+		Flow:       models.FlowMedium,
+		CycleStart: true,
+	}).Error; err != nil {
+		t.Fatalf("seed cycle start anchor: %v", err)
+	}
+	return today
+}
+
+func fetchDayEditorMarkup(t *testing.T, app *fiber.App, authCookie string, day time.Time) string {
+	t.Helper()
+
+	request := httptest.NewRequest(http.MethodGet, "/calendar/day/"+day.Format("2006-01-02")+"?mode=edit", nil)
+	request.Header.Set("Accept-Language", "en")
+	request.Header.Set("Cookie", joinCookieHeader(authCookie, timezoneCookieName+"=UTC"))
+	request.Header.Set(timezoneHeaderName, "UTC")
+
+	response := mustAppResponse(t, app, request)
+	assertStatusCode(t, response, http.StatusOK)
+	return mustReadBodyString(t, response.Body)
+}
+
+func TestDayEditorAsksTheCycleStartQuestionExactlyInTheSuggestionState(t *testing.T) {
+	app, database := newOnboardingTestApp(t)
+
+	asked := createOnboardingTestUser(t, database, "day-editor-cycle-start-question@example.com", "StrongPass1", true)
+	today := seedCycleStartAnchorForDayEditor(t, database, asked.ID, 28)
+	askedMarkup := fetchDayEditorMarkup(t, app, loginAndExtractAuthCookie(t, app, asked.Email, "StrongPass1"), today)
+
+	if got := strings.Count(askedMarkup, "data-cycle-start-question"); got != 1 {
+		t.Fatalf("expected exactly one inline cycle-start question in the suggestion state, got %d", got)
+	}
+	if !strings.Contains(askedMarkup, `name="cycle_start"`) {
+		t.Fatalf("expected the inline question to ride the day form as a cycle_start control")
+	}
+	if !strings.Contains(askedMarkup, `data-cycle-start-answer="no"`) {
+		t.Fatalf("expected the inline question to offer declining as its own control")
+	}
+
+	quiet := createOnboardingTestUser(t, database, "day-editor-cycle-start-quiet@example.com", "StrongPass1", true)
+	seedCycleStartAnchorForDayEditor(t, database, quiet.ID, 4)
+	quietMarkup := fetchDayEditorMarkup(t, app, loginAndExtractAuthCookie(t, app, quiet.Email, "StrongPass1"), today)
+
+	// Positive anchor first: the form itself renders, so the absence below is
+	// the policy staying quiet rather than a panel that failed to load.
+	if !strings.Contains(quietMarkup, "data-period-toggle") {
+		t.Fatalf("expected the day editor form to render for the second owner")
+	}
+	if strings.Contains(quietMarkup, "data-cycle-start-question") {
+		t.Fatalf("expected no inline cycle-start question four days after the previous start")
+	}
+}
+
+// The answer is carried by the save that records the bleeding, and only by an
+// explicit yes: the same form without the field leaves a plain period day.
+func TestDayEditorSaveCarriesTheInlineCycleStartAnswer(t *testing.T) {
+	app, database := newOnboardingTestApp(t)
+
+	saveDay := func(t *testing.T, email string, form url.Values) models.DailyLog {
+		t.Helper()
+
+		user := createOnboardingTestUser(t, database, email, "StrongPass1", true)
+		today := seedCycleStartAnchorForDayEditor(t, database, user.ID, 28)
+		authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
+
+		request := httptest.NewRequest(http.MethodPut, "/api/v1/days/"+today.Format("2006-01-02"), strings.NewReader(form.Encode()))
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		request.Header.Set("HX-Request", "true")
+		request.Header.Set("Accept-Language", "en")
+		request.Header.Set("Cookie", joinCookieHeader(authCookie, timezoneCookieName+"=UTC"))
+		request.Header.Set(timezoneHeaderName, "UTC")
+
+		response := mustAppResponse(t, app, request)
+		assertStatusCode(t, response, http.StatusOK)
+
+		var saved models.DailyLog
+		if err := database.Where("user_id = ? AND date = ?", user.ID, today).First(&saved).Error; err != nil {
+			t.Fatalf("load saved day: %v", err)
+		}
+		return saved
+	}
+
+	confirmed := saveDay(t, "day-save-cycle-start-yes@example.com", url.Values{
+		"is_period":   {"true"},
+		"flow":        {models.FlowMedium},
+		"cycle_start": {"true"},
+	})
+	if !confirmed.CycleStart {
+		t.Fatalf("expected the confirmed inline answer to mark the saved day as a cycle start")
+	}
+	if !confirmed.IsPeriod {
+		t.Fatalf("expected the confirmed day to stay a period day")
+	}
+
+	untouched := saveDay(t, "day-save-cycle-start-untouched@example.com", url.Values{
+		"is_period": {"true"},
+		"flow":      {models.FlowMedium},
+	})
+	if untouched.CycleStart {
+		t.Fatalf("expected an untouched inline question to write no cycle start")
+	}
+
+	declined := saveDay(t, "day-save-cycle-start-no@example.com", url.Values{
+		"is_period":   {"true"},
+		"flow":        {models.FlowMedium},
+		"cycle_start": {"false"},
+	})
+	if declined.CycleStart {
+		t.Fatalf("expected declining to leave a plain period day")
+	}
+	if !declined.IsPeriod {
+		t.Fatalf("expected declining to keep the period day itself")
 	}
 }
 

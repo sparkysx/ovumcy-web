@@ -1,0 +1,557 @@
+package services
+
+import (
+	"testing"
+	"time"
+
+	"github.com/ovumcy/ovumcy-web/internal/models"
+)
+
+// The long-cycle safety gate, from the history that used to walk straight
+// through it.
+//
+// One missed period log merges two real cycles into a single enormous span, and
+// that span lands in the same recent-cycle window every statistic is computed
+// over. The MEAN absorbs it — three 28-day cycles beside one 300-day gap average
+// 96, four of them average 82 — while the median stays 28. The overdue gate was
+// resolved against the average-first reference length, so it asked "is cycle day
+// 61 past 103?", answered no, and every surface kept publishing dates produced
+// by rolling the 28-day median forward: a projection 33 days past the length that
+// produced it, presented as an estimate. That is the estimate-presented-as-fact
+// the medical-safety invariant forbids (docs/SECURITY_INVARIANTS.md -> medical
+// safety), and the account that hits it is the one asking the most anxious
+// question in the product.
+//
+// The two histories are the ones named in the release plan, with their arithmetic
+// asserted rather than assumed: a scenario that stopped producing mean 96 beside
+// median 28 would no longer be about this defect at all.
+
+// longCycleGateUser is an ordinary owner with the model defaults, so nothing in
+// these cases turns on a setting.
+func longCycleGateUser() *models.User {
+	return &models.User{Role: models.RoleOwner, CycleLength: 28, PeriodLength: 5, LutealPhase: 14}
+}
+
+// longCycleGateLogs writes one explicit cycle start per offset, counted from
+// base. The starts are what CycleBoundaries reads, so the spans between them
+// are the observed cycle lengths.
+func longCycleGateLogs(base time.Time, offsets []int) []models.DailyLog {
+	logs := make([]models.DailyLog, 0, len(offsets))
+	for _, offset := range offsets {
+		logs = append(logs, models.DailyLog{
+			Date:       base.AddDate(0, 0, offset),
+			IsPeriod:   true,
+			CycleStart: true,
+		})
+	}
+	return logs
+}
+
+type longCycleGateScenario struct {
+	name string
+	// startOffsets are the explicit cycle starts; the last gap is the merged one.
+	startOffsets []int
+	// wantRoundedAverage is the inflated reference the mean produces here.
+	wantRoundedAverage int
+	wantCompleted      int
+}
+
+var longCycleGateScenarios = []longCycleGateScenario{
+	{
+		name:               "three 28-day cycles and a 300-day gap average 96",
+		startOffsets:       []int{0, 28, 56, 84, 384},
+		wantRoundedAverage: 96,
+		wantCompleted:      4,
+	},
+	{
+		name:               "four 28-day cycles and a 300-day gap average 82",
+		startOffsets:       []int{0, 28, 56, 84, 112, 412},
+		wantRoundedAverage: 82,
+		wantCompleted:      5,
+	},
+}
+
+// longCycleGateSetup returns the stats every surface below is built from, on the
+// path the owner surfaces actually take (ApplyUserCycleBaseline over
+// BuildCycleStatsFromLogs), plus the day the account is on.
+func longCycleGateSetup(t *testing.T, scenario longCycleGateScenario) (*models.User, []models.DailyLog, CycleStats, time.Time) {
+	t.Helper()
+
+	loc := time.UTC
+	base := time.Date(2025, time.January, 1, 0, 0, 0, 0, loc)
+	logs := longCycleGateLogs(base, scenario.startOffsets)
+	lastStart := base.AddDate(0, 0, scenario.startOffsets[len(scenario.startOffsets)-1])
+	today := lastStart.AddDate(0, 0, 60)
+
+	user := longCycleGateUser()
+	stats := ApplyUserCycleBaseline(user, logs, BuildCycleStatsFromLogs(user, logs, today, loc), today, loc)
+
+	if stats.CurrentCycleDay != 61 {
+		t.Fatalf("scenario setup: CurrentCycleDay = %d, want 61", stats.CurrentCycleDay)
+	}
+	if stats.CompletedCycleCount != scenario.wantCompleted {
+		t.Fatalf("scenario setup: CompletedCycleCount = %d, want %d", stats.CompletedCycleCount, scenario.wantCompleted)
+	}
+	if stats.MedianCycleLength != 28 {
+		t.Fatalf("scenario setup: MedianCycleLength = %d, want 28", stats.MedianCycleLength)
+	}
+	if rounded := int(stats.AverageCycleLength + 0.5); rounded != scenario.wantRoundedAverage {
+		t.Fatalf("scenario setup: rounded AverageCycleLength = %d, want %d", rounded, scenario.wantRoundedAverage)
+	}
+	// The bypass itself, pinned as a precondition: the inflated mean lifts the
+	// old threshold ABOVE cycle day 61, which is how the projection survived. A
+	// scenario where the mean no longer hides the day would pass the assertions
+	// below without ever exercising the defect.
+	if reference := DashboardCycleReferenceLength(user, stats); stats.CurrentCycleDay > reference+7 {
+		t.Fatalf("scenario setup: cycle day %d is already past the average-first reference %d + 7, so this history never bypassed the gate",
+			stats.CurrentCycleDay, reference)
+	}
+
+	return user, logs, stats, today
+}
+
+// TestLongCycleGateSuppressesEverySurfaceWhenAMergedCycleInflatesTheAverage is
+// the cross-surface regression: dashboard, calendar grid, published stats (the
+// one helper /stats, the dashboard and the JSON API all read), the .ics feed and
+// the webhook pass must all withhold.
+func TestLongCycleGateSuppressesEverySurfaceWhenAMergedCycleInflatesTheAverage(t *testing.T) {
+	loc := time.UTC
+
+	for _, scenario := range longCycleGateScenarios {
+		t.Run(scenario.name, func(t *testing.T) {
+			user, logs, stats, today := longCycleGateSetup(t, scenario)
+
+			if !DashboardCycleOverdue(user, stats) {
+				t.Fatalf("cycle day %d against median %d is overdue whatever the mean says: DashboardCycleOverdue = false",
+					stats.CurrentCycleDay, stats.MedianCycleLength)
+			}
+			if !PredictionsSuppressed(user, stats) {
+				t.Fatal("PredictionsSuppressed = false, so every surface below is free to publish a projected date")
+			}
+
+			// 1. Dashboard hero and header.
+			cycleContext := BuildDashboardCycleContext(user, logs, stats, today, loc)
+			if !cycleContext.DisplayNextPeriodStart.IsZero() || !cycleContext.DisplayNextPeriodEnd.IsZero() {
+				t.Fatalf("dashboard published a next-period window: %s..%s",
+					cycleContext.DisplayNextPeriodStart.Format("2006-01-02"), cycleContext.DisplayNextPeriodEnd.Format("2006-01-02"))
+			}
+			if !cycleContext.DisplayOvulationDate.IsZero() {
+				t.Fatalf("dashboard published an ovulation date: %s", cycleContext.DisplayOvulationDate.Format("2006-01-02"))
+			}
+			if !cycleContext.NextPeriodEstimatePaused {
+				t.Fatal("the dashboard cleared the window without saying the estimate is paused, which is a blank slot with no explanation")
+			}
+			// The notice is what stands where the date was: a surface that
+			// withholds silently tells the owner nothing at all.
+			//
+			// WHICH notice was an open question (WEB-3 finding 5): for this
+			// fixture BuildLateCycleNotice used to compare cycle day 61 against
+			// stats.MaxCycleLength — 300, the merged span itself — and land on
+			// "still inside your recorded range of 28 to 300 days", beside a
+			// withheld date. Deciding when a recorded span stops counting as a
+			// cycle is still not this gate's call to make, so the fix does not
+			// answer that; it stops comparing to a range that can itself be the
+			// outlier, and states the fact the gate already acted on instead.
+			if !cycleContext.LateCycle.Visible {
+				t.Fatal("no late-cycle notice beside the withheld window")
+			}
+			if cycleContext.LateCycle.MessageKey != LateCyclePredictionsPausedKey {
+				t.Fatalf("late-cycle notice key = %q, want %q: the recorded maximum is the merged span itself, so it must not be read back as a reassuring range",
+					cycleContext.LateCycle.MessageKey, LateCyclePredictionsPausedKey)
+			}
+
+			// 2. The hero ribbon, which asks its own question rather than reading
+			// the gate: an inflated reference kept cycle day 61 inside a 96-day
+			// axis, so the ribbon drew a projected cycle map — projected days and
+			// a projected ovulation day among them — beside a header saying the
+			// estimate is paused.
+			hero := BuildDashboardCycleHero(user, stats, cycleContext, dashboardCycleHeroInput{Logs: logs, Today: today, Location: loc})
+			if hero.Visible || hero.CycleLength > 0 || len(hero.Days) > 0 {
+				t.Fatalf("the hero drew a %d-day projected cycle map for a suppressed account: visible=%v, %d day cells",
+					hero.CycleLength, hero.Visible, len(hero.Days))
+			}
+
+			// 3. The published copy every page and the JSON API read.
+			published, suppression, _ := PublishedOverviewStats(user, logs, stats, today, loc)
+			if !suppression.PredictionsSuppressed {
+				t.Fatal("PublishedOverviewStats reported no suppression")
+			}
+			if !published.NextPeriodStart.IsZero() {
+				t.Fatalf("published NextPeriodStart = %s", published.NextPeriodStart.Format("2006-01-02"))
+			}
+			if !published.OvulationDate.IsZero() || !published.FertilityWindowStart.IsZero() || !published.FertilityWindowEnd.IsZero() {
+				t.Fatalf("published fertility projection survived: ovulation %s, window %s..%s",
+					published.OvulationDate.Format("2006-01-02"),
+					published.FertilityWindowStart.Format("2006-01-02"),
+					published.FertilityWindowEnd.Format("2006-01-02"))
+			}
+
+			// 4. Calendar grid — the month the un-rolled projection falls in and
+			// the month the owner is actually looking at.
+			for _, month := range []time.Time{
+				firstOfMonth(stats.NextPeriodStart, loc),
+				firstOfMonth(today, loc),
+			} {
+				if month.IsZero() {
+					continue
+				}
+				for _, day := range BuildCalendarDayStates(user, month, logs, stats, today, loc) {
+					if day.IsPredicted || day.IsPredictedStartWindow || day.IsPreFertile || day.IsFertility || day.IsOvulation || day.IsTentativeOvulation {
+						t.Fatalf("calendar grid painted a prediction on %s: %#v", day.Date.Format("2006-01-02"), day)
+					}
+				}
+			}
+
+			// 5. The .ics feed.
+			events := calendarFeedEvents(CalendarFeedICSInput{User: user, Logs: logs, Now: today, Location: loc})
+			if len(events) > 0 {
+				t.Fatalf("the .ics feed announced %d event(s) for a suppressed account: %#v", len(events), events)
+			}
+
+			// 6. The webhook reminder pass.
+			if reminders := DecideDueReminders(user, enabledWebhookSettings(14), logs, today, loc); len(reminders) > 0 {
+				t.Fatalf("the webhook pass queued %d reminder(s) for a suppressed account: %#v", len(reminders), reminders)
+			}
+		})
+	}
+}
+
+// TestLongCycleGateMeasuresEveryHistoryAgainstItsOwnProjection is the control
+// table, and it deliberately includes the histories the gate's answer CHANGED
+// for, not only the ones it left alone. An earlier draft asserted only on
+// histories where the mean equals the median — where the change is a no-op by
+// construction — and the whole affected cohort was untestable in it.
+//
+// The two boundaries the gate must respect:
+//   - it may not fire while the account is inside the shorter of its two
+//     lengths, plus the week of grace;
+//   - it must fire once past that, for a right-skewed history too, where the mean
+//     used to buy days of grace the projection had already spent — and for a
+//     left-skewed one no later than it always did.
+func TestLongCycleGateMeasuresEveryHistoryAgainstItsOwnProjection(t *testing.T) {
+	loc := time.UTC
+	base := time.Date(2025, time.January, 1, 0, 0, 0, 0, loc)
+
+	cases := []struct {
+		name         string
+		startOffsets []int
+		cycleDay     int
+		// wantProjectionLength is the median the account's dates are rolled
+		// forward from, written out so a scenario that stopped being about this
+		// arithmetic reds here rather than passing quietly.
+		wantProjectionLength int
+		wantOverdue          bool
+	}{
+		// The window between the projected next period (cycle day 29 of a
+		// 28-day median) and the overdue threshold (28 + 7 = 35): the gate stays
+		// open on its first and last day, so the estimate is still shown there.
+		{"four 28-day cycles, cycle day 29 (projected start passed)", []int{0, 28, 56, 84, 112}, 29, 28, false},
+		{"four 28-day cycles, cycle day 30", []int{0, 28, 56, 84, 112}, 30, 28, false},
+		{"four 28-day cycles, cycle day 35 (last day of grace)", []int{0, 28, 56, 84, 112}, 35, 28, false},
+		{"four 28-day cycles, cycle day 36", []int{0, 28, 56, 84, 112}, 36, 28, true},
+		{"three real 50-day cycles, cycle day 55", []int{0, 50, 100, 150}, 55, 50, false},
+		{"three real 50-day cycles, cycle day 58", []int{0, 50, 100, 150}, 58, 50, true},
+		// 25/28/28/45 — no merged span, mean 32 against median 28. The mean used
+		// to grant grace to cycle day 39; the projection it publishes ran out on
+		// day 35. Both sides of that boundary are pinned.
+		{"a variable history inside its projection, cycle day 34", []int{0, 25, 53, 81, 126}, 34, 28, false},
+		{"a variable history past its projection, cycle day 36", []int{0, 25, 53, 81, 126}, 36, 28, true},
+		// 28/60/60 — median 60 above mean 49. The gate reads the SHORTER length,
+		// the mean here, exactly as it did before: measured against the median it
+		// kept dates published to day 67 while the out-of-date check, which reads
+		// the mean with no grace, had turned the page amber on day 50.
+		{"a history whose median exceeds its mean, cycle day 56", []int{0, 28, 88, 148}, 56, 60, false},
+		{"a history whose median exceeds its mean, cycle day 57", []int{0, 28, 88, 148}, 57, 60, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := longCycleGateLogs(base, tc.startOffsets)
+			lastStart := base.AddDate(0, 0, tc.startOffsets[len(tc.startOffsets)-1])
+			today := lastStart.AddDate(0, 0, tc.cycleDay-1)
+
+			user := longCycleGateUser()
+			stats := ApplyUserCycleBaseline(user, logs, BuildCycleStatsFromLogs(user, logs, today, loc), today, loc)
+			if stats.CurrentCycleDay != tc.cycleDay {
+				t.Fatalf("scenario setup: CurrentCycleDay = %d, want %d", stats.CurrentCycleDay, tc.cycleDay)
+			}
+			if got := DashboardProjectionCycleLength(user, stats); got != tc.wantProjectionLength {
+				t.Fatalf("scenario setup: projection length = %d, want %d (median %d, mean %.1f)",
+					got, tc.wantProjectionLength, stats.MedianCycleLength, stats.AverageCycleLength)
+			}
+
+			if got := DashboardCycleOverdue(user, stats); got != tc.wantOverdue {
+				t.Fatalf("DashboardCycleOverdue = %v, want %v (cycle day %d, median %d, mean %.1f)",
+					got, tc.wantOverdue, stats.CurrentCycleDay, stats.MedianCycleLength, stats.AverageCycleLength)
+			}
+
+			cycleContext := BuildDashboardCycleContext(user, logs, stats, today, loc)
+			if tc.wantOverdue {
+				if !cycleContext.DisplayNextPeriodStart.IsZero() {
+					t.Fatalf("an overdue cycle still published %s", cycleContext.DisplayNextPeriodStart.Format("2006-01-02"))
+				}
+				return
+			}
+			if cycleContext.DisplayNextPeriodStart.IsZero() {
+				t.Fatal("a cycle inside its own length lost its next-period estimate — the gate is over-suppressing")
+			}
+		})
+	}
+}
+
+// firstOfMonth is the month a date falls in, or the zero time for a zero date.
+func firstOfMonth(day time.Time, loc *time.Location) time.Time {
+	if day.IsZero() {
+		return time.Time{}
+	}
+	return time.Date(day.Year(), day.Month(), 1, 0, 0, 0, 0, loc)
+}
+
+// longCycleGateAt builds the owner-path stats for a history on a given cycle day.
+func longCycleGateAt(t *testing.T, user *models.User, logs []models.DailyLog, lastStart time.Time, cycleDay int) (CycleStats, time.Time) {
+	t.Helper()
+	today := lastStart.AddDate(0, 0, cycleDay-1)
+	stats := ApplyUserCycleBaseline(user, logs, BuildCycleStatsFromLogs(user, logs, today, time.UTC), today, time.UTC)
+	if stats.CurrentCycleDay != cycleDay {
+		t.Fatalf("scenario setup: CurrentCycleDay = %d, want %d", stats.CurrentCycleDay, cycleDay)
+	}
+	return stats, today
+}
+
+// TestLongCycleGateKeepsTheOutOfDateBandToAWeek pins the days on which the
+// dashboard says two things at once: the amber out-of-date banner
+// (CycleDataStale, measured against the average with no grace) beside a
+// next-period date that is still published (the gate not yet fired). That band
+// was seven days wide before the gate moved; measured against the median alone
+// it widened to eighteen for a history whose median sits above its mean. The
+// ordinary right-skewed history must not turn stale any earlier for it.
+func TestLongCycleGateKeepsTheOutOfDateBandToAWeek(t *testing.T) {
+	base := time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name               string
+		startOffsets       []int
+		wantFirstStale     int
+		wantFirstPaused    int
+		ordinaryQuietUntil int
+	}{
+		// 28/60/60: mean 49, median 60.
+		{"a history whose median exceeds its mean", []int{0, 28, 88, 148}, 50, 57, 49},
+		// 27/28/28/36: mean 30, median 28. Neither stale nor paused on day 29.
+		{"an ordinary right-skewed history", []int{0, 27, 55, 83, 119}, 31, 36, 30},
+		// 3×28 + 300: the gate fires long before the inflated mean turns stale.
+		{"three 28-day cycles and a 300-day gap", []int{0, 28, 56, 84, 384}, 97, 36, 35},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			user := longCycleGateUser()
+			logs := longCycleGateLogs(base, tc.startOffsets)
+			lastStart := base.AddDate(0, 0, tc.startOffsets[len(tc.startOffsets)-1])
+
+			firstStale, firstPaused := 0, 0
+			for cycleDay := 1; cycleDay <= 110; cycleDay++ {
+				stats, today := longCycleGateAt(t, user, logs, lastStart, cycleDay)
+				cycleContext := BuildDashboardCycleContext(user, logs, stats, today, time.UTC)
+				if cycleDay <= tc.ordinaryQuietUntil && (cycleContext.CycleDataStale || cycleContext.NextPeriodEstimatePaused) {
+					t.Fatalf("cycle day %d: stale=%t paused=%t, want neither this early", cycleDay, cycleContext.CycleDataStale, cycleContext.NextPeriodEstimatePaused)
+				}
+				if firstStale == 0 && cycleContext.CycleDataStale {
+					firstStale = cycleDay
+				}
+				if firstPaused == 0 && cycleContext.NextPeriodEstimatePaused {
+					firstPaused = cycleDay
+				}
+			}
+			if firstStale != tc.wantFirstStale || firstPaused != tc.wantFirstPaused {
+				t.Fatalf("first stale day %d, first paused day %d; want %d and %d", firstStale, firstPaused, tc.wantFirstStale, tc.wantFirstPaused)
+			}
+			if band := firstPaused - firstStale; band > 7 {
+				t.Fatalf("out-of-date banner beside a published date on %d days (cycle days %d-%d), want 7 at most", band, firstStale, firstPaused-1)
+			}
+		})
+	}
+}
+
+// TestLongCycleGateNeverRunsOnAZeroLength pins the fallback: both lengths can
+// round to zero on the same caller-built stats, and a gate handed zero answers
+// false for every cycle day there is.
+func TestLongCycleGateNeverRunsOnAZeroLength(t *testing.T) {
+	stats := CycleStats{AverageCycleLength: 0.3, CurrentCycleDay: models.DefaultCycleLength + 7}
+	if projection, reference := DashboardProjectionCycleLength(nil, stats), DashboardCycleReferenceLength(nil, stats); projection != 0 || reference != 0 {
+		t.Fatalf("scenario setup: projection %d, reference %d, want both 0", projection, reference)
+	}
+	if DashboardCycleOverdue(nil, stats) {
+		t.Fatalf("cycle day %d is inside the default length plus its week of grace", stats.CurrentCycleDay)
+	}
+	stats.CurrentCycleDay++
+	if !DashboardCycleOverdue(nil, stats) {
+		t.Fatalf("cycle day %d with no known length: the gate switched itself off", stats.CurrentCycleDay)
+	}
+	if !PredictionsSuppressed(nil, stats) {
+		t.Fatal("PredictionsSuppressed = false beside an overdue verdict")
+	}
+}
+
+// TestLongCycleGateWithholdsTheFertileSaveMessage covers the day-save feedback,
+// which reads the projected window off its own stats: on cycle day 61 of the
+// merged history the window still sat inside the running cycle, and saving one
+// of its days answered "fertile" while every other surface withheld it.
+func TestLongCycleGateWithholdsTheFertileSaveMessage(t *testing.T) {
+	base := time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC)
+	user := longCycleGateUser()
+
+	for _, tc := range []struct {
+		name         string
+		startOffsets []int
+		cycleDay     int
+		wantFertile  bool
+	}{
+		{"four 28-day cycles, inside the projection", []int{0, 28, 56, 84, 112}, 16, true},
+		{"three 28-day cycles and a 300-day gap, cycle day 61", []int{0, 28, 56, 84, 384}, 61, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := longCycleGateLogs(base, tc.startOffsets)
+			lastStart := base.AddDate(0, 0, tc.startOffsets[len(tc.startOffsets)-1])
+			today := lastStart.AddDate(0, 0, tc.cycleDay-1)
+			stats := BuildCycleStats(filterLogsNotAfter(logs, today), today, BoundaryContext{})
+			if stats.FertilityWindowStart.IsZero() {
+				t.Fatal("scenario setup: no projected window to save a day inside")
+			}
+			if first, last := CalendarDaysBetween(lastStart, stats.FertilityWindowStart)+1, CalendarDaysBetween(lastStart, stats.FertilityWindowEnd)+1; first != 9 || last != 14 {
+				t.Fatalf("scenario setup: window on cycle days %d-%d, want 9-14", first, last)
+			}
+			_, published, suppression := ConfirmedAndPublishedStats(user, logs, stats, today, time.UTC)
+			for day := stats.FertilityWindowStart; !day.After(stats.FertilityWindowEnd); day = day.AddDate(0, 0, 1) {
+				// The day is saved on itself ("today" = the day): a backfilled day never
+				// gets the fertile line, so only the gate under test may withhold it here.
+				if got := resolveDaySaveMessageKey(user, day, day, published, suppression) == daySaveMessageFertile; got != tc.wantFertile {
+					t.Fatalf("saving %s: fertile message = %t, want %t", CalendarDayKey(day), got, tc.wantFertile)
+				}
+			}
+		})
+	}
+}
+
+// TestLongCycleGateWithholdsTheImplantationHint covers the manual cycle-start
+// policy, which counts from the closing cycle's projected ovulation. A 28/60/60
+// history projects that ovulation from its median (cycle day 46) while its gate
+// answers from the mean on day 57, so the hint's six-to-twelve-day gap reached
+// two days the gate had already withheld.
+func TestLongCycleGateWithholdsTheImplantationHint(t *testing.T) {
+	base := time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC)
+	user := longCycleGateUser()
+	logs := longCycleGateLogs(base, []int{0, 28, 88, 148})
+	lastStart := base.AddDate(0, 0, 148)
+
+	offeredInside, overdueInGap := 0, 0
+	for cycleDay := 40; cycleDay <= 70; cycleDay++ {
+		day := lastStart.AddDate(0, 0, cycleDay-1)
+		stats := BuildCycleStats(filterLogsNotAfter(logs, day.AddDate(0, 0, -1)), day.Add(-time.Second), BoundaryContext{})
+		stats.CurrentCycleDay = cycleDay
+		overdue := DashboardCycleOverdue(user, stats)
+		window := PredictCycleWindow(lastStart, DashboardProjectionCycleLength(user, stats), stats.LutealPhase)
+		gap := CalendarDaysBetween(window.OvulationDate, day)
+		inGap := gap >= 6 && gap <= 12
+
+		policy := ResolveManualCycleStartPolicy(user, logs, day, day, time.UTC)
+		if overdue && policy.PotentialImplantation {
+			t.Fatalf("cycle day %d is past the gate, yet the implantation hint counts %d days from a withheld ovulation", cycleDay, policy.ImplantationGapDays)
+		}
+		if !overdue && policy.PotentialImplantation != inGap {
+			t.Fatalf("cycle day %d inside the gate: hint = %t, want %t (gap %d)", cycleDay, policy.PotentialImplantation, inGap, gap)
+		}
+		if inGap && overdue {
+			overdueInGap++
+		}
+		if inGap && !overdue {
+			offeredInside++
+		}
+	}
+	if overdueInGap != 2 || offeredInside == 0 {
+		t.Fatalf("scenario setup: %d gap days past the gate, %d inside it — this history no longer straddles the gate", overdueInGap, offeredInside)
+	}
+}
+
+// TestImplantationHintFollowsEverySuppressionSignal: the hint counts from a
+// projected ovulation, so the two signals that withhold that ovulation on every
+// other surface without any overdue verdict — unpredictable-cycle mode and a
+// pregnancy pause — withhold the hint too. A 28/28/28 history on cycle day 22
+// is well inside the gate and eight days past the projected ovulation.
+func TestImplantationHintFollowsEverySuppressionSignal(t *testing.T) {
+	base := time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC)
+	logs := longCycleGateLogs(base, []int{0, 28, 56, 84})
+	day := base.AddDate(0, 0, 84+21)
+
+	if policy := ResolveManualCycleStartPolicy(longCycleGateUser(), logs, day, day, time.UTC); !policy.PotentialImplantation {
+		t.Fatal("scenario setup: an ordinary history on cycle day 22 offers no implantation hint, so this test proves nothing")
+	}
+
+	unpredictable := longCycleGateUser()
+	unpredictable.UnpredictableCycle = true
+	if policy := ResolveManualCycleStartPolicy(unpredictable, logs, day, day, time.UTC); policy.PotentialImplantation {
+		t.Fatalf("unpredictable-cycle mode withholds every projection, yet the hint counts %d days from a projected ovulation", policy.ImplantationGapDays)
+	}
+
+	paused := append(append([]models.DailyLog(nil), logs...), models.DailyLog{
+		Date:          base.AddDate(0, 0, 84+17),
+		PregnancyTest: models.PregnancyTestPositive,
+	})
+	if policy := ResolveManualCycleStartPolicy(longCycleGateUser(), paused, day, day, time.UTC); policy.PotentialImplantation {
+		t.Fatalf("a pregnancy pause withholds every projection, yet the hint counts %d days from a projected ovulation", policy.ImplantationGapDays)
+	}
+}
+
+// TestLongCycleGateKeepsAConfirmedOvulationOnEverySurface is the 25/28/28/45
+// history (mean 32, median 28) on cycle day 36: the gate now fires there, three
+// days before the average used to let it, and a thermal shift the owner
+// recorded on days 24-32 of the running cycle names day 29. The projection goes;
+// the recorded day stays on the dashboard, the calendar and the JSON overview.
+func TestLongCycleGateKeepsAConfirmedOvulationOnEverySurface(t *testing.T) {
+	base := time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC)
+	user := longCycleGateUser()
+	user.TrackBBT = true
+	logs := longCycleGateLogs(base, []int{0, 25, 53, 81, 126})
+	lastStart := base.AddDate(0, 0, 126)
+	for cycleDay := 24; cycleDay <= 32; cycleDay++ {
+		reading := 36.20
+		if cycleDay >= 30 {
+			reading = 36.50
+		}
+		logs = append(logs, models.DailyLog{Date: lastStart.AddDate(0, 0, cycleDay-1), BBT: &reading})
+	}
+	stats, today := longCycleGateAt(t, user, logs, lastStart, 36)
+	if !DashboardCycleOverdue(user, stats) || stats.CurrentCycleDay > DashboardCycleReferenceLength(user, stats)+7 {
+		t.Fatalf("scenario setup: want the gate firing on a day the average alone still allowed (reference %d)", DashboardCycleReferenceLength(user, stats))
+	}
+	wantKey := CalendarDayKey(lastStart.AddDate(0, 0, 28))
+
+	confirmed, ok := ConfirmedCurrentCycleOvulation(user, logs, stats, today, time.UTC)
+	if !ok || CalendarDayKey(confirmed) != wantKey {
+		t.Fatalf("resolver: confirmed %s (ok=%t), want %s", CalendarDayKey(confirmed), ok, wantKey)
+	}
+
+	cycleContext := BuildDashboardCycleContext(user, logs, stats, today, time.UTC)
+	if !cycleContext.NextPeriodEstimatePaused || CalendarDayKey(cycleContext.DisplayOvulationDate) != wantKey || !cycleContext.DisplayOvulationConfirmed {
+		t.Fatalf("dashboard: paused=%t ovulation=%q confirmed=%t, want paused beside the confirmed %s",
+			cycleContext.NextPeriodEstimatePaused, CalendarDayKey(cycleContext.DisplayOvulationDate), cycleContext.DisplayOvulationConfirmed, wantKey)
+	}
+
+	days := BuildCalendarDayStates(user, firstOfMonth(today, time.UTC), logs, stats, today, time.UTC)
+	days = append(days, BuildCalendarDayStates(user, firstOfMonth(lastStart.AddDate(0, 0, 28), time.UTC), logs, stats, today, time.UTC)...)
+	solid, tentative := ovulationMarkerKeys(days)
+	for _, key := range solid {
+		if key != wantKey {
+			t.Fatalf("calendar: solid marker on %s, want only %s", key, wantKey)
+		}
+	}
+	if len(solid) == 0 || len(tentative) != 0 {
+		t.Fatalf("calendar: solid %v, tentative %v, want the confirmed %s alone", solid, tentative, wantKey)
+	}
+
+	published, suppression, confirmedOvulation := PublishedOverviewStats(user, logs, stats, today, time.UTC)
+	if !suppression.PredictionsSuppressed || CalendarDayKey(published.OvulationDate) != wantKey || !confirmedOvulation {
+		t.Fatalf("API: suppressed=%t ovulation=%q confirmed=%t, want the confirmed %s under suppression",
+			suppression.PredictionsSuppressed, CalendarDayKey(published.OvulationDate), confirmedOvulation, wantKey)
+	}
+	if !published.FertilityWindowStart.IsZero() || published.CurrentFertility != FertilityStatusUnknown {
+		t.Fatalf("API: window %s, fertility %q — the window derived from the confirmed day is still withheld", CalendarDayKey(published.FertilityWindowStart), published.CurrentFertility)
+	}
+}

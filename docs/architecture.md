@@ -18,7 +18,10 @@ the source of truth.
 ## Layered architecture
 
 Strict one-directional layering. Transport never reaches the database; domain
-logic never depends on HTTP; persisted types stay transport-free.
+logic never depends on HTTP; persisted types stay transport-free. All three are
+checked mechanically against the whole tree by `scripts/archcheck`, which CI
+runs on every change; test files are outside the check, because a fixture
+legitimately reaches across a layer boundary to prove the layer below it.
 
 ```mermaid
 flowchart TB
@@ -26,6 +29,7 @@ flowchart TB
         browser["Browser / PWA<br/>server-rendered HTML + HTMX + JS"]
         ical["Calendar client<br/>read-only .ics subscription"]
         idp["OIDC provider<br/>optional SSO"]
+        operator["Operator shell<br/>ovumcy CLI subcommands"]
     end
 
     proxy["Reverse proxy (optional)<br/>TLS termination"]
@@ -33,20 +37,28 @@ flowchart TB
     subgraph app["Ovumcy server — single Go binary"]
         direction TB
         api["internal/api — transport only<br/>routing · auth · role · CSRF · HTMX / JSON / HTML"]
-        services["internal/services — domain logic<br/>cycle · stats · dashboard · settings · export · onboarding"]
+        cli["internal/cli — operator commands<br/>users · reset-password · notify · webhook · healthcheck · repair"]
+        reminders["internal/reminders — background scheduler<br/>trigger for the request-free webhook notify pass"]
+        services["internal/services — domain logic<br/>cycle · stats · dashboard · settings · export · onboarding · webhook delivery"]
         db["internal/db — persistence<br/>repositories · forward-only migrations"]
         models["internal/models — transport-free types"]
         cross["cross-cutting: internal/security · i18n · templates · httpx · bootstrap"]
     end
 
     store[("SQLite (default)<br/>or PostgreSQL (advanced)")]
+    hook["Owner-configured webhook URL<br/>outbound reminder delivery"]
 
     browser --> proxy
     ical --> proxy
     proxy --> api
-    idp -. "form_post callback" .-> api
+    idp -. "callback: POST (form_post) or GET (query mode)" .-> api
+    operator --> cli
     api --> services
+    cli --> services
+    cli --> db
+    reminders --> services
     services --> db
+    services -. "outbound POST" .-> hook
     db --> store
     api -. "reads/writes" .-> models
     services -. "returns" .-> models
@@ -68,6 +80,32 @@ flowchart TB
 - **Cross-cutting** (`internal/security`, `i18n`, `templates`, `httpx`,
   `bootstrap`): AEAD sealing and token logic, localization, HTMX status-markup
   wrappers, and one dependency-wiring recipe shared by production and tests.
+- **`internal/reminders` (background scheduler).** The one caller that reaches the
+  domain layer with neither a request nor an operator behind it: a lifecycle-tied
+  trigger, started from `cmd/ovumcy` when the off-by-default
+  `REMINDER_SCHEDULER_ENABLED` is on, that decides *when* to run the daily webhook
+  notify pass. The pass itself — listing owners, deciding due reminders,
+  delivering, and writing each per-reminder watermark — stays in
+  `internal/services`, and the outbound POST it makes is the only call the app
+  places that no one asked it for; everything else it dials (OIDC discovery, JWKS,
+  token exchange) happens inside a request it is answering. Because the pass runs
+  outside a request it has no session and no CSRF token: its owner scoping comes
+  from the same per-`user_id` repository calls the request path uses.
+- **`internal/cli` (operator commands).** The second entry point of the binary
+  (`ovumcy users`, `reset-password`, `notify`, `webhook`, `healthcheck`,
+  `repair`). It is not transport and does not pass through the authorization
+  boundary below — it reaches `internal/services` and `internal/db` directly, and
+  is gated by shell or container access to the host instead. All of them but
+  `repair` open the database the way the server does, migrations included;
+  `repair` is the one that must reach a database a migration is refusing, so it
+  opens without applying any and is the only entry point that does. Operator use
+  is documented in
+  the [README](../README.md#architecture) and
+  [`docs/self-hosted.md`](self-hosted.md).
+
+`internal/apideps` (the dependency-wiring struct and ports shared by the server
+and the CLI) and `internal/testdb` (a PostgreSQL test harness) are wiring rather
+than layers and are deliberately left off this map.
 
 ## Trust boundaries
 
@@ -89,7 +127,7 @@ flowchart LR
     end
 
     subgraph authz["Authorization boundary — internal/api"]
-        csrf["CSRF (Origin-checked)<br/>sole exemption: OIDC callback"]
+        csrf["CSRF (Origin-checked)<br/>sole validation exemption: OIDC callback"]
         auth["AuthRequired<br/>sealed session cookie + AuthSessionVersion"]
         owner["OwnerOnly<br/>explicit, defense-in-depth"]
     end
@@ -99,11 +137,15 @@ flowchart LR
         data[("Per-owner data<br/>isolated by user_id")]
     end
 
-    secrets["No secret in transport:<br/>AEAD-sealed cookies · bcrypt / hashed<br/>tokens &amp; recovery codes at rest"]
+    secrets["No usable secret in transport:<br/>AEAD-sealed cookies · bcrypt / hashed<br/>tokens &amp; recovery codes at rest"]
+    sched["internal/reminders scheduler<br/>no request · no session · no CSRF token"]
+    hook["Owner-configured webhook URL<br/>bounded outbound POST · opt-in private-address block"]
 
     ub --> rl --> csrf --> auth --> owner --> domain --> data
-    ui -. "sealed state + PKCE" .-> auth
+    ui -. "sealed state + PKCE · POST form_post · GET query mode" .-> auth
     uc -. "404-no-oracle · hashed · rate-limited" .-> domain
+    sched --> domain
+    domain -. "reminder delivery" .-> hook
     hdr -.- csrf
     secrets -.- auth
 ```
@@ -113,13 +155,34 @@ Load-bearing invariants (see [`docs/SECURITY_INVARIANTS.md`](SECURITY_INVARIANTS
 - **Privacy boundary.** No account, surface, or export may expose another
   account's data. A resource id from the request is always combined with the
   session `user_id`, never trusted alone.
-- **Endpoint defense-in-depth.** Every state-mutating `/api/v1/*` endpoint
-  declares `OwnerOnly` **and** is CSRF-protected. The single CSRF exemption is
-  `POST /auth/oidc/callback`, protected by the sealed one-time state cookie.
-- **No secret in transport.** Secrets, auth/recovery/reset tokens, recovery
-  codes and passwords never appear in URLs, JSON, HTML or logs. The one
-  sanctioned carve-out is the read-only calendar-feed capability token (hashed at
-  rest, one-click-revocable, 404-no-oracle, rate-limited, log-redacted).
+- **Endpoint defense-in-depth.** Every state-mutating `/api/v1/*` endpoint is
+  CSRF-protected — the pre-session ones (register, login, password reset)
+  included, since the CSRF middleware is mounted globally, ahead of routing, and
+  does not care whether a session exists. Every such endpoint that sits behind
+  `AuthRequired` **additionally** declares `OwnerOnly`; the endpoints that run
+  before any session exists have no role to enforce, and that exclusion set —
+  which applies to `OwnerOnly` alone, never to CSRF — is named in full in
+  [`docs/SECURITY_INVARIANTS.md`](SECURITY_INVARIANTS.md) rather than restated
+  here. The single CSRF **validation** exemption is the OIDC callback — `POST
+  /auth/oidc/callback`, plus `GET` on the same path under
+  `OIDC_RESPONSE_MODE=query`, a safe method the middleware never validates —
+  protected by the sealed one-time state cookie. The calendar client's own
+  path in the diagram above bypasses the CSRF box entirely rather than passing
+  through it unvalidated: its GET is excluded (see `api.IsCalendarFeedRequest`)
+  from the same middleware's safe-method side effect (minting and setting its
+  own cookie), which is not a validation exemption and does not widen the one
+  named here — detail in [`docs/SECURITY_INVARIANTS.md`](SECURITY_INVARIANTS.md)'s
+  *Calendar feed subscription* and *CSRF and CORS* sections.
+- **No usable secret in transport.** Passwords, auth/recovery/reset tokens and
+  stored secrets never appear in URLs, JSON, HTML or logs. The exception ledger is
+  [`docs/SECURITY_INVARIANTS.md`](SECURITY_INVARIANTS.md)'s, not this file's:
+  the read-only calendar-feed capability token (hashed at rest,
+  one-click-revocable, 404-no-oracle, rate-limited, log-redacted) is the one
+  exception for a value usable on its own; the TOTP enrollment seed rendered
+  into the enrollment page's HTML is the second, narrower declared exception
+  (minted fresh per visit, inert until the first code verifies); and the
+  one-time HTML reveals — the recovery code and the feed subscribe URL — are
+  sanctioned shown-once displays, consumed server-side and never re-rendered.
 - **Session invalidation.** Any credential or security-posture change bumps
   `AuthSessionVersion` in the same atomic update, so stale sessions stop working.
 - **Sealed cookies.** All auth/recovery/reset/flash cookies are AEAD-sealed
@@ -127,8 +190,11 @@ Load-bearing invariants (see [`docs/SECURITY_INVARIANTS.md`](SECURITY_INVARIANTS
 - **Medical safety.** Every ovulation and next-period surface carries an estimate
   qualifier plus a persistent "not medical advice or a method of contraception"
   disclaimer.
-- **Re-auth for erasure.** Clear-data and delete-account require a fresh
-  current-password confirmation on top of session + role + CSRF.
+- **Re-auth for erasure.** Clear-data and delete-account require fresh
+  re-authentication on top of session + role + CSRF: the current local
+  password, or — only for an account that has no local password — a fresh
+  purpose-bound OIDC step-up. The check never downgrades for an account that
+  has a password.
 
 ## Lifecycle of a state-mutating request
 
@@ -178,4 +244,6 @@ reverse-proxy stack, backups, and secrets) are documented in the
 [README](../README.md#architecture) and [`docs/self-hosted.md`](self-hosted.md).
 The pushed image is a shell-free `FROM scratch` runtime built from the repo-root
 `Dockerfile`; every published image is Cosign-signed and carries a SLSA
-build-provenance attestation and an SBOM.
+build-provenance attestation and an SBOM. Publication waits for the commit's own
+CI run and scans the exact image before pushing it, so a tag or `:latest` never
+reaches the registry ahead of the checks for the commit it was built from.

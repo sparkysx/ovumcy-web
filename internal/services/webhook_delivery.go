@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -23,13 +24,14 @@ import (
 //
 // Envelope hardening (all mandatory, none configurable away):
 //
-//   - Hard total timeout via context.WithTimeout plus a matching dialer timeout
-//     and client Timeout, so a slow or hung endpoint cannot stall the notify
-//     pass.
+//   - Hard total timeout via context.WithTimeout plus a matching client Timeout,
+//     so a slow or hung endpoint cannot stall the notify pass; underneath it each
+//     phase — dial, TLS handshake, response headers — carries its own smaller
+//     budget so none can eat the whole of it.
 //   - DisableKeepAlives: each delivery is a one-shot connection; we never pool to
 //     an owner-controlled host.
 //   - ZERO redirects: CheckRedirect always returns an error, so a 3xx response
-//     cannot steer the request (or the JSON body) to a second, unvalidated origin
+//     cannot steer the request (or its body) to a second, unvalidated origin
 //     after the scheme/host check passed (SSRF-via-redirect).
 //   - Response body capped by io.LimitReader: we only need the status code, so we
 //     read at most a few KB and discard the rest — a hostile endpoint cannot make
@@ -51,8 +53,33 @@ const (
 	// We only need the status code; anything beyond this is drained-and-ignored so
 	// a hostile endpoint cannot make us buffer an unbounded body.
 	webhookResponseReadLimit = 8 * 1024
+	// webhookResponseHeaderLimit caps the response HEADER block, which is read
+	// before the body limit above can apply and otherwise takes Go's 10 MiB
+	// default. A webhook acknowledgement needs a status line and a handful of
+	// headers; 16 KiB is generous for that and still bounded.
+	webhookResponseHeaderLimit = 16 * 1024
+	// webhookPhaseTimeout bounds the dial (DNS + TCP connect), the TLS handshake
+	// and the wait for response headers individually. The total client budget still
+	// applies on top; this stops one phase from spending all of it.
+	webhookPhaseTimeout = 5 * time.Second
 	// webhookUserAgent identifies our POSTs without revealing anything sensitive.
 	webhookUserAgent = "ovumcy-webhook/1"
+	// webhookFormatQueryParam is the URL query key that selects a delivery
+	// format for one stored webhook URL. The opt-in lives in the URL itself —
+	// already owner-controlled and encrypted at rest — so no settings column
+	// or schema change is involved in choosing a format.
+	webhookFormatQueryParam = "format"
+	// webhookFormatNtfy is the value of the format query param that selects
+	// ntfy-native plain-text delivery. ntfy renders a plain-body topic POST
+	// verbatim as the notification, so the default JSON envelope otherwise
+	// reaches the phone as a raw JSON blob.
+	webhookFormatNtfy = "ntfy"
+	// webhookNtfyTagsPeriod and webhookNtfyTagsOvulation are ntfy emoji
+	// shortcodes used as the notification tag/icon per reminder kind. They are
+	// cosmetic only: an unknown shortcode degrades to plain tag text in the
+	// ntfy client, never to a failed delivery.
+	webhookNtfyTagsPeriod    = "drop_of_blood"
+	webhookNtfyTagsOvulation = "sparkles"
 )
 
 // ErrWebhookDeliveryURLScheme is returned when a decrypted URL does not use
@@ -83,13 +110,18 @@ type ipResolver interface {
 // recovery code) and no health specifics beyond the reminder type, estimated
 // date, and lead days already summarized into Title/Message.
 type WebhookPayload struct {
-	// Title is a short reminder headline (e.g. "Period reminder").
+	// Title is a short reminder headline, owner-localized from the catalogue
+	// (i18n keys webhook.reminder.{period,ovulation}.title).
 	Title string `json:"title"`
-	// Message is the human-readable reminder line (type + estimated date + lead).
+	// Message is the human-readable reminder line (type + estimated date),
+	// owner-localized from the catalogue (i18n keys
+	// webhook.reminder.{period,ovulation}.message).
 	Message string `json:"message"`
 	// Disclaimer is the medical-safety qualifier, MANDATORY in every payload. It
 	// is the owner-localized "estimates, not medical advice or a method of
-	// contraception" string (i18n key dashboard.prediction_disclaimer).
+	// contraception" string (i18n key medical.disclaimer). All three localized
+	// fields resolve at ONE language — the owner's users.interface_language — so a
+	// payload is never half in the owner's language and half in the server's.
 	Disclaimer string `json:"disclaimer"`
 	// Type is the machine-readable reminder kind (DueReminderType*), so a webhook
 	// consumer can route on it without parsing Message.
@@ -97,6 +129,10 @@ type WebhookPayload struct {
 	// EventDate is the estimated event's calendar day in RFC3339-less YYYY-MM-DD
 	// form (owner-local). Minimized health specific: the date only, no cycle math.
 	EventDate string `json:"event_date"`
+	// EventDateEnd is the last day of the estimated range, in the same form, when
+	// the app shows this event as a range rather than one day (EventDate is then
+	// the range's first day). Absent for a single-date reminder.
+	EventDateEnd string `json:"event_date_end,omitempty"`
 	// LeadDays echoes the lead window that surfaced this reminder.
 	LeadDays int `json:"lead_days"`
 }
@@ -105,7 +141,8 @@ type WebhookPayload struct {
 // is an interface so tests can substitute a capturing/failing stub and the
 // notify service never reaches for a real socket.
 type WebhookDeliverer interface {
-	// Deliver POSTs payload as JSON to decryptedURL and reports success. Success
+	// Deliver POSTs payload to decryptedURL — as the JSON envelope, or as ntfy's
+	// plain-text form when the URL carries format=ntfy — and reports success. Success
 	// is a 2xx response; every other outcome (non-2xx, timeout, refused redirect,
 	// bad scheme, transport error) is a failure. It must never log the URL beyond
 	// its hostname, and never the body.
@@ -146,7 +183,12 @@ func newWebhookDelivererWithResolver(blockPrivateAddresses bool, resolver ipReso
 // blockPrivateAddresses is on is the resolve-and-check DialContext installed; the
 // default (gate-off) path keeps the plain stock dialer, byte-for-byte unchanged.
 func newWebhookHTTPClient(blockPrivateAddresses bool, resolver ipResolver) *http.Client {
-	baseDialer := &net.Dialer{Timeout: webhookDeliveryTimeout}
+	// The dial (DNS + TCP connect) is a phase like the two below, not the whole
+	// budget: at webhookDeliveryTimeout a single hung connect consumed all 10s and
+	// left the handshake and the header wait nothing, which is exactly what the
+	// per-phase comment further down claims cannot happen. The total stays bounded
+	// by the client Timeout and the request context regardless.
+	baseDialer := &net.Dialer{Timeout: webhookPhaseTimeout}
 	dialContext := baseDialer.DialContext
 	if blockPrivateAddresses {
 		dialContext = guardedDialContext(baseDialer.DialContext, resolver)
@@ -156,6 +198,17 @@ func newWebhookHTTPClient(blockPrivateAddresses bool, resolver ipResolver) *http
 		Transport: &http.Transport{
 			DisableKeepAlives: true,
 			DialContext:       dialContext,
+			// The response body is capped at webhookResponseReadLimit, but headers
+			// are read before any of that and default to Go's 10 MiB — three orders
+			// of magnitude past anything a webhook acknowledgement needs, and read
+			// from an owner-controlled endpoint. Bound them to match the envelope.
+			MaxResponseHeaderBytes: webhookResponseHeaderLimit,
+			// The client Timeout already covers handshake and headers as part of the
+			// total budget. These bound each phase on its own, so one slow phase
+			// cannot consume the whole budget and starve the rest — the dial phase
+			// that runs before them is bounded by the same value on baseDialer above.
+			TLSHandshakeTimeout:   webhookPhaseTimeout,
+			ResponseHeaderTimeout: webhookPhaseTimeout,
 		},
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return errWebhookRedirect
@@ -220,7 +273,10 @@ func guardedDialContext(dial dialFunc, resolver ipResolver) dialFunc {
 	}
 }
 
-// Deliver POSTs the payload as JSON to decryptedURL under the hardened envelope.
+// Deliver POSTs the payload to decryptedURL under the hardened envelope, in
+// one of two body formats chosen by the URL itself: the default generic JSON
+// envelope, or — when the URL carries ?format=ntfy — an ntfy-native plain-text
+// body with title and tag in X-Title/X-Tags headers (see webhookFormatNtfy).
 // It returns nil only on a 2xx response. On any failure it logs a stable reason
 // key plus the destination HOST and (when available) the status code — never the
 // URL, query, userinfo, or response body — and returns an error that likewise
@@ -238,18 +294,54 @@ func (client *webhookDeliveryClient) Deliver(ctx context.Context, decryptedURL s
 		return ErrWebhookDeliveryURLScheme
 	}
 
+	// Re-run the authority shape check the save path already applies. Save-time
+	// validation never revisits a row already in the database, so an endpoint
+	// stored before that check existed would otherwise still reach the dialer. A
+	// port-only authority ("http://:8080/") is the case that matters: url.Parse
+	// gives it a non-empty Host, and Go then reads the empty hostname as the
+	// unspecified address and connects to the local machine.
+	if err := validateWebhookAuthority(parsed); err != nil {
+		log.Printf("webhook delivery skipped: reason=authority_invalid host=%s", parsed.Hostname())
+		return ErrWebhookDeliveryURLScheme
+	}
+
 	if client.blockPrivateAddresses && isPrivateHost(parsed.Hostname()) {
 		log.Printf("webhook delivery skipped: reason=private_address_blocked host=%s", parsed.Hostname())
 		return fmt.Errorf("webhook delivery to private address refused")
 	}
 
-	body, err := json.Marshal(payload)
-	if err != nil {
-		// codecov:ignore -- unreachable: WebhookPayload is all JSON-safe scalar
-		// fields, so json.Marshal cannot fail here. Kept as a fail-safe so a future
-		// unmarshalable field never delivers a malformed body.
-		log.Printf("webhook delivery skipped: reason=payload_marshal_failed host=%s", parsed.Hostname())
-		return fmt.Errorf("marshal webhook payload: %w", err)
+	// Delivery format is selected by the URL itself. The default is the generic
+	// JSON envelope any webhook consumer can parse. Appending ?format=ntfy to
+	// a stored ntfy topic URL opts that one URL into ntfy's native plain-text
+	// publish — title/tag headers plus a body ntfy renders as the notification
+	// text — because ntfy shows a plain-body topic POST verbatim, so the JSON
+	// envelope would reach the phone as a raw blob. The opt-in travels in the
+	// already-encrypted URL, and every other query parameter (e.g. an ntfy
+	// ?auth= token) passes through untouched: ntfy ignores the unknown
+	// `format` key, and no other consumer is affected.
+	ntfyFormat := strings.EqualFold(parsed.Query().Get(webhookFormatQueryParam), webhookFormatNtfy)
+
+	var body []byte
+	var contentType string
+	if ntfyFormat {
+		// Plain-text body: the human message, then the MANDATORY medical-safety
+		// disclaimer. The disclaimer invariant is about delivery, not JSON
+		// shape, so it rides in the body here exactly as it rides in a field
+		// of the JSON envelope.
+		body = []byte(payload.Message + "\n\n" + payload.Disclaimer)
+		contentType = "text/plain"
+	} else {
+		var marshalErr error
+		body, marshalErr = json.Marshal(payload)
+		if marshalErr != nil {
+			// codecov:ignore:start -- unreachable: WebhookPayload is all JSON-safe scalar
+			// fields, so json.Marshal cannot fail here. Kept as a fail-safe so a
+			// future unmarshalable field never delivers a malformed body.
+			log.Printf("webhook delivery skipped: reason=payload_marshal_failed host=%s", parsed.Hostname())
+			return fmt.Errorf("marshal webhook payload: %w", marshalErr)
+			// codecov:ignore:end
+		}
+		contentType = "application/json"
 	}
 
 	requestCtx, cancel := context.WithTimeout(ctx, webhookDeliveryTimeout)
@@ -262,8 +354,26 @@ func (client *webhookDeliveryClient) Deliver(ctx context.Context, decryptedURL s
 		log.Printf("webhook delivery skipped: reason=build_request_failed host=%s", parsed.Hostname())
 		return fmt.Errorf("build webhook request: %w", err)
 	}
-	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Content-Type", contentType)
 	request.Header.Set("User-Agent", webhookUserAgent)
+	if ntfyFormat {
+		// ntfy reads the notification title and tag list from these headers.
+		// Both values come from the reminder copy/i18n catalogue or our own
+		// tag constants; headerSafeValue skips a pair only if the value ever
+		// carried control characters (which would fail the request write at
+		// the transport layer), degrading to ntfy's topic-name title rather
+		// than failing the delivery.
+		if headerSafeValue(payload.Title) {
+			// A localized title is often non-ASCII; header bytes past ASCII are
+			// not portable across proxies, so they travel as an RFC 2047 encoded
+			// word, which ntfy decodes. ASCII titles pass through unchanged.
+			request.Header.Set("X-Title", mime.BEncoding.Encode("UTF-8", payload.Title))
+		}
+		tags := ntfyTagsForReminderType(payload.Type)
+		if headerSafeValue(tags) {
+			request.Header.Set("X-Tags", tags)
+		}
+	}
 
 	response, err := client.httpClient.Do(request)
 	if err != nil {
@@ -298,6 +408,30 @@ func (client *webhookDeliveryClient) Deliver(ctx context.Context, decryptedURL s
 	return nil
 }
 
+// ntfyTagsForReminderType maps a reminder kind to an ntfy tag list. The tags
+// are ntfy emoji shortcodes rendered as the notification icon — drop_of_blood (🩸) for
+// a period reminder, sparkles (✨) for ovulation — and are cosmetic only: an
+// unknown kind, or a client without the shortcode, degrades to plain tag text
+// in the notification, never a failed delivery.
+func ntfyTagsForReminderType(reminderType string) string {
+	if reminderType == DueReminderTypeOvulation {
+		return webhookNtfyTagsOvulation
+	}
+	return webhookNtfyTagsPeriod
+}
+
+// headerSafeValue reports whether value can travel in an HTTP header as-is:
+// no C0 controls and no DEL, which would make the request write fail at the
+// transport layer. Non-ASCII text is allowed here; the caller encodes it.
+func headerSafeValue(value string) bool {
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 // isRedirectRefusal reports whether err is our zero-redirect refusal, which the
 // stdlib returns wrapped in *url.Error from client.Do.
 func isRedirectRefusal(err error) bool {
@@ -324,12 +458,104 @@ func isPrivateHost(host string) bool {
 // infrastructure legitimately lives there, so the gate classifies it as private.
 var cgnatNet = mustParseWebhookCIDR("100.64.0.0/10")
 
-// nat64WellKnownNet is the RFC 6052 NAT64 well-known prefix (64:ff9b::/96). An
-// address inside it embeds an IPv4 destination in its last four bytes; on a
-// network with a NAT64 gateway it routes to that embedded IPv4, so the embedded
-// address — not the IPv6 wrapper — decides internal reachability. isPrivateIP
-// unwraps it and re-classifies the embedded v4.
-var nat64WellKnownNet = mustParseWebhookCIDR("64:ff9b::/96")
+// siteLocalNet is the deprecated IPv6 site-local prefix (fec0::/10, deprecated by
+// RFC 3879). Go's net.IP.IsPrivate() covers only the ULA range fc00::/7, so a
+// site-local literal would otherwise classify as public even though a stack that
+// still honours it routes the address inside the site.
+var siteLocalNet = mustParseWebhookCIDR("fec0::/10")
+
+// thisNetworkNet is RFC 1122's "this network" block (0.0.0.0/8). IsUnspecified()
+// matches 0.0.0.0 exactly, yet the whole /8 is non-routable and a connect() to any
+// of it lands on the local host on common stacks — so the block, not just its first
+// address, is internal.
+var thisNetworkNet = mustParseWebhookCIDR("0.0.0.0/8")
+
+// nat64LocalUseNet is the RFC 8215 local-use NAT64 block (64:ff9b:1::/48). Unlike
+// the well-known prefix it carries no fixed embedded-IPv4 offset — RFC 6052 allows
+// six prefix lengths inside it, each placing the v4 differently — but "local use"
+// is the whole point of the block: a translation under it terminates inside the
+// operator's own network whatever it wraps. Classified private wholesale, which is
+// both simpler and stricter than decoding six layouts.
+var nat64LocalUseNet = mustParseWebhookCIDR("64:ff9b:1::/48")
+
+// specialPurposeNets are the IANA special-purpose prefixes that are NOT globally
+// reachable and that none of the named rules above already covers. The gate used
+// to know only the ranges someone had reported, so the ones nobody had named were
+// delivered to as if they were the public internet — RFC 2544 benchmarking space
+// and the reserved 240.0.0.0/4 route on real networks, and 192.0.0.0/24 carries
+// live protocol machinery. Each is terminal: the whole prefix is refused, no
+// unwrapping, because no owner endpoint can legitimately live inside one.
+//
+//   - 192.0.0.0/24 IETF protocol assignments (RFC 6890), which contains DS-Lite
+//     192.0.0.0/29, the RFC 7600 dummy address and the NAT64/DNS64 discovery
+//     pair. The two globally reachable anycast addresses inside it (192.0.0.9
+//     PCP, 192.0.0.10 TURN) are refused with the rest rather than carved out: an
+//     egress gate errs toward refusal, and no webhook endpoint lives on an
+//     address reserved for a UDP protocol's anycast rendezvous.
+//   - 192.88.99.0/24, the 6to4 relay anycast prefix deprecated by RFC 7526 — the
+//     IPv4 side of the 2002::/16 form the classifier already decodes.
+//   - 198.18.0.0/15 benchmarking (RFC 2544): lab and vendor networks answer here.
+//   - 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 documentation (RFC 5737) and
+//     2001:db8::/32, 3fff::/20 (RFC 3849, RFC 9637). Reserved so they never
+//     appear on the public internet, which is precisely why a host that answers
+//     one is inside somebody's network.
+//   - 240.0.0.0/4 reserved (RFC 1112), which also contains the limited broadcast
+//     address 255.255.255.255.
+//   - 100::/64 discard-only (RFC 6666), 2001:2::/48 benchmarking (RFC 5180),
+//     2001:20::/28 ORCHIDv2 (RFC 7343), 2001:30::/28 drone remote ID (RFC 9374),
+//     and 5f00::/16 SRv6 SIDs (RFC 9602) — the last is by construction internal
+//     to one routing domain.
+//
+// Deliberately NOT here: the special-purpose prefixes the registry marks
+// globally reachable, which must keep resolving as public — AS112
+// (192.31.196.0/24, 192.175.48.0/24, 2001:4:112::/48), AMT (192.52.193.0/24,
+// 2001:3::/32) and the 2001:1::1-3 anycast trio. The registry walk in
+// TestIsPrivateIPWalksTheSpecialPurposeRegistries pins both sides, so a later
+// widening that swallows one of those fails there.
+var specialPurposeNets = []*net.IPNet{
+	mustParseWebhookCIDR("192.0.0.0/24"),
+	mustParseWebhookCIDR("192.0.2.0/24"),
+	mustParseWebhookCIDR("192.88.99.0/24"),
+	mustParseWebhookCIDR("198.18.0.0/15"),
+	mustParseWebhookCIDR("198.51.100.0/24"),
+	mustParseWebhookCIDR("203.0.113.0/24"),
+	mustParseWebhookCIDR("240.0.0.0/4"),
+	mustParseWebhookCIDR("100::/64"),
+	mustParseWebhookCIDR("2001:2::/48"),
+	mustParseWebhookCIDR("2001:20::/28"),
+	mustParseWebhookCIDR("2001:30::/28"),
+	mustParseWebhookCIDR("2001:db8::/32"),
+	mustParseWebhookCIDR("3fff::/20"),
+	mustParseWebhookCIDR("5f00::/16"),
+}
+
+// The IPv6 transition prefixes whose addresses EMBED an IPv4 destination. On a
+// network that routes the form, the packet reaches the embedded IPv4 — so the
+// embedded address, not the IPv6 wrapper, decides internal reachability, exactly as
+// it already did for NAT64. Handling one form and not the rest is what made the
+// omission a defect (GHSA-hg2x-v5cc-m384): 2002:7f00:1:: is 127.0.0.1 spelled
+// differently. Each is decoded rather than blocked wholesale, so the NAT64 rule
+// generalizes unchanged — a wrapper around a PRIVATE v4 is blocked, a wrapper
+// around a PUBLIC v4 stays allowed.
+var (
+	// nat64WellKnownNet is the RFC 6052 NAT64 well-known prefix; v4 in bytes 12-15.
+	nat64WellKnownNet = mustParseWebhookCIDR("64:ff9b::/96")
+	// sixToFourNet is RFC 3056 6to4; v4 in bytes 2-5. Deprecated by RFC 7526 and so
+	// unrouted by a stock stack, but 6to4 relays persist on dual-stack gateways.
+	sixToFourNet = mustParseWebhookCIDR("2002::/16")
+	// teredoNet is RFC 4380 Teredo; it embeds TWO v4 addresses — the server in bytes
+	// 4-7 and the client in bytes 12-15, the latter stored bitwise-inverted.
+	teredoNet = mustParseWebhookCIDR("2001::/32")
+	// ipv4CompatibleNet is RFC 4291's deprecated IPv4-compatible form; v4 in bytes
+	// 12-15. It also contains :: and ::1, which is why the terminal classifications
+	// in isPrivateIP must run BEFORE any unwrapping: decoding ::1 first would yield
+	// 0.0.0.1 and turn IPv6 loopback into a public address.
+	ipv4CompatibleNet = mustParseWebhookCIDR("::/96")
+	// ipv4TranslatedNet is the RFC 2765 SIIT IPv4-translated form (::ffff:0:0:0/96);
+	// v4 in bytes 12-15. Distinct from IPv4-MAPPED (::ffff:0:0/96), which Go's
+	// net.IP.To4() already unwraps and the terminal checks therefore cover.
+	ipv4TranslatedNet = mustParseWebhookCIDR("::ffff:0:0:0/96")
+)
 
 // mustParseWebhookCIDR parses a CIDR literal once, at package-init time. Its only
 // callers pass compile-time constants, so a parse failure is a build-time
@@ -343,23 +569,83 @@ func mustParseWebhookCIDR(cidr string) *net.IPNet {
 	return network
 }
 
-// isPrivateIP is the core address classifier shared by the literal pre-check and
-// the guarded dialer: loopback, RFC1918/ULA private, link-local (unicast and
-// multicast), the unspecified address, RFC 6598 CGNAT space (100.64.0.0/10,
-// which net.IP.IsPrivate() omits), and the RFC 6052 NAT64 well-known prefix
-// (64:ff9b::/96) wrapping a private IPv4 all count as private.
-func isPrivateIP(ip net.IP) bool {
-	// NAT64 well-known prefix (64:ff9b::/96) embeds an IPv4 destination in its
-	// last four bytes; on a NAT64-gatewayed network the address routes to that
-	// embedded IPv4, so a wrapper around a PRIVATE v4 (64:ff9b::a00:1 → 10.0.0.1)
-	// must be blocked, while a wrapper around a PUBLIC v4 (64:ff9b::808:808 →
-	// 8.8.8.8) stays allowed. Re-classify the embedded v4 — it is never itself in
-	// the prefix, so this recurses at most once. Contains is true only for a
-	// 16-byte v6 ip, so the ip[12:16] index is always in range.
-	if nat64WellKnownNet.Contains(ip) {
-		return isPrivateIP(net.IPv4(ip[12], ip[13], ip[14], ip[15]))
+// embeddedIPv4s returns every IPv4 destination an IPv6 transition form wraps, or
+// nil when ip is not such a form. Teredo carries two — the relay server and the
+// tunnel client — and either reaching inside the network is enough to refuse the
+// target, so the result is a slice rather than a single address.
+//
+// A 4-byte or IPv4-mapped ip returns nil: Go's net.IP.To4() already unwraps that
+// case, so the caller's terminal classifications have seen it as a v4 already.
+// Contains is true only for a 16-byte v6 ip, so every byte index below is in range.
+func embeddedIPv4s(ip net.IP) []net.IP {
+	v6 := ip.To16()
+	if v6 == nil || ip.To4() != nil {
+		return nil
 	}
-	return ip.IsLoopback() || ip.IsPrivate() ||
-		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-		ip.IsUnspecified() || cgnatNet.Contains(ip)
+	switch {
+	case nat64WellKnownNet.Contains(ip), ipv4CompatibleNet.Contains(ip), ipv4TranslatedNet.Contains(ip):
+		return []net.IP{net.IPv4(v6[12], v6[13], v6[14], v6[15])}
+	case sixToFourNet.Contains(ip):
+		return []net.IP{net.IPv4(v6[2], v6[3], v6[4], v6[5])}
+	case teredoNet.Contains(ip):
+		return []net.IP{
+			net.IPv4(v6[4], v6[5], v6[6], v6[7]),
+			net.IPv4(^v6[12], ^v6[13], ^v6[14], ^v6[15]),
+		}
+	}
+	return nil
+}
+
+// isPrivateIP is the core address classifier shared by the literal pre-check and
+// the guarded dialer. Private means: loopback, RFC1918/ULA private, link-local
+// unicast, multicast (all of it, not only the link-local scope: an interface- or
+// site-local group is inside the operator's network by definition), the
+// unspecified address, RFC 6598 CGNAT space (100.64.0.0/10, which
+// net.IP.IsPrivate() omits), RFC 1122 "this network" (0.0.0.0/8), deprecated IPv6
+// site-local (fec0::/10), the RFC 8215 local-use NAT64 block, every remaining IANA
+// special-purpose prefix that is not globally reachable (specialPurposeNets), and
+// any IPv6 transition form (embeddedIPv4s) wrapping an IPv4 that is itself
+// private.
+//
+// The terminal classifications run FIRST and unwrapping only afterwards, because
+// :: and ::1 sit inside the IPv4-compatible prefix ::/96: an unwrap-first
+// classifier decodes IPv6 loopback to 0.0.0.1, which is how the remedy first
+// proposed for this class turned two deprecated bypasses into a live loopback one.
+//
+// Measured, so the comment does not overstate the test: inverting the two halves
+// today does NOT move ::1, because 0.0.0.1 lands in the 0.0.0.0/8 rule two lines
+// up and is refused there instead. The ordering is therefore defence in depth
+// rather than the thing currently holding ::1 — it is what keeps ::1 refused if
+// that /8 rule is ever narrowed. Keep both; neither alone is the guarantee.
+func isPrivateIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() || ip.IsMulticast() ||
+		ip.IsUnspecified() || cgnatNet.Contains(ip) ||
+		thisNetworkNet.Contains(ip) || siteLocalNet.Contains(ip) ||
+		nat64LocalUseNet.Contains(ip) || isSpecialPurposeAddress(ip) {
+		return true
+	}
+	// A wrapper around a PRIVATE v4 (64:ff9b::a00:1 or 2002:a00:1:: → 10.0.0.1) is
+	// blocked; a wrapper around a PUBLIC v4 (64:ff9b::808:808 → 8.8.8.8) stays
+	// allowed, because that is where it actually routes. Every embedded address is a
+	// v4, which embeds nothing further, so this recurses exactly once.
+	for _, embedded := range embeddedIPv4s(ip) {
+		if isPrivateIP(embedded) {
+			return true
+		}
+	}
+	return false
+}
+
+// isSpecialPurposeAddress reports whether ip sits in one of the non-globally-
+// reachable IANA special-purpose prefixes (specialPurposeNets). Kept as a loop
+// over a table rather than another chain of named vars: the registry is a list
+// that grows, and a new entry should be one line beside its neighbours.
+func isSpecialPurposeAddress(ip net.IP) bool {
+	for _, network := range specialPurposeNets {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }

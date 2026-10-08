@@ -39,7 +39,7 @@ func totpserviceCovEnroll(t *testing.T, svc *TOTPService, repo *stubTOTPUserRepo
 	if err != nil {
 		t.Fatalf("GenerateSetupKey: %v", err)
 	}
-	if err := svc.EnableTOTP(context.Background(), userID, key.Secret()); err != nil {
+	if err := svc.EnableTOTP(context.Background(), userID, 1, key.Secret(), pastEnrollmentStep()); err != nil {
 		t.Fatalf("EnableTOTP(%d): %v", userID, err)
 	}
 	return key.Secret(), repo.updatedSecret
@@ -242,7 +242,7 @@ func TestTOTPService_findValidatedTOTPStep_ValidCodeAccepted(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Lines 18 & 20 – DefaultTOTPAttemptsWindow / DefaultTOTPDisableAttemptsWindow
+// Lines 18 & 20 – DefaultTOTPAttemptsWindow / DefaultSettingsReauthAttemptsWindow
 // ---------------------------------------------------------------------------
 
 // TestTOTPService_CheckRateLimit_WindowExpiry asserts that a failure recorded
@@ -282,30 +282,29 @@ func TestTOTPService_CheckRateLimit_WindowExpiry(t *testing.T) {
 }
 
 // TestTOTPService_CheckDisableRateLimit_WindowExpiry mirrors the above for
-// the disable-attempt policy (line 20 DefaultTOTPDisableAttemptsWindow).
+// the disable confirmation's budget (DefaultSettingsReauthAttemptsWindow, the
+// account's password re-auth window).
 func TestTOTPService_CheckDisableRateLimit_WindowExpiry(t *testing.T) {
-	repo := &stubTOTPUserRepo{}
-	secretKey := []byte(totpserviceCovSecretKey)
-	svc := NewTOTPService(repo, secretKey, nil)
+	svc := newDisableBudgetSettings([]byte(totpserviceCovSecretKey), nil)
 
-	staleTime := time.Now().Add(-(DefaultTOTPDisableAttemptsWindow + time.Second))
+	staleTime := time.Now().Add(-(DefaultSettingsReauthAttemptsWindow + time.Second))
 	now := time.Now()
-	for range DefaultTOTPDisableAttemptsLimit {
-		svc.RecordDisableFailure(secretKey, "10.0.0.3", 60, staleTime)
+	for range DefaultSettingsReauthAttemptsLimit {
+		recordDisableFailure(svc, "10.0.0.3", 60, staleTime)
 	}
 
-	if err := svc.CheckDisableRateLimit(secretKey, "10.0.0.3", 60, now); err != nil {
-		t.Errorf("CheckDisableRateLimit() = %v after %d failures outside window; want nil",
-			err, DefaultTOTPDisableAttemptsLimit)
+	if err := checkDisableBudget(svc, "10.0.0.3", 60, now); err != nil {
+		t.Errorf("disable budget = %v after %d failures outside window; want nil",
+			err, DefaultSettingsReauthAttemptsLimit)
 	}
 
-	freshTime := now.Add(-(DefaultTOTPDisableAttemptsWindow - time.Second))
-	for range DefaultTOTPDisableAttemptsLimit {
-		svc.RecordDisableFailure(secretKey, "10.0.0.4", 61, freshTime)
+	freshTime := now.Add(-(DefaultSettingsReauthAttemptsWindow - time.Second))
+	for range DefaultSettingsReauthAttemptsLimit {
+		recordDisableFailure(svc, "10.0.0.4", 61, freshTime)
 	}
 
-	if err := svc.CheckDisableRateLimit(secretKey, "10.0.0.4", 61, now); err == nil {
-		t.Errorf("CheckDisableRateLimit() = nil after %d failures inside window; want ErrTOTPDisableRateLimited",
-			DefaultTOTPDisableAttemptsLimit)
+	if err := checkDisableBudget(svc, "10.0.0.4", 61, now); err == nil {
+		t.Errorf("disable budget = nil after %d failures inside window; want ErrSettingsReauthRateLimited",
+			DefaultSettingsReauthAttemptsLimit)
 	}
 }

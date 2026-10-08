@@ -7,6 +7,7 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/ovumcy/ovumcy-web/internal/api"
+	"github.com/ovumcy/ovumcy-web/internal/httpx"
 )
 
 // trustedProxyMatcher classifies an address as a trusted proxy using the same
@@ -150,11 +151,15 @@ func newAPIRateLimitHandler(handler *api.Handler) fiber.Handler {
 }
 
 // newCalendarFeedRateLimitHandler is the LimitReached handler for the per-IP
-// calendar-feed limiter. The feed has no UI, so a 429 needs no HTML/JSON body:
-// it returns a bare 429 (preserving the limiter-set Retry-After header) after
-// logging the hit and a security event. logRateLimitHit masks the token in the
-// path via SafeRequestLogPath, so the rate-limit log line never carries the
-// token value.
+// calendar-feed limiter. The feed has no UI, so its 429 is never rendered as a
+// page — but it answers through the shared rate-limit envelope like every other
+// limiter (preserving the limiter-set Retry-After header and echoing it as
+// retry_after_seconds) rather than the bare status it used to return: the
+// envelope is an app-wide contract, and one surface answering a bodyless 429
+// was the same split this change closes elsewhere. Nothing about the request is
+// echoed — the spec is the shared global one, so the subscribe token in the
+// path cannot reach the body. logRateLimitHit masks that token in the path via
+// SafeRequestLogPath, so the rate-limit log line never carries it either.
 func newCalendarFeedRateLimitHandler(handler *api.Handler) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		logRateLimitHit(c)
@@ -162,12 +167,12 @@ func newCalendarFeedRateLimitHandler(handler *api.Handler) fiber.Handler {
 			api.SecurityEventField{Key: "scope", Value: "calendar_feed"},
 			api.SecurityEventField{Key: "reason", Value: "too many requests"},
 		)
-		return c.SendStatus(fiber.StatusTooManyRequests)
+		return handler.RespondCalendarFeedRateLimited(c)
 	}
 }
 
 func rateLimitScope(c fiber.Ctx) string {
-	path := c.Path()
+	path := httpx.RoutingNormalizedPath(c.Path())
 	switch {
 	case strings.HasPrefix(path, "/api/v1/users/current"):
 		return "settings"
@@ -175,6 +180,22 @@ func rateLimitScope(c fiber.Ctx) string {
 		return "auth"
 	default:
 		return "api"
+	}
+}
+
+// newCalendarPageRateLimitHandler is the LimitReached handler for GET
+// /calendar's own budget (WEB-14 SEC-H5). It answers through the same
+// negotiated envelope as the general API limiter (JSON when asked, the mapped
+// HTML/flash form otherwise) — RespondAPIRateLimited's default case already
+// covers a page outside every named prefix, so no new response arm is needed.
+func newCalendarPageRateLimitHandler(handler *api.Handler) fiber.Handler {
+	return func(c fiber.Ctx) error {
+		logRateLimitHit(c)
+		handler.LogSecurityEvent(c, "rate_limit", "blocked",
+			api.SecurityEventField{Key: "scope", Value: "calendar"},
+			api.SecurityEventField{Key: "reason", Value: "too many requests"},
+		)
+		return handler.RespondAPIRateLimited(c)
 	}
 }
 
@@ -198,9 +219,27 @@ func isV1AuthPath(path string) bool {
 // this filter a limiter wired to "/api/v1/sessions" would also fire on
 // sibling routes such as POST /api/v1/sessions/2fa-challenge that share the
 // prefix, silently broadening the rate-limit budget.
+//
+// "Exactly" is measured on the routing normalization (httpx.RoutingNormalizedPath),
+// not on the raw bytes: the scope has to be as wide as the set of spellings
+// that reach the guarded handler, and no wider. Normalizing does not turn the
+// comparison into a prefix match — /api/v1/sessions/2fa-challenge normalizes to
+// itself and still misses /api/v1/sessions. Comparing the raw path instead is
+// what let POST /LANG and POST /lang/ reach the language handler while this
+// predicate waved them through uncounted.
+//
+// The method needs no such treatment: fiber resolves the verb to an int against
+// its canonical constants and answers 501 before any middleware runs when the
+// lookup fails, so c.Method() inside a limiter is always one of those constants.
+// A GET scope also charges HEAD: api.RegisterRoutes gives every GET route a HEAD
+// twin running the same handler chain, so HEAD reaches the guarded handler and
+// would otherwise spend nothing.
 func rateLimitOnlyFor(method, path string) func(fiber.Ctx) bool {
+	scopedPath := httpx.RoutingNormalizedPath(path)
 	return func(c fiber.Ctx) bool {
-		return c.Method() != method || c.Path() != path
+		requestMethod := c.Method()
+		methodMatches := requestMethod == method || (method == fiber.MethodGet && requestMethod == fiber.MethodHead)
+		return !methodMatches || httpx.RoutingNormalizedPath(c.Path()) != scopedPath
 	}
 }
 

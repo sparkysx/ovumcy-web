@@ -19,13 +19,17 @@ func TestApplyTrackingSettings(t *testing.T) {
 		TemperatureUnit:    "",
 	}
 
+	// The three section toggles arrive positive: "not shown" is what the
+	// inverted columns store as hidden.
 	service.ApplyTrackingSettings(user, TrackingSettingsUpdate{
 		TrackBBT:           true,
 		TrackCervicalMucus: true,
-		HideSexChip:        true,
-		HideCycleFactors:   true,
-		HideNotesField:     true,
-		TemperatureUnit:    TemperatureUnitFahrenheit,
+		Visibility: TrackingVisibility{
+			ShowSexChip:      false,
+			ShowCycleFactors: false,
+			ShowNotesField:   false,
+		},
+		TemperatureUnit: TemperatureUnitFahrenheit,
 	})
 
 	if !user.TrackBBT {
@@ -55,10 +59,12 @@ func TestSaveTrackingSettings(t *testing.T) {
 	err := service.SaveTrackingSettings(context.Background(), 42, TrackingSettingsUpdate{
 		TrackBBT:           true,
 		TrackCervicalMucus: true,
-		HideSexChip:        true,
-		HideCycleFactors:   true,
-		HideNotesField:     true,
-		TemperatureUnit:    TemperatureUnitFahrenheit,
+		Visibility: TrackingVisibility{
+			ShowSexChip:      false,
+			ShowCycleFactors: false,
+			ShowNotesField:   false,
+		},
+		TemperatureUnit: TemperatureUnitFahrenheit,
 	})
 	if err != nil {
 		t.Fatalf("expected nil error, got %v", err)
@@ -103,14 +109,38 @@ type stubSettingsTrackingUserRepo struct {
 	reminderUpdatedUserID     uint
 	reminderLeadDaysPersisted int
 	reminderErr               error
+	// Interface-language write: languageRowMatched is what the repository
+	// reports back, so a test can drive the zero-row outcome an account deleted
+	// mid-request produces. It defaults to false, so a test asserting a
+	// successful save has to say so explicitly.
+	languageCalls         int
+	languageUpdatedUserID uint
+	languagePersisted     string
+	languageRowMatched    bool
+	languageErr           error
 }
 
 func (stub *stubSettingsTrackingUserRepo) UpdateDisplayName(context.Context, uint, string) error {
 	return nil
 }
 
+// UpdateCycleSettingsMovingPeriodStart records the column half exactly as
+// UpdateByID does: a save that moves the start writes the same columns.
+func (stub *stubSettingsTrackingUserRepo) UpdateCycleSettingsMovingPeriodStart(_ context.Context, userID uint, updates map[string]any, _ models.PeriodStartMove) error {
+	stub.updatedUserID = userID
+	stub.updates = updates
+	return stub.updateErr
+}
+
 func (stub *stubSettingsTrackingUserRepo) UpdateUserTimezone(context.Context, uint, string) error {
 	return nil
+}
+
+func (stub *stubSettingsTrackingUserRepo) UpdateInterfaceLanguage(_ context.Context, userID uint, language string) (bool, error) {
+	stub.languageCalls++
+	stub.languageUpdatedUserID = userID
+	stub.languagePersisted = language
+	return stub.languageRowMatched, stub.languageErr
 }
 
 func (stub *stubSettingsTrackingUserRepo) UpdateReminderLeadDays(_ context.Context, userID uint, leadDays int) error {
@@ -120,11 +150,14 @@ func (stub *stubSettingsTrackingUserRepo) UpdateReminderLeadDays(_ context.Conte
 	return stub.reminderErr
 }
 
-func (stub *stubSettingsTrackingUserRepo) UpdatePasswordAndRevokeSessions(context.Context, uint, string, bool) error {
+func (stub *stubSettingsTrackingUserRepo) UpdatePasswordAndRevokeSessions(context.Context, uint, int, string, bool) error {
 	return nil
 }
 
-func (stub *stubSettingsTrackingUserRepo) UpdatePasswordRecoveryCodeAndRevokeSessions(context.Context, uint, string, string, bool) error {
+func (stub *stubSettingsTrackingUserRepo) UpdatePasswordRecoveryCodeAndRevokeSessions(_ context.Context, _ uint, _ int, _ string, _ string, _ bool, beforeCommit func(sessionVersion int) error) error {
+	if beforeCommit != nil {
+		return beforeCommit(1)
+	}
 	return nil
 }
 
@@ -138,7 +171,7 @@ func (stub *stubSettingsTrackingUserRepo) LoadSettingsByID(context.Context, uint
 	return models.User{}, nil
 }
 
-func (stub *stubSettingsTrackingUserRepo) ClearAllDataAndResetSettings(context.Context, uint) error {
+func (stub *stubSettingsTrackingUserRepo) ClearAllDataAndResetSettings(context.Context, uint, int) error {
 	return nil
 }
 

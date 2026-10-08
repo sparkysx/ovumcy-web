@@ -195,6 +195,149 @@ func TestResolveDatabaseConfigAcceptsPostgres(t *testing.T) {
 	}
 }
 
+// TestResolveDatabaseConfigDatabaseURLFile pins DATABASE_URL_FILE, the
+// Docker Swarm/Compose secrets route for the Postgres DSN on the shell-free
+// runtime image — the same ReadBoundedRegularFile contract and the same
+// DATABASE_URL-wins-silently precedence as SECRET_KEY/SECRET_KEY_FILE.
+func TestResolveDatabaseConfigDatabaseURLFile(t *testing.T) {
+	const dsn = "postgres://ovumcy:s3cret@127.0.0.1:5432/ovumcy?sslmode=disable"
+
+	t.Run("reads and trims DATABASE_URL_FILE", func(t *testing.T) {
+		t.Setenv("DB_DRIVER", "postgres")
+		t.Setenv("DATABASE_URL", "")
+		t.Setenv("DATABASE_URL_FILE", writeTempSecretFile(t, dsn+"\n"))
+
+		config, err := resolveDatabaseConfig()
+		if err != nil {
+			t.Fatalf("expected postgres config from file, got error: %v", err)
+		}
+		if config.PostgresURL != dsn {
+			t.Fatalf("expected %q, got %q", dsn, config.PostgresURL)
+		}
+	})
+
+	t.Run("trims leading and trailing whitespace from DATABASE_URL_FILE", func(t *testing.T) {
+		t.Setenv("DB_DRIVER", "postgres")
+		t.Setenv("DATABASE_URL", "")
+		t.Setenv("DATABASE_URL_FILE", writeTempSecretFile(t, "  "+dsn+"  \n\t"))
+
+		config, err := resolveDatabaseConfig()
+		if err != nil {
+			t.Fatalf("expected postgres config from file, got error: %v", err)
+		}
+		if config.PostgresURL != dsn {
+			t.Fatalf("expected %q, got %q", dsn, config.PostgresURL)
+		}
+	})
+
+	t.Run("DATABASE_URL takes precedence over DATABASE_URL_FILE", func(t *testing.T) {
+		t.Setenv("DB_DRIVER", "postgres")
+		t.Setenv("DATABASE_URL", dsn)
+		t.Setenv("DATABASE_URL_FILE", filepath.Join(t.TempDir(), "missing-database-url.txt"))
+
+		config, err := resolveDatabaseConfig()
+		if err != nil {
+			t.Fatalf("expected env DSN to win, got error: %v", err)
+		}
+		if config.PostgresURL != dsn {
+			t.Fatalf("expected %q from env, got %q", dsn, config.PostgresURL)
+		}
+	})
+
+	t.Run("fails when DATABASE_URL_FILE cannot be read", func(t *testing.T) {
+		t.Setenv("DB_DRIVER", "postgres")
+		t.Setenv("DATABASE_URL", "")
+		missingPath := filepath.Join(t.TempDir(), "missing-database-url.txt")
+		t.Setenv("DATABASE_URL_FILE", missingPath)
+
+		_, err := resolveDatabaseConfig()
+		if err == nil || !strings.Contains(err.Error(), "failed to read DATABASE_URL_FILE") {
+			t.Fatalf("expected error naming DATABASE_URL_FILE, got %v", err)
+		}
+	})
+
+	t.Run("rejects a directory DATABASE_URL_FILE path", func(t *testing.T) {
+		t.Setenv("DB_DRIVER", "postgres")
+		t.Setenv("DATABASE_URL", "")
+		t.Setenv("DATABASE_URL_FILE", t.TempDir())
+
+		_, err := resolveDatabaseConfig()
+		if err == nil || !strings.Contains(err.Error(), "regular file") {
+			t.Fatalf("expected a directory DATABASE_URL_FILE to be rejected, got %v", err)
+		}
+	})
+
+	t.Run("an empty DATABASE_URL_FILE still fails postgres validation", func(t *testing.T) {
+		t.Setenv("DB_DRIVER", "postgres")
+		t.Setenv("DATABASE_URL", "")
+		t.Setenv("DATABASE_URL_FILE", writeTempSecretFile(t, " \n\t "))
+
+		_, err := resolveDatabaseConfig()
+		if err == nil || !strings.Contains(err.Error(), "postgres requires DATABASE_URL") {
+			t.Fatalf("expected an empty DATABASE_URL_FILE to fail postgres validation, got %v", err)
+		}
+	})
+
+	// A sqlite instance never consumes DATABASE_URL/DATABASE_URL_FILE, so a
+	// stale or dangling DATABASE_URL_FILE (an old value left in .env, or a
+	// Swarm secret mount that vanished on redeploy) must not block boot. The
+	// old plain os.Getenv read could never fail; resolving through the file
+	// helper must not turn that into a new way to fail closed on a value the
+	// driver never reads.
+	t.Run("sqlite driver boots despite an unreadable DATABASE_URL_FILE it never consumes", func(t *testing.T) {
+		t.Setenv("DB_DRIVER", "sqlite")
+		t.Setenv("DATABASE_URL", "")
+		t.Setenv("DATABASE_URL_FILE", filepath.Join(t.TempDir(), "missing-database-url.txt"))
+
+		config, err := resolveDatabaseConfig()
+		if err != nil {
+			t.Fatalf("expected sqlite driver to boot despite an unreadable DATABASE_URL_FILE it never reads, got error: %v", err)
+		}
+		if config.Driver != db.DriverSQLite {
+			t.Fatalf("expected sqlite driver, got %q", config.Driver)
+		}
+	})
+
+	// DATABASE_URL winning over DATABASE_URL_FILE is silent by design (see
+	// resolveSecretFromEnvOrFile), but silent is only safe once the operator can
+	// find out some other way. A wrong DSN does not fail at all — unlike a wrong
+	// SECRET_KEY, which fails loudly at first use — so the boot log must name
+	// which variable supplied the value and which _FILE variable it ignored,
+	// without ever printing the value itself.
+	t.Run("both-set logs which variable supplied the value and names the ignored file, without the value", func(t *testing.T) {
+		var buffer bytes.Buffer
+		originalWriter := log.Writer()
+		log.SetOutput(&buffer)
+		t.Cleanup(func() { log.SetOutput(originalWriter) })
+
+		t.Setenv("DB_DRIVER", "postgres")
+		t.Setenv("DATABASE_URL", dsn)
+		t.Setenv("DATABASE_URL_FILE", writeTempSecretFile(t, dsn))
+
+		if _, err := resolveDatabaseConfig(); err != nil {
+			t.Fatalf("expected env DSN to win, got error: %v", err)
+		}
+
+		logged := buffer.String()
+		if !strings.Contains(logged, "DATABASE_URL") || !strings.Contains(logged, "DATABASE_URL_FILE") {
+			t.Fatalf("expected the boot log to name both DATABASE_URL and the ignored DATABASE_URL_FILE, got %q", logged)
+		}
+		if strings.Contains(logged, dsn) || strings.Contains(logged, "s3cret") {
+			t.Fatalf("expected the boot log to never contain the resolved DSN or its password, got %q", logged)
+		}
+	})
+}
+
+func writeTempSecretFile(t *testing.T, contents string) string {
+	t.Helper()
+
+	filePath := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(filePath, []byte(contents), 0o600); err != nil {
+		t.Fatalf("failed to write temp secret file: %v", err)
+	}
+	return filePath
+}
+
 func TestCSRFMiddlewareConfigUsesCookieSecureFlag(t *testing.T) {
 	handler := newRateLimitTestHandler(t)
 	secureConfig := csrfMiddlewareConfig(true, handler)
@@ -552,6 +695,164 @@ func assertResolveOIDCConfigError(t *testing.T, cookieSecure bool, registrationM
 	}
 }
 
+// TestResolveOIDCConfigClientSecretFile pins OIDC_CLIENT_SECRET_FILE, the
+// Docker Swarm/Compose secrets route for the OIDC client secret on the
+// shell-free runtime image — the same ReadBoundedRegularFile contract and the
+// same OIDC_CLIENT_SECRET-wins-silently precedence as
+// SECRET_KEY/SECRET_KEY_FILE.
+func TestResolveOIDCConfigClientSecretFile(t *testing.T) {
+	const clientSecret = "s3cret-oidc-client-value"
+
+	t.Run("reads and trims OIDC_CLIENT_SECRET_FILE", func(t *testing.T) {
+		setValidOIDCTestEnv(t)
+		t.Setenv("OIDC_CLIENT_SECRET", "")
+		t.Setenv("OIDC_CLIENT_SECRET_FILE", writeTempSecretFile(t, clientSecret+"\n"))
+
+		config, err := resolveOIDCConfig(true, services.RegistrationModeOpen)
+		if err != nil {
+			t.Fatalf("expected valid OIDC config from file, got error: %v", err)
+		}
+		if config.ClientSecret != clientSecret {
+			t.Fatalf("expected %q, got %q", clientSecret, config.ClientSecret)
+		}
+	})
+
+	t.Run("trims leading and trailing whitespace from OIDC_CLIENT_SECRET_FILE", func(t *testing.T) {
+		setValidOIDCTestEnv(t)
+		t.Setenv("OIDC_CLIENT_SECRET", "")
+		t.Setenv("OIDC_CLIENT_SECRET_FILE", writeTempSecretFile(t, "  "+clientSecret+"  \n\t"))
+
+		config, err := resolveOIDCConfig(true, services.RegistrationModeOpen)
+		if err != nil {
+			t.Fatalf("expected valid OIDC config from file, got error: %v", err)
+		}
+		if config.ClientSecret != clientSecret {
+			t.Fatalf("expected %q, got %q", clientSecret, config.ClientSecret)
+		}
+	})
+
+	t.Run("OIDC_CLIENT_SECRET takes precedence over OIDC_CLIENT_SECRET_FILE", func(t *testing.T) {
+		setValidOIDCTestEnv(t)
+		t.Setenv("OIDC_CLIENT_SECRET", clientSecret)
+		t.Setenv("OIDC_CLIENT_SECRET_FILE", filepath.Join(t.TempDir(), "missing-client-secret.txt"))
+
+		config, err := resolveOIDCConfig(true, services.RegistrationModeOpen)
+		if err != nil {
+			t.Fatalf("expected env client secret to win, got error: %v", err)
+		}
+		if config.ClientSecret != clientSecret {
+			t.Fatalf("expected %q from env, got %q", clientSecret, config.ClientSecret)
+		}
+	})
+
+	t.Run("fails when OIDC_CLIENT_SECRET_FILE cannot be read", func(t *testing.T) {
+		setValidOIDCTestEnv(t)
+		t.Setenv("OIDC_CLIENT_SECRET", "")
+		missingPath := filepath.Join(t.TempDir(), "missing-client-secret.txt")
+		t.Setenv("OIDC_CLIENT_SECRET_FILE", missingPath)
+
+		_, err := resolveOIDCConfig(true, services.RegistrationModeOpen)
+		if err == nil || !strings.Contains(err.Error(), "failed to read OIDC_CLIENT_SECRET_FILE") {
+			t.Fatalf("expected error naming OIDC_CLIENT_SECRET_FILE, got %v", err)
+		}
+	})
+
+	t.Run("rejects a directory OIDC_CLIENT_SECRET_FILE path", func(t *testing.T) {
+		setValidOIDCTestEnv(t)
+		t.Setenv("OIDC_CLIENT_SECRET", "")
+		t.Setenv("OIDC_CLIENT_SECRET_FILE", t.TempDir())
+
+		_, err := resolveOIDCConfig(true, services.RegistrationModeOpen)
+		if err == nil || !strings.Contains(err.Error(), "regular file") {
+			t.Fatalf("expected a directory OIDC_CLIENT_SECRET_FILE to be rejected, got %v", err)
+		}
+	})
+
+	t.Run("an empty OIDC_CLIENT_SECRET_FILE still fails required-field validation", func(t *testing.T) {
+		setValidOIDCTestEnv(t)
+		t.Setenv("OIDC_CLIENT_SECRET", "")
+		t.Setenv("OIDC_CLIENT_SECRET_FILE", writeTempSecretFile(t, " \n\t "))
+
+		_, err := resolveOIDCConfig(true, services.RegistrationModeOpen)
+		if err == nil || !strings.Contains(err.Error(), "OIDC_CLIENT_SECRET is required") {
+			t.Fatalf("expected an empty OIDC_CLIENT_SECRET_FILE to fail required-field validation, got %v", err)
+		}
+	})
+
+	// A disabled instance never consumes the client secret, so neither source is
+	// read: a stale or unreadable OIDC_CLIENT_SECRET_FILE — alone or beside an
+	// OIDC_CLIENT_SECRET — must not stop the boot. Driven through
+	// loadRuntimeConfig because the contract is "the instance starts", not only
+	// "the resolver returns".
+	disabledCases := []struct {
+		name    string
+		enabled string
+		secret  string
+		file    func(t *testing.T) string
+	}{
+		{"disabled with a missing OIDC_CLIENT_SECRET_FILE boots", "false", "", func(t *testing.T) string {
+			return filepath.Join(t.TempDir(), "missing-client-secret.txt")
+		}},
+		{"unset OIDC_ENABLED with a missing OIDC_CLIENT_SECRET_FILE boots", "", "", func(t *testing.T) string {
+			return filepath.Join(t.TempDir(), "missing-client-secret.txt")
+		}},
+		{"disabled with a directory OIDC_CLIENT_SECRET_FILE boots", "false", "", func(t *testing.T) string {
+			return t.TempDir()
+		}},
+		{"disabled with both sources set and the file missing boots", "false", clientSecret, func(t *testing.T) string {
+			return filepath.Join(t.TempDir(), "missing-client-secret.txt")
+		}},
+		// A readable file is the case that tells "never read" from "read, then
+		// discarded": only a real read logs which source supplied the secret.
+		{"disabled with a readable OIDC_CLIENT_SECRET_FILE does not read it", "false", "", func(t *testing.T) string {
+			return writeTempSecretFile(t, clientSecret+"\n")
+		}},
+	}
+	for _, tc := range disabledCases {
+		t.Run(tc.name, func(t *testing.T) {
+			setValidBootEnv(t)
+			t.Setenv("OIDC_ENABLED", tc.enabled)
+			t.Setenv("OIDC_CLIENT_SECRET", tc.secret)
+			t.Setenv("OIDC_CLIENT_SECRET_FILE", tc.file(t))
+
+			var logged bytes.Buffer
+			originalWriter := log.Writer()
+			log.SetOutput(&logged)
+			t.Cleanup(func() { log.SetOutput(originalWriter) })
+
+			config, err := loadRuntimeConfig(time.UTC)
+			if err != nil {
+				t.Fatalf("expected a disabled OIDC config to boot without reading the secret, got: %v", err)
+			}
+			if config.OIDC.Enabled {
+				t.Fatal("expected OIDC to stay disabled")
+			}
+			if config.OIDC.ClientSecret != "" {
+				t.Fatal("expected a disabled OIDC config to carry no client secret")
+			}
+			if strings.Contains(logged.String(), "OIDC_CLIENT_SECRET") {
+				t.Fatalf("expected a disabled OIDC config to consult neither secret source, but boot logged: %q", logged.String())
+			}
+		})
+	}
+
+	// The same unreadable file stays a refusal the moment OIDC is enabled and
+	// the file is the only source: the disabled carve-out above must not loosen
+	// the enabled case.
+	t.Run("enabled with a missing OIDC_CLIENT_SECRET_FILE still refuses the boot", func(t *testing.T) {
+		setValidBootEnv(t)
+		setValidOIDCTestEnv(t)
+		t.Setenv("COOKIE_SECURE", "true")
+		t.Setenv("OIDC_CLIENT_SECRET", "")
+		t.Setenv("OIDC_CLIENT_SECRET_FILE", filepath.Join(t.TempDir(), "missing-client-secret.txt"))
+
+		_, err := loadRuntimeConfig(time.UTC)
+		if err == nil || !strings.Contains(err.Error(), "failed to read OIDC_CLIENT_SECRET_FILE") {
+			t.Fatalf("expected an enabled OIDC config to refuse an unreadable secret file, got %v", err)
+		}
+	})
+}
+
 func setValidOIDCTestEnv(t *testing.T) {
 	t.Helper()
 
@@ -615,6 +916,7 @@ func TestLoadRuntimeConfigBuildsExpectedSettings(t *testing.T) {
 	t.Setenv("TRUST_PROXY_ENABLED", "true")
 	t.Setenv("PROXY_HEADER", "X-Forwarded-For")
 	t.Setenv("TRUSTED_PROXIES", "127.0.0.1, ::1")
+	t.Setenv(security.CalendarFeedFencePathEnv, "")
 
 	location := time.FixedZone("UTC+3", 3*60*60)
 	config, err := loadRuntimeConfig(location)
@@ -696,9 +998,7 @@ func assertProxyRuntimeConfig(t *testing.T, config runtimeConfig) {
 // state audit logging is off by default. (The api-package audit-flag test
 // covers the request path; this one exercises the startup default.)
 func TestLoadRuntimeConfigDefaultsAuditLogOff(t *testing.T) {
-	t.Setenv("SECRET_KEY", "0123456789abcdef0123456789abcdef")
-	t.Setenv("DB_DRIVER", "sqlite")
-	t.Setenv("DB_PATH", "data/ovumcy.db")
+	minimalRuntimeEnv(t)
 	t.Setenv("AUDIT_LOG_ENABLED", "")
 
 	config, err := loadRuntimeConfig(time.UTC)
@@ -711,9 +1011,7 @@ func TestLoadRuntimeConfigDefaultsAuditLogOff(t *testing.T) {
 }
 
 func TestLoadRuntimeConfigHonorsAuditLogEnabled(t *testing.T) {
-	t.Setenv("SECRET_KEY", "0123456789abcdef0123456789abcdef")
-	t.Setenv("DB_DRIVER", "sqlite")
-	t.Setenv("DB_PATH", "data/ovumcy.db")
+	minimalRuntimeEnv(t)
 	t.Setenv("AUDIT_LOG_ENABLED", "true")
 
 	config, err := loadRuntimeConfig(time.UTC)
@@ -730,9 +1028,7 @@ func TestLoadRuntimeConfigHonorsAuditLogEnabled(t *testing.T) {
 // and runs at local hour 9 when its env is unset. This is the instant-rollback
 // contract (REMINDER_SCHEDULER_ENABLED=false).
 func TestLoadRuntimeConfigDefaultsReminderSchedulerOff(t *testing.T) {
-	t.Setenv("SECRET_KEY", "0123456789abcdef0123456789abcdef")
-	t.Setenv("DB_DRIVER", "sqlite")
-	t.Setenv("DB_PATH", "data/ovumcy.db")
+	minimalRuntimeEnv(t)
 	t.Setenv("REMINDER_SCHEDULER_ENABLED", "")
 	t.Setenv("REMINDER_SCHEDULER_HOUR", "")
 
@@ -752,9 +1048,7 @@ func TestLoadRuntimeConfigDefaultsReminderSchedulerOff(t *testing.T) {
 // and hour override, including hour 0 (midnight) which getEnvInt would have
 // rejected — the dedicated range helper must accept it.
 func TestLoadRuntimeConfigHonorsReminderSchedulerSettings(t *testing.T) {
-	t.Setenv("SECRET_KEY", "0123456789abcdef0123456789abcdef")
-	t.Setenv("DB_DRIVER", "sqlite")
-	t.Setenv("DB_PATH", "data/ovumcy.db")
+	minimalRuntimeEnv(t)
 	t.Setenv("REMINDER_SCHEDULER_ENABLED", "true")
 	t.Setenv("REMINDER_SCHEDULER_HOUR", "0")
 
@@ -862,9 +1156,7 @@ func TestLoadRuntimeConfigResolvesHSTSSwitch(t *testing.T) {
 	for _, tt := range tests {
 
 		t.Run(tt.name, func(t *testing.T) {
-			t.Setenv("SECRET_KEY", "0123456789abcdef0123456789abcdef")
-			t.Setenv("DB_DRIVER", "sqlite")
-			t.Setenv("DB_PATH", "data/ovumcy.db")
+			minimalRuntimeEnv(t)
 			t.Setenv("COOKIE_SECURE", tt.cookieSecure)
 			t.Setenv("HSTS_ENABLED", tt.hstsEnabled)
 
@@ -879,12 +1171,60 @@ func TestLoadRuntimeConfigResolvesHSTSSwitch(t *testing.T) {
 	}
 }
 
+// TestLoadRuntimeConfigGivesCalendarFeedItsOwnBudget pins the split between the
+// calendar-feed budget and the /api catch-all. The feed is a cookieless
+// unauthenticated polling surface this budget is the only cap on, and reusing
+// the API budget — sized for cheap authorized reads — would hand one IP APIMax
+// unauthenticated polls per window (plus, on a row minted before migration 032,
+// that many residual bcrypts). The assertion is deliberately
+// "strictly below APIMax" rather than an exact number, so retuning either budget
+// stays free while a silent revert to the shared budget fails.
+func TestLoadRuntimeConfigGivesCalendarFeedItsOwnBudget(t *testing.T) {
+	t.Run("defaults are independent and the feed is the tighter one", func(t *testing.T) {
+		minimalRuntimeEnv(t)
+
+		config, err := loadRuntimeConfig(time.UTC)
+		if err != nil {
+			t.Fatalf("load runtime config: %v", err)
+		}
+		if config.RateLimits.CalendarFeedMax >= config.RateLimits.APIMax {
+			t.Fatalf("calendar feed budget (%d) must stay strictly below the API budget (%d); a cookieless unauthenticated endpoint cannot inherit the cheap-read budget",
+				config.RateLimits.CalendarFeedMax, config.RateLimits.APIMax)
+		}
+		if config.RateLimits.CalendarFeedMax <= 0 || config.RateLimits.CalendarFeedWindow <= 0 {
+			t.Fatalf("calendar feed budget must be positive, got %d / %s",
+				config.RateLimits.CalendarFeedMax, config.RateLimits.CalendarFeedWindow)
+		}
+	})
+
+	t.Run("operator overrides are honored independently of the API budget", func(t *testing.T) {
+		minimalRuntimeEnv(t)
+		t.Setenv("RATE_LIMIT_API_MAX", "250")
+		t.Setenv("RATE_LIMIT_CALENDAR_FEED_MAX", "7")
+		t.Setenv("RATE_LIMIT_CALENDAR_FEED_WINDOW", "30s")
+
+		config, err := loadRuntimeConfig(time.UTC)
+		if err != nil {
+			t.Fatalf("load runtime config: %v", err)
+		}
+		if config.RateLimits.CalendarFeedMax != 7 {
+			t.Fatalf("CalendarFeedMax = %d, want 7", config.RateLimits.CalendarFeedMax)
+		}
+		if config.RateLimits.CalendarFeedWindow != 30*time.Second {
+			t.Fatalf("CalendarFeedWindow = %s, want 30s", config.RateLimits.CalendarFeedWindow)
+		}
+		if config.RateLimits.APIMax != 250 {
+			t.Fatalf("APIMax = %d, want 250 (the feed override must not bleed into the API budget)", config.RateLimits.APIMax)
+		}
+	})
+}
+
 func TestFiberConfigAppliesTrustedProxySettings(t *testing.T) {
-	config := fiberConfig(runtimeConfig{Proxy: proxySettings{
+	config := fiberConfig(proxySettings{
 		Enabled:        true,
 		Header:         "X-Forwarded-For",
 		TrustedProxies: []string{"127.0.0.1", "::1"},
-	}})
+	}, nil)
 
 	if config.ProxyHeader != "X-Forwarded-For" {
 		t.Fatalf("expected proxy header to be applied, got %q", config.ProxyHeader)
@@ -906,13 +1246,79 @@ func TestFiberConfigAppliesTrustedProxySettings(t *testing.T) {
 // restore (~8-12 MiB) — the documented import capacity would be unreachable
 // over HTTP.
 func TestFiberConfigSetsImportSizedBodyLimit(t *testing.T) {
-	config := fiberConfig(runtimeConfig{})
+	config := fiberConfig(proxySettings{}, nil)
 
 	if config.BodyLimit != maxRequestBodyBytes {
 		t.Fatalf("expected BodyLimit=%d, got %d", maxRequestBodyBytes, config.BodyLimit)
 	}
 	if maxRequestBodyBytes <= fiber.DefaultBodyLimit {
 		t.Fatalf("expected body limit above fiber default %d, got %d", fiber.DefaultBodyLimit, maxRequestBodyBytes)
+	}
+}
+
+// TestWriteTimeoutBoundsTheResponseWriteNotTheHandler pins the framework seam
+// the request-budget rationale rests on. fasthttp arms the write deadline only
+// after the handler returns (v1.72.0 server.go: s.Handler(ctx) at 2618,
+// SetWriteDeadline at 2637), so WriteTimeout caps writing a finished response to
+// the socket and never how long the handler spent producing it. The comment on
+// api.RequestBudget once said the opposite — that 60s "matches the server's
+// WriteTimeout" because a handler outliving it could not deliver anyway — and
+// the abandoned writes that motivated the budget answered with latencies past
+// 14m40s under exactly that WriteTimeout.
+//
+// It needs a real listener: the in-memory app.Test connection no-ops every
+// SetDeadline call, so nothing there can observe a write deadline at all. A
+// handler that outlives the write timeout by a wide margin and still delivers
+// its body is the observable; an upgrade that moved the deadline ahead of the
+// handler would truncate this response instead, and fail here rather than
+// silently changing what WriteTimeout means.
+func TestWriteTimeoutBoundsTheResponseWriteNotTheHandler(t *testing.T) {
+	const (
+		writeTimeout   = 200 * time.Millisecond
+		handlerRuntime = 3 * writeTimeout
+		delivered      = "the handler outlived the write timeout and still answered"
+	)
+
+	app := fiber.New(fiber.Config{WriteTimeout: writeTimeout})
+	app.Get("/slow", func(c fiber.Ctx) error {
+		time.Sleep(handlerRuntime)
+		return c.SendString(delivered)
+	})
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- app.Listener(listener, fiber.ListenConfig{DisableStartupMessage: true})
+	}()
+	t.Cleanup(func() {
+		if shutdownErr := app.ShutdownWithTimeout(5 * time.Second); shutdownErr != nil {
+			t.Errorf("shutdown: %v", shutdownErr)
+		}
+		if runErr := <-serveErr; runErr != nil {
+			t.Errorf("serve: %v", runErr)
+		}
+	})
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	started := time.Now()
+	response, err := client.Get("http://" + listener.Addr().String() + "/slow")
+	if err != nil {
+		t.Fatalf("the response never arrived (%v) — a write deadline armed before the handler ran would look exactly like this", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read body: %v — a response cut off mid-write means the deadline covered the handler", err)
+	}
+	if string(body) != delivered {
+		t.Fatalf("body = %q, want %q", body, delivered)
+	}
+	if elapsed := time.Since(started); elapsed < handlerRuntime {
+		t.Fatalf("the request took %s, less than the %s the handler was meant to spend; the handler never outlived the write timeout and the test proved nothing", elapsed, handlerRuntime)
 	}
 }
 
@@ -928,7 +1334,7 @@ func TestFiberConfigSetsImportSizedBodyLimit(t *testing.T) {
 // rather than routing it through serverErrorHandler — enforcement of the cap
 // itself is covered by TestFiberAppEnforcesBodyLimit.)
 func TestOvumcyErrorHandlerMapsBodyLimitTo413(t *testing.T) {
-	app := fiber.New(fiber.Config{ErrorHandler: ovumcyErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: newOvumcyErrorHandler(newRateLimitTestHandler(t))})
 	app.Post("/api/v1/imports/json", func(c fiber.Ctx) error {
 		return fiber.ErrRequestEntityTooLarge
 	})
@@ -974,7 +1380,7 @@ func TestOvumcyErrorHandlerMapsBodyLimitTo413(t *testing.T) {
 // rejected before any handler runs. A tiny BodyLimit keeps the body small.
 func TestFiberAppEnforcesBodyLimit(t *testing.T) {
 	app := fiber.New(fiber.Config{
-		ErrorHandler: ovumcyErrorHandler,
+		ErrorHandler: newOvumcyErrorHandler(newRateLimitTestHandler(t)),
 		BodyLimit:    16,
 	})
 	handlerReached := false
@@ -1050,13 +1456,28 @@ func TestSecurityHeadersMiddlewareAddsHSTSWhenSecureCookiesEnabled(t *testing.T)
 	assertDefaultSecurityHeaders(t, response, true)
 }
 
-func TestOvumcyErrorHandlerMasksRawErrorsAndPreservesFiberErrors(t *testing.T) {
-	app := fiber.New(fiber.Config{ErrorHandler: ovumcyErrorHandler})
+// TestOvumcyErrorHandlerMasksRawErrorsAndEnvelopesFiberErrors pins the two ends
+// of the top-level handler: an explicit *fiber.Error keeps its status and is
+// answered through the shared mapped-error envelope, and a raw error is
+// answered as a generic 500 through the same envelope with none of its text.
+//
+// It previously asserted the OPPOSITE for the *fiber.Error arm — that the body
+// was fiber's bare "Forbidden" — which is what let every status other than
+// 413/431 answer in the framework's format while the envelope was documented as
+// app-wide. The message a *fiber.Error carries is now never echoed: the client
+// gets the stable key mapped from the status instead.
+func TestOvumcyErrorHandlerMasksRawErrorsAndEnvelopesFiberErrors(t *testing.T) {
+	app := fiber.New(fiber.Config{ErrorHandler: newOvumcyErrorHandler(newRateLimitTestHandler(t))})
 	app.Get("/fiber-error", func(c fiber.Ctx) error {
 		return fiber.ErrForbidden
 	})
 	app.Get("/raw-error", func(c fiber.Ctx) error {
 		return errors.New("internal users table secret column leaked")
+	})
+	// A *fiber.Error whose message was supplied by the app rather than by the
+	// framework: whatever a caller puts in it must not reach the response either.
+	app.Get("/annotated-fiber-error", func(c fiber.Ctx) error {
+		return fiber.NewError(fiber.StatusBadRequest, "users.totp_secret column is null")
 	})
 
 	fiberErrResp, err := app.Test(httptest.NewRequest(http.MethodGet, "/fiber-error", nil), testConfigNoTimeout)
@@ -1069,9 +1490,10 @@ func TestOvumcyErrorHandlerMasksRawErrorsAndPreservesFiberErrors(t *testing.T) {
 	}
 	fiberBody := new(bytes.Buffer)
 	_, _ = fiberBody.ReadFrom(fiberErrResp.Body)
-	if fiberBody.String() != "Forbidden" {
-		t.Fatalf("fiber.Error body = %q, want %q (status/message preserved)", fiberBody.String(), "Forbidden")
+	if fiberBody.String() == "Forbidden" {
+		t.Fatalf("fiber.Error body = %q: the framework's bare text must not reach the client; the envelope is app-wide", fiberBody.String())
 	}
+	assertTransportErrorEnvelope(t, fiberBody.Bytes(), "forbidden", "forbidden")
 
 	rawErrResp, err := app.Test(httptest.NewRequest(http.MethodGet, "/raw-error", nil), testConfigNoTimeout)
 	if err != nil {
@@ -1083,11 +1505,47 @@ func TestOvumcyErrorHandlerMasksRawErrorsAndPreservesFiberErrors(t *testing.T) {
 	}
 	rawBody := new(bytes.Buffer)
 	_, _ = rawBody.ReadFrom(rawErrResp.Body)
-	if rawBody.String() != "Internal Server Error" {
-		t.Fatalf("raw error body = %q, want generic message", rawBody.String())
-	}
 	if strings.Contains(rawBody.String(), "secret column leaked") {
 		t.Fatalf("raw error body leaked internal detail: %q", rawBody.String())
+	}
+	assertTransportErrorEnvelope(t, rawBody.Bytes(), "internal_error", "internal")
+
+	annotatedResp, err := app.Test(httptest.NewRequest(http.MethodGet, "/annotated-fiber-error", nil), testConfigNoTimeout)
+	if err != nil {
+		t.Fatalf("annotated-fiber-error request failed: %v", err)
+	}
+	defer func() { _ = annotatedResp.Body.Close() }()
+	if annotatedResp.StatusCode != fiber.StatusBadRequest {
+		t.Fatalf("annotated fiber.Error status = %d, want 400", annotatedResp.StatusCode)
+	}
+	annotatedBody := new(bytes.Buffer)
+	_, _ = annotatedBody.ReadFrom(annotatedResp.Body)
+	if strings.Contains(annotatedBody.String(), "totp_secret") {
+		t.Fatalf("fiber.Error message reached the response body: %q", annotatedBody.String())
+	}
+	assertTransportErrorEnvelope(t, annotatedBody.Bytes(), "bad_request", "validation")
+}
+
+// assertTransportErrorEnvelope reads the shared JSON error envelope and pins the
+// stable key plus its category. Both halves matter: the key is what a client
+// branches on, and error_detail proves the response came from the mapped spec
+// rather than from an ad-hoc JSON body that happens to carry an "error" field.
+func assertTransportErrorEnvelope(t *testing.T, body []byte, wantKey string, wantCategory string) {
+	t.Helper()
+
+	payload := map[string]any{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("expected the shared JSON error envelope, got %q: %v", body, err)
+	}
+	if payload["error"] != wantKey {
+		t.Fatalf("error key = %v, want %q (body %q)", payload["error"], wantKey, body)
+	}
+	detail, ok := payload["error_detail"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected error_detail object, got %v (body %q)", payload["error_detail"], body)
+	}
+	if detail["key"] != wantKey || detail["category"] != wantCategory || detail["target"] != "global" {
+		t.Fatalf("error_detail = %v, want key=%q category=%q target=global", detail, wantKey, wantCategory)
 	}
 }
 
@@ -1481,7 +1939,7 @@ func TestTryRunCLICommandWithHandlersDispatchesUsersCommand(t *testing.T) {
 
 	called := false
 	handled, err := tryRunCLICommandWithHandlers([]string{"users", "list"}, cliCommandHandlers{
-		runResetPassword: func(db.Config, string) error {
+		runResetPassword: func(db.Config, []string) error {
 			t.Fatal("did not expect reset-password handler")
 			return nil
 		},
@@ -1512,7 +1970,7 @@ func TestTryRunCLICommandWithHandlersRejectsMissingUsersSubcommand(t *testing.T)
 	if !handled {
 		t.Fatal("expected users command to be handled")
 	}
-	if err == nil || !strings.Contains(err.Error(), "usage: ovumcy users <list|delete|create>") {
+	if err == nil || !strings.Contains(err.Error(), "usage: ovumcy users <list|delete|create|set-email>") {
 		t.Fatalf("expected users usage error, got %v", err)
 	}
 }
@@ -1524,7 +1982,7 @@ func TestTryRunCLICommandWithHandlersPropagatesUsersError(t *testing.T) {
 
 	expectedErr := errors.New("delete failed")
 	handled, err := tryRunCLICommandWithHandlers([]string{"users", "delete", "owner@example.com", "--yes"}, cliCommandHandlers{
-		runResetPassword: func(db.Config, string) error {
+		runResetPassword: func(db.Config, []string) error {
 			t.Fatal("did not expect reset-password handler")
 			return nil
 		},
@@ -1589,6 +2047,78 @@ func TestTryRunCLICommandWithHandlersPropagatesHealthcheckError(t *testing.T) {
 	if !errors.Is(err, expectedErr) {
 		t.Fatalf("expected propagated healthcheck error, got %v", err)
 	}
+}
+
+// TestTryRunCLICommandWithHandlersReadycheckBranches covers the readycheck
+// dispatch the same way healthcheck is covered above: the port travels from
+// PORT, extra arguments are refused, a missing handler and an unusable PORT are
+// reported, and the probe's own error propagates so the process exits non-zero.
+func TestTryRunCLICommandWithHandlersReadycheckBranches(t *testing.T) {
+	t.Run("forwards the configured port", func(t *testing.T) {
+		t.Setenv("PORT", "9877")
+
+		var receivedPort string
+		handled, err := tryRunCLICommandWithHandlers([]string{"readycheck"}, cliCommandHandlers{
+			runReadycheck: func(port string, _ time.Duration) error {
+				receivedPort = port
+				return nil
+			},
+		})
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if !handled {
+			t.Fatal("expected readycheck command to be handled")
+		}
+		if receivedPort != "9877" {
+			t.Fatalf("expected port forwarded from PORT env, got %q", receivedPort)
+		}
+	})
+
+	t.Run("rejects extra args", func(t *testing.T) {
+		handled, err := tryRunCLICommandWithHandlers([]string{"readycheck", "extra"}, cliCommandHandlers{
+			runReadycheck: func(string, time.Duration) error {
+				t.Fatal("did not expect readycheck handler to be called")
+				return nil
+			},
+		})
+		if !handled {
+			t.Fatal("expected readycheck command to be handled")
+		}
+		if err == nil || !strings.Contains(err.Error(), "usage: ovumcy readycheck") {
+			t.Fatalf("expected readycheck usage error, got %v", err)
+		}
+	})
+
+	t.Run("requires a handler", func(t *testing.T) {
+		handled, err := tryRunCLICommandWithHandlers([]string{"readycheck"}, cliCommandHandlers{})
+		if !handled || err == nil {
+			t.Fatalf("expected handled error, got (%t, %v)", handled, err)
+		}
+	})
+
+	t.Run("reports an invalid port", func(t *testing.T) {
+		t.Setenv("PORT", "70000")
+		handled, err := tryRunCLICommandWithHandlers([]string{"readycheck"}, cliCommandHandlers{
+			runReadycheck: func(string, time.Duration) error { return nil },
+		})
+		if !handled || err == nil {
+			t.Fatalf("expected handled port error, got (%t, %v)", handled, err)
+		}
+	})
+
+	t.Run("propagates the probe error", func(t *testing.T) {
+		expectedErr := errors.New("not ready")
+		handled, err := tryRunCLICommandWithHandlers([]string{"readycheck"}, cliCommandHandlers{
+			runReadycheck: func(string, time.Duration) error { return expectedErr },
+		})
+		if !handled {
+			t.Fatal("expected readycheck command to be handled")
+		}
+		if !errors.Is(err, expectedErr) {
+			t.Fatalf("expected propagated readycheck error, got %v", err)
+		}
+	})
 }
 
 func TestTryRunCLICommandWithHandlersDispatchesNotify(t *testing.T) {
@@ -1761,6 +2291,80 @@ func TestTryRunCLICommandWithHandlersDispatchesWebhook(t *testing.T) {
 	}
 }
 
+func TestTryRunCLICommandWithHandlersDispatchesRepair(t *testing.T) {
+	// No SECRET_KEY is set, deliberately. This subcommand runs on an instance a
+	// migration has stopped, so a prerequisite beyond the database location
+	// would be one the operator meets least easily exactly when they need it.
+	t.Setenv("DB_DRIVER", "sqlite")
+	t.Setenv("SECRET_KEY", "")
+	t.Setenv("SECRET_KEY_FILE", "")
+
+	var receivedArgs []string
+	handled, err := tryRunCLICommandWithHandlers([]string{"repair", "symptom-names", "--apply"}, cliCommandHandlers{
+		runRepair: func(_ db.Config, args []string) error {
+			receivedArgs = args
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if !handled {
+		t.Fatal("expected repair command to be handled")
+	}
+	if len(receivedArgs) != 2 || receivedArgs[0] != "symptom-names" || receivedArgs[1] != "--apply" {
+		t.Fatalf("expected the repair name and its flag forwarded as args, got %v", receivedArgs)
+	}
+}
+
+func TestTryRunCLICommandWithHandlersRepairWithNoArgumentsReachesItsHandler(t *testing.T) {
+	// `ovumcy repair` alone is what the migration refusal tells the operator to
+	// run, and it has to reach the handler that lists the repairs rather than be
+	// rejected here as a missing subcommand.
+	t.Setenv("DB_DRIVER", "sqlite")
+
+	called := false
+	handled, err := tryRunCLICommandWithHandlers([]string{"repair"}, cliCommandHandlers{
+		runRepair: func(_ db.Config, args []string) error {
+			called = true
+			if len(args) != 0 {
+				t.Fatalf("expected no args, got %v", args)
+			}
+			return nil
+		},
+	})
+	if err != nil || !handled || !called {
+		t.Fatalf("expected the repair handler to be reached, got handled=%t called=%t err=%v", handled, called, err)
+	}
+}
+
+func TestTryRunCLICommandWithHandlersRepairRequiresHandler(t *testing.T) {
+	handled, err := tryRunCLICommandWithHandlers([]string{"repair", "symptom-names"}, cliCommandHandlers{})
+	if !handled {
+		t.Fatal("expected repair command to be handled")
+	}
+	if err == nil || !strings.Contains(err.Error(), "repair handler is required") {
+		t.Fatalf("expected repair-handler-required error, got %v", err)
+	}
+}
+
+func TestTryRunCLICommandWithHandlersRepairReportsInvalidDatabaseConfig(t *testing.T) {
+	t.Setenv("DB_DRIVER", "mysql")
+
+	handled, err := tryRunCLICommandWithHandlers([]string{"repair", "symptom-names"}, cliCommandHandlers{
+		runRepair: func(db.Config, []string) error {
+			t.Fatal("did not expect the repair handler to be called with an invalid DB config")
+			return nil
+		},
+	})
+	if !handled {
+		t.Fatal("expected repair command to be handled")
+	}
+	if err == nil || !strings.Contains(err.Error(), "invalid database config") {
+		t.Fatalf("expected an invalid-database-config error, got %v", err)
+	}
+}
+
 func TestTryRunCLICommandWithHandlersRejectsMissingWebhookSubcommand(t *testing.T) {
 	handled, err := tryRunCLICommandWithHandlers([]string{"webhook"}, cliCommandHandlers{})
 	if !handled {
@@ -1912,15 +2516,28 @@ func TestDefaultRequestLoggerDoesNotLogFormSecrets(t *testing.T) {
 }
 
 func TestRequestLoggerUsesSafeRouteTemplateWithoutIP(t *testing.T) {
+	// app.Test dumps the request over the wire (httputil.DumpRequest) and
+	// serves it on a fake conn whose RemoteAddr is always 0.0.0.0 — setting
+	// http.Request.RemoteAddr directly never reaches the handler, so the only
+	// way to deliver a real client IP here is the trusted-proxy header path
+	// the app itself honours (fiberConfig + c.IP()). Trusting the fixed
+	// 0.0.0.0 test-conn peer lets X-Real-IP flow through exactly as it would
+	// behind a configured reverse proxy.
 	var output bytes.Buffer
-	app := fiber.New()
+	app := fiber.New(fiberConfig(proxySettings{
+		Enabled:        true,
+		Header:         "X-Real-IP",
+		TrustedProxies: []string{"0.0.0.0"},
+	}, nil))
 	app.Use(newRequestLogger(&output))
+	var observedIP string
 	app.Put("/api/v1/days/:date", func(c fiber.Ctx) error {
+		observedIP = c.IP()
 		return c.SendStatus(http.StatusNoContent)
 	})
 
 	request := httptest.NewRequest(http.MethodPut, "/api/v1/days/2026-02-17", nil)
-	request.RemoteAddr = "203.0.113.9:43123"
+	request.Header.Set("X-Real-IP", "203.0.113.9")
 
 	response, err := app.Test(request, testConfigNoTimeout)
 	if err != nil {
@@ -1930,6 +2547,13 @@ func TestRequestLoggerUsesSafeRouteTemplateWithoutIP(t *testing.T) {
 
 	if response.StatusCode != http.StatusNoContent {
 		t.Fatalf("expected status 204, got %d", response.StatusCode)
+	}
+
+	// Positive control: prove the request path actually observed the client
+	// IP before asserting it stays out of the log — otherwise the log
+	// assertion below would hold vacuously for an IP the handler never saw.
+	if observedIP != "203.0.113.9" {
+		t.Fatalf("expected the handler to observe the client ip via X-Real-IP, got %q", observedIP)
 	}
 
 	logLine := output.String()
@@ -1953,8 +2577,18 @@ func TestRateLimitLogDoesNotLogQueryPII(t *testing.T) {
 
 	const plaintextPassword = "PlaintextPassword123!"
 
-	app := fiber.New()
+	// See TestRequestLoggerUsesSafeRouteTemplateWithoutIP: app.Test never
+	// delivers http.Request.RemoteAddr to the handler, so the client IP here
+	// is driven through the trusted-proxy header path (fiberConfig + c.IP())
+	// the app actually honours, trusting the fixed 0.0.0.0 test-conn peer.
+	app := fiber.New(fiberConfig(proxySettings{
+		Enabled:        true,
+		Header:         "X-Real-IP",
+		TrustedProxies: []string{"0.0.0.0"},
+	}, nil))
+	var observedIP string
 	app.Put("/api/v1/days/:date", func(c fiber.Ctx) error {
+		observedIP = c.IP()
 		c.Response().Header.Set(fiber.HeaderRetryAfter, "60")
 		logRateLimitHit(c)
 		return c.SendStatus(http.StatusTooManyRequests)
@@ -1966,7 +2600,7 @@ func TestRateLimitLogDoesNotLogQueryPII(t *testing.T) {
 		strings.NewReader("email=user@example.com&password=PlaintextPassword123%21&token=plain-reset-token"),
 	)
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	request.RemoteAddr = "203.0.113.9:43123"
+	request.Header.Set("X-Real-IP", "203.0.113.9")
 
 	response, err := app.Test(request, testConfigNoTimeout)
 	if err != nil {
@@ -1976,6 +2610,13 @@ func TestRateLimitLogDoesNotLogQueryPII(t *testing.T) {
 
 	if response.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("expected status 429, got %d", response.StatusCode)
+	}
+
+	// Positive control: prove logRateLimitHit ran against a request the
+	// handler actually observed the client IP for, before asserting that IP
+	// stays out of the log.
+	if observedIP != "203.0.113.9" {
+		t.Fatalf("expected the handler to observe the client ip via X-Real-IP, got %q", observedIP)
 	}
 
 	logLine := output.String()
@@ -2180,9 +2821,9 @@ func mustRateLimitedResponse(t *testing.T, app *fiber.App, request *http.Request
 // *sql.DB must reject further use, so SQLite has checkpointed its WAL and
 // freed the file before process exit.
 func TestCloseDatabaseClosesUnderlyingConnection(t *testing.T) {
-	database, err := db.OpenSQLite(filepath.Join(t.TempDir(), "close-test.db"))
+	database, err := db.OpenDatabase(db.Config{Driver: db.DriverSQLite, SQLitePath: filepath.Join(t.TempDir(), "close-test.db")})
 	if err != nil {
-		t.Fatalf("OpenSQLite() unexpected error: %v", err)
+		t.Fatalf("OpenDatabase() unexpected error: %v", err)
 	}
 
 	closeDatabase(database)
@@ -2206,9 +2847,9 @@ func TestCloseDatabaseClosesUnderlyingConnection(t *testing.T) {
 // subsequent closeDatabase still checkpoints and closes it, so SQLite releases
 // the file even on a failed start.
 func TestRunServerReturnsListenError(t *testing.T) {
-	database, err := db.OpenSQLite(filepath.Join(t.TempDir(), "runserver-err.db"))
+	database, err := db.OpenDatabase(db.Config{Driver: db.DriverSQLite, SQLitePath: filepath.Join(t.TempDir(), "runserver-err.db")})
 	if err != nil {
-		t.Fatalf("OpenSQLite() unexpected error: %v", err)
+		t.Fatalf("OpenDatabase() unexpected error: %v", err)
 	}
 	app := fiber.New()
 
@@ -2240,9 +2881,9 @@ func TestRunServerReturnsListenError(t *testing.T) {
 // Shutdown to take effect. The DB close now happens in main after runServer
 // returns; this test mirrors that final close and asserts the file is released.
 func TestRunServerReturnsAfterGracefulStop(t *testing.T) {
-	database, err := db.OpenSQLite(filepath.Join(t.TempDir(), "runserver-stop.db"))
+	database, err := db.OpenDatabase(db.Config{Driver: db.DriverSQLite, SQLitePath: filepath.Join(t.TempDir(), "runserver-stop.db")})
 	if err != nil {
-		t.Fatalf("OpenSQLite() unexpected error: %v", err)
+		t.Fatalf("OpenDatabase() unexpected error: %v", err)
 	}
 	app := fiber.New()
 
@@ -2309,9 +2950,9 @@ func TestRunServerReturnsAfterGracefulStop(t *testing.T) {
 // loop must still notice and bridge the gap once Serve registers the
 // listener.
 func TestRetryShutdownBridgesBootWindow(t *testing.T) {
-	database, err := db.OpenSQLite(filepath.Join(t.TempDir(), "boot-window-stop.db"))
+	database, err := db.OpenDatabase(db.Config{Driver: db.DriverSQLite, SQLitePath: filepath.Join(t.TempDir(), "boot-window-stop.db")})
 	if err != nil {
-		t.Fatalf("OpenSQLite() unexpected error: %v", err)
+		t.Fatalf("OpenDatabase() unexpected error: %v", err)
 	}
 	app := fiber.New()
 
@@ -2473,9 +3114,9 @@ func TestInstallGracefulShutdownBridgesSIGTERM(t *testing.T) {
 		t.Skip("SIGTERM self-delivery is not supported by the Go runtime on windows; validated in Linux CI")
 	}
 
-	database, err := db.OpenSQLite(filepath.Join(t.TempDir(), "sigterm-stop.db"))
+	database, err := db.OpenDatabase(db.Config{Driver: db.DriverSQLite, SQLitePath: filepath.Join(t.TempDir(), "sigterm-stop.db")})
 	if err != nil {
-		t.Fatalf("OpenSQLite() unexpected error: %v", err)
+		t.Fatalf("OpenDatabase() unexpected error: %v", err)
 	}
 	app := fiber.New()
 
@@ -2611,6 +3252,72 @@ func TestVCSRevisionFromBuildInfo(t *testing.T) {
 			if revision != tt.wantRevision || modified != tt.wantModified {
 				t.Fatalf("vcsRevisionFromBuildInfo() = (%q, %t), want (%q, %t)",
 					revision, modified, tt.wantRevision, tt.wantModified)
+			}
+		})
+	}
+}
+
+// TestResolveBuildRevisionFallbackChain pins the banner's identity resolution,
+// including the case the shipped image is always in: a container build carries
+// no vcs.* setting (.dockerignore excludes .git), so without the ldflags
+// fallback every published image reported "unknown". The order is deliberately
+// the opposite of assetCacheBustToken's — only the VCS stamp can report a dirty
+// tree, so a release stamp must not outrank it.
+func TestResolveBuildRevisionFallbackChain(t *testing.T) {
+	fullRevision := "0123456789abcdef0123456789abcdef01234567"
+	infoWithRevision := buildInfoWithSettings(debug.BuildSetting{Key: "vcs.revision", Value: fullRevision})
+
+	tests := []struct {
+		name           string
+		ldflagsVersion string
+		info           *debug.BuildInfo
+		want           string
+	}{
+		{
+			name:           "container build: no VCS stamp, ldflags names the revision",
+			ldflagsVersion: fullRevision,
+			info:           buildInfoWithSettings(debug.BuildSetting{Key: "-ldflags", Value: "-s -w"}),
+			want:           fullRevision,
+		},
+		{
+			name:           "nil build info still reports the ldflags stamp",
+			ldflagsVersion: "v1.9.2",
+			info:           nil,
+			want:           "v1.9.2",
+		},
+		{
+			name:           "VCS stamp outranks the ldflags stamp",
+			ldflagsVersion: "v1.7.0",
+			info:           infoWithRevision,
+			want:           fullRevision,
+		},
+		{
+			name:           "a dirty tree is reported even when a release stamp is present",
+			ldflagsVersion: "v1.7.0",
+			info: buildInfoWithSettings(
+				debug.BuildSetting{Key: "vcs.revision", Value: fullRevision},
+				debug.BuildSetting{Key: "vcs.modified", Value: "true"},
+			),
+			want: fullRevision + "-dirty",
+		},
+		{
+			name:           "whitespace-only ldflags stamp is not an identity",
+			ldflagsVersion: "   ",
+			info:           nil,
+			want:           "unknown",
+		},
+		{
+			name: "neither stamp: unknown",
+			info: nil,
+			want: "unknown",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveBuildRevision(tt.ldflagsVersion, tt.info)
+			if got != tt.want {
+				t.Fatalf("resolveBuildRevision(%q, ...) = %q, want %q", tt.ldflagsVersion, got, tt.want)
 			}
 		})
 	}

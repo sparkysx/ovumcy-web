@@ -78,7 +78,7 @@ const (
 // prediction it summarizes and how many days away it is. It carries no
 // rendering concerns beyond the i18n key selection — the disclaimer and
 // estimate qualifier are rendered by the existing dashboard prediction
-// surface (dashboard.prediction_disclaimer), not duplicated here.
+// surface (medical.disclaimer), not duplicated here.
 //
 // Countable reports whether TitleKey is the "~N days" plural copy (which the
 // caller resolves with the day count) rather than the fixed "today"/"tomorrow"
@@ -107,6 +107,11 @@ type DashboardReminderBanner struct {
 //
 // The banner is suppressed (Show=false) whenever:
 //   - predictions are disabled or paused (PredictionDisabled),
+//   - the next-period estimate is withheld because the cycle is overdue
+//     (NextPeriodEstimatePaused). The cleared Display* fields already suppress
+//     the banner through the zero-date branch below; the explicit check keeps the
+//     rule readable at the surface that would otherwise announce "period in ~N
+//     days" for a window the dashboard itself refuses to show,
 //   - the cycle context has no single-date estimate to summarize (needs more
 //     data, ovulation is impossible, or the corresponding date is zero),
 //   - the context is showing an uncertainty *range* instead of a single date
@@ -121,7 +126,7 @@ type DashboardReminderBanner struct {
 // When both the next period and ovulation fall inside the window on the same
 // request, the period reminder is returned (see DashboardReminderBannerKindPeriod).
 func BuildDashboardReminderBanner(cycleContext DashboardCycleContext, today time.Time, leadDays int) DashboardReminderBanner {
-	if cycleContext.PredictionDisabled {
+	if cycleContext.PredictionDisabled || cycleContext.NextPeriodEstimatePaused {
 		return DashboardReminderBanner{}
 	}
 	windowDays := dashboardReminderBannerWindowDays(leadDays)
@@ -159,7 +164,15 @@ func dashboardReminderBannerForPeriod(cycleContext DashboardCycleContext, today 
 }
 
 func dashboardReminderBannerForOvulation(cycleContext DashboardCycleContext, today time.Time, windowDays int) (DashboardReminderBanner, bool) {
-	if cycleContext.DisplayOvulationUseRange || cycleContext.DisplayOvulationNeedsData || cycleContext.DisplayOvulationImpossible {
+	// FertilitySuppressed is the shared fertility floor as the context resolved
+	// it (FertilityProjectionSuppressed) — read, never re-derived here: with no
+	// completed cycle the date counted down to would be the onboarding slider
+	// projected forward, and the banner was the one place that date still spoke
+	// while the header beside it stayed quiet. Reading the carried decision is
+	// what keeps this surface moving with the calendar, the feed and the webhook
+	// when the predicate changes. The three disjuncts after it are the banner's
+	// own display conditions, not policy.
+	if cycleContext.FertilitySuppressed || cycleContext.DisplayOvulationUseRange || cycleContext.DisplayOvulationNeedsData || cycleContext.DisplayOvulationImpossible {
 		return DashboardReminderBanner{}, false
 	}
 	daysUntil, ok := dashboardReminderBannerDaysUntil(cycleContext.DisplayOvulationDate, today, windowDays)
@@ -173,12 +186,19 @@ func dashboardReminderBannerForOvulation(cycleContext DashboardCycleContext, tod
 		DashboardReminderBannerOvulationKey,
 	)
 	return DashboardReminderBanner{
-		Show:        true,
-		Kind:        DashboardReminderBannerKindOvulation,
-		TitleKey:    titleKey,
-		DaysUntil:   daysUntil,
-		Countable:   countable,
-		Approximate: !cycleContext.DisplayOvulationExact,
+		Show:      true,
+		Kind:      DashboardReminderBannerKindOvulation,
+		TitleKey:  titleKey,
+		DaysUntil: daysUntil,
+		Countable: countable,
+		// Mirrors dashboard.html's own approximate marker (see the comment
+		// there): DisplayOvulationExact reports whether CalcOvulationDay
+		// clamped the luteal phase, a property of the projection's
+		// arithmetic. A confirmed thermal shift did not come out of that
+		// arithmetic, so a clamped-but-confirmed day must not be flagged
+		// approximate here either — the two surfaces would otherwise
+		// disagree on the same date.
+		Approximate: !cycleContext.DisplayOvulationExact && !cycleContext.DisplayOvulationConfirmed,
 	}, true
 }
 

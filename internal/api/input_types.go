@@ -8,8 +8,20 @@ type credentialsInput struct {
 	Consent         string `json:"consent" form:"consent"`
 }
 
+// dayPayload is the transport shape of a day save. ConfirmCycleStart carries
+// the answer to the inline cycle-start question the HTML day form asks beside
+// the period toggle; it is read from the form body only and stays out of the
+// published v1 JSON body (`json:"-"`), which keeps marking a cycle start over
+// JSON the dedicated POST /api/v1/days/:date/cycle-start endpoint's job.
+// PeriodFromStoredStart is form-only the same way: the hidden
+// period_from_stored_start field a day form posts when its period tick came
+// from the stored onboarding start on a date without a row, so un-ticking it
+// withdraws that start (services.DayEntryInput.PeriodFromStoredStart).
 type dayPayload struct {
-	IsPeriod        bool     `json:"is_period"`
+	IsPeriod              bool `json:"is_period"`
+	ConfirmCycleStart     bool `json:"-"`
+	PeriodFromStoredStart bool `json:"-"`
+
 	Flow            string   `json:"flow"`
 	Mood            int      `json:"mood"`
 	SexActivity     string   `json:"sex_activity"`
@@ -27,9 +39,19 @@ type symptomPayload struct {
 	Color string `json:"color" form:"color"`
 }
 
+type totpChallengeInput struct {
+	Code string `json:"code" form:"code"`
+}
+
+// forgotPasswordInput carries both step-1 (email only) and step-2 (email +
+// recovery code + the account's CURRENT password) submissions of
+// POST /api/v1/password-resets. Password is the account's existing password,
+// never a new one: the recovery code substitutes for the second factor, not for
+// the first (docs/SECURITY_INVARIANTS.md → Password recovery).
 type forgotPasswordInput struct {
 	Email        string `json:"email" form:"email"`
 	RecoveryCode string `json:"recovery_code" form:"recovery_code"`
+	Password     string `json:"password" form:"password"`
 }
 
 type resetPasswordInput struct {
@@ -43,18 +65,6 @@ type changePasswordInput struct {
 	ConfirmPassword string `json:"confirm_password" form:"confirm_password"`
 }
 
-type cycleSettingsInput struct {
-	CycleLength        int    `json:"cycle_length" form:"cycle_length"`
-	PeriodLength       int    `json:"period_length" form:"period_length"`
-	AutoPeriodFill     bool   `json:"auto_period_fill" form:"auto_period_fill"`
-	IrregularCycle     bool   `json:"irregular_cycle" form:"irregular_cycle"`
-	UnpredictableCycle bool   `json:"unpredictable_cycle" form:"unpredictable_cycle"`
-	AgeGroup           string `json:"age_group" form:"age_group"`
-	UsageGoal          string `json:"usage_goal" form:"usage_goal"`
-	LastPeriodStart    string `json:"last_period_start" form:"last_period_start"`
-	LastPeriodStartSet bool   `json:"-" form:"-"`
-}
-
 type profileSettingsInput struct {
 	DisplayName string `json:"display_name" form:"display_name"`
 }
@@ -64,6 +74,13 @@ type interfaceSettingsInput struct {
 	Theme    string `json:"theme" form:"theme"`
 }
 
+// trackingSettingsInput is the published v1 JSON body of
+// PATCH /api/v1/users/current/tracking. The three section toggles keep the
+// stored, inverted spelling here because renaming a v1 field is a breaking
+// change (CONTRIBUTING "API Stability Contract"); trackingUpdate converts them
+// into the positive view model through the services conversion point, so the
+// transport layer never performs the negation itself. The bundled HTML form
+// posts the positive show_* fields instead — see parseTrackingSettingsInput.
 type trackingSettingsInput struct {
 	TrackBBT             bool   `json:"track_bbt" form:"track_bbt"`
 	TemperatureUnit      string `json:"temperature_unit" form:"temperature_unit"`

@@ -2,7 +2,7 @@ openapi: 3.1.0
 
 info:
   title: Ovumcy API
-  version: 1.0.0
+  version: 2.0.0
   summary: HTTP API surface of the ovumcy-web self-hosted deployment.
   description: |
     This document specifies the **current** state of the JSON-emitting HTTP
@@ -11,11 +11,23 @@ info:
 
     Stability — per [CONTRIBUTING.md](../CONTRIBUTING.md#api-stability-contract):
 
-    - `/api/v1/*` is the canonical, stable HTTP surface. Wrappers and external
-      integrations should target this prefix exclusively.
-    - Field additions are non-breaking and may ship in any minor release.
-    - Field renames, removals, status code changes, route moves, and error key
-      changes are breaking and require a new major version (`/api/v2/*`).
+    - `/api/v1/*` is the only HTTP API prefix; wrappers and external
+      integrations should target it exclusively. There is no `/api/v2/*` and
+      none is planned: a breaking change ships in a new major release of
+      Ovumcy on the same prefix.
+    - Non-breaking, any minor or patch release: a new response field, a new
+      optional request field, a new endpoint. A client that validates
+      responses strictly must validate against the spec of the release it runs.
+    - Breaking, major release only: renaming or removing a field, requiring a
+      request member that was optional, refusing one that was accepted,
+      changing what a field or an operation means, changing a status code, a
+      route or an error key. Each ships as a **Breaking (API shape)** entry in
+      CHANGELOG.md.
+    - A correction that makes this document describe what the server already
+      does is not a breaking change, even when the corrected text is stricter;
+      it is listed under **Fixed**.
+    - `info.version` names the major release this contract belongs to
+      (`2.0.0` for every v2.x release) and changes only with a major release.
     - The export payload (`/api/v1/exports/*`) follows the separate stability
       contract documented in [docs/export.md](export.md).
 
@@ -24,6 +36,13 @@ info:
     send `Accept: application/json` to opt into the JSON shape. Without that
     header the server returns HTML or `303` redirects suitable for browser
     navigation, and the corresponding response is not part of this contract.
+
+    Methods — every operation served on `GET` is also served on `HEAD` by the
+    same handler chain: same status, same headers, no body. Those mirrors are
+    not published as separate operations; read the `GET` operation for what a
+    `HEAD` request answers. `HEAD /api/v1/days/{date}` is the one `HEAD` with
+    semantics of its own — it reports whether the day holds any data — and is
+    documented per path below.
 
     Authentication & authorization — most endpoints require the sealed
     `ovumcy_auth` session cookie issued by `POST /api/v1/sessions`. Endpoints
@@ -38,8 +57,9 @@ info:
     per-account budgets enforced by `AuthAttemptPolicy`. Specific defaults
     are listed in [SECURITY.md#rate-limits](../SECURITY.md#rate-limits).
 
-    Errors — every error response carries `{ "error": "<key>", "error_detail":
-    { "key", "category", "target" } }`. The top-level `error` string is the
+    Errors — every error response from the endpoints below carries
+    `{ "error": "<key>", "error_detail": { "key", "category", "target" } }`.
+    The top-level `error` string is the
     legacy field kept for backward compatibility; `error_detail` is the
     structured form for programmatic clients (see `ApiError` /
     `ApiErrorDetail` in `components.schemas`). Clients should branch on the
@@ -116,7 +136,10 @@ components:
       name: date
       in: path
       required: true
-      description: Calendar day in the user's timezone, ISO 8601 (`YYYY-MM-DD`).
+      description: |
+        Calendar day in the user's timezone, ISO 8601 (`YYYY-MM-DD`), from `1900-01-01` through
+        `9999-12-30` inclusive. A date outside that range, a malformed one, and a day the
+        timezone never had are all refused with `400` and the key `invalid date`.
       schema:
         type: string
         format: date
@@ -125,7 +148,9 @@ components:
       name: from
       in: query
       required: false
-      description: Range start (inclusive), `YYYY-MM-DD` in the user's timezone.
+      description: |
+        Range start (inclusive), `YYYY-MM-DD` in the user's timezone, from `1900-01-01`
+        through `9999-12-30`; a date outside that range is refused with `400`.
       schema:
         type: string
         format: date
@@ -133,7 +158,9 @@ components:
       name: to
       in: query
       required: false
-      description: Range end (inclusive), `YYYY-MM-DD` in the user's timezone.
+      description: |
+        Range end (inclusive), `YYYY-MM-DD` in the user's timezone, from `1900-01-01`
+        through `9999-12-30`; a date outside that range is refused with `400`.
       schema:
         type: string
         format: date
@@ -153,31 +180,101 @@ components:
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ApiError' }
-          example: { error: "unauthorized" }
+          example:
+            error: "unauthorized"
+            error_detail: { key: "unauthorized", category: "unauthorized", target: "global" }
     Forbidden:
       description: Session is valid but the caller lacks the required role (typically owner-only) or CSRF validation failed.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ApiError' }
-          example: { error: "forbidden" }
+          example:
+            error: "forbidden"
+            error_detail: { key: "forbidden", category: "forbidden", target: "global" }
     ValidationError:
-      description: Request body or query parameters failed validation.
+      description: |
+        Request body, path, or query parameters failed validation. The server
+        answers `400`; the one `422` is the browser day form submitted without
+        JavaScript, which `PUT`, `PATCH` and `DELETE /api/v1/days/{date}` declare
+        themselves. A client that needs to tell a
+        validation refusal apart from any other `400` reads
+        `error_detail.category`, which is `validation` for every response using
+        this component. `error_detail.target` follows the surface: `global` for
+        programmatic endpoints, `auth_form` or `settings_form` where the
+        rejection belongs inside a rendered form.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ApiError' }
-          example: { error: "invalid input" }
+          example:
+            error: "invalid input"
+            error_detail: { key: "invalid input", category: "validation", target: "global" }
+    NotFound:
+      description: The addressed resource does not exist for the authenticated account.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+          example:
+            error: "symptom not found"
+            error_detail: { key: "symptom not found", category: "not_found", target: "settings_form" }
+    Conflict:
+      description: |
+        The request collides with state the account already holds — a duplicate
+        symptom name, or a cycle start that would overwrite an existing one. The
+        envelope carries `error_detail.category: "conflict"`; the collision is
+        resolvable by the client (rename, or resend with `replace_existing`).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+          example:
+            error: "symptom name already exists"
+            error_detail: { key: "symptom name already exists", category: "conflict", target: "settings_form" }
     RateLimited:
-      description: Rate limit exceeded.
+      description: |
+        Rate limit exceeded. Both the header and `retry_after_seconds` below are
+        sent only when the refusal came from the per-IP edge limiter, which is
+        the one that tracks a refill timer. Wherever a route draws a
+        per-account attempt budget, a 429 can instead come from that budget,
+        which has no such timer: sign-in and logout on `/api/v1/sessions`,
+        `/api/v1/password-resets`, the 2FA challenge, 2FA enrollment and
+        disable, and every settings route that re-authenticates with the
+        password. That answer carries the same envelope (keys such as "too
+        many login attempts", "too many recovery attempts", "totp too many
+        attempts", "too many logout attempts", "too many requests") but
+        neither the header nor `retry_after_seconds`.
+      headers:
+        Retry-After:
+          description: |
+            Whole seconds until the budget refills; `retry_after_seconds`
+            echoes it. Absent for a per-account attempt-lockout refusal — see
+            above.
+          schema: { type: integer, minimum: 1 }
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ApiError' }
-          example: { error: "too many attempts" }
+          example:
+            error: "too many requests"
+            error_detail: { key: "too many requests", category: "rate_limited", target: "global" }
+            retry_after_seconds: 60
+    ServiceUnavailable:
+      description: |
+        A dependency the operation needs is not available. On the step-up
+        endpoints this is the identity provider: the account has no local
+        password, so the re-authentication can only be satisfied through SSO,
+        and SSO is disabled or unreachable. Retryable once the provider is back.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+          example:
+            error: "sso temporarily unavailable"
+            error_detail: { key: "sso temporarily unavailable", category: "internal", target: "auth_form" }
     InternalError:
       description: Unexpected server error.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ApiError' }
-          example: { error: "internal error" }
+          example:
+            error: "internal_error"
+            error_detail: { key: "internal_error", category: "internal", target: "global" }
 
   schemas:
     ApiError:
@@ -191,13 +288,76 @@ components:
         should branch on the HTTP status code plus `error_detail.category`
         rather than the key string, and treat unknown keys/categories as their
         generic status-class failure.
+
+        The envelope covers **every** rejection reachable from the surface this
+        document describes, including the ones raised before or outside any
+        operation below, so a client needs exactly one parse path. Those
+        transport-level rejections are listed here rather than per-path — the
+        request never reached an operation, so attaching them to one would
+        misdescribe what happened — and each carries a stable key derived from
+        the status alone:
+
+          * `400` — `bad_request`
+          * `401` — `unauthorized`
+          * `403` — `forbidden` (this is the key a CSRF failure carries)
+          * `404` — `not found`
+          * `405` — `method_not_allowed`
+          * `413` — `request_too_large` (body past the 16 MiB limit: wire size,
+            and for a compressed body its decompressed size too)
+          * `415` — `unsupported_media_type`
+          * `429` — `too many requests`
+          * `431` — `request_headers_too_large` (request head past the read
+            buffer)
+          * `500` — `internal_error`
+          * `503` — `service_unavailable`
+
+        One further `503` exists and carries its own key: a request that
+        outlives the 60-second request budget is answered `request_timeout`,
+        which says the request was abandoned rather than that the server is
+        unwell, so a client may retry it.
+
+        A status not in that list still answers with the envelope, keyed
+        `request_rejected` for a `4xx` and `internal_error` for a `5xx`. The
+        message a failing request produced internally is never echoed into the
+        body.
+
+        Three routes answer with a **fixed body** instead, and are named here
+        so the rule above reads as exact rather than approximate — the same
+        way the single CSRF validation exemption is named rather than left
+        implied. `GET /healthz` and `GET /readyz` answer a fixed one-word JSON
+        body in both outcomes, and the read-only calendar feed
+        `GET /calendar/feed/{token}.ics` answers
+        its not-found path with the fixed status-text body `Not Found`: one
+        identical, cause-free `404` for a malformed token, an unknown selector,
+        a wrong verifier and a disabled feed alike (see
+        [docs/SECURITY_INVARIANTS.md](SECURITY_INVARIANTS.md) → *Calendar feed
+        subscription*). The feed's per-IP `429` is not part of the exemption:
+        its limiter refuses through the application's shared rate-limit path,
+        as on every other route — the exemption covers the not-found answer,
+        never a route wholesale. None of the three is part of this
+        specification (`/healthz` and `/readyz` are documented below as a
+        courtesy; the feed is a page route), and none is consumed by a client
+        of this API — the probes are parsed by an operator's health check, the
+        feed by a calendar application. The envelope negotiates its shape from
+        the caller's `Accept`/`HX-Request` headers and carries localized copy,
+        so putting it on the probes or on the feed's not-found path would let
+        an anonymous caller choose the shape of those fixed answers; the
+        feed's `404` must additionally stay identical whatever refused the
+        token.
       required: [error, error_detail]
       properties:
         error:
           type: string
-          example: "auth.invalid_credentials"
+          example: "invalid credentials"
         error_detail:
           $ref: '#/components/schemas/ApiErrorDetail'
+        retry_after_seconds:
+          type: integer
+          minimum: 1
+          description: >-
+            Present only on a `429`: an extension member echoing the
+            `Retry-After` header, so it inherits that header's bound of whole
+            seconds no larger than the configured window.
       additionalProperties: false
 
     ApiErrorDetail:
@@ -207,11 +367,27 @@ components:
         key:
           type: string
           description: Same value as the top-level `error` string. Duplicated here so a client that consumes only `error_detail` can branch without parsing the parent envelope.
-          example: "auth.invalid_credentials"
+          example: "invalid credentials"
         category:
           type: string
-          enum: [validation, not_found, conflict, unauthorized, forbidden, rate_limited, internal]
-          description: Error class. Stable enum — new values may be added in any release but existing values do not change meaning.
+          enum: [validation, not_found, conflict, unauthorized, forbidden, rate_limited, too_large, internal]
+          description: |
+            Error class. Stable enum — new values may be added in any release
+            but existing values do not change meaning, so treat an unknown
+            category as the generic failure for its status class.
+
+            `category` names the **reason**, not the status, so it is not a
+            function of the status code. `413` is the case where that matters:
+            a body past the 16 MiB limit — measured on the wire and, for a
+            compressed request, on the decompressed stream — is refused before
+            the request reaches any operation and carries `too_large` with the
+            key `request_too_large`, while a restore payload that parses
+            cleanly but declares more than 20 000 day entries has failed a
+            content rule and carries `validation` with the key
+            `import file too large`. Both are `413`; a client that branches on
+            `413` alone cannot tell "send fewer bytes" from "split this export
+            into several restores". `too_large` is likewise what a `431`
+            carries when the request head does not fit the read buffer.
         target:
           type: string
           enum: [global, auth_form, settings_form]
@@ -225,6 +401,166 @@ components:
         ok:
           type: boolean
           enum: [true]
+      additionalProperties: false
+
+    ProbeStatus:
+      type: object
+      description: Fixed body of a probe that answers `200`.
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+      additionalProperties: false
+
+    ProbeUnavailable:
+      type: object
+      description: Fixed body of `/readyz` when storage does not answer; it carries no failure detail.
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [unavailable]
+      additionalProperties: false
+
+    TrackingSettingsUpdated:
+      type: object
+      description: |
+        JSON answer of the tracking-preferences save: the outcome key and the
+        saved settings, normalised the way they are stored (an unrecognised
+        `temperature_unit` reads as `c`, an unrecognised `week_starts_on` as
+        `sunday`).
+      required: [ok, status, track_bbt, temperature_unit, track_cervical_mucus, hide_sex_chip, hide_cycle_factors, hide_notes_field, show_historical_phases, week_starts_on]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        status:
+          type: string
+          enum: [tracking_updated]
+        track_bbt: { type: boolean }
+        temperature_unit:
+          type: string
+          enum: [c, f]
+        track_cervical_mucus: { type: boolean }
+        hide_sex_chip: { type: boolean }
+        hide_cycle_factors: { type: boolean }
+        hide_notes_field: { type: boolean }
+        show_historical_phases: { type: boolean }
+        week_starts_on:
+          type: string
+          enum: [sunday, monday]
+      additionalProperties: false
+
+    ProfileUpdated:
+      type: object
+      description: |
+        JSON answer of the profile save. `status` is `profile_name_cleared`
+        when a non-blank display name was replaced by an empty one, otherwise
+        `profile_updated`; `display_name` is the saved, trimmed value (`""`
+        once cleared).
+      required: [ok, status, display_name]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        status:
+          type: string
+          enum: [profile_updated, profile_name_cleared]
+        display_name:
+          type: string
+          maxLength: 64
+      additionalProperties: false
+
+    InterfaceSettingsUpdated:
+      type: object
+      description: JSON answer of the interface save; `language` and `theme` are the normalised values the save accepted.
+      required: [ok, status, language, theme]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        status:
+          type: string
+          enum: [interface_updated]
+        language:
+          type: string
+          enum: [en, ru, es, fr, de, it]
+        theme:
+          type: string
+          enum: [light, dark, system]
+      additionalProperties: false
+
+    RemindersUpdated:
+      type: object
+      description: JSON answer of the reminder save. `reminder_lead_days` is the stored value; every save clamps it to 0–14.
+      required: [ok, status, reminder_lead_days]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        status:
+          type: string
+          enum: [reminders_updated]
+        reminder_lead_days:
+          type: integer
+          minimum: 0
+          maximum: 14
+      additionalProperties: false
+
+    TimezoneUpdated:
+      type: object
+      description: JSON answer of the timezone save. `changed` is `false` when the stored zone already equalled the canonical form of the posted one.
+      required: [ok, changed]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        changed: { type: boolean }
+      additionalProperties: false
+
+    WebhookSettingsUpdated:
+      type: object
+      description: |
+        JSON answer of the webhook save. The three flags report the settings AS
+        SAVED, read back after the write, not the request: with
+        `webhook_remove_url: true` delivery is turned off and `webhook_enabled`
+        reports `false` whatever was posted. The endpoint URL is never echoed.
+      required: [ok, status, webhook_enabled, notify_period, notify_ovulation]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        status:
+          type: string
+          enum: [webhook_updated]
+        webhook_enabled: { type: boolean }
+        notify_period: { type: boolean }
+        notify_ovulation: { type: boolean }
+      additionalProperties: false
+
+    WebhookRemoved:
+      type: object
+      required: [ok, status]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        status:
+          type: string
+          enum: [webhook_removed]
+      additionalProperties: false
+
+    CalendarFeedRevoked:
+      type: object
+      required: [ok, status]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        status:
+          type: string
+          enum: [calendar_feed_revoked]
       additionalProperties: false
 
     ImportResult:
@@ -245,6 +581,34 @@ components:
           description: Malformed or duplicate day records dropped without writing.
       additionalProperties: false
 
+    NextStepResponse:
+      type: object
+      description: |
+        Answer of an auth step that succeeded but is not finished: the server
+        sealed a one-time cookie and names where the client must go to spend it.
+        `next_step` is the stable programmatic name of that stage; `next_path` is
+        the page serving it. Two stages answer with THIS shape:
+        `register_welcome` from `POST /api/v1/users`, and `recovery_code` from
+        `POST /api/v1/password-resets/redeem` and
+        `POST /api/v1/users/current/recovery-code`. A stage name is not unique
+        to this schema, so do not read the enum as a list of producers:
+        `POST /api/v1/password-resets` also answers `recovery_code`, through
+        `RecoveryCodeRequiredResponse` and with no `next_path`, and the
+        calendar-feed reveal names its own stage through its own schema. A new
+        stage extends this enum only if it also answers with this shape.
+      required: [ok, next_step, next_path]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        next_step:
+          type: string
+          enum: [register_welcome, recovery_code]
+        next_path:
+          type: string
+          example: "/recovery-code"
+      additionalProperties: false
+
     OkRedirectResponse:
       type: object
       required: [ok, redirect]
@@ -260,7 +624,7 @@ components:
 
     RegisterRequest:
       type: object
-      required: [email, password, confirm_password]
+      required: [email, password, confirm_password, consent]
       properties:
         email:
           type: string
@@ -274,6 +638,9 @@ components:
         confirm_password:
           type: string
           format: password
+        consent:
+          type: string
+          description: Explicit consent to store health data, required for every registration. Truthy spellings, compared case-insensitively after trimming — `1`, `true`, `on`, `yes`. Any other value, and an absent field, are refused with 400 and `error_detail.key` `consent required`.
       additionalProperties: false
 
     LoginRequest:
@@ -289,7 +656,41 @@ components:
         remember_me:
           type: boolean
           default: false
-          description: When true, the issued `ovumcy_auth` cookie carries an explicit ~7-day Expires. Otherwise the cookie is browser-session-scoped.
+          description: >-
+            Chooses the lifetime of the `ovumcy_auth` cookie this sign-in
+            issues. When true, the cookie is persistent: its `Expires` is set
+            30 days after the cookie is issued, and the session token sealed
+            inside it expires at the same time. When false or absent, the
+            cookie carries neither `Expires` nor `Max-Age`, so it lasts for the
+            browser session; the session token inside still expires 7 days
+            after the cookie is issued, so a browser session that runs longer
+            is signed out then. Either way the cookie is `HttpOnly`,
+            `SameSite=Lax` and `Path=/`, and `Secure` when the server runs with
+            `COOKIE_SECURE` enabled. A sign-in answered with `requires_totp`
+            keeps the choice: the cookie `POST /api/v1/sessions/2fa-challenge`
+            issues carries the lifetime chosen here. A sign-in redirected to
+            `/reset-password` does not: the cookie
+            `POST /api/v1/password-resets/redeem` then issues is always
+            browser-session-scoped. A later re-issue of the session, after a
+            password change or turning 2FA on or off, keeps the kind of cookie
+            chosen here, with its lifetime counted from the re-issue.
+      additionalProperties: false
+
+    RecoveryCodeRequiredResponse:
+      type: object
+      description: >-
+        Step 1 of `POST /api/v1/password-resets`: the body named `email` alone,
+        so nothing was started and the caller must repeat the request with
+        `recovery_code` and `password`. Carries no `next_path` — the step is the
+        same endpoint again, not another one.
+      required: [ok, next_step]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        next_step:
+          type: string
+          enum: [recovery_code]
       additionalProperties: false
 
     LoginTOTPRequiredResponse:
@@ -314,15 +715,65 @@ components:
 
     ForgotPasswordRequest:
       type: object
-      required: [email, recovery_code]
+      required: [email]
+      description: >-
+        Two-step body on one endpoint. Step 1 sends `email` alone; the
+        response is `{"ok": true, "next_step": "recovery_code"}` and starts
+        nothing. Step 2 repeats `email` and adds `recovery_code` and
+        `password`, which is what actually calls `StartRecovery`. Neither
+        step-2 field is schema-required, because an absent one does not fail
+        validation, but the two are NOT read alike: `recovery_code` absent, or
+        present and blank once trimmed, is what SELECTS step 1 — it is
+        answered as `{"ok": true, "next_step": "recovery_code"}` like any
+        other step-1 request, never refused. `password` has no such reading;
+        once a non-blank `recovery_code` is present, an absent or blank
+        `password` is refused later, by name, with the same uniform credential
+        rejection a wrong value gets. See each field's own description.
       properties:
         email:
           type: string
           format: email
+        password:
+          type: string
+          description: >-
+            The account's CURRENT password, required alongside the recovery
+            code. The recovery code substitutes for the second factor (TOTP),
+            never for the password, so this endpoint verifies two secrets. A
+            wrong or empty password is refused exactly as a wrong recovery
+            code is — same status, same body — and consumes the same attempt
+            budget. A JSON body that omits the member entirely is the shape
+            this endpoint accepted before v2.0.0, so it is refused by name
+            (`recovery reset requires the account password`, 400) before any
+            account is read: it names no credential and reveals nothing.
+            Form encoding cannot express the
+            difference between an omitted and an empty field, so a form
+            submission keeps the uniform credential refusal. The route's own
+            per-IP budget applies to it as to any other request here; what it
+            skips is the per-address attempt bucket, which only a submitted
+            credential can spend. An owner who has
+            forgotten the password cannot recover here and needs the operator
+            CLI `ovumcy reset-password <email>`.
         recovery_code:
           type: string
-          pattern: "^OVUM-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}$"
-          description: Single-use recovery code minted at registration or by `POST /api/v1/users/current/recovery-code`.
+          pattern: '^OVUM-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$|^\s*$'
+          description: >-
+            Single-use recovery code minted at registration or by `POST
+            /api/v1/users/current/recovery-code`. Omitted, or sent blank —
+            empty or all whitespace, matching the server's own
+            `strings.TrimSpace(...) == ""` test — selects step 1 (see this
+            schema's own description) and is never refused on that account;
+            the pattern's `|^\s*$` alternative exists for that value alone,
+            not to widen what a real code may look like. Once non-blank, the
+            pattern documents the server's
+            accepted request shape (`ValidateRecoveryCodeFormat` in
+            `internal/services/auth_input_policy.go`), which is deliberately
+            wider than the alphabet `GenerateRecoveryCode`
+            (`internal/services/auth_reset_policy.go`) actually emits —
+            Crockford-style base32 excluding `I`/`O`/`0`/`1` to avoid
+            visually-ambiguous characters. Narrowing this pattern to the
+            generator's exact alphabet would reintroduce the same defect this
+            fixes in milder form: a spec-following client would reject some
+            fraction of codes the server would otherwise accept.
       additionalProperties: false
 
     ResetPasswordRequest:
@@ -343,10 +794,22 @@ components:
     DayPayload:
       type: object
       description: |
-        Day entry payload. Hidden-field preservation: when the caller omits a
-        field that the user has chosen to hide in their tracking preferences
-        (BBT, cervical mucus, sex activity, cycle factors, notes), the previous
-        value is preserved on update rather than overwritten with the default.
+        Day entry payload. Under `PUT` a JSON body replaces the whole record
+        with exactly what it states: every field it sends is read, and an
+        omitted field is written as its default. Under `PATCH` only the keys
+        the body carries change; an omitted key keeps its stored value and the
+        defaults below do not apply, while an explicit `null` is a stated value
+        and clears the field. Read is not the same as validated — a
+        temperature outside the accepted range is refused with 400, an unknown
+        spelling of sex_activity, cervical_mucus or pregnancy_test collapses to
+        "none", and notes are trimmed. Hidden-field preservation belongs to the
+        form body the browser day editor posts, not here — for a field the
+        account hides in its tracking preferences (BBT, cervical mucus, sex
+        activity, cycle factors, notes) that form carries no input, the request
+        is not read for one, and an update keeps what is already stored under
+        the same rules a sent value gets: a stored temperature outside the
+        accepted range is no reading and comes back empty. A new day starts the
+        field empty.
       properties:
         is_period:
           type: boolean
@@ -363,14 +826,17 @@ components:
           enum: [none, protected, unprotected]
           default: none
         bbt:
-          type: number
+          type: [number, "null"]
           format: float
-          nullable: true
           description: >-
             Basal body temperature in the unit selected per account (°C or °F).
             Omitted or null means not measured. On write, a null, an omitted
             field, or a non-positive value (legacy 0 sentinel) is stored as
-            "not measured".
+            "not measured"; the non-positive test is applied to the value as
+            sent, in the account's unit, so a positive value outside the
+            physiological range is refused with 400 rather than emptied (a form
+            save from an account that hides temperature does not read the field
+            at all).
         cervical_mucus:
           type: string
           enum: [none, dry, moist, creamy, eggwhite]
@@ -397,8 +863,10 @@ components:
     DailyLog:
       type: object
       description: |
-        A persisted day record. `date` is stored as UTC midnight on disk and
-        rendered in the caller's timezone at read time.
+        A day record: a stored one, or the `id: 0` placeholder that
+        `GET /api/v1/days/{date}` answers for a day without one. `date` is
+        stored as UTC midnight on disk and returned as that calendar day, with
+        no timezone shift.
       required: [id, user_id, date, is_period, flow, mood, sex_activity, cervical_mucus, pregnancy_test]
       properties:
         id:
@@ -421,10 +889,13 @@ components:
           type: string
           enum: [none, protected, unprotected]
         bbt:
-          type: number
+          type: [number, "null"]
           format: float
-          nullable: true
-          description: Present only when measured; absent when not measured.
+          description: >-
+            Always Celsius regardless of the account's display unit
+            preference (write-side unit conversion happens on input; storage
+            and this response are canonical Celsius). Present only when
+            measured; absent when not measured.
         cervical_mucus:
           type: string
           enum: [none, dry, moist, creamy, eggwhite]
@@ -453,10 +924,24 @@ components:
       properties:
         name:
           type: string
-          description: User-visible symptom label.
+          maxLength: 40
+          description: >-
+            User-visible symptom label. The server caps it at 40 **runes**
+            (Unicode code points), not bytes, and measures the value after
+            collapsing internal whitespace runs and trimming
+            (`normalizeSymptomNameInput` in
+            `internal/services/symptom_name_policy.go`), so a name whose
+            normalized form fits is accepted even when the raw string is
+            longer. Markup (`<`, `>`) and control characters are rejected,
+            not stripped.
         icon:
           type: string
-          description: Single emoji or short symbol shown next to the name in the UI.
+          maxLength: 16
+          description: >-
+            Single emoji or short symbol shown next to the name in the UI.
+            Capped at 16 **runes** after trimming
+            (`normalizeSymptomIconInput`) — wide enough for a multi-codepoint
+            emoji sequence. Omitted or blank falls back to the default icon.
         color:
           type: string
           pattern: "^#[0-9A-Fa-f]{6}$"
@@ -478,17 +963,319 @@ components:
         color: { type: string }
         is_builtin: { type: boolean }
         archived_at:
-          type: string
+          type: [string, "null"]
           format: date-time
-          nullable: true
 
     StatsOverview:
       type: object
       description: |
-        Aggregate statistics for the current owner. The field set evolves
-        between releases — treat unknown fields as informational, do not error
-        on them.
-      additionalProperties: true
+        Aggregate cycle statistics for the current owner.
+
+        Recorded history — the observed cycle lengths, the last period start,
+        the current cycle day — is published in every state. Every PROJECTED
+        date is `null` while the projection it belongs to is suppressed: read
+        `suppression` for whether and why. The instance withholds a claim it
+        cannot stand behind rather than qualifying it, so an absent date is a
+        decision, never a gap in the data.
+
+        A projected date is also `null`, with `suppression` unchanged, when it
+        would fall after `9999-12-31`: `format: date` has a four-digit year.
+        Only a cycle logged in late 9999 projects that far. The fertile window
+        is then `null` as a whole once `ovulation_date` would pass that day,
+        never a start without its end.
+      required:
+        - current_cycle_day
+        - current_phase
+        - current_fertility
+        - fertility_basis
+        - cycle_data_stale
+        - average_cycle_length
+        - median_cycle_length
+        - min_cycle_length
+        - max_cycle_length
+        - cycle_length_std_dev
+        - completed_cycle_count
+        - average_period_length
+        - last_cycle_length
+        - last_period_length
+        - luteal_phase
+        - luteal_phase_personalised
+        - last_period_start
+        - next_period_start
+        - ovulation_date
+        - ovulation_exact
+        - ovulation_confirmed
+        - ovulation_impossible
+        - fertility_window_start
+        - fertility_window_end
+        - pregnancy_paused
+        - suppression
+        - disclaimer
+        - disclaimer_key
+      properties:
+        current_cycle_day:
+          type: integer
+          description: Day of the running cycle, 1-based. `0` before any cycle anchor exists.
+        current_phase:
+          type: string
+          enum: [menstrual, follicular, ovulation, luteal, unknown]
+          description: >-
+            Phase taxonomy. "Fertile" is a status, never a phase — see
+            `current_fertility`. The phase is the axis orthogonal to fertility,
+            but three of its values are not: `follicular`, `ovulation` and
+            `luteal` are decided by comparing today against `ovulation_date`, so
+            naming one of them beside a null `ovulation_date` would spell out the
+            very day that null withholds. The field is therefore reported in
+            every state, and it carries only `menstrual` — read off recorded or
+            projected bleeding — or `unknown` whenever `ovulation_date` is null,
+            and whenever `suppression.fertility` is true, even beside a
+            confirmed `ovulation_date` reported under `cycle_overdue` alone.
+            `suppression` accounts for a null date only when it withheld it: a
+            cycle with `ovulation_impossible`, or one whose projected day would
+            fall after `9999-12-31`, has `suppression.fertility` false. Always
+            `unknown` while `cycle_data_stale` is true, whatever the dates
+            beside it, `menstrual` included. Also `unknown`, `menstrual`
+            included, on a day after `ovulation_date` that the fertile window
+            still covers: only the irregular range mode builds such a window
+            (see `fertility_window_end`), and on those days the ovulation may
+            still be ahead, which `luteal` would deny. A day the owner recorded
+            as bleeding stays `menstrual`.
+        current_fertility:
+          type: string
+          enum: [fertile, outside_estimated_window, unknown]
+          description: >-
+            Whether today falls inside the ESTIMATED fertile window this
+            response reports — the projected one, or the one derived from the
+            confirmed shift when `ovulation_confirmed`, never a mix of the two;
+            `fertility_basis` says which. It describes membership in an
+            estimate, never the owner's body: `outside_estimated_window` is not
+            an infertility claim and not a safe day — an estimated window often
+            misses the real fertile days, regular cycles included — and it is
+            not a method of contraception. The axis orthogonal to
+            `current_phase`. `unknown` whenever the fertile window is null:
+            when `suppression.fertility` is true, even beside a confirmed
+            `ovulation_date` reported under `cycle_overdue` alone; when
+            `ovulation_impossible` is true; and when the window would end after
+            `9999-12-31`. The last two leave `suppression.fertility` false. Also
+            `unknown` while `cycle_data_stale` is true, with the dates still
+            reported unless a suppression signal withholds them.
+        fertility_basis:
+          type: [string, "null"]
+          enum: [projection, confirmed, null]
+          description: >-
+            The window `current_fertility` was read against: `projection` for
+            the window rolled forward from the cycle history, `confirmed` for
+            the window derived from a thermal shift the owner's own
+            temperatures confirm (`ovulation_confirmed`). Null exactly when
+            `current_fertility` is `unknown`.
+        cycle_data_stale:
+          type: boolean
+          description: >-
+            The day count of the running cycle, from `last_period_start`, is
+            past the account's reference cycle length, so the recorded data is
+            out of date — the verdict the dashboard and the statistics page
+            show as their out-of-date notice. The reference length is the
+            first of these that exists: the mean of the recent observed cycle
+            lengths rounded to the nearest day (before any cycle has been
+            observed, the configured cycle length stands in for that mean);
+            the median observed cycle length; the configured cycle length; 28
+            days. It is a reference only — projected dates are rolled from the
+            median. While true, `current_phase` and `current_fertility` are
+            `unknown` and `fertility_basis` is null; the projected dates are
+            still reported unless a suppression signal withholds them, as the
+            pages still show them. This is not a `suppression` signal: it withholds no date,
+            and the fuller withholding of an overdue cycle is
+            `suppression.reasons` `cycle_overdue`. Always false during a
+            pregnancy pause and in unpredictable-cycle mode, where no fertility
+            status is published at all.
+        average_cycle_length:
+          type: number
+          format: double
+        median_cycle_length:
+          type: integer
+        min_cycle_length:
+          type: integer
+        max_cycle_length:
+          type: integer
+        cycle_length_std_dev:
+          type: number
+          format: double
+        completed_cycle_count:
+          type: integer
+          description: >-
+            Completed cycles observed. Below three the fertility half of the
+            projection (ovulation date, fertile window) is suppressed: at zero
+            it has nothing but the onboarding cycle-length setting behind it
+            (`awaiting_first_cycle`), at one or two it rests on too few observed
+            lengths (`awaiting_more_cycles`, regular mode; irregular mode
+            reports `irregular_needs_more_cycles`).
+        average_period_length:
+          type: number
+          format: double
+        last_cycle_length:
+          type: integer
+        last_period_length:
+          type: integer
+        luteal_phase:
+          type: integer
+          description: Days following ovulation; per-owner when inferable, else the 14-day default.
+        luteal_phase_personalised:
+          type: boolean
+          description: >-
+            `luteal_phase` was inferred from the owner's own logs, rather than
+            the 14-day model default. This says nothing about whether the
+            resulting ovulation date avoided the arithmetic clamp (see
+            `ovulation_exact`) and nothing about whether the current cycle's
+            ovulation was confirmed by a BBT shift (see `ovulation_confirmed`)
+            — a personalised luteal phase can still be clamped, and a default
+            one can still fit exactly. `false` means the owner's logs did not
+            yet support an inference, not that a personalised value was tried
+            and found wrong. Always false when `suppression.fertility` is
+            true.
+        last_period_start:
+          type: [string, "null"]
+          format: date
+          description: Recorded anchor, not a projection. Null only when no cycle start is known.
+        next_period_start:
+          type: [string, "null"]
+          format: date
+          description: >-
+            Projected. Null when `suppression.predictions` is true, or when the
+            projection would fall after `9999-12-31`.
+        ovulation_date:
+          type: [string, "null"]
+          format: date
+          description: >-
+            Projected, unless the owner's own BBT readings have already
+            confirmed the current cycle's ovulation, in which case this is the
+            day inferred from the owner's own temperature shift — an inference
+            from a recorded signal, never a measurement of the ovulation itself
+            — and the same day the calendar and dashboard show. A confirmed
+            date may fall on or after `next_period_start`: a late shift outlives
+            the projected next start, which stays a projection and is not
+            recomputed from the confirmed day. Null when `suppression.fertility`
+            is true, with one exception: when `cycle_overdue` is the only entry
+            in `suppression.reasons`, a confirmed day (`ovulation_confirmed`) is
+            still reported — the cycle has outrun the length its projection was
+            rolled from, and the confirmed day is not such a projection. Every
+            projected field stays null then, and the fertile window and
+            `current_fertility` stay withheld. A projected day that would fall
+            after `9999-12-31` is null too.
+        ovulation_exact:
+          type: boolean
+          description: >-
+            The luteal phase fit within the cycle without the arithmetic
+            clamp. This is NOT a personalisation signal and NOT an accuracy
+            claim: it is `true` on the 14-day model default whenever that
+            default fits the cycle, and `false` on a per-owner inferred value
+            the cycle was too short to hold. See `luteal_phase_personalised`
+            for whether the luteal phase came from the owner's own logs.
+            Independent of `ovulation_confirmed` — an unclamped cycle (`true`
+            here) can still have its ovulation confirmed by a BBT shift, and a
+            clamped one can too. Always false when `ovulation_date` is null.
+        ovulation_confirmed:
+          type: boolean
+          description: >-
+            `ovulation_date` is inferred from the owner's own temperature
+            shift: the recorded BBT readings confirm that the current cycle's
+            ovulation has already happened, and the date reported is the
+            detector's day rather than the model's projection — the same day
+            the calendar's solid marker and the dashboard's ovulation line
+            show. The claim is that the ovulation is behind the owner and
+            nothing more. `fertility_window_start`/`fertility_window_end` and
+            the fertility status are derived from that same day, and withheld
+            with the rest of the fertility projection while
+            `suppression.fertility` is true. Always false when
+            `ovulation_date` is null.
+        ovulation_impossible:
+          type: boolean
+          description: >-
+            No ovulation can be placed in the running cycle at all. Always
+            `false` when `suppression.fertility` is true — the underlying
+            claim is itself derived from the fertility projection, so it is
+            withheld along with `ovulation_date` and the fertile window
+            rather than surviving beside a suppressed one. Also `false`
+            whenever `ovulation_confirmed` is true — a recorded shift is the
+            observation that answers the projection's impossibility claim.
+        fertility_window_start:
+          type: [string, "null"]
+          format: date
+          description: >-
+            Projected, or derived from the confirmed shift when
+            `ovulation_confirmed` — then `ovulation_date` minus five days,
+            clamped to `last_period_start`. A projected start is
+            `ovulation_date` minus five days with the same clamp, except in
+            the irregular range mode (irregular-cycle mode with three or more
+            completed cycles): there the current cycle's window opens where
+            the SHORTEST recent cycle's window would — that cycle's ovulation
+            day minus five days, with the same clamp, or `last_period_start`
+            when no ovulation fits in that cycle. Null when
+            `suppression.fertility` is true, or when the window's last day
+            would fall after `9999-12-31`.
+        fertility_window_end:
+          type: [string, "null"]
+          format: date
+          description: >-
+            Projected, or derived from the confirmed shift when
+            `ovulation_confirmed` — then `ovulation_date` itself. A projected
+            end is `ovulation_date`, except in the irregular range mode (see
+            `fertility_window_start`): there the current cycle's window ends on
+            the LONGEST recent cycle's ovulation day, while `ovulation_date`
+            stays the median projection — so it can sit in the middle of the
+            window, and this end can fall on or after `next_period_start`. The
+            widening covers the current cycle only; the cycles the calendar
+            projects after it keep the median window. Null when
+            `suppression.fertility` is true, or when it would fall after
+            `9999-12-31`.
+        pregnancy_paused:
+          type: boolean
+          description: >-
+            A positive pregnancy test with no later cycle start. One of the
+            signals behind `suppression`.
+        suppression:
+          $ref: '#/components/schemas/StatsOverviewSuppression'
+        disclaimer:
+          type: string
+          description: >-
+            The medical-safety disclaimer in the owner's interface language.
+            Render it wherever any of these values is shown.
+        disclaimer_key:
+          type: string
+          description: >-
+            Stable catalogue key of `disclaimer` (`medical.disclaimer`), so a
+            client can branch on it without parsing translated prose.
+      additionalProperties: false
+
+    StatsOverviewSuppression:
+      type: object
+      description: |
+        Why the payload withholds a projection. `predictions` covers every
+        projected date; `fertility` covers the fertility half only (ovulation
+        date and fertile window) and is true whenever `predictions` is.
+      required: [predictions, fertility, reasons]
+      properties:
+        predictions:
+          type: boolean
+        fertility:
+          type: boolean
+        reasons:
+          type: array
+          description: >-
+            Signals that hold right now — possibly several at once, possibly
+            none. Never null.
+          items:
+            type: string
+            enum:
+              - unpredictable_cycle
+              - pregnancy_pause
+              - cycle_overdue
+              - irregular_needs_more_cycles
+              - awaiting_first_cycle
+              - awaiting_more_cycles
+          # awaiting_first_cycle: no completed cycle yet. awaiting_more_cycles:
+          # a regular-mode account with one or two completed cycles. Both
+          # withhold the fertility half only; the next-period estimate stays.
+      additionalProperties: false
 
     ExportJSONEntry:
       type: object
@@ -499,7 +1286,6 @@ components:
         - flow
         - mood_rating
         - sex_activity
-        - bbt
         - cervical_mucus
         - cycle_factors
         - symptoms
@@ -520,13 +1306,16 @@ components:
           type: string
           enum: [none, protected, unprotected]
         bbt:
-          type: number
+          type: [number, "null"]
           format: float
-          nullable: true
           description: >-
-            Emitted only when measured; absent otherwise. On import, absent,
-            null, or a non-positive value (legacy 0 sentinel) all mean "not
-            measured".
+            Emitted only when measured; absent otherwise. Always Celsius,
+            whatever unit the account displays. On import, absent, null, or a
+            non-positive value (legacy 0 sentinel) all mean "not measured". A
+            value outside the accepted range is read as "not measured" like any
+            other malformed field, not rejected — an import restores the file
+            around it instead of refusing the day, which is the opposite of what
+            a day write does with the same value.
         cervical_mucus:
           type: string
           enum: [none, dry, moist, creamy, eggwhite]
@@ -593,6 +1382,14 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ExportJSONEntry'
+        last_period_start:
+          type: string
+          format: date
+          description: >-
+            Optional. The owner's stored onboarding start, a cycle boundary that
+            no logged day carries. Absent when the account has none, or when the
+            requested `from`/`to` range leaves it out. Restore sets it only on an
+            account that holds none.
       additionalProperties: false
 
     ExportSummary:
@@ -603,20 +1400,52 @@ components:
         has_data: { type: boolean }
         date_from:
           type: string
-          format: date
+          description: First exported day as `YYYY-MM-DD`, or `""` when `has_data` is `false`.
         date_to:
           type: string
-          format: date
+          description: Last exported day as `YYYY-MM-DD`, or `""` when `has_data` is `false`.
 
     CycleSettings:
       type: object
+      description: |
+        A partial update, as the verb says: a member this body does not carry
+        keeps the value the account already holds, and only what is actually
+        sent can change. A member carrying a zero value (`false`, `""`) is
+        present and is written — absence and a zero value are different answers.
+        Until v2.0.0 an absent member was read as its zero value, so a save of
+        the two lengths alone rewrote `usage_goal` to `health` and `age_group`
+        to unknown.
+
+        A body that names none of these members is refused with `400
+        invalid settings input` rather than answered `200`: it asks for no
+        change, and a save that changed nothing must not be recorded as one.
+
+        The bundled settings form is not affected and is not described by this
+        schema: it submits every control it owns on every save, and an unchecked
+        box submits nothing at all, so a form body carries no absence to honour
+        and is read as the full snapshot it is.
       properties:
         cycle_length:
           type: integer
-          minimum: 1
+          minimum: 15
+          maximum: 90
+          description: >-
+            Rejected with a validation error outside 15–90
+            (`ValidateCycleSettings` in
+            `internal/services/settings_cycle_policy.go`) — unlike the
+            identically-named field on `OnboardingStep2Request`, which is
+            clamped into range instead.
         period_length:
           type: integer
           minimum: 1
+          maximum: 14
+          description: >-
+            Rejected with a validation error outside 1–14. A cross-field rule
+            the numeric bounds cannot express applies on top: the server also
+            requires `period_length` to be at most `cycle_length` minus 10
+            (still capped at 14), so a payload valid against both bounds on
+            its own — say `cycle_length: 15`, `period_length: 14` — is still
+            refused.
         auto_period_fill: { type: boolean }
         irregular_cycle: { type: boolean }
         unpredictable_cycle: { type: boolean }
@@ -626,6 +1455,13 @@ components:
         usage_goal:
           type: string
           enum: [health, avoid_pregnancy, trying_to_conceive]
+          description: >-
+            A body carrying `usage_goal` and no other member at all is the
+            dashboard quick switch: it writes that one column directly. Any
+            other body takes the ordinary partial path above, which reaches the
+            same result for the members it carries. The goal is only ever
+            changed by an explicit owner action — nothing logged on a day,
+            including a positive pregnancy test, rewrites it.
         last_period_start:
           type: string
           format: date
@@ -659,19 +1495,44 @@ components:
       properties:
         display_name:
           type: string
-          maxLength: 80
+          maxLength: 64
+          description: >-
+            Capped at 64 **runes** (Unicode code points), not bytes, and
+            measured after trimming surrounding whitespace
+            (`NormalizeDisplayName` in
+            `internal/services/settings_profile_policy.go`), so a padded value
+            whose trimmed form fits is accepted. Markup (`<`, `>`) and control
+            characters are rejected, not stripped. An empty value clears the
+            display name.
 
     InterfaceSettings:
       type: object
+      description: |
+        Interface preferences save. `language` is stored twice: in the
+        `ovumcy_lang` cookie the response sets, and on the account
+        (`users.interface_language`), which is what re-issues that cookie on a
+        device signing in for the first time. `theme` has no server-side
+        storage — it stays in the browser's `localStorage`.
       properties:
         language:
           type: string
-          enum: [en, ru, es, fr, de]
+          enum: [en, ru, es, fr, de, it]
         theme:
           type: string
 
     TrackingSettings:
       type: object
+      description: |
+        JSON body of the tracking-preferences save. The three section
+        visibility flags keep their stored, inverted spelling here
+        (`hide_sex_chip`, `hide_cycle_factors`, `hide_notes_field`): renaming a
+        v1 field is a breaking change, so the published contract is unchanged.
+        The bundled settings form posts the positive `show_sex_chip`,
+        `show_cycle_factors` and `show_notes_field` fields instead — the
+        toggles read "show" in the interface — and the server converts the two
+        vocabularies in a single place. Every field is a full snapshot: an
+        omitted flag reads as `false`, it is not a no-op; an omitted or
+        unrecognised `week_starts_on` reads as `sunday`.
       properties:
         track_bbt: { type: boolean }
         temperature_unit:
@@ -682,6 +1543,9 @@ components:
         hide_cycle_factors: { type: boolean }
         hide_notes_field: { type: boolean }
         show_historical_phases: { type: boolean }
+        week_starts_on:
+          type: string
+          enum: [sunday, monday]
 
     TimezoneSettings:
       type: object
@@ -832,20 +1696,25 @@ components:
       properties:
         cycle_length:
           type: integer
-          minimum: 14
-          maximum: 60
+          minimum: 15
+          maximum: 90
         period_length:
           type: integer
           minimum: 1
           maximum: 14
         auto_period_fill: { type: boolean }
         irregular_cycle: { type: boolean }
-        age_group:
-          type: string
-          enum: ["", under_40, age_40_45, age_45_plus]
         usage_goal:
           type: string
           enum: [health, avoid_pregnancy, trying_to_conceive]
+          description: >-
+            Absent or unknown resolves to `health`, which is what the step's
+            visible skip action submits. Onboarding does not collect the age
+            bracket; `age_group` is written by
+            `PATCH /api/v1/users/current/cycle` only. A body that still names
+            `age_group` — the shape this step accepted before v2.0.0 — is
+            refused with `onboarding does not accept an age group` (400) on
+            both transports, rather than saved minus the field it submitted.
 
 paths:
   # =========================================================================
@@ -855,17 +1724,55 @@ paths:
     get:
       tags: [meta]
       summary: Liveness probe.
-      description: Returns 200 OK when the application is running. Public, no session required.
+      description: >-
+        Returns 200 OK when the application is running. It never touches the database,
+        so it stays green while storage is unreachable — use `/readyz` for that.
+        Public, no session required.
       security: []
       responses:
         '200':
           description: Service is alive.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProbeStatus' }
+
+  /readyz:
+    get:
+      tags: [meta]
+      summary: Readiness probe.
+      description: >-
+        Returns 200 OK when the application can serve traffic, and 503 when the storage
+        layer does not answer a trivial probe. Both responses carry a fixed, non-revealing
+        body; no driver, path, or error detail is exposed. Public, no session required.
+        The container health check deliberately stays on `/healthz` so a transient storage
+        failure cannot restart the container.
+      security: []
+      responses:
+        '200':
+          description: Service is ready.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProbeStatus' }
+        '503':
+          description: Service is not ready.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProbeUnavailable' }
 
   /lang:
     post:
       tags: [meta]
       summary: Set UI language preference.
-      description: Writes the `ovumcy_lang` cookie for the chosen language. Public, no session required.
+      description: |
+        Writes the `ovumcy_lang` cookie for the chosen language. Public, no session required.
+        When the request does carry a valid session, the language is also stored on the account
+        (`users.interface_language`, the same column `PATCH /api/v1/users/current/interface`
+        writes), so a later session issue re-serves the switched language instead of reverting
+        the cookie to the stored one. The response is the same either way, unless that account
+        write fails (`500`).
+
+        This path is outside `/api`, so the `/api` rate limit does not reach it; it carries a
+        per-IP limit of its own, sized like the `/api` budget, and answers `429` once it is spent.
       security:
         - csrfToken: []
       requestBody:
@@ -874,17 +1781,116 @@ paths:
           application/x-www-form-urlencoded:
             schema:
               type: object
-              required: [language, csrf_token]
+              required: [lang, csrf_token]
               properties:
-                language:
+                lang:
                   type: string
-                  enum: [en, ru, es, fr, de]
+                  description: |
+                    Form field name is `lang` (the handler reads `c.FormValue("lang")`) — distinct
+                    from the `language` JSON field on `PATCH /api/v1/users/current/interface`. The
+                    shipped codes are `en`, `ru`, `es`, `fr`, `de` and `it`. The value is not
+                    validated against that list: a blank value is refused with `400`, and any
+                    other code the server does not ship falls back to the instance's default
+                    language.
                 csrf_token: { type: string }
+                next:
+                  type: string
+                  description: Optional same-origin path to return to; anything else falls back to `/`.
       responses:
         '200':
           description: HTMX-style success.
         '303':
-          description: Redirect to referer or `/`.
+          description: |
+            Redirect to the form's `next` path, or to `/` when `next` is absent or is not a
+            same-origin path.
+        '400':
+          description: |
+            `lang` is missing or blank. The handler raises the transport-level `400`, so the
+            refusal carries the shared `bad_request` key rather than a key of this route's own.
+            A non-blank code the server does not ship is not refused: it falls back to the
+            instance's default language and answers like a success.
+
+            A caller that asks for JSON gets the JSON envelope below: one whose `Accept`
+            header names `application/json`, or one that sends its body as
+            `Content-Type: application/json`, either one alone being enough. An HTMX request
+            (`HX-Request: true`) outranks both and gets the localized status fragment as
+            `text/html` instead, and so does a plain form submission that asks for neither —
+            one sending `Accept: */*` or no `Accept` header at all included. That fragment is
+            the whole page the browser shows, so it ends with a link back to the form's `next`
+            path, or to `/` when `next` is absent or is not a same-origin path.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "bad_request"
+                error_detail: { key: "bad_request", category: "validation", target: "global" }
+        '403':
+          description: |
+            The CSRF check refused the request: no token; a token that does not match the
+            `ovumcy_csrf` cookie, or one the server no longer holds (idle for over an hour, or
+            issued before the server restarted — that answer also clears the cookie, so fetch a
+            page again); an `Origin` whose scheme or host differs from the server's, a sibling
+            subdomain included, or over HTTPS with no `Origin`, a missing or foreign `Referer`;
+            or a malformed `Sec-Fetch-Site`. The refusal comes from the CSRF middleware before the
+            handler runs, so no `ovumcy_lang` cookie is set and nothing is stored on the
+            account. It carries the shared `forbidden` key rather than a key of this route's
+            own.
+
+            A caller that asks for JSON gets the JSON envelope below: one whose `Accept`
+            header names `application/json`, or one that sends its body as
+            `Content-Type: application/json`, either one alone being enough. An HTMX request
+            (`HX-Request: true`) outranks both and gets the localized status fragment as
+            `text/html` instead, and so does a plain form submission that asks for neither —
+            one sending `Accept: */*` or no `Accept` header at all included. That fragment is
+            the whole page the browser shows, so it ends with a link back to the form's `next`
+            path, or to `/` when `next` is absent or is not a same-origin path.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "forbidden"
+                error_detail: { key: "forbidden", category: "forbidden", target: "global" }
+        '500':
+          description: |
+            The request carries a live owner session and a shipped language code, and storing
+            that language on the account failed. The switch is reported as failed rather than
+            kept as a cookie-only change: no `ovumcy_lang` cookie is set. A caller with no
+            session, or one that sends a code the server does not ship, never reaches the
+            account write and never gets this answer.
+
+            Any other fault while answering the request, such as a recovered panic, is a `500`
+            too, carrying the shared `internal_error` key.
+
+            A caller that asks for JSON gets the JSON envelope below: one whose `Accept`
+            header names `application/json`, or one that sends its body as
+            `Content-Type: application/json`, either one alone being enough. An HTMX request
+            (`HX-Request: true`) outranks both and gets the localized status fragment as
+            `text/html` instead, and so does a plain form submission that asks for neither —
+            one sending `Accept: */*` or no `Accept` header at all included. That fragment is
+            the whole page the browser shows, so it ends with a link back to the form's `next`
+            path, or to `/` when `next` is absent or is not a same-origin path.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "failed to update interface settings"
+                error_detail: { key: "failed to update interface settings", category: "internal", target: "global" }
+        '429':
+          $ref: '#/components/responses/RateLimited'
+          description: |
+            Rate limit exceeded. Every answer carries the `Retry-After` header. A caller that
+            asks for JSON gets the JSON envelope, with `retry_after_seconds`: one whose `Accept`
+            header names `application/json`, or one that sends its body as
+            `Content-Type: application/json`, either one alone being enough. An HTMX request
+            (`HX-Request: true`) outranks both and gets the localized status fragment as
+            `text/html` instead, with no `retry_after_seconds`, and so does the plain form
+            submission (this route's primary client) that asks for neither.
 
   # =========================================================================
   # auth
@@ -906,12 +1912,59 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/RegisterRequest' }
       responses:
+        '201':
+          description: |
+            Pickup cookie issued. Sent when `Accept: application/json` is set; the
+            browser surface gets the `303` below instead. Identical for new and
+            duplicate emails.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NextStepResponse' }
+              example:
+                ok: true
+                next_step: "register_welcome"
+                next_path: "/register/welcome"
         '303':
           description: Redirect to `/register/welcome` with the sealed pickup cookie. Shape is identical for new and duplicate emails.
-        '422':
+        '400':
           $ref: '#/components/responses/ValidationError'
+        '403':
+          description: |
+            Registration is closed on this deployment (SSO-only) — carries this route's own key,
+            `local sign-in unavailable`, target `auth_form`; a plain browser Accept flash-redirects
+            to `/register` (see the `303` above) rather than answering here directly.
+
+            A CSRF refusal (no token; a token that does not match the `ovumcy_csrf` cookie, or one
+            the server no longer holds; a foreign `Origin`/`Referer`) is a separate cause reached
+            before the handler runs, so it carries the shared `forbidden` key instead. A caller
+            that asks for JSON gets the JSON envelope; a plain form submission that asks for
+            neither gets the shared localized status fragment as `text/html` (WEB-84) — the same
+            shape `POST /lang` documents above — instead of the raw envelope.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              examples:
+                registrationClosed:
+                  summary: Local sign-in disabled
+                  value:
+                    error: "local sign-in unavailable"
+                    error_detail: { key: "local sign-in unavailable", category: "forbidden", target: "auth_form" }
+                csrfDenied:
+                  summary: CSRF refusal
+                  value:
+                    error: "forbidden"
+                    error_detail: { key: "forbidden", category: "forbidden", target: "global" }
         '429':
           $ref: '#/components/responses/RateLimited'
+          description: |
+            Rate limit exceeded (per-IP registration budget). Unlike this route's `403` above, a
+            plain browser Accept does NOT get the WEB-84 status fragment here: this rejection
+            carries a domain spec whose target is `auth_form`, so it flash-redirects to `/register`
+            with the error flashed (see the `303` above) before the shared negotiation in `apiError`
+            — the fragment's carrier — is ever reached. A caller that asks for JSON keeps the JSON
+            envelope with `retry_after_seconds` below.
 
   /api/v1/sessions:
     post:
@@ -952,9 +2005,49 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
-              example: { error: "auth.invalid_credentials" }
+              example:
+                error: "invalid credentials"
+                error_detail: { key: "invalid credentials", category: "unauthorized", target: "auth_form" }
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '403':
+          description: |
+            Local sign-in is disabled on this deployment (SSO-only) — carries this route's own
+            key, `local sign-in unavailable`, target `auth_form`; a plain browser Accept flash-
+            redirects to `/login` (see the `303` above) rather than answering here directly.
+
+            A CSRF refusal (no token; a token that does not match the `ovumcy_csrf` cookie, or one
+            the server no longer holds; a foreign `Origin`/`Referer`) is a separate cause reached
+            before the handler runs, so it carries the shared `forbidden` key instead. A caller
+            that asks for JSON gets the JSON envelope; a plain form submission that asks for
+            neither gets the shared localized status fragment as `text/html` (WEB-84) — the same
+            shape `POST /lang` documents above — instead of the raw envelope.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              examples:
+                localSignInDisabled:
+                  summary: Local sign-in disabled
+                  value:
+                    error: "local sign-in unavailable"
+                    error_detail: { key: "local sign-in unavailable", category: "forbidden", target: "auth_form" }
+                csrfDenied:
+                  summary: CSRF refusal
+                  value:
+                    error: "forbidden"
+                    error_detail: { key: "forbidden", category: "forbidden", target: "global" }
         '429':
           $ref: '#/components/responses/RateLimited'
+          description: |
+            Rate limit exceeded (per-IP login budget plus the per-account `AuthAttemptPolicy`
+            budget). Unlike this route's `403` above, a plain browser Accept does NOT get the
+            WEB-84 status fragment here: this rejection carries a domain spec whose target is
+            `auth_form`, so it flash-redirects to `/login` with the error flashed (see the `303`
+            above) before the shared negotiation in `apiError` — the fragment's carrier — is ever
+            reached. A caller that asks for JSON keeps the JSON envelope with
+            `retry_after_seconds` below.
 
   /api/v1/sessions/2fa-challenge:
     post:
@@ -962,15 +2055,18 @@ paths:
       summary: Submit the TOTP code in the 2FA challenge.
       description: |
         Requires the `ovumcy_totp_pending` cookie issued by a successful
-        password login. Per-account TOTP rate limit: 5 attempts / 15 min.
-        Replayed codes within the 30-second step are rejected with the same
-        response shape as an invalid code.
+        password login. Per-IP rate limit: default 8 / 15 min, on top of the
+        per-account TOTP rate limit: 5 attempts / 15 min. Replayed codes
+        within the 30-second step are rejected with the same response shape as
+        an invalid code.
       security:
         - csrfToken: []
       requestBody:
         required: true
         content:
           application/json:
+            schema: { $ref: '#/components/schemas/TOTPLoginRequest' }
+          application/x-www-form-urlencoded:
             schema: { $ref: '#/components/schemas/TOTPLoginRequest' }
       responses:
         '200':
@@ -985,8 +2081,42 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
+        '403':
+          description: |
+            A CSRF refusal (no token; a token that does not match the `ovumcy_csrf` cookie, or one
+            the server no longer holds; a foreign `Origin`/`Referer`) reached before the handler
+            runs, carrying the shared `forbidden` key. A caller that asks for JSON gets the JSON
+            envelope below; a plain form submission that asks for neither gets the shared
+            localized status fragment as `text/html` (WEB-84) — the same shape `POST /lang`
+            documents above — instead of the raw envelope.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "forbidden"
+                error_detail: { key: "forbidden", category: "forbidden", target: "global" }
         '429':
-          $ref: '#/components/responses/RateLimited'
+          description: |
+            Rate limit exceeded (per-account TOTP budget: 5 attempts / 15 min, key
+            `totp too many attempts`). Unlike this route's `403` above, a plain browser Accept
+            does NOT get the WEB-84 status fragment here: this rejection carries a domain spec
+            whose target is `auth_form`, so it flash-redirects to `/auth/2fa` with the error
+            flashed (see the `303` above) before the shared negotiation in `apiError` — the
+            fragment's carrier — is ever reached. A caller that asks for JSON keeps the JSON
+            envelope below, but unlike the app-wide `RateLimited` response, it carries no
+            `retry_after_seconds`: this budget is checked in the handler
+            (`totpService.ReserveAttempt`), which answers through `respondAuthError` /
+            `apiErrorEnvelope` directly rather than through the edge limiter's
+            `respondRateLimitedMappedError`, and stamps no `Retry-After` header for
+            `retry_after_seconds` to echo.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "totp too many attempts"
+                error_detail: { key: "totp too many attempts", category: "rate_limited", target: "auth_form" }
 
   /api/v1/sessions/current:
     delete:
@@ -1010,16 +2140,23 @@ paths:
           description: Browser redirect to `/login` or the OIDC logout bridge path.
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '429':
           $ref: '#/components/responses/RateLimited'
 
   /api/v1/password-resets:
     post:
       tags: [auth]
-      summary: Begin password reset via recovery code.
+      summary: Begin password reset with the password and the recovery code.
       description: |
-        Validates the `(email, recovery_code)` pair without leaking which one
-        was wrong. Per-IP rate limit: default 8 / 1 hour.
+        Validates the `(email, recovery_code, password)` triple without leaking
+        which part was wrong. The recovery code stands in for the second factor
+        only — the account password is required too — and every rejection
+        (unknown address, local auth disabled, wrong code, wrong or empty
+        password) answers identically. A JSON body carrying no `password`
+        member is answered before that check, by name — see the field's own
+        description. Per-IP rate limit: default 8 / 1 hour.
       security:
         - csrfToken: []
       requestBody:
@@ -1028,15 +2165,74 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/ForgotPasswordRequest' }
       responses:
+        '200':
+          description: |
+            Sent when `Accept: application/json` is set; the browser surface gets
+            the `303` below instead. Two shapes, one per step of the flow — see
+            `ForgotPasswordRequest`.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/RecoveryCodeRequiredResponse'
+                  - $ref: '#/components/schemas/OkResponse'
+              examples:
+                recoveryCodeRequired:
+                  summary: Step 1 — email alone; nothing started yet
+                  value: { ok: true, next_step: "recovery_code" }
+                resetCookieIssued:
+                  summary: Step 2 — reset cookie issued
+                  value: { ok: true }
         '303':
           description: Redirect to `/reset-password` with a sealed reset cookie.
-        '401':
-          description: Recovery code does not match the supplied email.
+        '400':
+          description: >-
+            Every step-2 rejection lands here with the same uniform body,
+            whichever of email/recovery_code/password was wrong or missing —
+            `mapPasswordRecoveryStartError` in `internal/api/error_mapping_auth.go`
+            has no arm that answers with 401: this endpoint proves nothing to
+            an unauthenticated caller by status code.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
+        '403':
+          description: |
+            Local password recovery is disabled on this deployment (SSO-only) — carries this
+            route's own key, `local recovery unavailable`, target `auth_form`; a plain browser
+            Accept flash-redirects to `/forgot-password` (see the `303` above) rather than
+            answering here directly.
+
+            A CSRF refusal (no token; a token that does not match the `ovumcy_csrf` cookie, or one
+            the server no longer holds; a foreign `Origin`/`Referer`) is a separate cause reached
+            before the handler runs, so it carries the shared `forbidden` key instead. A caller
+            that asks for JSON gets the JSON envelope; a plain form submission that asks for
+            neither gets the shared localized status fragment as `text/html` (WEB-84) — the same
+            shape `POST /lang` documents above — instead of the raw envelope.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              examples:
+                localRecoveryDisabled:
+                  summary: Local recovery disabled
+                  value:
+                    error: "local recovery unavailable"
+                    error_detail: { key: "local recovery unavailable", category: "forbidden", target: "auth_form" }
+                csrfDenied:
+                  summary: CSRF refusal
+                  value:
+                    error: "forbidden"
+                    error_detail: { key: "forbidden", category: "forbidden", target: "global" }
         '429':
           $ref: '#/components/responses/RateLimited'
+          description: |
+            Rate limit exceeded (per-IP recovery budget: default 8 / 1 hour). Unlike this route's
+            `403` above, a plain browser Accept does NOT get the WEB-84 status fragment here: this
+            rejection carries a domain spec whose target is `auth_form`, so it flash-redirects to
+            `/forgot-password` with the error flashed (see the `303` above) before the shared
+            negotiation in `apiError` — the fragment's carrier — is ever reached. A caller that
+            asks for JSON keeps the JSON envelope with `retry_after_seconds` below.
 
   /api/v1/password-resets/redeem:
     post:
@@ -1045,6 +2241,7 @@ paths:
       description: |
         Requires the `ovumcy_reset_password` cookie issued by `POST
         /api/v1/password-resets`. Bumps `auth_session_version` on success.
+        Per-IP rate limit: default 8 / 15 min.
       security:
         - csrfToken: []
       requestBody:
@@ -1053,10 +2250,76 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/ResetPasswordRequest' }
       responses:
+        '200':
+          description: |
+            Password replaced and a session issued; the freshly minted recovery
+            code waits behind `next_path`. The body above is sent when
+            `Accept: application/json` is set. An htmx request lands on this
+            status too, but answers `HX-Redirect: /recovery-code` with a
+            plain-text `OK` body — NOT the JSON above. A plain browser request
+            gets the `303` below.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NextStepResponse' }
+              example:
+                ok: true
+                next_step: "recovery_code"
+                next_path: "/recovery-code"
         '303':
-          description: Redirect to `/login` after success.
-        '422':
+          description: "Redirect to `/recovery-code` after success, for a plain browser request — neither `Accept: application/json` nor htmx."
+        '400':
           $ref: '#/components/responses/ValidationError'
+        '403':
+          description: |
+            Local password recovery is disabled on this deployment (SSO-only).
+            Only a reset token minted by the OIDC sign-in flow survives this
+            gate and can still be redeemed — for an account carrying
+            `must_change_password`, or one whose enrolled TOTP secret has gone
+            unverifiable (undecryptable under the instance's active
+            `SECRET_KEY`, e.g. after a rotation), since neither account can
+            reach a live session through the credential this deployment has
+            disabled and the forced reset is its only way back in. A token
+            minted by a LOCAL password — the plain sign-in form, or the OIDC
+            account-link confirmation step's own password challenge — is
+            refused here exactly like an ordinary password-recovery token,
+            since it was produced by the very factor this deployment has
+            disabled. This carries this route's own key, `local recovery
+            unavailable`, target `auth_form`; a plain browser Accept
+            flash-redirects to `/reset-password` (see the `303` above) rather
+            than answering here directly.
+
+            A CSRF refusal (no token; a token that does not match the `ovumcy_csrf` cookie, or one
+            the server no longer holds; a foreign `Origin`/`Referer`) is a separate cause reached
+            before the handler runs, so it carries the shared `forbidden` key instead. A caller
+            that asks for JSON gets the JSON envelope; a plain form submission that asks for
+            neither gets the shared localized status fragment as `text/html` (WEB-84) — the same
+            shape `POST /lang` documents above — instead of the raw envelope.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              examples:
+                localRecoveryDisabled:
+                  summary: Local recovery disabled
+                  value:
+                    error: "local recovery unavailable"
+                    error_detail: { key: "local recovery unavailable", category: "forbidden", target: "auth_form" }
+                csrfDenied:
+                  summary: CSRF refusal
+                  value:
+                    error: "forbidden"
+                    error_detail: { key: "forbidden", category: "forbidden", target: "global" }
+        '429':
+          $ref: '#/components/responses/RateLimited'
+          description: |
+            Rate limit exceeded (this route shares the recovery-start budget). Unlike this
+            route's `403` above, a plain browser Accept does NOT get the WEB-84 status fragment
+            here: this rejection carries a domain spec whose target is `auth_form`, so it
+            flash-redirects to `/reset-password` with the error flashed (see the `303` above)
+            before the shared negotiation in `apiError` — the fragment's carrier — is ever
+            reached. A caller that asks for JSON keeps the JSON envelope with
+            `retry_after_seconds` below.
 
   # =========================================================================
   # onboarding
@@ -1077,7 +2340,22 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/OkResponse' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '422': { $ref: '#/components/responses/ValidationError' }
+        '400':
+          description: |
+            The date is missing, unparseable or outside the allowed range.
+
+            A caller that sends no `Accept` header, or one naming `application/json`, gets
+            the JSON envelope below. An HTMX request (`HX-Request: true`), and a browser form
+            submission whose `Accept` names `text/html`, get the localized status fragment
+            as `text/html` instead. For the browser that fragment is the whole page, so it
+            ends with a link back to `/onboarding?step=1`.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   /api/v1/onboarding/steps/2:
     post:
@@ -1095,7 +2373,22 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/OkResponse' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '422': { $ref: '#/components/responses/ValidationError' }
+        '400':
+          description: |
+            The step's input is invalid.
+
+            A caller that sends no `Accept` header, or one naming `application/json`, gets
+            the JSON envelope below. An HTMX request (`HX-Request: true`), and a browser form
+            submission whose `Accept` names `text/html`, get the localized status fragment
+            as `text/html` instead. For the browser that fragment is the whole page, so it
+            ends with a link back to `/onboarding?step=2`.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   /api/v1/onboarding/complete:
     post:
@@ -1108,6 +2401,9 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/OkResponse' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   # =========================================================================
   # days
@@ -1116,9 +2412,25 @@ paths:
     get:
       tags: [days]
       summary: List daily log entries in a date range.
+      description: |
+        Both bounds are required and inclusive: `from` equal to `to` lists that one day. Each
+        bound is read on the request's timezone, and surrounding whitespace is trimmed before
+        it is parsed. Each bound is a date from `1900-01-01` through `9999-12-30`.
       parameters:
-        - $ref: '#/components/parameters/FromQuery'
-        - $ref: '#/components/parameters/ToQuery'
+        - in: query
+          name: from
+          required: true
+          description: Range start (inclusive), `YYYY-MM-DD` in the request's timezone.
+          schema:
+            type: string
+            format: date
+        - in: query
+          name: to
+          required: true
+          description: Range end (inclusive), `YYYY-MM-DD` in the request's timezone. Not before `from`.
+          schema:
+            type: string
+            format: date
       responses:
         '200':
           description: Array of day entries. Empty array when no rows match the range.
@@ -1128,43 +2440,108 @@ paths:
                 type: array
                 items: { $ref: '#/components/schemas/DailyLog' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '422': { $ref: '#/components/responses/ValidationError' }
+        '400':
+          description: |
+            The range is refused before any row is read, with one of three keys. `from` is checked
+            first, then `to`, then their order, so a request with both bounds wrong names only
+            `from`:
+
+            - `invalid from date`: `from` is missing, blank (whitespace only), not a `YYYY-MM-DD`
+              date, not a real calendar date, outside `1900-01-01` through `9999-12-30`, or a day
+              the request's timezone never had.
+            - `invalid to date`: the same for `to`, once `from` parsed.
+            - `invalid range`: both parse but `to` is before `from`.
+
+            A missing bound gets the same key as a malformed one; there is no separate
+            "required" key. Every caller except an HTMX request gets the JSON envelope below. An
+            HTMX request (`HX-Request: true`) gets the localized status fragment as `text/html`
+            instead.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              examples:
+                invalidFrom:
+                  summary: "`from` missing or not a date"
+                  value:
+                    error: "invalid from date"
+                    error_detail: { key: "invalid from date", category: "validation", target: "global" }
+                invalidTo:
+                  summary: "`to` missing or not a date"
+                  value:
+                    error: "invalid to date"
+                    error_detail: { key: "invalid to date", category: "validation", target: "global" }
+                invalidRange:
+                  summary: "`to` before `from`"
+                  value:
+                    error: "invalid range"
+                    error_detail: { key: "invalid range", category: "validation", target: "global" }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   /api/v1/days/{date}:
     parameters:
       - $ref: '#/components/parameters/DateParam'
     get:
       tags: [days]
-      summary: Read a single day's entry.
+      summary: Read a single day's entry (owner only).
+      description: |
+        For a date the request accepts, the status does not depend on whether
+        the day has a stored record: a day with no record is answered `200`
+        with a placeholder built at
+        read time and never stored: `id` is `0`, `user_id` is the caller,
+        `date` is the requested date, `is_period`, `cycle_start` and
+        `is_uncertain` are `false`, `flow`, `sex_activity`, `cervical_mucus`
+        and `pregnancy_test` are `none`, `mood` is `0`, `notes` is empty,
+        `cycle_factor_keys` and `symptom_ids` are `[]`, `bbt` is absent, and
+        `created_at` and `updated_at` are `0001-01-01T00:00:00Z`.
+        `id: 0` means "no stored record"; a stored record always has a
+        non-zero `id`. A stored record can still hold no data (a `PUT` that
+        sends no values creates one), so ask `HEAD` whether the day holds data.
       responses:
         '200':
-          description: The day record.
+          description: 'The stored day record, or the `id: 0` placeholder when the day has none.'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/DailyLog' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '422': { $ref: '#/components/responses/ValidationError' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
     head:
       tags: [days]
-      summary: Check whether the day has any persisted data (owner only).
+      summary: Check whether the day holds any entered data (owner only).
       description: |
-        Returns `200` if the day has at least one persisted field and `404`
-        otherwise. The response body is empty (HEAD); clients must branch on
-        the status code.
+        Answers, without a body, whether the day holds data: `200` when a
+        stored record for the day carries at least one entered value — period,
+        a flow other than `none`, mood 1–5, intimacy, BBT, cervical mucus, a
+        pregnancy test, a cycle factor, a symptom, or non-blank notes — and
+        `404` otherwise, including when a record exists but carries none of
+        them. Here `404` is an answer, not an error. Clients branch on the
+        status code.
       responses:
         '200':
-          description: Day has persisted data.
+          description: The day holds data.
         '404':
-          description: Day has no persisted data.
+          description: The day holds no data, whether or not a record is stored.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
     put:
       tags: [days]
       summary: Upsert a day's entry (owner only).
       description: |
-        Creates a new row when missing or updates the existing row. Hidden-field
-        preservation rules apply for tracking preferences (BBT, mucus, sex
-        activity, cycle factors, notes).
+        Creates a new row when missing or updates the existing row. The JSON body
+        below carries every field it sends: an omitted field is cleared, and an
+        impossible value is refused rather than stored as "not measured".
+        Hidden-field preservation is a property of the form body the browser day
+        editor posts, which this operation does not describe.
+
+        **`PUT` is full replace.** A body that names only some fields clears
+        every other one: `{"mood": 3}` sent to a period day stores a day with no
+        period, flow, temperature or notes, and a day that stops being a period
+        day also stops being a cycle start, which moves the cycle statistics. A
+        client that writes only some fields sends `PATCH` instead.
       requestBody:
         required: true
         content:
@@ -1177,8 +2554,99 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/DailyLog' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '422': { $ref: '#/components/responses/ValidationError' }
+        '403':
+          description: |
+            The caller is not the owner, or the request was refused before the handler runs
+            (CSRF) with the shared `forbidden` key.
+
+            A caller that asks for JSON gets the JSON envelope. A browser form submitted without
+            JavaScript — a `POST` carrying the hidden `_method=PUT` field, with an `Accept` that
+            names `text/html` — gets the shared localized status fragment as `text/html` instead.
+            For the browser that fragment is the whole page, so it ends with a link back to the
+            calendar day when the form's `source` query parameter is `calendar`, and to
+            `/dashboard` otherwise. The link is fixed by the route; nothing else the request
+            carries reaches it, and no cookie, flash included, is set.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "forbidden"
+                error_detail: { key: "forbidden", category: "forbidden", target: "global" }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '422':
+          description: |
+            The same validation refusal as the `400`, answered to a browser form submitted
+            without JavaScript (a `POST` carrying `_method=PUT` and an `Accept` that names
+            `text/html`): the localized message as `text/html`, with the link back described on
+            the `403`. A JSON or HTMX caller never receives this status; it gets the `400` and
+            its envelope.
+          content:
+            text/html:
+              schema: { type: string }
+        '429': { $ref: '#/components/responses/RateLimited' }
+    patch:
+      tags: [days]
+      summary: Update some fields of a day's entry (owner only).
+      description: |
+        Merges the body into the stored day: only the keys the body carries
+        change, and every field it omits keeps its stored value. `{"mood": 3}`
+        sent to a period day changes the mood and nothing else — the period,
+        flow, temperature, notes and the cycle start stay as stored. An
+        explicit `null` is a stated value and clears the field. A day with no
+        row is created, its omitted fields empty.
+
+        The rules that follow from the period flag apply to the merged day,
+        as under `PUT`: a body stating `is_period: false` also clears the flow
+        and the cycle start, and a flow stated for a day that is not a period
+        day is stored as `none`. A body that omits `is_period` leaves the
+        period flag, the flow and the cycle start as stored. Values are
+        validated and refused exactly as under `PUT`, and the answer is the
+        same: the whole day as persisted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DayPayload' }
+      responses:
+        '200':
+          description: Persisted entry, after the merge.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DailyLog' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            The caller is not the owner, or the request was refused before the handler runs
+            (CSRF) with the shared `forbidden` key.
+
+            A caller that asks for JSON gets the JSON envelope. A browser form submitted without
+            JavaScript — a `POST` carrying the hidden `_method=PATCH` field, with an `Accept`
+            that names `text/html` — gets the shared localized status fragment as `text/html`
+            instead, ending with a link back to the calendar day when the form's `source` query
+            parameter is `calendar`, and to `/dashboard` otherwise. The link is fixed by the
+            route, and no cookie, flash included, is set.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "forbidden"
+                error_detail: { key: "forbidden", category: "forbidden", target: "global" }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '422':
+          description: |
+            The same validation refusal as the `400`, answered to a browser form submitted
+            without JavaScript (a `POST` carrying `_method=PATCH` and an `Accept` that names
+            `text/html`): the localized message as `text/html`, with the link back described on
+            the `403`. A JSON or HTMX caller never receives this status; it gets the `400` and
+            its envelope.
+          content:
+            text/html:
+              schema: { type: string }
+        '429': { $ref: '#/components/responses/RateLimited' }
     delete:
       tags: [days]
       summary: Delete a single day's entry (owner only).
@@ -1201,7 +2669,36 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/OkResponse' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
+        '403':
+          description: |
+            The caller is not the owner, or the request was refused before the handler runs
+            (CSRF) with the shared `forbidden` key.
+
+            A caller that asks for JSON gets the JSON envelope. A browser form submitted without
+            JavaScript — a `POST` carrying the hidden `_method=DELETE` field, with an `Accept`
+            that names `text/html` — gets the shared localized status fragment as `text/html`
+            instead, ending with a link back to the calendar day when `source=calendar` and to
+            `/dashboard` otherwise. The link is fixed by the route, and no cookie, flash
+            included, is set.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "forbidden"
+                error_detail: { key: "forbidden", category: "forbidden", target: "global" }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '422':
+          description: |
+            The same validation refusal as the `400`, answered to a browser form submitted
+            without JavaScript (a `POST` carrying `_method=DELETE` and an `Accept` that names
+            `text/html`): the localized message as `text/html`, with the link back described on
+            the `403`. A JSON or HTMX caller never receives this status.
+          content:
+            text/html:
+              schema: { type: string }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   /api/v1/days/{date}/cycle-start:
     post:
@@ -1228,8 +2725,41 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/OkResponse' }
+        '400':
+          description: |
+            The date is invalid for a manual cycle start, or the mark closes a short gap
+            and was sent without `mark_uncertain=true`.
+
+            A caller that sends no `Accept` header, or one naming `application/json`, gets
+            the JSON envelope below. An HTMX request (`HX-Request: true`), and a browser form
+            submission whose `Accept` names `text/html`, get the localized status fragment
+            as `text/html` instead. For the browser that fragment is the whole page, so it
+            ends with a link back to the calendar day when `source=calendar`, and to
+            `/dashboard` otherwise.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: |
+            The day already carries a cycle start (or data that marking one would
+            overwrite). Resend with `replace_existing=true` to take it.
+
+            The carrier follows the same rule as the `400` above: an HTMX request or a
+            `text/html` browser form submission gets the localized fragment with its link
+            back, and every other caller gets the JSON envelope.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "cycle start replace required"
+                error_detail: { key: "cycle start replace required", category: "conflict", target: "global" }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   # =========================================================================
   # symptoms
@@ -1247,9 +2777,17 @@ paths:
                 type: array
                 items: { $ref: '#/components/schemas/Symptom' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
     post:
       tags: [symptoms]
       summary: Create a custom symptom (owner only).
+      description: |
+        A refusal raised before the handler runs (a stale CSRF token, a rate limit) answers a
+        browser form submission without JavaScript — `Accept` names `text/html` — with the
+        shared localized status fragment as `text/html`, under the refusal's own status and
+        key, ending with a link back to `/settings`, instead of the JSON envelope. Every other
+        caller keeps the JSON envelope.
       requestBody:
         required: true
         content:
@@ -1263,7 +2801,9 @@ paths:
               schema: { $ref: '#/components/schemas/Symptom' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
-        '422': { $ref: '#/components/responses/ValidationError' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   /api/v1/symptoms/{id}:
     parameters:
@@ -1271,6 +2811,13 @@ paths:
     patch:
       tags: [symptoms]
       summary: Update a symptom (owner only).
+      description: |
+        A refusal raised before the handler runs (a stale CSRF token, a rate limit) answers a
+        browser form submission without JavaScript — `Accept` names `text/html`, the form's
+        hidden `_method` field makes it arrive as PATCH — with the shared localized status
+        fragment as `text/html`, under the refusal's own status and key, ending with a link back
+        to `/settings`, instead of the JSON envelope. Every other caller, one that sends PATCH
+        itself included, keeps the JSON envelope.
       requestBody:
         required: true
         content:
@@ -1284,7 +2831,10 @@ paths:
               schema: { $ref: '#/components/schemas/Symptom' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
-        '422': { $ref: '#/components/responses/ValidationError' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
     delete:
       tags: [symptoms]
       summary: Archive (soft-delete) a symptom (owner only).
@@ -1293,19 +2843,35 @@ paths:
         entries that reference the symptom keep the ID so historical entries
         remain readable; new entries cannot select an archived symptom until
         it is restored via `POST /api/v1/symptoms/{id}/restore`.
+
+        A refusal raised before the handler runs (a stale CSRF token, a rate limit) answers a
+        browser form submission without JavaScript — `Accept` names `text/html`, the form's
+        hidden `_method` field makes it arrive as DELETE — with the shared localized status
+        fragment as `text/html`, under the refusal's own status and key, ending with a link back
+        to `/settings`, instead of the JSON envelope. Every other caller, one that sends DELETE
+        itself included, keeps the JSON envelope.
       responses:
         '200':
           description: Archived.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/OkResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   /api/v1/symptoms/{id}/restore:
     post:
       tags: [symptoms]
       summary: Restore a previously archived symptom (owner only).
+      description: |
+        A refusal raised before the handler runs (a stale CSRF token, a rate limit) answers a
+        browser form submission without JavaScript — `Accept` names `text/html` — with the
+        shared localized status fragment as `text/html`, under the refusal's own status and
+        key, ending with a link back to `/settings`, instead of the JSON envelope. Every other
+        caller keeps the JSON envelope.
       parameters:
         - $ref: '#/components/parameters/SymptomId'
       responses:
@@ -1314,8 +2880,12 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/OkResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   # =========================================================================
   # stats
@@ -1331,6 +2901,8 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/StatsOverview' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   # =========================================================================
   # exports
@@ -1350,6 +2922,8 @@ paths:
               schema: { $ref: '#/components/schemas/ExportSummary' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   /api/v1/exports/csv:
     get:
@@ -1370,6 +2944,8 @@ paths:
               schema: { type: string }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   /api/v1/exports/json:
     get:
@@ -1390,6 +2966,8 @@ paths:
               schema: { $ref: '#/components/schemas/ExportJSON' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   /api/v1/imports/json:
     post:
@@ -1401,7 +2979,8 @@ paths:
         overwritten or deleted, so no re-authentication is required (unlike
         clear-data). Every field is re-validated server-side and scoped to the
         session owner; malformed or duplicate day records are dropped and
-        reported in the counts rather than aborting the restore. State-mutating,
+        reported in the counts rather than aborting the restore; a day dated outside
+        `1900-01-01` through `9999-12-30` is one of them. State-mutating,
         so CSRF-protected. See [docs/export.md](export.md).
       requestBody:
         required: true
@@ -1418,7 +2997,23 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '413':
-          description: Payload exceeds the size or entry-count limit.
+          description: |
+            Payload exceeds the size or entry-count limit. Two independent caps
+            produce two different keys **and two different categories**, because
+            they measure different things at different moments:
+            `import file too large` / `validation` from the entry cap (20 000),
+            counted on a payload that already parsed; and `request_too_large` /
+            `too_large` from the 16 MiB body limit, which the server enforces
+            before the handler runs — on the wire body and, when the request is
+            compressed, on its decompressed size — without looking at the
+            content at all. Branch on `error_detail`, not on the status.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "import file too large"
+                error_detail: { key: "import file too large", category: "validation", target: "global" }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   # =========================================================================
   # users/current — whoami, settings, and account management
@@ -1440,6 +3035,8 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/CurrentUser' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
     delete:
       tags: [settings]
       summary: Delete the current account and all related data (owner only).
@@ -1459,7 +3056,26 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/OkResponse' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '422': { $ref: '#/components/responses/ValidationError' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '403':
+          description: |
+            The caller is not the owner, or the request was refused before the handler runs
+            (CSRF) with the shared `forbidden` key.
+
+            A caller that asks for JSON gets the JSON envelope. A browser form submitted without
+            JavaScript — a `POST` carrying the hidden `_method=DELETE` field, with an `Accept`
+            that names `text/html` — gets the shared localized status fragment as `text/html`
+            instead, ending with a link back to `/settings`. The link is fixed by the route, and
+            no cookie, flash included, is set.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "forbidden"
+                error_detail: { key: "forbidden", category: "forbidden", target: "global" }
 
   /api/v1/users/current/profile:
     patch:
@@ -1475,15 +3091,43 @@ paths:
           description: Saved.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/OkResponse' }
+              schema: { $ref: '#/components/schemas/ProfileUpdated' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '422': { $ref: '#/components/responses/ValidationError' }
+        '403':
+          description: |
+            The caller is not the owner, or the request was refused before the handler runs
+            (CSRF) with the shared `forbidden` key.
+
+            A caller that asks for JSON gets the JSON envelope. A browser form submitted without
+            JavaScript — a `POST` carrying the hidden `_method=PATCH` field, with an `Accept`
+            that names `text/html` — gets the shared localized status fragment as `text/html`
+            instead, ending with a link back to `/settings`, the page that hosts the form. The
+            link is fixed by the route, and no cookie, flash included, is set.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "forbidden"
+                error_detail: { key: "forbidden", category: "forbidden", target: "global" }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   /api/v1/users/current/interface:
     patch:
       tags: [settings]
       summary: Update interface preferences (owner only).
+      description: |
+        A refusal raised before the handler runs (a stale CSRF token) answers a
+        browser form submission without JavaScript — `Accept` names `text/html`, the form's
+        hidden `_method` field makes it arrive as PATCH — with the shared localized status
+        fragment as `text/html`, under the refusal's own status and key, ending with a link back
+        to `/settings`, instead of the JSON envelope. Every other caller, one that sends PATCH
+        itself included, keeps the JSON envelope.
+        A rate limit is not answered so: a caller that does not ask for JSON is redirected `303`
+        to `/settings` with the refusal in a flash message, as before, an htmx request gets the
+        status fragment under `200`, and a JSON caller keeps the `429` envelope.
       requestBody:
         required: true
         content:
@@ -1494,14 +3138,26 @@ paths:
           description: Saved.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/OkResponse' }
+              schema: { $ref: '#/components/schemas/InterfaceSettingsUpdated' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   /api/v1/users/current/tracking:
     patch:
       tags: [settings]
       summary: Update tracking preferences (owner only).
+      description: |
+        A refusal raised before the handler runs (a stale CSRF token) answers a
+        browser form submission without JavaScript — `Accept` names `text/html`, the form's
+        hidden `_method` field makes it arrive as PATCH — with the shared localized status
+        fragment as `text/html`, under the refusal's own status and key, ending with a link back
+        to `/settings`, instead of the JSON envelope. Every other caller, one that sends PATCH
+        itself included, keeps the JSON envelope.
+        A rate limit is not answered so: a caller that does not ask for JSON is redirected `303`
+        to `/settings` with the refusal in a flash message, as before, an htmx request gets the
+        status fragment under `200`, and a JSON caller keeps the `429` envelope.
       requestBody:
         required: true
         content:
@@ -1512,9 +3168,11 @@ paths:
           description: Saved.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/OkResponse' }
+              schema: { $ref: '#/components/schemas/TrackingSettingsUpdated' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   /api/v1/users/current/timezone:
     post:
@@ -1537,7 +3195,7 @@ paths:
           description: Saved.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/OkResponse' }
+              schema: { $ref: '#/components/schemas/TimezoneUpdated' }
         '204':
           description: Saved (HTMX request).
         '400':
@@ -1547,6 +3205,7 @@ paths:
               schema: { $ref: '#/components/schemas/ApiError' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   /api/v1/users/current/webhook:
     post:
@@ -1572,15 +3231,104 @@ paths:
           description: Saved.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/OkResponse' }
+              schema: { $ref: '#/components/schemas/WebhookSettingsUpdated' }
         '400':
-          description: Invalid webhook URL (empty when enabling, or non-http(s) scheme).
+          description: |
+            Invalid webhook URL (empty when enabling, or non-http(s) scheme), or
+            `webhook url unreadable` when the field was left blank - meaning "keep
+            the stored endpoint" - and the stored ciphertext no longer opens under
+            this instance's key. The second case is refused rather than resolved
+            to an empty endpoint, because that silently deleted the endpoint the
+            request asked to keep; withdraw it with `DELETE` instead.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
-              example: { error: "invalid webhook url" }
+              example:
+                error: "invalid webhook url"
+                error_detail: { key: "invalid webhook url", category: "validation", target: "settings_form" }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
+        '403':
+          description: |
+            The caller is not the owner, or the request was refused before the handler runs
+            (CSRF) with the shared `forbidden` key.
+
+            A caller that asks for JSON gets the JSON envelope. A browser form submitted without
+            JavaScript, with an `Accept` that names `text/html`, gets the shared localized status
+            fragment as `text/html` instead, ending with a link back to `/settings`. The link is
+            fixed by the route, and no cookie, flash included, is set.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "forbidden"
+                error_detail: { key: "forbidden", category: "forbidden", target: "global" }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500':
+          description: |
+            `failed to update webhook settings` - persistence failed and nothing
+            was saved. `failed to load settings` - the save COMMITTED and only the
+            read-back that builds the answer failed, so re-read the settings
+            rather than retry as if nothing had been stored. Neither carries the
+            endpoint.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "failed to load settings"
+                error_detail: { key: "failed to load settings", category: "internal", target: "global" }
+    delete:
+      tags: [settings]
+      summary: Withdraw the stored webhook endpoint (owner only).
+      description: |
+        Withdraws the owner's delivery endpoint and switches delivery off, in one
+        request. It writes only the endpoint columns: the two per-kind notify
+        toggles and the shared `reminder_lead_days` window are left exactly where
+        the owner set them, because withdrawing an address is not a request to
+        forget which reminders they wanted or how early. It advances the
+        revocation epoch in the same statement, so a delivery pass already
+        holding the previous configuration loses its claim rather than posting to
+        a withdrawn endpoint, and it clears the accepted-delivery mark, which
+        describes an endpoint that no longer exists.
+
+        It never decrypts the stored ciphertext, which is what makes an endpoint
+        this instance can no longer read (after a `SECRET_KEY` rotation) still
+        withdrawable. Idempotent. Does NOT bump `auth_session_version`.
+      responses:
+        '200':
+          description: Endpoint withdrawn.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookRemoved' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            The caller is not the owner, or the request was refused before the handler runs
+            (CSRF) with the shared `forbidden` key.
+
+            A caller that asks for JSON gets the JSON envelope. A browser form submitted without
+            JavaScript — a `POST` carrying the hidden `_method=DELETE` field, with an `Accept`
+            that names `text/html` — gets the shared localized status fragment as `text/html`
+            instead, ending with a link back to `/settings`. The link is fixed by the route, and
+            no cookie, flash included, is set.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "forbidden"
+                error_detail: { key: "forbidden", category: "forbidden", target: "global" }
+        '500':
+          description: Persistence failed. Carries no endpoint.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "failed to update webhook settings"
+                error_detail: { key: "failed to update webhook settings", category: "internal", target: "global" }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   /api/v1/users/current/calendar-feed:
     post:
@@ -1609,13 +3357,32 @@ paths:
         '303':
           description: "Browser redirect to the one-time reveal page (`/settings/calendar-feed`) when `Accept: application/json` is not set."
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
+        '403':
+          description: |
+            The caller is not the owner, or the request was refused before the handler runs
+            (CSRF) with the shared `forbidden` key.
+
+            A caller that asks for JSON gets the JSON envelope. A browser form submitted without
+            JavaScript, with an `Accept` that names `text/html`, gets the shared localized status
+            fragment as `text/html` instead, ending with a link back to `/settings`. The link is
+            fixed by the route, and no cookie, flash included, is set.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "forbidden"
+                error_detail: { key: "forbidden", category: "forbidden", target: "global" }
         '500':
           description: Token generation or persistence failed. Carries no token.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
-              example: { error: "failed to update calendar feed" }
+              example:
+                error: "failed to update calendar feed"
+                error_detail: { key: "failed to update calendar feed", category: "internal", target: "global" }
+        '429': { $ref: '#/components/responses/RateLimited' }
     delete:
       tags: [settings]
       summary: Revoke (disable) the calendar (.ics) feed (owner only).
@@ -1629,15 +3396,35 @@ paths:
           description: Feed disabled.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/OkResponse' }
+              schema: { $ref: '#/components/schemas/CalendarFeedRevoked' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
+        '403':
+          description: |
+            The caller is not the owner, or the request was refused before the handler runs
+            (CSRF) with the shared `forbidden` key.
+
+            A caller that asks for JSON gets the JSON envelope. A browser form submitted without
+            JavaScript — a `POST` carrying the hidden `_method=DELETE` field, with an `Accept`
+            that names `text/html` — gets the shared localized status fragment as `text/html`
+            instead, ending with a link back to `/settings`. The link is fixed by the route, and
+            no cookie, flash included, is set.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "forbidden"
+                error_detail: { key: "forbidden", category: "forbidden", target: "global" }
         '500':
           description: Persistence failed. Carries no token.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
-              example: { error: "failed to update calendar feed" }
+              example:
+                error: "failed to update calendar feed"
+                error_detail: { key: "failed to update calendar feed", category: "internal", target: "global" }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   /api/v1/users/current/calendar-feed/rotate:
     post:
@@ -1661,18 +3448,43 @@ paths:
         '303':
           description: "Browser redirect to the one-time reveal page (`/settings/calendar-feed`) when `Accept: application/json` is not set."
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
+        '403':
+          description: |
+            The caller is not the owner, or the request was refused before the handler runs
+            (CSRF) with the shared `forbidden` key.
+
+            A caller that asks for JSON gets the JSON envelope. A browser form submitted without
+            JavaScript, with an `Accept` that names `text/html`, gets the shared localized status
+            fragment as `text/html` instead, ending with a link back to `/settings`. The link is
+            fixed by the route, and no cookie, flash included, is set.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "forbidden"
+                error_detail: { key: "forbidden", category: "forbidden", target: "global" }
         '500':
           description: Token generation or persistence failed. Carries no token.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
-              example: { error: "failed to update calendar feed" }
+              example:
+                error: "failed to update calendar feed"
+                error_detail: { key: "failed to update calendar feed", category: "internal", target: "global" }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   /api/v1/users/current/cycle:
     patch:
       tags: [settings]
       summary: Update cycle settings (owner only).
+      description: >-
+        Partial: the request body carries the members to change, and every
+        member it omits keeps its stored value. `CycleSettings` states what a
+        present member and an absent one each mean. The success body is
+        `OkResponse` and carries nothing else — including on the goal-only
+        quick switch, which echoed the stored goal back until v2.0.0.
       requestBody:
         required: true
         content:
@@ -1685,8 +3497,28 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/OkResponse' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '422': { $ref: '#/components/responses/ValidationError' }
+        '403':
+          description: |
+            The caller is not the owner, or the request was refused before the handler runs
+            (CSRF) with the shared `forbidden` key.
+
+            A caller that asks for JSON gets the JSON envelope. A browser form submitted without
+            JavaScript — a `POST` carrying the hidden `_method=PATCH` field, with an `Accept`
+            that names `text/html` — gets the shared localized status fragment as `text/html`
+            instead, ending with a link back to `/dashboard` when the form's `source` query
+            parameter is `dashboard` (the dashboard's usage-goal switch) and to `/settings`
+            otherwise (the settings form posts here without one). The link is fixed by the route, and no cookie,
+            flash included, is set.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "forbidden"
+                error_detail: { key: "forbidden", category: "forbidden", target: "global" }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   /api/v1/users/current/reminders:
     patch:
@@ -1696,6 +3528,16 @@ paths:
         Sets the shared reminder lead window (users.reminder_lead_days) governing
         how many days ahead the dashboard period/ovulation reminder appears. The
         value is clamped to 0–14; it does not bump auth_session_version.
+
+        A refusal raised before the handler runs (a stale CSRF token) answers a
+        browser form submission without JavaScript — `Accept` names `text/html`, the form's
+        hidden `_method` field makes it arrive as PATCH — with the shared localized status
+        fragment as `text/html`, under the refusal's own status and key, ending with a link back
+        to `/settings`, instead of the JSON envelope. Every other caller, one that sends PATCH
+        itself included, keeps the JSON envelope.
+        A rate limit is not answered so: a caller that does not ask for JSON is redirected `303`
+        to `/settings` with the refusal in a flash message, as before, an htmx request gets the
+        status fragment under `200`, and a JSON caller keeps the `429` envelope.
       requestBody:
         required: true
         content:
@@ -1706,9 +3548,11 @@ paths:
           description: Saved.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/OkResponse' }
+              schema: { $ref: '#/components/schemas/RemindersUpdated' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   /api/v1/users/current/password:
     put:
@@ -1717,8 +3561,16 @@ paths:
       description: |
         For accounts with `local_auth_enabled=false` (OIDC-only), this endpoint
         returns `403 oidc reauth required` — those accounts must use the
-        step-up flow at `POST /api/v1/users/current/password/step-up`. Bumps
-        `auth_session_version` on success.
+        step-up flow at `POST /api/v1/users/current/password/step-up`. This is
+        the one accepted, documented exception to the invariant below: it
+        answers before the current-password compare even runs, so it is not
+        that oracle — see [SECURITY_INVARIANTS.md → Authentication and
+        sessions](SECURITY_INVARIANTS.md#authentication-and-sessions).
+        A wrong `current_password` on an account that HAS a local password
+        answers `401 invalid current password`, and that is byte-identical to
+        the account-state refusal a local-password-not-set condition would
+        otherwise produce past this gate (WEB-54) — the two are never
+        distinguishable to the caller. Bumps `auth_session_version` on success.
       requestBody:
         required: true
         content:
@@ -1732,12 +3584,26 @@ paths:
               schema: { $ref: '#/components/schemas/OkResponse' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
-          description: OIDC re-auth required for OIDC-only accounts.
+          description: |
+            OIDC re-auth required for OIDC-only accounts, or the request was refused before the
+            handler runs (CSRF) with the shared `forbidden` key.
+
+            A browser form submitted without JavaScript — a `POST` carrying the hidden
+            `_method=PUT` field, with an `Accept` that names `text/html` — and refused before the
+            handler gets the shared localized status fragment as `text/html` instead of the JSON
+            envelope, ending with a link back to `/settings`, the page that hosts the form. The
+            link is fixed by the route, and no cookie, flash included, is set. The handler's own
+            `oidc reauth required` refusal is not this page: it still flashes onto `/settings`.
           content:
+            text/html:
+              schema: { type: string }
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
-              example: { error: "oidc reauth required" }
-        '422': { $ref: '#/components/responses/ValidationError' }
+              example:
+                error: "oidc reauth required"
+                error_detail: { key: "oidc reauth required", category: "forbidden", target: "settings_form" }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   /api/v1/users/current/password/step-up:
     post:
@@ -1745,10 +3611,18 @@ paths:
       summary: Begin the OIDC step-up flow to enable a local password (owner only, OIDC-only).
       description: |
         Validates the new password pair, stashes its bcrypt hash in a sealed
-        cookie, and returns the provider's authorize URL. The browser follows
-        the redirect; the provider re-authenticates the user; the callback at
+        cookie, and returns the provider's authorize URL. The caller sends the
+        browser there; the provider re-authenticates the user; the callback at
         `/auth/oidc/callback` finalizes the local password and mints a
         recovery code. See [docs/oidc.md "How Auto-Provision Works"](oidc.md#how-auto-provision-works).
+
+        A request that does not accept JSON (an ordinary form submit) is
+        answered, on success, with a same-origin interstitial page instead of
+        the JSON body, because the settings page CSP pins `form-action` to
+        `'self'` across the whole redirect chain; the responses below describe
+        the JSON surface, and a refusal the handler raises on the browser one
+        flashes onto `/settings` rather than carrying the status. A refusal
+        before the handler is the `403` `text/html` page below.
       requestBody:
         required: true
         content:
@@ -1760,21 +3634,173 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/StartLocalPasswordSetupResponse' }
-        '303':
-          description: "Browser redirect to the provider authorize URL when `Accept: application/json` is not set."
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '422': { $ref: '#/components/responses/ValidationError' }
+        '403':
+          description: |
+            The caller is not the owner, or the request was refused before the handler runs
+            (CSRF) with the shared `forbidden` key.
 
-  /api/v1/users/current/recovery-code:
+            A caller that asks for JSON gets the JSON envelope. A browser form submitted without
+            JavaScript — a `POST` with an `Accept` that names `text/html` — and refused before
+            the handler gets the shared localized status fragment as `text/html` instead, ending
+            with a link back to `/settings`, the page that hosts the form. The link is fixed by
+            the route, and no cookie, flash included, is set.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "forbidden"
+                error_detail: { key: "forbidden", category: "forbidden", target: "global" }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /api/v1/users/current/data-wipe/step-up:
     post:
       tags: [settings]
-      summary: Issue a fresh recovery code (owner only).
+      summary: Begin the OIDC step-up that authorizes a data wipe (owner only, accounts without a local password).
       description: |
-        Requires the current password (or OIDC-only accounts must first enrol a
-        local password via the step-up flow). Bumps `auth_session_version`;
-        other devices are signed out, the originating device is refreshed
-        inline.
+        Erasing health data always costs a fresh re-authentication. An account
+        provisioned through OIDC has no local password to confirm with, so this
+        endpoint starts the same step-up flow used for local-password
+        enrollment and returns the provider's authorize URL. The confirmed
+        operation is sealed into the step-up cookie, and the callback at
+        `/auth/oidc/callback` performs the wipe once the provider has
+        re-authenticated the owner.
+
+        An account that **has** a local password is refused here: its erasure
+        gate stays the password, so the SSO path can never be used to bypass it.
+
+        A request that does not accept JSON (an ordinary form submit) is
+        answered, on success, with a same-origin interstitial page instead of
+        the JSON body, because the settings page CSP pins `form-action` to
+        `'self'` across the whole redirect chain; the responses below describe
+        the JSON surface, and a refusal the handler raises on the browser one
+        flashes onto `/settings` rather than carrying the status. A refusal
+        before the handler is the `403` below.
+      responses:
+        '200':
+          description: OIDC redirect URL emitted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StartLocalPasswordSetupResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            The caller is not the owner, or the request was refused before the handler runs
+            (CSRF) with the shared `forbidden` key.
+
+            A caller that asks for JSON gets the JSON envelope. A browser form submitted without
+            JavaScript, with an `Accept` that names `text/html`, gets the shared localized status
+            fragment as `text/html` instead, ending with a link back to `/settings`. The link is
+            fixed by the route, and no cookie, flash included, is set.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "forbidden"
+                error_detail: { key: "forbidden", category: "forbidden", target: "global" }
+        '400':
+          description: The account has a local password, so this flow does not apply; the erasure is confirmed with that password instead.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "invalid settings input"
+                error_detail: { key: "invalid settings input", category: "validation", target: "settings_form" }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /api/v1/users/current/deletion/step-up:
+    post:
+      tags: [settings]
+      summary: Begin the OIDC step-up that authorizes an account deletion (owner only, accounts without a local password).
+      description: |
+        The account-deletion counterpart of
+        `POST /api/v1/users/current/data-wipe/step-up`; the same rules apply,
+        including the refusal for accounts that hold a local password. The
+        callback deletes the account and retracts the session.
+
+        A request that does not accept JSON (an ordinary form submit) is
+        answered, on success, with a same-origin interstitial page instead of
+        the JSON body, because the settings page CSP pins `form-action` to
+        `'self'` across the whole redirect chain; the responses below describe
+        the JSON surface, and a refusal the handler raises on the browser one
+        flashes onto `/settings` rather than carrying the status. A refusal
+        before the handler is the `403` below.
+      responses:
+        '200':
+          description: OIDC redirect URL emitted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StartLocalPasswordSetupResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            The caller is not the owner, or the request was refused before the handler runs
+            (CSRF) with the shared `forbidden` key.
+
+            A caller that asks for JSON gets the JSON envelope. A browser form submitted without
+            JavaScript, with an `Accept` that names `text/html`, gets the shared localized status
+            fragment as `text/html` instead, ending with a link back to `/settings`. The link is
+            fixed by the route, and no cookie, flash included, is set.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "forbidden"
+                error_detail: { key: "forbidden", category: "forbidden", target: "global" }
+        '400':
+          description: The account has a local password, so this flow does not apply; the erasure is confirmed with that password instead.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "invalid settings input"
+                error_detail: { key: "invalid settings input", category: "validation", target: "settings_form" }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /api/v1/users/current/oidc/link/step-up:
+    post:
+      tags: [settings]
+      summary: Begin the OIDC step-up that authorizes linking a new OIDC identity to this account (owner only).
+      description: |
+        Linking an identity is a permanent `(issuer, subject)` → account
+        binding, so it is authorized the same way the other step-ups in this
+        section are: a fresh interactive re-authentication at the provider
+        (`prompt=login`, `max_age=0`). This endpoint only mints the sealed
+        step-up cookie and returns the provider's authorize URL — nothing is
+        written until the callback at `/auth/oidc/callback` proves the fresh
+        authentication, links the identity and redirects to `/settings`.
+
+        A request that does not accept JSON (an ordinary form submit) is
+        answered with a same-origin interstitial page instead of the JSON body,
+        because the settings page CSP pins `form-action` to `'self'` across the
+        whole redirect chain.
+
+        The provider re-authentication proves control of the identity being
+        linked, not of this account, so the request must also carry the
+        account's current local password (budgeted like every settings
+        re-auth). An account with no local password answers with the SAME
+        `401 invalid password` a wrong password gets — the two are
+        indistinguishable to the caller by design, so this re-auth's own
+        response is no oracle for whether the account has a local password
+        set (WEB-54; `GET /api/v1/users/current`'s `local_auth_enabled` and
+        the settings page already answer that question directly to a signed-in
+        session, so this endpoint is not what stands between a caller and it);
+        set one first through the local-password step-up. On success the link
+        bumps `auth_session_version`: every other session is signed out and
+        the originating device is re-issued a session. The identity's `email`
+        and `email_verified` claims are not consulted — the binding is keyed on
+        `(issuer, subject)` alone and authorized by the password plus the fresh
+        provider sign-in.
       requestBody:
         required: true
         content:
@@ -1782,10 +3808,163 @@ paths:
             schema: { $ref: '#/components/schemas/PasswordOnlyRequest' }
       responses:
         '200':
-          description: Recovery code surface rendered. JSON clients should follow the redirect to `/recovery-code` to pick up the plaintext code (shown exactly once).
+          description: OIDC redirect URL emitted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StartLocalPasswordSetupResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '422': { $ref: '#/components/responses/ValidationError' }
+        '403':
+          description: |
+            The caller is not the owner, or the request was refused before the handler runs
+            (CSRF) with the shared `forbidden` key.
+
+            A caller that asks for JSON gets the JSON envelope. A browser form submitted without
+            JavaScript — a `POST` with an `Accept` that names `text/html` — gets the shared
+            localized status fragment as `text/html` instead, ending with a link back to
+            `/settings`, the page that hosts the form. The link is fixed by the route, and no
+            cookie, flash included, is set. A refusal the handler raises for a settings form (a
+            wrong password, say) still flashes onto `/settings`; any other refusal it raises
+            answers this same page with its own status and key.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "forbidden"
+                error_detail: { key: "forbidden", category: "forbidden", target: "global" }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503':
+          description: SSO is disabled or the provider is unreachable, so the linking re-authentication cannot be started. Retryable once the provider is back.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "sso temporarily unavailable"
+                error_detail: { key: "sso temporarily unavailable", category: "internal", target: "auth_form" }
+
+  /api/v1/users/current/oidc/identities/{id}:
+    delete:
+      tags: [settings]
+      summary: Unlink one OIDC identity from this account (owner only).
+      description: |
+        Requires the account's current local password (budgeted like every
+        settings re-auth). The id is always combined with the session's
+        account: another owner's id, a missing id and a malformed one all
+        answer `404`. Removing the account's last way in is refused with
+        `403 local password required` — the only identity goes only while
+        local password sign-in is set up and allowed on this instance
+        (`OIDC_LOGIN_MODE=hybrid`). The delete bumps `auth_session_version` in
+        the same write, so every other session — including one the removed
+        identity minted — is signed out; the originating device is re-issued a
+        session. An htmx request is answered with `HX-Redirect: /settings`.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer, minimum: 1 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PasswordOnlyRequest' }
+      responses:
+        '200':
+          description: Identity unlinked.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OkResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            The caller is not the owner, the account's last way in would go
+            (`local password required`), or the request was refused before the handler runs
+            (CSRF) with the shared `forbidden` key.
+
+            A caller that asks for JSON gets the JSON envelope. A browser form submitted without
+            JavaScript — a `POST` carrying the hidden `_method=DELETE` field, with an `Accept`
+            that names `text/html` — and refused before the handler gets the shared localized
+            status fragment as `text/html` instead, ending with a link back to `/settings`, the
+            page that hosts the form. The link is fixed by the route: the identity id is never
+            echoed into it, and no cookie, flash included, is set. A refusal the handler raises
+            for a settings form (a wrong password, say) still flashes onto `/settings`; any other
+            refusal it raises answers this same page with its own status and key.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "forbidden"
+                error_detail: { key: "forbidden", category: "forbidden", target: "global" }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503':
+          description: SSO is disabled or the identity store is unavailable.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+
+  /api/v1/users/current/recovery-code:
+    post:
+      tags: [settings]
+      summary: Issue a fresh recovery code (owner only).
+      description: |
+        Requires the current password. An account with no local password
+        answers with the SAME `401 invalid password` a wrong password gets
+        (WEB-54) rather than naming its own state — it must first enrol a
+        local password via the step-up flow before this can succeed. Bumps
+        `auth_session_version`;
+        other devices are signed out, the originating device is refreshed
+        inline. An htmx request is answered with `HX-Redirect: /recovery-code`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PasswordOnlyRequest' }
+      responses:
+        '200':
+          description: |
+            The body above is sent when `Accept: application/json` is set. The
+            plaintext code is never in it — the code waits behind `next_path`,
+            sealed in a one-time reveal cookie, exactly like the redeem step of
+            password reset. An htmx request lands on this status too, but
+            answers `HX-Redirect: /recovery-code` with a plain-text `OK` body
+            — NOT the JSON above.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NextStepResponse' }
+              example:
+                ok: true
+                next_step: "recovery_code"
+                next_path: "/recovery-code"
+        '303':
+          description: "Redirect to `/recovery-code` for a plain browser request — neither `Accept: application/json` nor htmx."
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            The caller is not the owner, or the request was refused before the handler runs
+            (CSRF) with the shared `forbidden` key.
+
+            A caller that asks for JSON gets the JSON envelope. A browser form submitted without
+            JavaScript — a `POST` with an `Accept` that names `text/html` — gets the shared
+            localized status fragment as `text/html` instead, ending with a link back to
+            `/settings`, the page that hosts the form. The link is fixed by the route, and no
+            cookie, flash included, is set. A refusal the handler raises for a settings form (a
+            wrong password, say) still flashes onto `/settings`; any other refusal it raises
+            answers this same page with its own status and key.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "forbidden"
+                error_detail: { key: "forbidden", category: "forbidden", target: "global" }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   /api/v1/users/current/2fa:
     put:
@@ -1795,17 +3974,98 @@ paths:
         Requires the user's current password plus the 6-digit code generated
         against the secret stashed by the `GET /settings/2fa` setup page in
         the `ovumcy_totp_setup` cookie. Bumps `auth_session_version`.
+
+        Two per-account rate limits apply, each 5 attempts / 15 min: the
+        password draws the settings re-authentication budget, and the code
+        draws its own enrollment-code budget, which counts every code that
+        does not verify (a missing or wrong-length code is not counted). Once
+        either is spent the request is refused `429` before that credential is
+        checked, even when it is correct; only an enrollment that commits
+        clears them.
       requestBody:
         required: true
         content:
           application/x-www-form-urlencoded:
             schema: { $ref: '#/components/schemas/TOTPEnrollmentRequest' }
+          application/json:
+            schema: { $ref: '#/components/schemas/TOTPEnrollmentRequest' }
       responses:
         '200':
           description: 2FA enabled.
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '422': { $ref: '#/components/responses/ValidationError' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OkResponse' }
+        '303':
+          description: "Browser redirect to `/settings`, which reads the success flash, when `Accept: application/json` is not set."
+        '401':
+          description: |
+            No session (`unauthorized`); a wrong current password (`invalid
+            password`); a setup cookie that is missing, expired, or was minted
+            for another account (`totp session expired`); a code that is
+            missing, not six digits, or does not verify against the pending
+            secret (`totp invalid code`); or, once the enrollment has committed,
+            a session that cannot be carried past it (`two factor enabled sign
+            in again`). A wrong code is a `401`, never a `400`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "totp invalid code"
+                error_detail: { key: "totp invalid code", category: "unauthorized", target: "auth_form" }
+        '403':
+          description: |
+            The caller is not the owner, or the request was refused before the handler runs
+            (CSRF) with the shared `forbidden` key.
+
+            A caller that asks for JSON gets the JSON envelope. A browser form submitted without
+            JavaScript — a `POST` carrying the hidden `_method=PUT` field, with an `Accept` that
+            names `text/html` — gets the shared localized status fragment as `text/html` instead,
+            ending with a link back to `/settings/2fa`, the page that hosts the form. The link is
+            fixed by the route, and no cookie, flash included, is set. A refusal the handler
+            raises for a settings form (a wrong password, say) still flashes onto `/settings`;
+            any other refusal it raises, a wrong code among them, answers this same page with its
+            own status and key.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "forbidden"
+                error_detail: { key: "forbidden", category: "forbidden", target: "global" }
+        '400':
+          description: The current password is missing, or the body carrying it fails to bind.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "invalid password"
+                error_detail: { key: "invalid password", category: "validation", target: "settings_form" }
+        '429':
+          description: |
+            Rate limit exceeded, from one of three sources. (1) The enrollment-code budget
+            (per account, 5 attempts / 15 min, key `totp too many attempts`): checked before
+            the code, so it refuses the correct code too. (2) The settings re-authentication
+            budget the password draws (per account, 5 attempts / 15 min, key `too many
+            requests`, target `settings_form`): checked before the password. (3) The app-wide
+            per-IP `/api` limiter (key `too many requests`, target `global`). Only the edge
+            limiter (3) tracks a refill timer, so only its answer carries a `Retry-After`
+            header and `retry_after_seconds`; the two per-account budgets are checked in the
+            handler and answer the same envelope with neither. A browser form submitted
+            without `Accept: application/json` gets a per-account refusal as a `303` to
+            `/settings` with the error flashed, like the other settings-form refusals.
+          headers:
+            Retry-After:
+              description: |
+                Whole seconds until the per-IP budget refills; sent only on the edge
+                limiter's `429`, never on a per-account budget refusal.
+              schema: { type: integer, minimum: 1 }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "totp too many attempts"
+                error_detail: { key: "totp too many attempts", category: "rate_limited", target: "settings_form" }
     delete:
       tags: [settings]
       summary: Disable TOTP 2FA (owner only).
@@ -1817,12 +4077,40 @@ paths:
         content:
           application/x-www-form-urlencoded:
             schema: { $ref: '#/components/schemas/PasswordOnlyRequest' }
+          application/json:
+            schema: { $ref: '#/components/schemas/PasswordOnlyRequest' }
       responses:
         '200':
           description: 2FA disabled.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OkResponse' }
+        '303':
+          description: "Browser redirect when `Accept: application/json` is not set: to `/settings` with the success flash, or with the refusal flash for a blank password or a spent attempt budget; to `/login` when the session was revoked during the disable."
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '422': { $ref: '#/components/responses/ValidationError' }
+        '403':
+          description: |
+            The caller is not the owner, or the request was refused before the handler runs
+            (CSRF) with the shared `forbidden` key.
+
+            A caller that asks for JSON gets the JSON envelope. A browser form submitted without
+            JavaScript — a `POST` carrying the hidden `_method=DELETE` field, with an `Accept`
+            that names `text/html` — gets the shared localized status fragment as `text/html`
+            instead, ending with a link back to `/settings/2fa`, the page that hosts the form.
+            The link is fixed by the route, and no cookie, flash included, is set. A blank
+            password, and a spent attempt budget, still flash onto `/settings`. A wrong password
+            answers this same page under `401` with the `invalid credentials` key. A session
+            revoked during the disable is redirected `303` to `/login`, and any other refusal the
+            handler raises answers this page with its own status and key.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "forbidden"
+                error_detail: { key: "forbidden", category: "forbidden", target: "global" }
+        '400': { $ref: '#/components/responses/ValidationError' }
         '429': { $ref: '#/components/responses/RateLimited' }
 
   /api/v1/users/current/data-wipe/validate:
@@ -1843,7 +4131,9 @@ paths:
         '204':
           description: Same as 200 for non-JSON clients.
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '422': { $ref: '#/components/responses/ValidationError' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '403': { $ref: '#/components/responses/Forbidden' }
 
   /api/v1/users/current/data-wipe:
     post:
@@ -1867,5 +4157,22 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/OkResponse' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '422': { $ref: '#/components/responses/ValidationError' }
+        '403':
+          description: |
+            The caller is not the owner, or the request was refused before the handler runs
+            (CSRF) with the shared `forbidden` key.
+
+            A caller that asks for JSON gets the JSON envelope. A browser form submitted without
+            JavaScript, with an `Accept` that names `text/html`, gets the shared localized status
+            fragment as `text/html` instead, ending with a link back to `/settings`. The link is
+            fixed by the route, and no cookie, flash included, is set.
+          content:
+            text/html:
+              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+              example:
+                error: "forbidden"
+                error_detail: { key: "forbidden", category: "forbidden", target: "global" }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }

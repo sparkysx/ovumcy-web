@@ -5,17 +5,28 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/ovumcy/ovumcy-web/internal/models"
+	"golang.org/x/net/html"
 )
 
+// TestCalendarRendersOvulationTagWithoutFertileOverride pins the ovulation
+// marker's rendering: a dot on the ovulation day, never the textual badge, in the
+// running cycle and in the next projected one.
+//
+// The cycle is seeded relative to the CURRENT day (cycle day 5). A fixture pinned
+// to fixed calendar dates would paint nothing at all once the clock moved a week
+// past the account's reference length — the calendar withholds every projected
+// marker for an overdue cycle (services.DashboardCycleOverdue) — so the marker
+// contract has to be measured on an account whose cycle is actually running.
 func TestCalendarRendersOvulationTagWithoutFertileOverride(t *testing.T) {
 	app, database := newOnboardingTestApp(t)
 	user := createOnboardingTestUser(t, database, "calendar-ovulation-tag@example.com", "StrongPass1", true)
-	periodStart := time.Date(2026, time.February, 10, 0, 0, 0, 0, time.UTC)
+	periodStart := time.Now().UTC().Truncate(24*time.Hour).AddDate(0, 0, -4)
 
 	if err := database.Model(&models.User{}).Where("id = ?", user.ID).Updates(map[string]any{
 		"cycle_length":      28,
@@ -25,32 +36,134 @@ func TestCalendarRendersOvulationTagWithoutFertileOverride(t *testing.T) {
 		t.Fatalf("update user cycle settings: %v", err)
 	}
 
-	for offset := range 5 {
-		if err := database.Create(&models.DailyLog{
-			UserID:   user.ID,
-			Date:     periodStart.AddDate(0, 0, offset),
-			IsPeriod: true,
-			Flow:     models.FlowMedium,
-		}).Error; err != nil {
-			t.Fatalf("create period log day %d: %v", offset, err)
+	// The ovulation markers ride the completed-cycle floor: the grid withholds a
+	// window resting on the cycle-length slider or on one or two observed
+	// lengths until three cycles have been observed. So the fixture carries the
+	// three previous cycles as well, each exactly 28 days — the same length the
+	// account settings already carry, which leaves every projected date where
+	// this test pins it.
+	for _, cycleStart := range []time.Time{periodStart.AddDate(0, 0, -84), periodStart.AddDate(0, 0, -56), periodStart.AddDate(0, 0, -28), periodStart} {
+		for offset := range 5 {
+			if err := database.Create(&models.DailyLog{
+				UserID:   user.ID,
+				Date:     cycleStart.AddDate(0, 0, offset),
+				IsPeriod: true,
+				Flow:     models.FlowMedium,
+			}).Error; err != nil {
+				t.Fatalf("create period log %s day %d: %v", cycleStart.Format("2006-01-02"), offset, err)
+			}
 		}
 	}
 
 	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
 
-	febRendered := renderCalendarMonthHTML(t, app, authCookie, "2026-02")
-	febDayMarkup := extractCalendarDayMarkup(t, febRendered, "2026-02-23")
-	if !regexp.MustCompile(`calendar-ovulation-dot`).MatchString(febDayMarkup) {
-		t.Fatalf("expected ovulation dot on 2026-02-23 in February calendar")
+	// Ovulation of the running cycle: cycle start + (28 - 14) - 1. The next
+	// projected cycle repeats it one cycle length later.
+	currentOvulation := periodStart.AddDate(0, 0, 13)
+	projectedOvulation := currentOvulation.AddDate(0, 0, 28)
+
+	currentRendered := renderCalendarMonthHTML(t, app, authCookie, currentOvulation.Format("2006-01"))
+	currentDayMarkup := extractCalendarDayMarkup(t, currentRendered, currentOvulation.Format("2006-01-02"))
+	if !regexp.MustCompile(`calendar-ovulation-dot`).MatchString(currentDayMarkup) {
+		t.Fatalf("expected ovulation dot on %s", currentOvulation.Format("2006-01-02"))
 	}
-	if regexp.MustCompile(`calendar-tag-label-full">Ovulation</span>`).MatchString(febDayMarkup) {
-		t.Fatalf("did not expect textual ovulation badge on 2026-02-23")
+	if regexp.MustCompile(`calendar-tag-label-full">Ovulation</span>`).MatchString(currentDayMarkup) {
+		t.Fatalf("did not expect textual ovulation badge on %s", currentOvulation.Format("2006-01-02"))
 	}
 
-	marRendered := renderCalendarMonthHTML(t, app, authCookie, "2026-03")
-	marDayMarkup := extractCalendarDayMarkup(t, marRendered, "2026-03-23")
-	if !regexp.MustCompile(`calendar-ovulation-dot`).MatchString(marDayMarkup) {
-		t.Fatalf("expected projected ovulation dot on 2026-03-23 in March calendar")
+	projectedRendered := renderCalendarMonthHTML(t, app, authCookie, projectedOvulation.Format("2006-01"))
+	projectedDayMarkup := extractCalendarDayMarkup(t, projectedRendered, projectedOvulation.Format("2006-01-02"))
+	if !regexp.MustCompile(`calendar-ovulation-dot`).MatchString(projectedDayMarkup) {
+		t.Fatalf("expected projected ovulation dot on %s", projectedOvulation.Format("2006-01-02"))
+	}
+}
+
+// TestCalendarLegendPromisesTheOvulationDashOnlyToOwnersWhoTrackTemperature pins
+// the legend against the grid: the dash marks a projection no temperature shift
+// has confirmed yet, and only an owner with BBT tracking on can ever see one. An
+// owner without it gets the solid dot alone, so the legend must neither draw the
+// dash swatch nor word a "no temperature shift yet" promise for them.
+func TestCalendarLegendPromisesTheOvulationDashOnlyToOwnersWhoTrackTemperature(t *testing.T) {
+	cases := []struct {
+		name     string
+		trackBBT bool
+	}{
+		{name: "track_bbt off", trackBBT: false},
+		{name: "track_bbt on", trackBBT: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			app, database := newOnboardingTestApp(t)
+			user := createOnboardingTestUser(t, database, "calendar-legend-dash@example.com", "StrongPass1", true)
+			periodStart := time.Now().UTC().Truncate(24*time.Hour).AddDate(0, 0, -4)
+
+			if err := database.Model(&models.User{}).Where("id = ?", user.ID).Updates(map[string]any{
+				"cycle_length":      28,
+				"period_length":     5,
+				"last_period_start": periodStart,
+				"track_bbt":         tc.trackBBT,
+			}).Error; err != nil {
+				t.Fatalf("update user cycle settings: %v", err)
+			}
+			// Three completed cycles clear the floor under which no ovulation is
+			// projected, so the running cycle's ovulation is projected.
+			for _, cycleStart := range []time.Time{periodStart.AddDate(0, 0, -84), periodStart.AddDate(0, 0, -56), periodStart.AddDate(0, 0, -28), periodStart} {
+				for offset := range 5 {
+					if err := database.Create(&models.DailyLog{
+						UserID:   user.ID,
+						Date:     cycleStart.AddDate(0, 0, offset),
+						IsPeriod: true,
+						Flow:     models.FlowMedium,
+					}).Error; err != nil {
+						t.Fatalf("create period log: %v", err)
+					}
+				}
+			}
+
+			authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
+			ovulation := periodStart.AddDate(0, 0, 13)
+			rendered := renderCalendarMonthHTML(t, app, authCookie, ovulation.Format("2006-01"))
+
+			document := mustParseHTMLDocument(t, rendered)
+			legend := htmlFindElement(document, htmlNodeHasAttr("data-calendar-legend"))
+			if legend == nil {
+				t.Fatalf("expected the calendar legend")
+			}
+			legendDots := htmlFindElements(legend, func(node *html.Node) bool { return htmlHasClass(node, "calendar-ovulation-dot") })
+			if len(legendDots) != 1 {
+				t.Fatalf("expected exactly one ovulation swatch in the legend, got %d", len(legendDots))
+			}
+			legendDashes := htmlFindElements(legend, func(node *html.Node) bool { return htmlHasClass(node, "calendar-ovulation-dash") })
+			legendText := htmlNodeText(legend)
+
+			// The cell is the legend's counterpart: a BBT owner whose shift is
+			// still unconfirmed gets the dash, everyone else the solid dot.
+			dayMarkup := extractCalendarDayMarkup(t, rendered, ovulation.Format("2006-01-02"))
+			hasDot := strings.Contains(dayMarkup, "calendar-ovulation-dot")
+			hasDash := strings.Contains(dayMarkup, "calendar-ovulation-dash")
+			if hasDot == tc.trackBBT || hasDash != tc.trackBBT {
+				t.Fatalf("expected dot=%t dash=%t on the projected day, got %q", !tc.trackBBT, tc.trackBBT, dayMarkup)
+			}
+
+			if tc.trackBBT {
+				if len(legendDashes) != 1 {
+					t.Fatalf("expected the dash swatch in the legend of a BBT owner, got %d", len(legendDashes))
+				}
+				if !strings.Contains(legendText, "no temperature shift yet") {
+					t.Fatalf("expected the temperature wording in the legend of a BBT owner, got %q", legendText)
+				}
+				return
+			}
+			if len(legendDashes) != 0 {
+				t.Fatalf("did not expect a dash swatch in the legend of an owner without BBT tracking, got %d", len(legendDashes))
+			}
+			if strings.Contains(strings.ToLower(legendText), "temperature") {
+				t.Fatalf("did not expect temperature wording in the legend of an owner without BBT tracking, got %q", legendText)
+			}
+			if !strings.Contains(legendText, "Estimated ovulation") {
+				t.Fatalf("expected the plain ovulation entry in the legend, got %q", legendText)
+			}
+		})
 	}
 }
 

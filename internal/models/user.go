@@ -6,18 +6,34 @@ const (
 	RoleOwner           = "owner"
 	DefaultCycleLength  = 28
 	DefaultPeriodLength = 5
+	// DefaultAutoPeriodFill is the value users.auto_period_fill carries on an
+	// account nobody has configured yet. Auto-fill writes inferred period days
+	// the owner never logged, so `SECURITY.md`'s GDPR Art. 25 row states it as a
+	// privacy-by-default control and it is OFF: an account starts by recording
+	// only what the owner entered, and the onboarding toggle turns inference on.
+	// It is kept in models so the gorm column default, both account
+	// constructors, the db clear-data reset and the onboarding view state read
+	// one source of truth without a layering violation.
+	//
+	// Existing accounts are untouched by this default — no migration rewrites a
+	// stored value, so an owner who turned auto-fill on keeps it.
+	DefaultAutoPeriodFill = false
 	// DefaultReminderLeadDays is the column default for users.reminder_lead_days
 	// (issue #124) — the SHARED banner + webhook lead window. It matches
 	// services.DashboardReminderBannerWindowDays; kept in models so the db
 	// clear-data reset can reference it without importing services (layering).
 	DefaultReminderLeadDays = 3
 	// Age brackets are calibrated to the medical literature: 35–39 is the
-	// lowest-variability cohort in Gibson et al., npj Digital Medicine 2023
-	// (Apple Women's Health Study, n=12,608), with within-individual cycle SD
-	// rising only modestly through 40–44 and sharply at 45+. Persistent ≥7-day
-	// differences between consecutive cycles after 40 are the STRAW+10 marker
-	// for the menopausal transition (median entry age 45.5 years), so the
-	// three brackets isolate the clinically meaningful threshold at 45.
+	// lowest-variability cohort in Li H. et al. (senior author Gibson EA), npj
+	// Digital Medicine 2023, PMID 37248288 (Apple Women's Health Study,
+	// n=12,608), where cycle variability rises modestly through 40–44 and is
+	// ~45% higher at 45–49 and ~200% higher at 50+ than at 35–39. A persistent
+	// difference of ≥7 days in consecutive cycle length, recurring within 10
+	// cycles, is the STRAW+10 marker for the early menopausal transition
+	// (Harlow SD et al., Menopause 2012;19:387–395, PMID 22343510); the
+	// ReSTAGE cohorts put its median onset between 41.0 (TREMIN) and 49.5
+	// (MWMHP) years (Fertil Steril 2008), so the three brackets isolate the
+	// clinically meaningful threshold at 45.
 	AgeGroupUnknown = ""
 	AgeGroupUnder40 = "under_40"
 	AgeGroup40To45  = "age_40_45"
@@ -36,45 +52,77 @@ const (
 )
 
 type User struct {
-	ID                   uint       `gorm:"primaryKey"`
-	DisplayName          string     `gorm:"size:80"`
-	Email                string     `gorm:"uniqueIndex;not null"`
-	PasswordHash         string     `gorm:"not null"`
-	RecoveryCodeHash     string     `gorm:"column:recovery_code_hash"`
-	LocalAuthEnabled     bool       `gorm:"column:local_auth_enabled;not null"`
-	AuthSessionVersion   int        `gorm:"column:auth_session_version;not null;default:1"`
-	MustChangePassword   bool       `gorm:"column:must_change_password;not null;default:false"`
-	Role                 string     `gorm:"not null;default:owner"`
-	OnboardingCompleted  bool       `gorm:"not null;default:false"`
-	CycleLength          int        `gorm:"not null;default:28"`
-	PeriodLength         int        `gorm:"not null;default:5"`
-	LutealPhase          int        `gorm:"column:luteal_phase;not null;default:14"`
-	AutoPeriodFill       bool       `gorm:"column:auto_period_fill;not null;default:true"`
-	IrregularCycle       bool       `gorm:"column:irregular_cycle;not null;default:false"`
-	TrackBBT             bool       `gorm:"column:track_bbt;not null;default:false"`
-	TemperatureUnit      string     `gorm:"column:temperature_unit;not null;default:c"`
-	TrackCervicalMucus   bool       `gorm:"column:track_cervical_mucus;not null;default:false"`
-	HideSexChip          bool       `gorm:"column:hide_sex_chip;not null;default:false"`
-	HideCycleFactors     bool       `gorm:"column:hide_cycle_factors;not null;default:false"`
-	HideNotesField       bool       `gorm:"column:hide_notes_field;not null;default:false"`
-	ShowHistoricalPhases bool       `gorm:"column:show_historical_phases;not null;default:false"`
-	WeekStartsOn         string     `gorm:"column:week_starts_on;not null;default:sunday"`
-	ShownPeriodTip       bool       `gorm:"column:shown_period_tip;not null;default:false"`
-	AgeGroup             string     `gorm:"column:age_group;not null;default:''"`
-	UsageGoal            string     `gorm:"column:usage_goal;not null;default:health"`
-	UnpredictableCycle   bool       `gorm:"column:unpredictable_cycle;not null;default:false"`
-	LongPeriodWarnedAt   *time.Time `gorm:"column:long_period_warning_cycle_start;type:date"`
-	LastPeriodStart      *time.Time `gorm:"type:date"`
-	CreatedAt            time.Time  `gorm:"not null"`
-	TOTPSecret           string     `gorm:"column:totp_secret"`
-	TOTPEnabled          bool       `gorm:"column:totp_enabled;not null;default:false"`
-	TOTPLastUsedStep     int64      `gorm:"column:totp_last_used_step;not null;default:0"`
+	ID                  uint   `gorm:"primaryKey"`
+	DisplayName         string `gorm:"size:80"`
+	Email               string `gorm:"uniqueIndex;not null"`
+	PasswordHash        string `gorm:"not null"`
+	RecoveryCodeHash    string `gorm:"column:recovery_code_hash"`
+	LocalAuthEnabled    bool   `gorm:"column:local_auth_enabled;not null"`
+	AuthSessionVersion  int    `gorm:"column:auth_session_version;not null;default:1"`
+	MustChangePassword  bool   `gorm:"column:must_change_password;not null;default:false"`
+	Role                string `gorm:"not null;default:owner"`
+	OnboardingCompleted bool   `gorm:"not null;default:false"`
+	CycleLength         int    `gorm:"not null;default:28"`
+	PeriodLength        int    `gorm:"not null;default:5"`
+	LutealPhase         int    `gorm:"column:luteal_phase;not null;default:14"`
+	AutoPeriodFill      bool   `gorm:"column:auto_period_fill;not null;default:false"`
+	IrregularCycle      bool   `gorm:"column:irregular_cycle;not null;default:false"`
+	TrackBBT            bool   `gorm:"column:track_bbt;not null;default:false"`
+	TemperatureUnit     string `gorm:"column:temperature_unit;not null;default:c"`
+	TrackCervicalMucus  bool   `gorm:"column:track_cervical_mucus;not null;default:false"`
+	HideSexChip         bool   `gorm:"column:hide_sex_chip;not null;default:false"`
+	HideCycleFactors    bool   `gorm:"column:hide_cycle_factors;not null;default:false"`
+	HideNotesField      bool   `gorm:"column:hide_notes_field;not null;default:false"`
+	// ShowHistoricalPhases governs the DRAWN phase markers on completed cycles:
+	// the calendar's historical pass and the stats cycle stack, which shares the
+	// calendar's encoding. Its settings copy promises exactly that scope.
+	//
+	// It does not reach the stats prose that groups moods and symptoms by
+	// inferred phase — those derive phases for their own gate (owner, plus the
+	// completed-cycle pattern minimum) and take no user at all in two of the
+	// three cases. That is deliberate, not an oversight; the scope is pinned in
+	// both directions by TestShowHistoricalPhasesGovernsTheDrawnMarkersOnly.
+	ShowHistoricalPhases bool   `gorm:"column:show_historical_phases;not null;default:false"`
+	WeekStartsOn         string `gorm:"column:week_starts_on;not null;default:sunday"`
+	ShownPeriodTip       bool   `gorm:"column:shown_period_tip;not null;default:false"`
+	AgeGroup             string `gorm:"column:age_group;not null;default:''"`
+	UsageGoal            string `gorm:"column:usage_goal;not null;default:health"`
+	UnpredictableCycle   bool   `gorm:"column:unpredictable_cycle;not null;default:false"`
+	// LongPeriodWarningCycleStart is the cycle START the long-period warning was
+	// last acknowledged for — a date-only value (`type:date`, UTC-midnight), not
+	// the instant the warning was shown. The name follows the column and the
+	// type so no reader reaches for DateAtLocation, the instant-only helper
+	// (day_utils.go, issue #48/#64 class).
+	LongPeriodWarningCycleStart *time.Time `gorm:"column:long_period_warning_cycle_start;type:date"`
+	LastPeriodStart             *time.Time `gorm:"type:date"`
+	CreatedAt                   time.Time  `gorm:"not null"`
+	TOTPSecret                  string     `gorm:"column:totp_secret"`
+	TOTPEnabled                 bool       `gorm:"column:totp_enabled;not null;default:false"`
+	TOTPLastUsedStep            int64      `gorm:"column:totp_last_used_step;not null;default:0"`
 	// Timezone is the owner's last known IANA timezone name (e.g.
 	// "Europe/Belgrade"), persisted from the request so request-free batch
 	// passes (webhook reminders, issue #124) can resolve "today" without a
 	// browser. Nullable/empty when never observed; only validated IANA values
 	// are written (see api.parseRequestTimezone). Not sensitive, not a secret.
 	Timezone string `gorm:"column:timezone"`
+	// InterfaceLanguage is the UI language the owner chose explicitly in
+	// Settings (migration 034). It is the account-side half of the
+	// `ovumcy_lang` cookie: the cookie still drives every render, and this
+	// column is what re-issues that cookie on a device that has none — a fresh
+	// browser, a cleared cookie jar, a second machine.
+	//
+	// Empty means NEVER CHOSEN, not "English": for such an account the request
+	// resolves the language exactly as it did before the column existed
+	// (cookie, then Accept-Language, then the operator's DEFAULT_LANGUAGE).
+	// Only an explicit save writes here, and the value written is already
+	// normalized against the shipped locales; a stored code is validated again
+	// on read, so an unsupported one degrades to "never chosen" rather than
+	// rendering a locale that does not exist.
+	//
+	// A presentation preference, not health data and not a secret — which is
+	// why clear-data deliberately leaves it standing (see
+	// UserRepository.ClearAllDataAndResetSettings).
+	InterfaceLanguage string `gorm:"column:interface_language;not null;default:''"`
 	// Webhook notification settings (issue #124). A future request-free batch
 	// pass reads these to decide whether to POST a period/ovulation reminder to
 	// an owner-configured webhook. This block is storage only — no reminder
@@ -98,15 +146,55 @@ type User struct {
 	// Nil until the first send. Stored as UTC-midnight DATE like LastPeriodStart.
 	WebhookPeriodLastSentCycleStart    *time.Time `gorm:"column:webhook_period_last_sent_cycle_start;type:date"`
 	WebhookOvulationLastSentCycleStart *time.Time `gorm:"column:webhook_ovulation_last_sent_cycle_start;type:date"`
+	// WebhookLastDeliveredAt is the only column in this block that records a
+	// DELIVERY (migration 039). The two watermarks above do not and cannot: each
+	// is claimed BEFORE the POST, holds a cycle anchor rather than a clock
+	// reading, and stands for a send that was never accepted until the failure
+	// path puts it back. This one is written in exactly one place — after the
+	// notify pass gets a 2xx, by MarkWebhookDelivered, pinned to the
+	// WebhookConfigVersion that pass read — so it can never be derived from, or
+	// confused with, a claim.
+	//
+	// Nil means "no delivery recorded", which is a statement about this
+	// instance's records and NOT about history: rows that predate migration 039
+	// are nil and were never backfilled, because the only values available to
+	// backfill from are the watermarks.
+	//
+	// It is cleared in the same UPDATE that writes webhook_url whenever the
+	// destination changes, is removed, or its ciphertext no longer opens, and by
+	// a clear-data wipe alongside both watermarks: a mark must never outlive the
+	// endpoint it was about.
+	WebhookLastDeliveredAt *time.Time `gorm:"column:webhook_last_delivered_at"`
 	// ReminderLeadDays is the SHARED lead window (in days) for BOTH the in-app
 	// dashboard banner (issue #123) and webhook reminders: a reminder surfaces
 	// once the predicted event is within this many days of "today". Default 3
 	// matches services.DashboardReminderBannerWindowDays; bounded 0–14 at save.
 	ReminderLeadDays int `gorm:"column:reminder_lead_days;not null;default:3"`
+	// WebhookConfigVersion is the monotonic REVOCATION EPOCH of the block above
+	// (migration 038). Every write to the owner's DELIVERY CONFIGURATION — the
+	// block above plus the shared reminder lead window: a settings save, a
+	// disable, an endpoint replacement or removal, a change to the lead window, a
+	// clear-data wipe — increments it in the same statement that performs the
+	// write, and the notify pass's pre-delivery watermark claim pins the value its
+	// own snapshot carried. It is therefore not a preference and never rendered:
+	// it exists so a pass that read the configuration BEFORE a revocation cannot
+	// win a claim and POST to the endpoint the owner has since revoked.
+	//
+	// Its scope is deliberately WHETHER, WHERE and HOW EARLY delivery happens —
+	// not what the reminder would say. A cycle-data edit, a timezone capture or a
+	// language change moves what a reminder announces and leaves this column
+	// alone: those are inputs to the prediction, not a gesture withdrawing
+	// consent to deliver, and a moved cycle is already the watermark
+	// compare-and-set's own subject.
+	//
+	// Monotonic, never reset: ClearAllDataAndResetSettings advances it like every
+	// other writer, because handing a revoked snapshot its own value back is
+	// exactly the window this column closes.
+	WebhookConfigVersion int `gorm:"column:webhook_config_version;not null;default:0"`
 	// Calendar (.ics) feed subscription token (slice 1: storage only). Backs a
 	// pull-based feed URL whose path carries a bearer capability token; a
-	// calendar client polls it for the owner's own cycle events. Both columns are
-	// empty when the feed is off (the default zero value). This block is storage
+	// calendar client polls it for the owner's own cycle events. Every column in
+	// the block is empty when the feed is off (the default zero value). This block is storage
 	// only — no endpoint, .ics builder, rate-limit, or settings UI lives here
 	// (later slices).
 	//
@@ -123,19 +211,128 @@ type User struct {
 	// CalendarFeedVerifierHash holds the BCRYPT hash of the secret verifier half,
 	// never the verifier plaintext. The full token (selector+verifier) is shown
 	// to the owner exactly once at generation and is not retrievable afterward,
-	// mirroring the recovery-code shown-once model. Verification looks the row up
-	// by selector, then constant-time bcrypt-compares the verifier; a missing
-	// selector and a wrong verifier both resolve to the same "not found".
+	// mirroring the recovery-code shown-once model.
+	//
+	// It is no longer the value the feed endpoint compares — CalendarFeedVerifierMAC
+	// is (migration 032). It stays written on every mint so a rollback to a binary
+	// that predates the MAC keeps verifying every token, and it remains the
+	// verification path for rows minted before that migration.
 	CalendarFeedVerifierHash string `gorm:"column:calendar_feed_verifier_hash"`
+	// CalendarFeedVerifierMAC holds the KEYED authenticator of the secret verifier
+	// half (migration 032) and is what the feed endpoint compares per request:
+	// hex HMAC-SHA256 over (selector, verifier) under a key derived from
+	// SECRET_KEY. The verifier plaintext is still never stored, and a DB leak
+	// alone does not allow offline verifier guessing — without SECRET_KEY the
+	// stored value is useless.
+	//
+	// Empty means "minted before migration 032": verification falls back to
+	// CalendarFeedVerifierHash for those rows and writes the MAC in on the first
+	// request that presents the correct token. Empty NEVER means "any MAC is
+	// acceptable", and a present-but-mismatched MAC is a hard refusal — it is not
+	// re-checked against bcrypt, so rotating SECRET_KEY disarms armed feeds
+	// instead of silently keeping a stale authenticator alive.
+	CalendarFeedVerifierMAC string `gorm:"column:calendar_feed_verifier_mac"`
+	// RecoveryCodeRevealedAt and CalendarFeedRevealedAt are the server-side
+	// consumption marks of the two shown-once secret reveals (migration 036).
+	// Both surfaces used to enforce "exactly once" by writing a cleared cookie
+	// into the reveal response and nothing else, which is a request to the
+	// browser rather than a record: a client that kept the sealed value could
+	// present it again on the owner's own session and be shown the secret a
+	// second time.
+	//
+	// NIL means NOT REVEALED YET. It is what a fresh account carries and what
+	// every mint restores — the UPDATE that writes a new recovery-code hash or a
+	// new feed token NULLs the matching column in the same atomic write, so
+	// re-issuing the secret re-arms exactly one reveal. The reveal claims the
+	// mark with a compare-and-set (`... WHERE <column> IS NULL`), so a replay and
+	// a concurrent second reveal both lose the race and are refused.
+	//
+	// They are security state, not preferences: neither is rendered, neither is
+	// in the settings load allow-list, and clear-data deliberately leaves them
+	// standing (clearing a consumption mark re-arms a reveal for a sealed cookie
+	// that may still be held). Account erasure removes them with the row.
+	RecoveryCodeRevealedAt *time.Time `gorm:"column:recovery_code_revealed_at"`
+	CalendarFeedRevealedAt *time.Time `gorm:"column:calendar_feed_revealed_at"`
+	// CalendarFeedKeyEpoch records WHICH verification regime the stored token was
+	// minted under (migration 039): the opaque security.CalendarFeedKeyEpoch value
+	// derived from the SECRET_KEY in force at the mint. It is stamped only by
+	// SaveCalendarFeedToken, in the same UPDATE as the token triple above, so
+	// arming and recording what armed it are one event and no new writer of a feed
+	// access column exists.
+	//
+	// It answers the one health question this row can answer honestly. The
+	// verifier is not stored in the clear and its MAC cannot be recomputed, so
+	// "does this token still verify" is genuinely unknown here — but "was it
+	// minted under the key this process is running" is knowable, and it is what
+	// decides whether the owner can still retire the URL they handed out.
+	//
+	// EMPTY means "issued before this was recorded" and never "minted under the
+	// current key": rows older than migration 039 were not backfilled, because
+	// the only value available to backfill from is the CURRENT epoch, which would
+	// assert exactly the thing the column exists to be able to deny. Revoke and
+	// both bulk disarms leave it alone — they clear the token, and a stamp
+	// without a token states nothing.
+	CalendarFeedKeyEpoch string `gorm:"column:calendar_feed_key_epoch"`
+	// CalendarFeedLastPolledOn records the owner's calendar day (in
+	// users.timezone) on which a successful, token-verified poll of the .ics
+	// feed most recently served this owner's data (migration 040, WEB-46). It
+	// is a coarse presence signal by design: day granularity, no IP, no user
+	// agent, no per-request row, so it gives an owner something to act on
+	// ("this keeps moving after I unsubscribed everywhere -- rotate the link")
+	// without becoming the per-request audit log the feed is deliberately
+	// without (docs/security/known-disclosures.md).
+	//
+	// Stored in the repo's UTC-midnight DATE form, like LastPeriodStart: the
+	// VALUE is the owner's calendar day (services.DateAtLocation(now,
+	// feedLocation) in CalendarFeedService.ResolveFeed, the same "today" the
+	// feed body itself is built from), re-anchored to UTC midnight for
+	// storage.
+	//
+	// NIL means "never successfully polled since this column existed" -- every
+	// row that predates migration 040 and every feed nobody has fetched yet.
+	// Written by UserRepository.MarkCalendarFeedPolled, a monotonic
+	// compare-and-set pinned to the selector the poll just verified
+	// (WHERE id = ? AND calendar_feed_selector = ? AND (this column IS NULL OR
+	// < the day)), called synchronously after ResolveFeed builds a successful
+	// feed body and skipped outright when the loaded row already holds today
+	// -- so a calendar client polling every few minutes costs at most one
+	// UPDATE per owner-day. Its error is ignored and not logged by the app: the feed
+	// answers the identical 200 whether or not the mark lands, and no failure
+	// path (404, 500) ever reaches this write.
+	//
+	// Cleared everywhere calendar_feed_selector is written, in the same
+	// statement: SaveCalendarFeedToken (mint/rotate starts a fresh mark for
+	// the fresh link), ClearCalendarFeedToken (revoke), both bulk disarms,
+	// UpdateRecoveryCodeHashAndRevokeSessions, ForceResetPasswordAndRevokeSessions,
+	// UpdatePasswordRecoveryCodeAndRevokeSessionsCAS, and
+	// ClearAllDataAndResetSettings -- the complete set, pinned by a type-resolved guard
+	// in calendar_feed_fence_writers_guard_test.go so the date never survives
+	// past the token it was about. Rendered on the settings card and cited by
+	// SECURITY.md's Calendar Feed Subscription rows.
+	CalendarFeedLastPolledOn *time.Time `gorm:"column:calendar_feed_last_polled_on;type:date"`
 }
 
-// CalendarFeedTokenColumns is the transport-free narrow payload written by the
-// calendar-feed token write path (slice 1). Selector is the NON-secret,
-// UNIQUE-indexed lookup id; VerifierHash is already a BCRYPT hash — the service
-// hashes the secret verifier before building this struct, so persistence never
-// sees the verifier plaintext. It carries only the two feed-token columns and
-// no security-posture field: writing it must not bump auth_session_version.
+// CalendarFeedTokenColumns is the transport-free narrow view of the three stored
+// calendar-feed token columns. It is what the write path persists AND what the
+// verify path compares against, so both sides name the same triple and cannot
+// drift apart.
+//
+// Selector is the NON-secret, UNIQUE-indexed lookup id; VerifierHash is already a
+// BCRYPT hash and VerifierMAC an already-computed keyed authenticator — the
+// service derives both from the secret verifier before building this struct, so
+// persistence never sees the verifier plaintext. Both are written on every mint:
+// the MAC is what verification compares, the hash keeps a rollback to a pre-032
+// binary working. It carries only the feed-token columns and no security-posture
+// field: writing it must not bump auth_session_version.
 type CalendarFeedTokenColumns struct {
 	Selector     string
 	VerifierHash string
+	VerifierMAC  string
+	// KeyEpoch is the opaque identifier of the verification regime this token was
+	// minted under (security.CalendarFeedKeyEpoch). It is derived at mint, beside
+	// VerifierMAC and from the same key, and written in the same UPDATE as the
+	// triple above — so a token and the record of what signed it can never
+	// disagree. The verify path builds this struct too and leaves it empty: it
+	// compares the MAC, and the epoch is not part of verification.
+	KeyEpoch string
 }

@@ -24,12 +24,12 @@ func (handler *Handler) buildOnboardingViewData(c fiber.Ctx, user *models.User, 
 		"OnboardingStep":  state.Step,
 		"MinDate":         state.MinDate.Format("2006-01-02"),
 		"MaxDate":         state.MaxDate.Format("2006-01-02"),
+		"WeekStart":       services.NormalizeWeekStart(user.WeekStartsOn),
 		"LastPeriodStart": lastPeriodStart,
 		"CycleLength":     state.CycleLength,
 		"PeriodLength":    state.PeriodLength,
 		"AutoPeriodFill":  state.AutoPeriodFill,
 		"IrregularCycle":  state.IrregularCycle,
-		"AgeGroup":        state.AgeGroup,
 		"UsageGoal":       state.UsageGoal,
 	}
 }

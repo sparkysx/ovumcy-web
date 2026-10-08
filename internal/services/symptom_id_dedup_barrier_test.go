@@ -1,0 +1,797 @@
+package services
+
+import (
+	"bytes"
+	"context"
+	"go/ast"
+	"go/parser"
+	"go/printer"
+	"go/token"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/ovumcy/ovumcy-web/internal/models"
+)
+
+// Barrier for the per-day symptom-id counting class.
+//
+// A day's SymptomIDs is a stored slice, and every surface that counts symptoms
+// walks it once per day. A slice that repeated an id would count that day
+// twice: the phase insights divide the count by the number of days in the
+// phase, so a repeat renders a percentage above 100, and the frequency list and
+// the picker's usage ranking are skewed the same way.
+//
+// ValidateSymptomIDs builds a unique map before persisting, so no stored slice
+// repeats an id today. That is what makes this internal rather than a live
+// defect — and it is exactly the shape this repository treats as a defect in
+// its own right when it is fixed at some sites and not others: three read sites
+// deduped and three not, with the deduped ones making the bare ones look
+// deliberate. A second write path, an import, or a repaired row is all it takes
+// for the bare sites to diverge from the deduped ones.
+//
+// So the class is closed at every site, and this barrier reads the shipped
+// source to keep it closed: a new loop over a day's symptom ids that does not
+// route through one of the two helpers fails here the moment it is written.
+//
+// Three properties keep the sweep honest, and each was added after the sweep
+// was measured passing without it:
+//
+//   - an exemption clears ONE loop, not a whole function, and an exempted loop
+//     that increments anything is itself an error — a counting loop added
+//     beside the cleared one used to be unexamined;
+//   - a single-assignment local is resolved back to the expression it was
+//     assigned from, because `ids := logEntry.SymptomIDs` followed by
+//     `range ids` is an everyday refactor and used to walk straight past;
+//   - the violation matcher is anchored on fixture sources this test owns, one
+//     that must be flagged and one that must not, because the real tree's six
+//     compliant sites keep the "found something" counter above zero on their
+//     own and would hide a matcher that had stopped matching.
+//
+// What it still cannot see, stated here and repeated in the failure text: a
+// local assigned more than once, a slice handed to a helper of this package's
+// own before being counted, an index loop rather than `range`, and any field
+// not named SymptomIDs. Those are why the three SurvivesARepeatedID guards
+// below exist beside it — the sweep is the barrier for sites added tomorrow,
+// and it is not the only one for the sites that exist today.
+var symptomIDDedupHelpers = map[string]struct{}{
+	"uniqueSymptomIDs":      {},
+	"uniqueKnownSymptomIDs": {},
+}
+
+// symptomIDLoopExemption clears exactly one loop: the one in `function` whose
+// range expression reads `rangeExpr` after alias resolution. Naming the
+// expression rather than the function is what stops the exemption from
+// spreading to a second loop somebody adds later.
+type symptomIDLoopExemption struct {
+	function  string
+	rangeExpr string
+	reason    string
+}
+
+// symptomIDLoopExemptions are the loops whose walk over a day's symptom ids is
+// provably idempotent under a repeat, so routing them through a helper would
+// buy nothing. A loop that increments anything does not belong here, and the
+// sweep enforces that rather than trusting this comment.
+var symptomIDLoopExemptions = []symptomIDLoopExemption{
+	{
+		function:  "buildExportSymptomFlags",
+		rangeExpr: "symptomIDs",
+		reason:    "sets booleans and collects names into a set, so a repeated id changes no output",
+	},
+}
+
+// Verdicts the sweep can reach for one loop over a day's symptom ids.
+const (
+	symptomLoopRouted          = "routed"
+	symptomLoopViolation       = "violation"
+	symptomLoopExempt          = "exempt"
+	symptomLoopExemptButCounts = "exempt-but-counts"
+)
+
+type symptomIDLoopFinding struct {
+	verdict   string
+	function  string
+	line      int
+	source    string // range expression, after alias resolution
+	written   string // range expression as written, when resolution changed it
+	exemption int    // index into the exemption slice, for exempt verdicts
+}
+
+// TestEverySymptomIDLoopDedupes fails when a production loop in this package
+// walks a day's symptom ids without routing them through a dedup helper.
+func TestEverySymptomIDLoopDedupes(t *testing.T) {
+	root := servicesSourceBarrierRoot(t)
+	dir := filepath.Join(root, "internal", "services")
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("reading %s: %v", dir, err)
+	}
+
+	inspected, found := 0, 0
+	exemptionUses := make([]int, len(symptomIDLoopExemptions))
+
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		inspected++
+
+		fset := token.NewFileSet()
+		parsed, parseErr := parser.ParseFile(fset, filepath.Join(dir, name), nil, 0)
+		if parseErr != nil {
+			t.Fatalf("parsing %s: %v", name, parseErr)
+		}
+
+		for _, finding := range symptomIDLoopFindings(t, fset, parsed, symptomIDLoopExemptions) {
+			found++
+			switch finding.verdict {
+			case symptomLoopViolation:
+				t.Errorf("%s:%d ranges over %s%s without deduping: a repeated id counts its day twice, which renders a phase percentage above 100 and skews both the frequency list and the picker's usage ranking. Route it through %v",
+					name, finding.line, finding.source, symptomLoopAliasNote(finding), sortedKeys(symptomIDDedupHelpers))
+			case symptomLoopExemptButCounts:
+				t.Errorf("%s:%d is exempted as %q, and its body increments a counter: an exemption clears a loop whose output a repeat cannot change, which this loop's no longer is",
+					name, finding.line, symptomIDLoopExemptions[finding.exemption].reason)
+				exemptionUses[finding.exemption]++
+			case symptomLoopExempt:
+				exemptionUses[finding.exemption]++
+			}
+		}
+	}
+
+	if inspected == 0 {
+		t.Fatalf("no production file was parsed in %s — the barrier swept nothing", dir)
+	}
+	if found == 0 {
+		t.Fatalf("no loop over a day's symptom ids was found in %s — the barrier's matcher no longer recognises the shape it judges", dir)
+	}
+	for index, uses := range exemptionUses {
+		if uses != 1 {
+			t.Errorf("the exemption for %s over %q matched %d loops, want exactly 1: an exemption that matches nothing hides nothing and should be dropped, and one that matches twice is clearing a loop nobody cleared",
+				symptomIDLoopExemptions[index].function, symptomIDLoopExemptions[index].rangeExpr, uses)
+		}
+	}
+}
+
+// TestSymptomIDSweepMatcherFlagsAKnownViolation anchors the sweep on fixture
+// sources this test owns. The real tree's compliant sites keep the sweep's
+// "found something" counter above zero by themselves, so without a fixture that
+// MUST be flagged, a matcher that had stopped matching would report success
+// while detecting nothing.
+func TestSymptomIDSweepMatcherFlagsAKnownViolation(t *testing.T) {
+	exemptions := []symptomIDLoopExemption{
+		{function: "exemptedFixture", rangeExpr: "logEntry.SymptomIDs", reason: "fixture"},
+	}
+
+	tests := []struct {
+		name        string
+		source      string
+		wantVerdict string
+		wantSource  string
+		// wantSilence marks a fixture the sweep must NOT report at all —
+		// a shape it cannot read is worth nothing said rather than the wrong
+		// thing said.
+		wantSilence bool
+	}{
+		{
+			name: "a bare loop is a violation",
+			source: `package p
+func f(logEntry L, counts map[uint]int) {
+	for _, id := range logEntry.SymptomIDs {
+		counts[id]++
+	}
+}`,
+			wantVerdict: symptomLoopViolation,
+			wantSource:  "logEntry.SymptomIDs",
+		},
+		{
+			name: "a helper-routed loop is compliant",
+			source: `package p
+func f(logEntry L, counts map[uint]int) {
+	for _, id := range uniqueSymptomIDs(logEntry.SymptomIDs) {
+		counts[id]++
+	}
+}`,
+			wantVerdict: symptomLoopRouted,
+			wantSource:  "uniqueSymptomIDs(logEntry.SymptomIDs)",
+		},
+		{
+			name: "a single-assignment alias is resolved and still a violation",
+			source: `package p
+func f(logEntry L, counts map[uint]int) {
+	ids := logEntry.SymptomIDs
+	for _, id := range ids {
+		counts[id]++
+	}
+}`,
+			wantVerdict: symptomLoopViolation,
+			wantSource:  "logEntry.SymptomIDs",
+		},
+		{
+			name: "an alias of a helper call is resolved and compliant",
+			source: `package p
+func f(logEntry L, counts map[uint]int) {
+	ids := uniqueSymptomIDs(logEntry.SymptomIDs)
+	for _, id := range ids {
+		counts[id]++
+	}
+}`,
+			wantVerdict: symptomLoopRouted,
+			wantSource:  "uniqueSymptomIDs(logEntry.SymptomIDs)",
+		},
+		{
+			name: "an exempted loop that counts nothing stays exempt",
+			source: `package p
+func exemptedFixture(logEntry L, flags map[uint]bool) {
+	for _, id := range logEntry.SymptomIDs {
+		flags[id] = true
+	}
+}`,
+			wantVerdict: symptomLoopExempt,
+			wantSource:  "logEntry.SymptomIDs",
+		},
+		{
+			name: "an exempted loop that increments is an error in its own right",
+			source: `package p
+func exemptedFixture(logEntry L, counts map[uint]int) {
+	for _, id := range logEntry.SymptomIDs {
+		counts[id]++
+	}
+}`,
+			wantVerdict: symptomLoopExemptButCounts,
+			wantSource:  "logEntry.SymptomIDs",
+		},
+		{
+			name: "a second loop beside an exempted one is still swept",
+			source: `package p
+func exemptedFixture(logEntry L, counts map[uint]int) {
+	for _, id := range logEntry.SymptomIDs {
+		_ = id
+	}
+	for _, id := range logEntry.OtherSymptomIDs {
+		counts[id]++
+	}
+}`,
+			wantVerdict: symptomLoopViolation,
+			wantSource:  "logEntry.OtherSymptomIDs",
+		},
+		{
+			// `m[k]++` is one spelling of counting and `m[k] = m[k] + 1` is
+			// another. An exemption states that a repeated id changes no
+			// output, so the check behind it has to read the meaning rather
+			// than the operator: a recogniser that knows one spelling clears a
+			// loop that counts in the other.
+			name: "an exempted loop that counts by assignment is still counting",
+			source: `package p
+func exemptedFixture(logEntry L, counts map[uint]int) {
+	for _, id := range logEntry.SymptomIDs {
+		counts[id] = counts[id] + 1
+	}
+}`,
+			wantVerdict: symptomLoopExemptButCounts,
+			wantSource:  "logEntry.SymptomIDs",
+		},
+		{
+			// Alias resolution counts assignments to decide whether a local
+			// still denotes what it was assigned. Two `:=` bindings of one name
+			// in sibling scopes are two locals, not one assigned twice, and
+			// reading them as one silently drops the resolution — so the
+			// counting loop below stops being recognised.
+			name: "a same-named local in a sibling scope does not blind the resolution",
+			source: `package p
+func f(logEntry L, counts map[uint]int, other []uint, flag bool) {
+	if flag {
+		ids := logEntry.SymptomIDs
+		for _, id := range ids {
+			counts[id]++
+		}
+	} else {
+		ids := other
+		_ = ids
+	}
+}`,
+			wantVerdict: symptomLoopViolation,
+			wantSource:  "logEntry.SymptomIDs",
+		},
+		{
+			// The other half of scoping, and the one that costs more when it is
+			// wrong: an inner block that REASSIGNS an outer name has changed
+			// what the name denotes. Carrying the outer expression in would
+			// report this loop as ranging over logEntry.SymptomIDs, which it
+			// does not — an over-report fails a correct tree, and that is worse
+			// for a barrier than staying quiet. Staying quiet is the right
+			// answer here: `other` is a plain slice and the sweep cannot know
+			// what it holds.
+			name: "an inner reassignment retires the outer alias rather than outliving it",
+			source: `package p
+func f(logEntry L, counts map[uint]int, other []uint, flag bool) {
+	ids := logEntry.SymptomIDs
+	if flag {
+		ids = other
+		for _, id := range ids {
+			counts[id]++
+		}
+	}
+	_ = ids
+}`,
+			wantSilence: true,
+		},
+		{
+			// An exemption's reason here is that the loop collects into a set.
+			// Appending to a slice is how that stops being true, and it is a
+			// likelier edit than adding a counter: a repeated id then emits the
+			// same name twice into the export column.
+			name: "an exempted loop that appends is no longer repeat-proof",
+			source: `package p
+func exemptedFixture(logEntry L, names []string, lookup map[uint]string) []string {
+	for _, id := range logEntry.SymptomIDs {
+		names = append(names, lookup[id])
+	}
+	return names
+}`,
+			wantVerdict: symptomLoopExemptButCounts,
+			wantSource:  "logEntry.SymptomIDs",
+		},
+		{
+			// `*total = *total + 1` is a counter written through a pointer and
+			// `n = (n) + 1` survives gofmt; both step their own target.
+			name: "a step through a pointer or a paren is still a step",
+			source: `package p
+func exemptedFixture(logEntry L, total *int) {
+	for _, id := range logEntry.SymptomIDs {
+		_ = id
+		*total = *total + 1
+	}
+}`,
+			wantVerdict: symptomLoopExemptButCounts,
+			wantSource:  "logEntry.SymptomIDs",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fset := token.NewFileSet()
+			parsed, err := parser.ParseFile(fset, "fixture.go", tc.source, 0)
+			if err != nil {
+				t.Fatalf("parsing the fixture: %v", err)
+			}
+
+			findings := symptomIDLoopFindings(t, fset, parsed, exemptions)
+			if tc.wantSilence {
+				if len(findings) != 0 {
+					t.Fatalf("the sweep reported %+v; this shape is one it cannot read, and naming an expression the loop does not range over fails a correct tree", findings)
+				}
+				return
+			}
+			matched := 0
+			for _, finding := range findings {
+				if finding.source != tc.wantSource {
+					continue
+				}
+				matched++
+				if finding.verdict != tc.wantVerdict {
+					t.Errorf("the sweep called %s %q, want %q", tc.wantSource, finding.verdict, tc.wantVerdict)
+				}
+			}
+			if matched != 1 {
+				t.Fatalf("the sweep returned %d findings for %s, want exactly 1 — the matcher no longer recognises the shape it judges (all findings: %+v)", matched, tc.wantSource, findings)
+			}
+		})
+	}
+}
+
+// TestSymptomDedupHelpersAgreeOnARepeatedID anchors the helpers themselves, so
+// the sweep cannot pass by pointing every loop at a helper that dedupes
+// nothing.
+func TestSymptomDedupHelpersAgreeOnARepeatedID(t *testing.T) {
+	known := map[uint]models.SymptomType{1: {ID: 1}, 2: {ID: 2}}
+
+	if got := uniqueSymptomIDs([]uint{1, 1, 2, 1}); len(got) != 2 || got[0] != 1 || got[1] != 2 {
+		t.Errorf("uniqueSymptomIDs did not collapse a repeat in stored order: %v", got)
+	}
+	if got := uniqueSymptomIDs([]uint{2, 1}); len(got) != 2 || got[0] != 2 {
+		t.Errorf("uniqueSymptomIDs dropped or reordered ids that repeat nothing: %v", got)
+	}
+	if got := uniqueKnownSymptomIDs([]uint{1, 1, 3}, known); len(got) != 1 || got[0] != 1 {
+		t.Errorf("uniqueKnownSymptomIDs kept a repeat or an unknown id: %v", got)
+	}
+}
+
+// TestPhaseSymptomPercentageSurvivesARepeatedID pins the consequence the sweep
+// above is written for: a day whose stored slice repeats an id must not push a
+// phase percentage past 100.
+func TestPhaseSymptomPercentageSurvivesARepeatedID(t *testing.T) {
+	symptomByID := map[uint]models.SymptomType{
+		1: {ID: 1, Name: "Cramps", Icon: "C"},
+	}
+	counter := &phaseSymptomCounter{counts: map[uint]int{}}
+	appendPhaseSymptomCounts(counter, []uint{1, 1, 1}, symptomByID)
+	counter.totalDays++
+
+	items := phaseSymptomInsightItems(counter, symptomByID)
+	if len(items) != 1 {
+		t.Fatalf("expected one phase symptom item, got %d", len(items))
+	}
+	if items[0].Count != 1 {
+		t.Errorf("one day carrying a repeated id counted %d times", items[0].Count)
+	}
+	if items[0].Percentage > 100 {
+		t.Errorf("a repeated id rendered %.1f%% of the phase's days", items[0].Percentage)
+	}
+}
+
+// TestSymptomFrequencySurvivesARepeatedID pins the same consequence on the
+// frequency list, whose count is read against the day total.
+func TestSymptomFrequencySurvivesARepeatedID(t *testing.T) {
+	service := NewSymptomService(&stubSymptomRepo{
+		builtinCnt: 1,
+		listed:     []models.SymptomType{{ID: 1, Name: "Cramps", Icon: "C"}},
+	})
+
+	logs := []models.DailyLog{{SymptomIDs: []uint{1, 1}}}
+	result, err := service.CalculateFrequencies(context.Background(), 10, logs)
+	if err != nil {
+		t.Fatalf("CalculateFrequencies() unexpected error: %v", err)
+	}
+	if len(result) != 1 {
+		t.Fatalf("expected one frequency, got %d", len(result))
+	}
+	if result[0].Count > result[0].TotalDays {
+		t.Errorf("a repeated id counted %d times across %d days", result[0].Count, result[0].TotalDays)
+	}
+}
+
+// TestPickerRankingSurvivesARepeatedID pins the third bare site: one day that
+// repeats an id must not outrank two days that each logged another.
+func TestPickerRankingSurvivesARepeatedID(t *testing.T) {
+	symptoms := []models.SymptomType{
+		{ID: 1, Name: "Cramps"},
+		{ID: 2, Name: "Headache"},
+	}
+	logs := []models.DailyLog{
+		{SymptomIDs: []uint{1, 1, 1}},
+		{SymptomIDs: []uint{2}},
+		{SymptomIDs: []uint{2}},
+	}
+
+	ranked := RankSymptomsForEntryPicker(symptoms, logs)
+	if len(ranked) != 2 {
+		t.Fatalf("expected two ranked symptoms, got %d", len(ranked))
+	}
+	if ranked[0].ID != 2 {
+		t.Errorf("one day repeating id 1 outranked the two days that logged id 2: got id %d first", ranked[0].ID)
+	}
+}
+
+// symptomIDLoopFindings classifies every `range` over a day's symptom ids in
+// one parsed file. The helpers' own bodies are skipped — one of them is where
+// the deduping happens — and everything else is judged loop by loop.
+func symptomIDLoopFindings(t *testing.T, fset *token.FileSet, file *ast.File, exemptions []symptomIDLoopExemption) []symptomIDLoopFinding {
+	t.Helper()
+
+	var findings []symptomIDLoopFinding
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil {
+			continue
+		}
+		if _, helper := symptomIDDedupHelpers[fn.Name.Name]; helper {
+			continue
+		}
+
+		aliases := resolveBlockAliases(fn.Body)
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			loop, ok := node.(*ast.RangeStmt)
+			if !ok {
+				return true
+			}
+
+			written := symptomLoopSource(t, fset, loop.X)
+			expr := loop.X
+			if resolved, known := aliases[loop.X]; known {
+				expr = resolved
+			}
+			source := symptomLoopSource(t, fset, expr)
+
+			routed := symptomLoopRoutesThroughADedupHelper(expr)
+			if !routed && !strings.HasSuffix(strings.ToLower(source), "symptomids") {
+				return true
+			}
+
+			finding := symptomIDLoopFinding{
+				function:  fn.Name.Name,
+				line:      fset.Position(loop.Pos()).Line,
+				source:    source,
+				exemption: -1,
+			}
+			if source != written {
+				finding.written = written
+			}
+
+			switch {
+			case routed:
+				finding.verdict = symptomLoopRouted
+			default:
+				finding.verdict = symptomLoopViolation
+				for index, exemption := range exemptions {
+					if exemption.function != fn.Name.Name || exemption.rangeExpr != source {
+						continue
+					}
+					finding.exemption = index
+					finding.verdict = symptomLoopExempt
+					if loopBodyIncrements(loop.Body) {
+						finding.verdict = symptomLoopExemptButCounts
+					}
+					break
+				}
+			}
+
+			findings = append(findings, finding)
+			return true
+		})
+	}
+	return findings
+}
+
+// singleAssignmentLocals maps each local that is assigned exactly once in the
+// body to the expression it was assigned from. Assigned twice, or assigned by a
+// `range` clause, and it is left unresolved: this is one dataflow step, enough
+// for the extract-a-local refactor and deliberately not more.
+// singleAssignmentLocals reads ONE block's own statements, not the whole
+// function: a name bound in a sibling branch is a different local, and reading
+// the function flat treated the two as one local assigned twice, dropped the
+// resolution for both, and quietly stopped recognising a counting loop whose
+// slice happened to sit in a variable named like another. resolveBlockAliases
+// walks the blocks and lets an inner binding shadow an outer one.
+//
+// Nested blocks are skipped here rather than flattened, for the same reason.
+// `ast.Object` would answer this directly and is deprecated precisely because
+// it cannot be trusted without type information, which this sweep does not
+// have.
+// resolveBlockAliases maps each `range` expression written as a bare name to
+// the expression that name was assigned from, resolved in the block that binds
+// it. Walking block by block is what keeps two same-named locals in sibling
+// branches apart; an inner binding shadows an outer one, as it does in Go.
+func resolveBlockAliases(body *ast.BlockStmt) map[ast.Expr]ast.Expr {
+	resolved := map[ast.Expr]ast.Expr{}
+
+	var walk func(block *ast.BlockStmt, outer map[string]ast.Expr)
+	walk = func(block *ast.BlockStmt, outer map[string]ast.Expr) {
+		bound, assigned := singleAssignmentLocals(block)
+
+		aliases := make(map[string]ast.Expr, len(outer))
+		for name, expr := range outer {
+			// A name this block writes no longer denotes what the outer block
+			// assigned it, whether the write rebinds it or reassigns it.
+			// Carrying the outer expression past a reassignment would report a
+			// loop against an expression it does not range over, and an
+			// over-report fails a correct tree.
+			if assigned[name] {
+				continue
+			}
+			aliases[name] = expr
+		}
+		for name, expr := range bound {
+			aliases[name] = expr
+		}
+
+		ast.Inspect(block, func(node ast.Node) bool {
+			if nested, ok := node.(*ast.BlockStmt); ok && nested != block {
+				walk(nested, aliases)
+				return false
+			}
+			loop, ok := node.(*ast.RangeStmt)
+			if !ok {
+				return true
+			}
+			if ident, isIdent := loop.X.(*ast.Ident); isIdent {
+				if expr, known := aliases[ident.Name]; known {
+					resolved[loop.X] = expr
+				}
+			}
+			return true
+		})
+	}
+
+	walk(body, nil)
+	return resolved
+}
+
+// It returns both the names this block binds exactly once, with the expression
+// each was bound from, and every name it writes at all — the caller needs the
+// second set to retire an outer alias the block has invalidated.
+func singleAssignmentLocals(body *ast.BlockStmt) (map[string]ast.Expr, map[string]bool) {
+	assignments := map[string]int{}
+	candidates := map[string]ast.Expr{}
+
+	note := func(expr ast.Expr) string {
+		ident, ok := expr.(*ast.Ident)
+		if !ok || ident.Name == "_" {
+			return ""
+		}
+		assignments[ident.Name]++
+		return ident.Name
+	}
+
+	ast.Inspect(body, func(node ast.Node) bool {
+		if block, nested := node.(*ast.BlockStmt); nested && block != body {
+			// A nested block owns its own bindings; resolveBlockAliases visits
+			// it separately with this block's map as the outer one.
+			return false
+		}
+		switch stmt := node.(type) {
+		case *ast.AssignStmt:
+			for _, lhs := range stmt.Lhs {
+				name := note(lhs)
+				if name != "" && stmt.Tok == token.DEFINE && len(stmt.Lhs) == 1 && len(stmt.Rhs) == 1 {
+					candidates[name] = stmt.Rhs[0]
+				}
+			}
+		case *ast.RangeStmt:
+			if stmt.Tok == token.DEFINE {
+				note(stmt.Key)
+				note(stmt.Value)
+			}
+		case *ast.IncDecStmt:
+			note(stmt.X)
+		case *ast.ValueSpec:
+			for index, name := range stmt.Names {
+				if name.Name == "_" {
+					continue
+				}
+				assignments[name.Name]++
+				if len(stmt.Names) == 1 && len(stmt.Values) == 1 {
+					candidates[name.Name] = stmt.Values[index]
+				}
+			}
+		}
+		return true
+	})
+
+	resolved := map[string]ast.Expr{}
+	written := make(map[string]bool, len(assignments))
+	for name, count := range assignments {
+		written[name] = true
+		if count == 1 {
+			if expr, bound := candidates[name]; bound {
+				resolved[name] = expr
+			}
+		}
+	}
+	return resolved, written
+}
+
+// loopBodyIncrements reports whether the loop counts anything — `x++`, `x--`,
+// a `+=`/`-=`, or the same step written out as `x = x + 1`. An exemption is a
+// statement that a repeated id changes no output, and a counter is the one
+// construct that always makes that false, so this has to read the step rather
+// than the operator: knowing `m[k]++` and not `m[k] = m[k] + 1` clears a loop
+// that counts, which is the whole thing the exemption promises it does not do.
+func loopBodyIncrements(body *ast.BlockStmt) bool {
+	counts := false
+	ast.Inspect(body, func(node ast.Node) bool {
+		switch stmt := node.(type) {
+		case *ast.IncDecStmt:
+			counts = true
+		case *ast.AssignStmt:
+			switch stmt.Tok {
+			case token.ADD_ASSIGN, token.SUB_ASSIGN:
+				counts = true
+			case token.ASSIGN:
+				for index, lhs := range stmt.Lhs {
+					if index >= len(stmt.Rhs) {
+						continue
+					}
+					if assignmentStepsItsOwnTarget(lhs, stmt.Rhs[index]) ||
+						assignmentAppendsToItsOwnTarget(lhs, stmt.Rhs[index]) {
+						counts = true
+					}
+				}
+			}
+		}
+		return !counts
+	})
+	return counts
+}
+
+// assignmentStepsItsOwnTarget reports whether `target = value` adds to or
+// subtracts from target itself, in either operand order (`n = n + 1` and
+// `n = 1 + n` are the same step).
+func assignmentStepsItsOwnTarget(target ast.Expr, value ast.Expr) bool {
+	binary, ok := value.(*ast.BinaryExpr)
+	if !ok || (binary.Op != token.ADD && binary.Op != token.SUB) {
+		return false
+	}
+	if sameSyntacticExpr(target, binary.X) {
+		return true
+	}
+	// `n = 1 - n` is not a step, it is a reflection; only addition commutes.
+	return binary.Op == token.ADD && sameSyntacticExpr(target, binary.Y)
+}
+
+// assignmentAppendsToItsOwnTarget reports whether `target = append(target, …)`
+// grows target in place. An exemption on this tree reads "collects names into a
+// set, so a repeated id changes no output", and dropping the set for a slice is
+// the likelier way that stops being true — a repeated id then emits the same
+// name twice into the export column, which no counter is involved in.
+func assignmentAppendsToItsOwnTarget(target ast.Expr, value ast.Expr) bool {
+	call, ok := value.(*ast.CallExpr)
+	if !ok || len(call.Args) == 0 {
+		return false
+	}
+	ident, ok := call.Fun.(*ast.Ident)
+	if !ok || ident.Name != "append" {
+		return false
+	}
+	return sameSyntacticExpr(target, call.Args[0])
+}
+
+// sameSyntacticExpr compares the shapes this barrier can meet on the left of an
+// assignment — a plain name, a field, a map or slice index, and a pointer
+// dereference. Parentheses are unwrapped first: `n = (n) + 1` survives gofmt
+// and steps its target exactly as the bare form does. It is deliberately
+// syntactic: the sweep parses without type information, so two expressions that
+// read the same are treated as the same target.
+func sameSyntacticExpr(left ast.Expr, right ast.Expr) bool {
+	left, right = unwrapParens(left), unwrapParens(right)
+
+	switch typed := left.(type) {
+	case *ast.Ident:
+		other, ok := right.(*ast.Ident)
+		return ok && typed.Name == other.Name
+	case *ast.SelectorExpr:
+		other, ok := right.(*ast.SelectorExpr)
+		return ok && typed.Sel.Name == other.Sel.Name && sameSyntacticExpr(typed.X, other.X)
+	case *ast.IndexExpr:
+		other, ok := right.(*ast.IndexExpr)
+		return ok && sameSyntacticExpr(typed.X, other.X) && sameSyntacticExpr(typed.Index, other.Index)
+	case *ast.StarExpr:
+		other, ok := right.(*ast.StarExpr)
+		return ok && sameSyntacticExpr(typed.X, other.X)
+	default:
+		return false
+	}
+}
+
+func unwrapParens(expr ast.Expr) ast.Expr {
+	for {
+		paren, ok := expr.(*ast.ParenExpr)
+		if !ok {
+			return expr
+		}
+		expr = paren.X
+	}
+}
+
+func symptomLoopAliasNote(finding symptomIDLoopFinding) string {
+	if finding.written == "" {
+		return ""
+	}
+	return " (written as " + finding.written + ")"
+}
+
+func symptomLoopSource(t *testing.T, fset *token.FileSet, expr ast.Expr) string {
+	t.Helper()
+
+	var buf bytes.Buffer
+	if err := printer.Fprint(&buf, fset, expr); err != nil {
+		t.Fatalf("printing a range expression: %v", err)
+	}
+	return buf.String()
+}
+
+func symptomLoopRoutesThroughADedupHelper(expr ast.Expr) bool {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	callee, ok := call.Fun.(*ast.Ident)
+	if !ok {
+		return false
+	}
+	_, known := symptomIDDedupHelpers[callee.Name]
+	return known
+}

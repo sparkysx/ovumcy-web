@@ -29,10 +29,10 @@ func (handler *Handler) currentUserOrRedirectToLogin(c fiber.Ctx) (*models.User,
 	return user, false, nil
 }
 
-func currentUserOrUnauthorized(c fiber.Ctx) (*models.User, bool, error) {
+func (handler *Handler) currentUserOrUnauthorized(c fiber.Ctx) (*models.User, bool, error) {
 	user, ok := currentUser(c)
 	if !ok {
-		if sendErr := respondGlobalMappedError(c, unauthorizedErrorSpec()); sendErr != nil {
+		if sendErr := handler.respondGlobalMappedError(c, unauthorizedErrorSpec()); sendErr != nil {
 			return nil, false, sendErr
 		}
 		return nil, true, nil
@@ -61,7 +61,7 @@ func (handler *Handler) requestLocation(c fiber.Ctx) *time.Location {
 
 func (handler *Handler) currentPageViewContext(c fiber.Ctx) (string, map[string]string, time.Time) {
 	location := handler.requestLocation(c)
-	return currentLanguage(c), currentMessages(c), time.Now().In(location)
+	return currentLanguage(c), currentMessages(c), handler.clockNow().In(location)
 }
 
 func (handler *Handler) optionalAuthenticatedUser(c fiber.Ctx) *models.User {

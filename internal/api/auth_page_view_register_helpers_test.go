@@ -1,7 +1,6 @@
 package api
 
 import (
-	"net/url"
 	"testing"
 
 	"github.com/gofiber/fiber/v3"
@@ -10,15 +9,11 @@ import (
 func TestBuildRegisterPageDataUsesOnlyFlashSources(t *testing.T) {
 	t.Parallel()
 
-	query := url.Values{
-		"error": {"weak password"},
-		"email": {"query@example.com"},
-	}
 	flash := FlashPayload{
 		AuthError: "email already exists",
 	}
 
-	payload := evaluateAuthPageBuilder(t, query, func(c fiber.Ctx) error {
+	payload := evaluateAuthPageBuilder(t, func(c fiber.Ctx) error {
 		return c.JSON(buildRegisterPageData(map[string]string{}, flash, true, true))
 	})
 
@@ -36,15 +31,10 @@ func TestBuildRegisterPageDataUsesOnlyFlashSources(t *testing.T) {
 	}
 }
 
-func TestBuildRegisterPageDataIgnoresRegisterQueryFallback(t *testing.T) {
+func TestBuildRegisterPageDataWithoutFlashHasNoErrorOrEmail(t *testing.T) {
 	t.Parallel()
 
-	query := url.Values{
-		"error": {"weak password"},
-		"email": {"query@example.com"},
-	}
-
-	payload := evaluateAuthPageBuilder(t, query, func(c fiber.Ctx) error {
+	payload := evaluateAuthPageBuilder(t, func(c fiber.Ctx) error {
 		return c.JSON(buildRegisterPageData(map[string]string{}, FlashPayload{}, false, true))
 	})
 
@@ -62,7 +52,7 @@ func TestBuildRegisterPageDataIgnoresRegisterQueryFallback(t *testing.T) {
 func TestBuildRegisterPageDataDefaultsToRegistrationDisabledWhenClosed(t *testing.T) {
 	t.Parallel()
 
-	payload := evaluateAuthPageBuilder(t, url.Values{}, func(c fiber.Ctx) error {
+	payload := evaluateAuthPageBuilder(t, func(c fiber.Ctx) error {
 		return c.JSON(buildRegisterPageData(map[string]string{}, FlashPayload{}, false, false))
 	})
 
@@ -72,4 +62,16 @@ func TestBuildRegisterPageDataDefaultsToRegistrationDisabledWhenClosed(t *testin
 	if payload["RegistrationOpen"] != false {
 		t.Fatalf("expected RegistrationOpen=false, got %#v", payload["RegistrationOpen"])
 	}
+}
+
+// Pinned on the real route, not on the builder: buildRegisterPageData takes no
+// fiber.Ctx, so nothing calling it directly can observe a query read added to
+// ShowRegisterPage. The claim is exactly the field and the error block — see
+// assertAuthPageDidNotPrefillFromQuery for what this page does still carry.
+func TestRegisterPageDoesNotPrefillEmailOrErrorFromQuery(t *testing.T) {
+	app, _ := newOnboardingTestApp(t)
+
+	body := requestAuthPageWithHostileQuery(t, app, "/register")
+
+	assertAuthPageDidNotPrefillFromQuery(t, body, "register-email")
 }

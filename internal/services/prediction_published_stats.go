@@ -1,0 +1,232 @@
+package services
+
+import (
+	"time"
+
+	"github.com/ovumcy/ovumcy-web/internal/models"
+)
+
+// PublishedStats returns the CycleStats a surface may PUBLISH — the computed
+// stats with every forward-looking value the display policy refuses cleared, so
+// the data cannot outlive the decision — together with the verdict that cleared
+// it.
+//
+// Suppression on these surfaces used to be a template obligation — one boolean
+// beside the full CycleStats it was supposed to hide — and a template that
+// forgets the boolean, a new partial, a JSON view or a debug dump of the struct
+// then publishes a claim the product has decided it must not make. Cleared here,
+// the same forgetful surface renders nothing instead of a suppressed estimate.
+// That failure was not hypothetical: GET /api/v1/stats/overview serialized the
+// domain struct whole, so every date /stats withheld left the instance as JSON.
+//
+// It serves EVERY surface that publishes a projection — /stats, the dashboard,
+// the JSON API, the webhook reminder pass and the .ics feed — and stays one
+// function rather than one per surface: a second implementation of the clearing
+// rule is precisely how /stats and the dashboard came to disagree in the first
+// place. The two egress passes recompute their dates from the anchors this
+// function does not touch (LastPeriodStart, LutealPhase) and withhold on the
+// verdict, so there the clearing is a floor under a later edit rather than a
+// change of what they send today.
+//
+// The verdict is returned rather than re-resolved by the caller: a surface that
+// asks the predicates a second time can be holding cleared stats by then, and
+// FertilityProjectionSuppressed reads fields this function empties.
+//
+// CurrentPhase is RECOMPUTED from the cleared fields below, not left standing
+// on the pre-clearing geometry it was originally derived from. Phase and
+// fertility are orthogonal axes here (#416): the taxonomy is
+// menstrual/follicular/ovulation/luteal/unknown and "fertile" is a status,
+// never a phase — but resolveCyclePhase itself reads OvulationDate to decide
+// between them, so a phase computed before this function clears that date
+// names the day suppression withholds ("ovulation" today, "follicular" or
+// "luteal" any other day of the cycle). Leaving it standing let a suppressed
+// account read the ovulation day straight off the phase label on the
+// dashboard, /stats and the JSON API, even with OvulationDate itself blank.
+// The fix is not to empty the copy either — the dashboard hero rebuilds its
+// own phase from the cycle geometry (dashboardCycleHeroCurrentPhase) and the
+// header prefers the hero's, so emptying the published copy would split one
+// page across two answers — but to recompute it from the SAME fields this
+// function just cleared: both sides then read the same geometry, and a
+// suppressed account's phase can still say "menstrual" during a logged or
+// projected period, or "unknown" the rest of the cycle, without ever pointing
+// at the withheld day.
+//
+// RECORDED history — observed cycle lengths, the last period start, the current
+// cycle day — is never touched: it is fact, not projection, and the "facts only"
+// tier exists precisely to keep showing it. Only the PUBLISHED copy is cleared;
+// every builder behind a page reads the full stats, because the ribbon, the
+// factor context and the cycle context each apply their own suppression rule to
+// it.
+//
+// OUT-OF-DATE DATA withholds the phase and the fertility status, and nothing
+// else. Once the running cycle has passed the account's reference length
+// (DashboardCycleDataLooksStale) both owner pages answer "unknown" for the
+// phase and the status wherever they show a phase at all — dashboard.html tests
+// CycleDataStale first, stats.html first inside its predictions-enabled branch —
+// while the projected dates stay published beside the out-of-date banner. A
+// status read against a window the cycle has already outrun is a projection
+// past its own reference range, which the medical-safety floor refuses;
+// publishing it on the JSON API alone is the divergence this function exists to
+// close. The verdict is the pages' own — dashboardCycleDataStale, the one helper
+// the dashboard context and the stats page flags also call — and it is NOT a
+// suppression signal: the two suppression bits also decide what the webhook
+// pass and the .ics feed send, and staleness withholds no date. CycleDataStale
+// carries the verdict on the published copy.
+func PublishedStats(user *models.User, stats CycleStats, logs []models.DailyLog, today time.Time, location *time.Location) (CycleStats, PredictionSuppression) {
+	// The verdict is read off the UNCLEARED stats, so the fertility gate cannot
+	// be answered from fields the clearing below has already emptied.
+	suppression := ResolvePredictionSuppression(user, stats)
+	// The pages' out-of-date verdict, from the helper both pages call.
+	cycleDataStale := dashboardCycleDataStale(user, stats, today, location)
+
+	// The two predicates clear different sets because they answer different
+	// questions: FertilityProjectionSuppressed also covers the zero-cycles floor,
+	// where the projected next period legitimately stays because its anchor is a
+	// recorded start and only the length falls back.
+	if suppression.FertilitySuppressed {
+		stats.OvulationDate = time.Time{}
+		stats.OvulationExact = false
+		// LutealPhasePersonalised describes the luteal phase this same clearing
+		// just withheld the ovulation date and window for; it must not keep
+		// asserting personalisation about a projection this tier has decided not
+		// to publish. LutealPhase itself (the RECORDED derived value, not a
+		// projection) is left standing along with the rest of the facts-only
+		// tier — only the personalisation CLAIM about it is cleared here.
+		stats.LutealPhasePersonalised = false
+		// OvulationImpossible is itself a claim derived from the fertility
+		// projection (clearPredictedCycleWindow in cycles.go sets it exactly
+		// where it also clears OvulationDate/OvulationExact/the window), so it
+		// travels with the rest of this tier rather than surviving it: a
+		// consumer must never read suppression.fertility=true beside an
+		// ovulation-impossibility claim computed from the data that
+		// suppression says is not to be published.
+		stats.OvulationImpossible = false
+		stats.FertilityWindowStart = time.Time{}
+		stats.FertilityWindowEnd = time.Time{}
+		withholdFertilityStatus(&stats)
+	}
+	if suppression.PredictionsSuppressed {
+		stats.NextPeriodStart = time.Time{}
+	}
+	// Recomputed against the fields this function just cleared (or left alone),
+	// never against the pre-clearing geometry CurrentPhase carried in: the
+	// phase is derived FROM OvulationDate (resolveCyclePhase), so a phase
+	// computed before the clearing above stays "ovulation"/"follicular"/
+	// "luteal" on a day the rest of this response no longer names. A suppressed
+	// account only sees "menstrual" (during a logged or projected period) or
+	// "unknown" — never the day the fertility clearing above just withheld.
+	stats.CurrentPhase = DetectCurrentPhase(stats, logs, today, location)
+	// Out-of-date data: "unknown" wins over whatever the recomputation above
+	// answered, "menstrual" included — a projected period the cycle has already
+	// outrun is no more current than its ovulation day, and the pages print
+	// "unknown" here whatever the phase would have been.
+	stats.CycleDataStale = cycleDataStale
+	if cycleDataStale {
+		withholdFertilityStatus(&stats)
+		stats.CurrentPhase = "unknown"
+	}
+	return stats, suppression
+}
+
+// ConfirmedAndPublishedStats is the two-step gate the owner surfaces that name a
+// fertile window run their derived stats through: a thermal shift the owner's own
+// temperatures confirm outranks the projection (ResolveConfirmedCycleStats), and
+// only then are the values the display policy refuses cleared (PublishedStats).
+// The order is the point — the confirmed window is what the suppression tiers
+// then keep or withhold.
+//
+// It returns all three halves because the callers need different ones: the
+// dashboard and the stats page feed the confirmed, uncleared stats to their
+// builders and publish the cleared copy, while the day-save message reads only
+// the cleared copy and the verdict. The dashboard, the stats page and the day-save
+// feedback all call it, so "which window does this surface call fertile" has one
+// answer and the save toast cannot name a day the dashboard header does not. The
+// JSON API's PublishedOverviewStats below runs through the same step, through
+// confirmedAndPublishedStats, which also reports whether a shift was confirmed.
+func ConfirmedAndPublishedStats(user *models.User, logs []models.DailyLog, stats CycleStats, today time.Time, location *time.Location) (CycleStats, CycleStats, PredictionSuppression) {
+	confirmed, published, suppression, _ := confirmedAndPublishedStats(user, logs, stats, today, location)
+	return confirmed, published, suppression
+}
+
+// confirmedAndPublishedStats is the one implementation of the ordering. The
+// fourth result is the "a thermal shift was confirmed" bit of
+// ResolveConfirmedCycleStats, for the one surface that publishes it.
+func confirmedAndPublishedStats(user *models.User, logs []models.DailyLog, stats CycleStats, today time.Time, location *time.Location) (CycleStats, CycleStats, PredictionSuppression, bool) {
+	confirmed, wasConfirmed := ResolveConfirmedCycleStats(user, logs, stats, today, location)
+	published, suppression := PublishedStats(user, confirmed, logs, today, location)
+	return confirmed, published, suppression, wasConfirmed
+}
+
+// PublishedOverviewStats is PublishedStats plus the confirmed-ovulation
+// substitution the on-screen surfaces already apply: the calendar's solid
+// marker (calendar_days.go), the dashboard's ovulation line
+// (dashboard_cycle.go) and the stats chart marker all resolve the CURRENT
+// cycle's ovulation day through ConfirmedCurrentCycleOvulation, so a shift
+// the owner's own temperatures already confirm outranks the model's
+// projection everywhere an owner reads it.
+//
+// The substitution is ResolveConfirmedCycleStats and covers the whole triple —
+// day, window, fertility status — rather than the date alone: this function
+// used to move the date and leave the window and CurrentFertility on the
+// projection, which published a confirmed day beside a window that disagreed
+// with it.
+//
+// The JSON API was the one surface that skipped this: it read stats.
+// OvulationDate straight off the model and published it even after a BBT
+// shift had superseded it, while the grid, the dashboard and the chart had
+// already moved on to the confirmed day. The substitution runs on the RAW
+// stats, ahead of PublishedStats' own clearing, for the same reason the
+// dashboard's runs ahead of its suppression branches: ConfirmedCurrentCycleOvulation
+// already reads its own gate (ConfirmedOvulationWithheld), so a confirmed day
+// never outlives a tier that withholds it, and running it first means PublishedStats sees the same OvulationDate every
+// other surface renders.
+//
+// The returned bool is the SAME "confirmed" bit the dashboard carries beside
+// its own OvulationExact (dashboard_cycle.go's DisplayOvulationConfirmed) —
+// deliberately a second signal, not a rewrite of the first. OvulationExact
+// keeps its own meaning (an exact luteal-phase fit vs a clamped estimate,
+// CalcOvulationDay); a BBT-confirmed day on a fallback-luteal account is
+// "confirmed" and still arithmetically "not exact" until it feeds back into
+// InferUserLutealPhase on a LATER cycle, and collapsing the two into one
+// boolean would make the JSON view unable to say which is true — exactly the
+// class of divergence PublishedStats itself exists to prevent, just one field
+// over.
+//
+// The bool is READ BACK off `published.OvulationDate` after PublishedStats has
+// run, rather than kept from the ConfirmedCurrentCycleOvulation call above:
+// today the two agree by construction (the day is put back below exactly when
+// the confirmation passed its own gate, ConfirmedOvulationWithheld), but a bool decided before the clearing and never
+// revisited would depend on that agreement holding forever across two files. A
+// suppressed projection reporting a confirmed day is exactly the medical-safety
+// floor this adapter exists to hold, so the field is derived from the
+// CLEARED stats it is published beside: it cannot outlive the date it
+// describes even if a future suppression signal reaches one predicate and not
+// the other. The read-back compares the DAY, not the presence of a date: a tier
+// that one day SUBSTITUTES another date instead of clearing the field must not
+// be able to report "confirmed" about a day the shift never named. Today
+// PublishedStats only zeroes OvulationDate, so day equality and a presence check
+// coincide by construction — which is why the stricter one is written here.
+func PublishedOverviewStats(user *models.User, logs []models.DailyLog, stats CycleStats, today time.Time, location *time.Location) (CycleStats, PredictionSuppression, bool) {
+	resolved, published, suppression, wasConfirmed := confirmedAndPublishedStats(user, logs, stats, today, location)
+	confirmedDay := resolved.OvulationDate
+	// The day comes back whenever the confirmation stood: whether it may be
+	// named was already decided, once, by the gate inside
+	// ConfirmedCurrentCycleOvulation (ConfirmedOvulationWithheld) — today it
+	// lets the day through under the overdue signal alone, where the cycle has
+	// outrun the length its projection was rolled from and the day the owner's
+	// temperatures named is not such a projection. It used to come back only
+	// under the fertility gate, a second condition that agreed with that owner
+	// only while every signal withholding the day was also a fertility signal.
+	// The clearing above keeps the window, the fertility status, its basis and
+	// the phase it withheld; only the day comes back, so the JSON API names what
+	// the dashboard and the calendar name. The put-back writes OvulationDate and
+	// nothing else, so it cannot resurrect a "confirmed" basis or a status that
+	// PublishedStats withheld — under the fertility gate or on out-of-date data.
+	// Outside every gate the assignment is a no-op: PublishedStats left the
+	// resolved day standing.
+	if wasConfirmed {
+		published.OvulationDate = confirmedDay
+	}
+	confirmedOvulation := wasConfirmed && sameDay(published.OvulationDate, confirmedDay)
+	return published, suppression, confirmedOvulation
+}

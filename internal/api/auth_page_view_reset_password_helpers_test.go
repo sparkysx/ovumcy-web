@@ -13,17 +13,16 @@ func TestBuildResetPasswordPageDataValidTokenAndForcedFlag(t *testing.T) {
 	t.Parallel()
 
 	handler := &Handler{secretKey: []byte("test-reset-secret")}
-	token, err := services.BuildPasswordResetToken(handler.secretKey, 42, "$2a$10$testhashvaluefortokenclaims", 30*time.Minute, time.Now())
+	token, err := services.BuildPasswordResetToken(handler.secretKey, 42, "$2a$10$testhashvaluefortokenclaims", 1, services.PasswordResetTokenPurposeForcedLocal, 30*time.Minute, time.Now())
 	if err != nil {
 		t.Fatalf("buildPasswordResetToken returned error: %v", err)
 	}
 	cookieHeader := mustBuildResetCookieHeader(t, handler.secretKey, resetPasswordCookiePayload{
-		Token:  token,
-		Forced: true,
+		Token: token,
 	})
 	flash := FlashPayload{AuthError: "invalid credentials"}
 
-	payload := evaluateAuthPageBuilderWithCookie(t, nil, cookieHeader, func(c fiber.Ctx) error {
+	payload := evaluateAuthPageBuilderWithCookie(t, cookieHeader, func(c fiber.Ctx) error {
 		return c.JSON(handler.buildResetPasswordPageData(c, map[string]string{}, flash))
 	})
 
@@ -46,7 +45,7 @@ func TestBuildResetPasswordPageDataMarksInvalidToken(t *testing.T) {
 		Token: "invalid-token",
 	})
 
-	payload := evaluateAuthPageBuilderWithCookie(t, nil, cookieHeader, func(c fiber.Ctx) error {
+	payload := evaluateAuthPageBuilderWithCookie(t, cookieHeader, func(c fiber.Ctx) error {
 		return c.JSON(handler.buildResetPasswordPageData(c, map[string]string{}, FlashPayload{}))
 	})
 

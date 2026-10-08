@@ -9,8 +9,9 @@ import (
 )
 
 // DateAtLocation projects an instant-in-time `value` onto the calendar of
-// `location` and returns midnight of that calendar day. Use this for
-// time.Time values that represent a real instant (time.Now(),
+// `location` and returns the start of that calendar day — midnight, or the
+// day's first existing instant when a DST jump skips it (StartOfCalendarDay).
+// Use this for time.Time values that represent a real instant (time.Now(),
 // user.CreatedAt) where the in-location calendar day is what you want.
 //
 // Do NOT use this for date-only stored values (DailyLog.Date,
@@ -24,16 +25,60 @@ func DateAtLocation(value time.Time, location *time.Location) time.Time {
 	}
 	localized := value.In(location)
 	year, month, day := localized.Date()
-	return time.Date(year, month, day, 0, 0, 0, 0, location)
+	return StartOfCalendarDay(year, month, day, location)
 }
 
-// CalendarDay rebuilds a date-only stored value at midnight in `location`,
-// preserving the calendar components of `value` exactly as stored. Use this
-// for time.Time values whose semantics is "a calendar date" rather than
-// "an instant in time" — DailyLog.Date, User.LastPeriodStart, derived stats
-// fields. Unlike DateAtLocation, this does not apply In(location) and
-// therefore does not shift the calendar day across timezones, which matters
-// when stored values were persisted with a UTC-midnight timestamp.
+// StartOfCalendarDay returns the first instant that actually exists on the
+// given calendar day in `location`. It is the one construction point for
+// every "midnight of this calendar day" value in the package, so the
+// YYYY-MM-DD key a helper is handed always round-trips. It is exported for
+// the same reason it exists: the reminder scheduler resolves the day of its
+// daily pass the same way, and a second implementation of this rule is how
+// the class of defects it fixes comes back.
+//
+// `location` must not be nil — every caller resolves that first (the wrappers
+// below and reminders.nextRun default it to UTC).
+//
+// Plain time.Date cannot be used directly: in a UTC-minus zone whose DST jump
+// lands exactly on midnight (America/Santiago, America/Havana), local midnight
+// does not exist and time.Date resolves the nonexistent wall clock through its
+// `utc >= end` branch, which normalizes BACKWARD into the previous calendar
+// day — the spring-forward date could then not be entered at all. Positive
+// offsets take the `utc < start` branch and normalize forward within the same
+// day, so they were never affected and are left byte-for-byte alone here, as
+// are zones without transitions (UTC included): the fallback below only fires
+// when the requested day did not survive the construction.
+func StartOfCalendarDay(year int, month time.Month, day int, location *time.Location) time.Time {
+	candidate := time.Date(year, month, day, 0, 0, 0, 0, location)
+	if y, m, d := candidate.Date(); y == year && m == month && d == day {
+		return candidate
+	}
+
+	// Midnight was skipped: the day really begins at the transition ending the
+	// zone period the normalized candidate fell back into.
+	if _, transition := candidate.ZoneBounds(); !transition.IsZero() {
+		if y, m, d := transition.Date(); y == year && m == month && d == day {
+			return transition
+		}
+	}
+
+	// No instant on the requested day exists (a zone that skips a whole
+	// calendar day, e.g. Pacific/Apia 2011-12-30). Keep time.Date's own answer:
+	// the callers reached from here (CalendarDay, DateAtLocation) rebuild stored
+	// values and have no error channel. The returned value therefore carries a
+	// DIFFERENT calendar date than the one requested, which is exactly how
+	// ParseDayDate detects the case and refuses the input instead.
+	return candidate
+}
+
+// CalendarDay rebuilds a date-only stored value at the start of its calendar
+// day in `location` (StartOfCalendarDay), preserving the calendar components
+// of `value` exactly as stored. Use this for time.Time values whose semantics
+// is "a calendar date" rather than "an instant in time" — DailyLog.Date,
+// User.LastPeriodStart, derived stats fields. Unlike DateAtLocation, this
+// does not apply In(location) and therefore does not shift the calendar day
+// across timezones, which matters when stored values were persisted with a
+// UTC-midnight timestamp.
 func CalendarDay(value time.Time, location *time.Location) time.Time {
 	if location == nil {
 		location = time.UTC
@@ -42,7 +87,7 @@ func CalendarDay(value time.Time, location *time.Location) time.Time {
 		return time.Time{}
 	}
 	year, month, day := value.Date()
-	return time.Date(year, month, day, 0, 0, 0, 0, location)
+	return StartOfCalendarDay(year, month, day, location)
 }
 
 // CalendarDayKey returns the YYYY-MM-DD ISO string for a date-only stored
@@ -102,6 +147,84 @@ func CalendarDaysBetween(from time.Time, to time.Time) int {
 	return int(end.Sub(start).Hours() / 24)
 }
 
+// AddCalendarDays returns the calendar day `days` after `day` (negative steps
+// backward), start-of-day in `location`. It is the counterpart of
+// CalendarDaysBetween — that one MEASURES a calendar-day distance, this one
+// WALKS one — and the single stepping point for code that is not already
+// walking a run of days through forEachCalendarDay.
+//
+// `day.AddDate(0, 0, n)` is not that. AddDate re-enters time.Date in the
+// receiver's own location, so where the resulting day's local midnight does not
+// exist (America/Santiago 2026-09-06, America/Havana 2026-03-08) it resolves
+// the missing wall clock BACKWARD and returns the PREVIOUS calendar day at
+// 23:00. Every reader that then takes the calendar components — CalendarDayKey,
+// a map key, a rendered date — is handed the wrong day, one day a year per
+// affected zone, silently.
+//
+// The step therefore runs over UTC-anchored days, where no midnight is ever
+// skipped, and the result is resolved back into `location` through the single
+// construction point. Keeping the caller's anchor is deliberate: these values
+// are routinely ordered against other location-midnight values, and returning a
+// UTC-midnight one would trade this defect for the cross-anchor comparison
+// defect (issue #48 class) the barrier's shape (b) exists to catch.
+func AddCalendarDays(day time.Time, days int, location *time.Location) time.Time {
+	if day.IsZero() {
+		return time.Time{}
+	}
+	stepped := dateOnly(day).AddDate(0, 0, days)
+	return CalendarDay(stepped, location)
+}
+
+// lastProjectableYear is the last year a projected date may name. Every surface
+// spells a date with a four-digit year — `format: date` on the API, an RFC 5545
+// DATE in the feed — and time.MarshalJSON refuses a later one. Day inputs stop
+// at DayDateMax, but a date derived from a late-9999 day can still cross it.
+const lastProjectableYear = 9999
+
+// projectedDay answers a derived date that falls after 9999-12-31 as absent —
+// the zero time, which every surface already reads as "no projection" — instead
+// of a year-10000 date no surface can spell. The step itself stays exact:
+// time.Time holds year 10000 fine, so this belongs where a projection is
+// published, not inside the arithmetic that walks past it.
+func projectedDay(day time.Time) time.Time {
+	if pastLastProjectableYear(day) {
+		return time.Time{}
+	}
+	return day
+}
+
+// pastLastProjectableYear reports whether day falls after 9999-12-31, for a
+// caller that must tell that apart from a date that is absent for another
+// reason — which projectedDay's zero answer cannot.
+func pastLastProjectableYear(day time.Time) bool {
+	return day.Year() > lastProjectableYear
+}
+
+// uniqueSymptomIDs returns a day's symptom ids in their stored order with
+// repeats removed. Every surface that COUNTS symptoms per day walks the slice
+// through this (or through uniqueKnownSymptomIDs, which filters unknown ids on
+// top of it): a repeated id would count its day twice, which renders a phase
+// percentage above 100 and skews both the frequency list and the picker's usage
+// ranking. ValidateSymptomIDs already deduplicates before persisting, so this is
+// the second of two barriers rather than the only one — the read side does not
+// depend on the write side having been the one that ran.
+func uniqueSymptomIDs(symptomIDs []uint) []uint {
+	if len(symptomIDs) == 0 {
+		return nil
+	}
+
+	unique := make([]uint, 0, len(symptomIDs))
+	seen := make(map[uint]struct{}, len(symptomIDs))
+	for _, symptomID := range symptomIDs {
+		if _, duplicate := seen[symptomID]; duplicate {
+			continue
+		}
+		seen[symptomID] = struct{}{}
+		unique = append(unique, symptomID)
+	}
+	return unique
+}
+
 func SymptomIDSet(ids []uint) map[uint]bool {
 	set := make(map[uint]bool, len(ids))
 	for _, id := range ids {
@@ -141,19 +264,42 @@ func DayHasData(entry models.DailyLog) bool {
 	return strings.TrimSpace(entry.Flow) != "" && entry.Flow != models.FlowNone
 }
 
+// comparableDayFlow folds a flow to the spelling writes store (trimmed,
+// lower-case) without mapping an unknown value to none, so a stray value in a
+// row still reads as a signal. Both sides of the propagated-flow comparison go
+// through it, which keeps that comparison symmetric.
+func comparableDayFlow(flow string) string {
+	return strings.ToLower(strings.TrimSpace(flow))
+}
+
 // IsAutoFilledPeriodCandidate reports whether a day log carries no manual
-// signal besides the IsPeriod flag (and the Flow value that
-// AutoFillFollowingPeriodDays propagates from the anchor), so toggling the
-// anchor day off can safely clear it. Days touched manually (mood, intimacy,
-// BBT, mucus, cycle factors, symptoms, notes), days marked as a cycle anchor,
-// and uncertain anchors are kept intact. The Flow field is excluded from the
-// check because web's auto-fill replays the anchor's flow into the neighbors;
-// a neighbor whose only manual change was a flow override therefore falls
-// inside the auto-fill window for clearing purposes. This is the parity
+// signal besides the IsPeriod flag, so toggling the anchor day off can safely
+// clear it. Days touched manually (flow, mood, intimacy, BBT, mucus, cycle
+// factors, symptoms, notes), days marked as a cycle anchor, and uncertain
+// anchors are kept intact.
+//
+// Flow is a manual signal with one exception. Web's auto-fill writes the
+// anchor's own flow into the neighbours it creates, so that single value is
+// the fill's mark rather than the owner's: propagatedFlow is the flow the
+// anchor carried when it was unchecked, and a neighbour whose flow is empty,
+// none or equal to it is still bare. Any other flow (a heavy day inside a
+// medium period, spotting beside a none anchor) was entered by hand. An empty
+// propagatedFlow means the anchor carried none, so every non-none flow counts
+// as manual. A neighbour that happens to carry the same flow by hand is
+// indistinguishable from the fill and stays clearable. This is the parity
 // counterpart of `isAutoFilledPeriodCandidate` in ovumcy-app, where auto-fill
-// does not propagate flow.
-func IsAutoFilledPeriodCandidate(entry models.DailyLog) bool {
+// does not propagate flow and any flow is a signal.
+//
+// The manual-signal fields it tests mirror DayHasData's, and
+// day_field_mirror_barrier_test.go holds the two together: a field wired into
+// one of them alone fails there, naming the field and which side is missing.
+// CycleStart and IsUncertain are the only asymmetry, each carried in that
+// barrier's exception set with the reason above.
+func IsAutoFilledPeriodCandidate(entry models.DailyLog, propagatedFlow string) bool {
 	if !entry.IsPeriod || entry.CycleStart || entry.IsUncertain {
+		return false
+	}
+	if flow := comparableDayFlow(entry.Flow); flow != "" && flow != models.FlowNone && flow != comparableDayFlow(propagatedFlow) {
 		return false
 	}
 	if entry.Mood >= MinDayMood && entry.Mood <= MaxDayMood {

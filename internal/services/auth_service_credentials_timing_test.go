@@ -18,10 +18,16 @@ import (
 // The earlier wall-clock budget (`elapsed >= 15*time.Millisecond`) was
 // replaced with a call-counter wrapper to remove wall-clock fragility on
 // shared CI runners. The counter asserts the equalizer was invoked exactly
-// once per call; that is the actual invariant we care about. A separate
-// test (TestCredentialsTimingEqualizationHashIsBcryptCompatible) still
-// verifies the placeholder hash is a real bcrypt hash, so the equalizer
-// cannot silently short-circuit even when overridden in tests.
+// once per call; that is half the invariant.
+//
+// The other half is that the equalizer still SPENDS something, and neither the
+// counter nor TestCredentialsTimingEqualizationHashIsBcryptCompatible can see
+// it: the counter replaces the whole var, and the hash check reads the constant
+// without ever asking whether the body still compares against it. An emptied
+// body left both of them green while the unknown-address branch returned with
+// no bcrypt work at all. TestAuthCredentialsEqualizerBodyComparesThePlaceholder
+// below closes that by swapping the compare INSIDE the body — the same seam
+// discipline timingTopUpCompare already gives the top-up half.
 
 func withCountingCredentialsEqualizer(t *testing.T) *int {
 	t.Helper()
@@ -40,7 +46,7 @@ func withCountingCredentialsEqualizer(t *testing.T) *int {
 func TestAuthenticateCredentialsEqualizesTimingForMissingUser(t *testing.T) {
 	count := withCountingCredentialsEqualizer(t)
 	service := NewAuthService(&stubAuthUserRepo{
-		findByEmailErr: errors.New("not found"),
+		emailErr: errors.New("not found"),
 	})
 
 	_, err := service.AuthenticateCredentials(context.Background(), "nonexistent@example.com", "AnyPass1!")
@@ -55,12 +61,14 @@ func TestAuthenticateCredentialsEqualizesTimingForMissingUser(t *testing.T) {
 
 func TestAuthenticateCredentialsEqualizesTimingForDisabledLocalAuth(t *testing.T) {
 	count := withCountingCredentialsEqualizer(t)
-	service := NewAuthService(&stubAuthUserRepo{
-		findByEmailUser: models.User{
-			LocalAuthEnabled: false,
-			PasswordHash:     "",
-		},
-	})
+	// The account must be FOUND, or the refusal comes from the unknown-address
+	// branch and this test measures nothing the missing-user test does not.
+	service := NewAuthService(&stubAuthUserRepo{emailMatches: []models.User{{
+		ID:               7,
+		Email:            "oidc-only@example.com",
+		Role:             models.RoleOwner,
+		LocalAuthEnabled: false,
+	}}})
 
 	_, err := service.AuthenticateCredentials(context.Background(), "oidc-only@example.com", "AnyPass1!")
 
@@ -81,4 +89,76 @@ func TestCredentialsTimingEqualizationHashIsBcryptCompatible(t *testing.T) {
 	} else if !errors.Is(err, bcrypt.ErrMismatchedHashAndPassword) {
 		t.Fatalf("hash is unparseable by bcrypt (%v) — equalizer would short-circuit", err)
 	}
+}
+
+// equalizerCompare is one comparison the shipped equalizer body made, read off
+// the seam rather than off the constant the body is supposed to name.
+type equalizerCompare struct {
+	hash    string
+	operand string
+}
+
+// withEqualizerCompareRecorder records every comparison an equalizer body
+// spends. It does not call through: these tests ask WHICH comparisons the body
+// makes, and what each one costs is pinned elsewhere — the placeholder costs by
+// TestTimingEqualizationHashesMatchTargetCost, the spent work by the ledger in
+// auth_service_timing_cost_topup_test.go, which does call through.
+func withEqualizerCompareRecorder(t *testing.T) *[]equalizerCompare {
+	t.Helper()
+
+	original := authTimingEqualizerCompare
+	recorded := []equalizerCompare{}
+	authTimingEqualizerCompare = func(hash []byte, operand []byte) error {
+		recorded = append(recorded, equalizerCompare{hash: string(hash), operand: string(operand)})
+		return bcrypt.ErrMismatchedHashAndPassword
+	}
+	t.Cleanup(func() { authTimingEqualizerCompare = original })
+	return &recorded
+}
+
+// assertEqualizerSpent is the shared assertion for the two body tests: the
+// comparisons the body actually made, in order, against the placeholders it is
+// supposed to name and the operand it was handed. An empty body, a body that
+// drops one of two comparisons, and a body that compares against the wrong
+// placeholder are three different mutants and each fails here.
+func assertEqualizerSpent(t *testing.T, recorded []equalizerCompare, wantHashes []string, wantOperand string) {
+	t.Helper()
+
+	if len(recorded) != len(wantHashes) {
+		t.Fatalf("the equalizer body spent %d bcrypt comparisons, want %d — an equalizer that spends less than it claims is the timing oracle it exists to close",
+			len(recorded), len(wantHashes))
+	}
+	for index, want := range wantHashes {
+		if recorded[index].hash != want {
+			t.Fatalf("comparison %d ran against hash %q, want placeholder %q — the work it buys is then whatever that hash costs",
+				index, hashPrefix(recorded[index].hash), hashPrefix(want))
+		}
+		if recorded[index].operand != wantOperand {
+			t.Fatalf("comparison %d ran against operand %q, want the submitted secret %q", index, recorded[index].operand, wantOperand)
+		}
+	}
+}
+
+// hashPrefix shortens a bcrypt hash for a failure message: the cost and the
+// first salt characters are enough to tell two placeholders apart.
+func hashPrefix(hash string) string {
+	if len(hash) > 16 {
+		return hash[:16] + "…"
+	}
+	return hash
+}
+
+// TestAuthCredentialsEqualizerBodyComparesThePlaceholder drives the SHIPPED
+// equalizer body, which the two call-site tests above cannot: they swap the
+// whole var away. Without this, emptying the body passes the entire suite —
+// including the work ledger in auth_service_timing_cost_topup_test.go, which
+// until this seam existed read the equalized branch's cost off
+// credentialsTimingEqualizationHash instead of off the comparison.
+func TestAuthCredentialsEqualizerBodyComparesThePlaceholder(t *testing.T) {
+	const submittedPassword = "WrongGuess1!"
+	recorded := withEqualizerCompareRecorder(t)
+
+	equalizeAuthCredentialsTiming(submittedPassword)
+
+	assertEqualizerSpent(t, *recorded, []string{credentialsTimingEqualizationHash}, submittedPassword)
 }

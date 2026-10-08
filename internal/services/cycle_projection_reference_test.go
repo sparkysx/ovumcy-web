@@ -6,6 +6,9 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/ovumcy/ovumcy-web/internal/models"
+	"github.com/ovumcy/ovumcy-web/internal/testenv"
 )
 
 // This file consumes the ADDITIVE "projection" section of the shared
@@ -18,6 +21,15 @@ import (
 //   - ProjectCycleStart (current-cycle anchor + 1-based cycle day for `today`),
 //   - the displayed next-period derivation (projected start + selected length),
 //   - the ShiftCycleStartToFutureOvulation forward roll for the ovulation date.
+//
+// A vector's `lutealPhase` input carries the model's own reading of that
+// parameter: the count of days that FOLLOW ovulation, so a 28-day cycle with a
+// 14 ovulates on cycle day 14 — not the calendar span from the ovulation date to
+// the next period start, which is one day longer and is the reading the
+// personalized luteal inference had silently adopted. The round trip between the
+// two directions is pinned by TestLutealPhaseRoundTrip_ReferenceVectors; what
+// step 5 below adds is narrower and specific to these vectors: that each one
+// exercises the exact arithmetic rather than the reserve clamp.
 //
 // The section is a NEW top-level key ("projection"), so ovumcy-app's existing
 // reference test — which decodes only "vectors" — keeps passing against a
@@ -82,11 +94,7 @@ func projectionLocation(t *testing.T, name string) *time.Location {
 	if name == "" || name == "UTC" {
 		return time.UTC
 	}
-	loc, err := time.LoadLocation(name)
-	if err != nil {
-		t.Skipf("tz database unavailable for %q: %v", name, err)
-	}
-	return loc
+	return testenv.RequireTimeZone(t, name)
 }
 
 // projectionDate parses a fixture "YYYY-MM-DD" as midnight in loc, matching how
@@ -138,12 +146,15 @@ func TestCycleProjection_GoldenVectors(t *testing.T) {
 				t.Errorf("projected cycle day = %d, want %d", cycleDay, vector.Expected.ProjectedCycleDay)
 			}
 
-			// 3. Displayed next-period date: the UN-shifted projected start plus
-			// the selected length, re-anchored in the request location. Mirrors
-			// DashboardUpcomingPredictions, which derives the displayed
-			// next-period before the ovulation forward roll.
-			displayedNext := CalendarDay(cycleStart.AddDate(0, 0, predictionLength), today.Location())
-			assertProjectionDay(t, "displayed next-period start", displayedNext, vector.Expected.DisplayedNextPeriodStart)
+			// 3. Displayed next-period date: the period that closes the RUNNING
+			// cycle, the last recorded start plus the selected length. It is not
+			// the step-2 start plus the length: that start rolls a cycle on from
+			// day m+1, when the period is due now. Read through
+			// DashboardUpcomingPredictions itself, so the vector pins what the
+			// surfaces show rather than a re-derivation of it.
+			user := &models.User{CycleLength: predictionLength, LutealPhase: vector.Input.LutealPhase}
+			upcoming := DashboardUpcomingPredictions(CycleStats{LastPeriodStart: lastPeriodStart, LutealPhase: vector.Input.LutealPhase}, user, today, predictionLength)
+			assertProjectionDay(t, "displayed next-period start", upcoming.NextPeriodStart, vector.Expected.DisplayedNextPeriodStart)
 
 			// 4. Ovulation date: the window for the projected cycle, rolled
 			// forward once if its ovulation already fell before `today` (the
@@ -159,6 +170,17 @@ func TestCycleProjection_GoldenVectors(t *testing.T) {
 				t.Fatalf("projected ovulation window not calculable for input %+v", vector.Input)
 			}
 			assertProjectionDay(t, "ovulation date", window.OvulationDate, vector.Expected.OvulationDate)
+
+			// 5. Each vector must exercise the exact arithmetic, not the
+			// reserve clamp: a lutealPhase that no longer fits its cycle length
+			// would still produce a date, and the vector would then be pinning
+			// maxSupportedLutealPhase instead of the model. Nothing else here
+			// distinguishes the two, because a clamped window is calculable and
+			// its date is stable.
+			if _, exact := CalcOvulationDay(predictionLength, vector.Input.LutealPhase); !exact {
+				t.Errorf("luteal phase %d does not fit a %d-day cycle exactly, so this vector pins the clamp rather than the projection",
+					vector.Input.LutealPhase, predictionLength)
+			}
 		})
 	}
 }

@@ -17,10 +17,12 @@ import (
 // unit-testable with an injected clock.
 //
 // Medical-safety invariant: this function reuses the EXACT prediction path the
-// dashboard uses (BuildCycleStatsFromLogs → DashboardUpcomingPredictions, gated
-// by DashboardPredictionDisabled / PregnancyPaused). It never fabricates a date
-// the app itself refuses to show — when in-app predictions are suppressed, it
-// emits nothing.
+// dashboard uses (BuildCycleStatsFromLogs → DashboardUpcomingPredictions), gated
+// by the verdict every surface shares (PublishedStats → PredictionsSuppressed /
+// FertilityProjectionSuppressed) and shaped by the same range-or-date answer
+// (ResolveProjectionRanges). It never sends a date the app itself refuses to
+// show — when in-app predictions are suppressed it emits nothing, and where the
+// dashboard shows a window it sends that window, not the median day.
 
 const (
 	// DueReminderTypePeriod and DueReminderTypeOvulation identify which upcoming
@@ -38,22 +40,32 @@ const (
 //
 //   - Type is DueReminderTypePeriod or DueReminderTypeOvulation.
 //   - EventDate is the predicted event's owner-local calendar day (the next
-//     period start, or the ovulation date).
+//     period start, or the ovulation date) — or, where the dashboard shows a
+//     range for it (ResolveProjectionRanges), the range's first day.
+//   - EventDateEnd is the range's last day, and the zero time for a single
+//     date.
 //   - CycleAnchor is the cycle-start the event belongs to. It is the watermark
 //     KEY: the delivery slice records it so at most one reminder of each kind is
 //     sent per cycle, and this decision skips a reminder whose incoming
 //     watermark already equals it.
 //   - LeadDays echoes the window that was in force (settings.ReminderLeadDays,
 //     clamped), for observability by the caller.
-//   - Estimate is always true: a predicted period/ovulation date is an estimate,
-//     never fact (medical-safety invariant), so any surface rendering this must
-//     carry the estimate qualifier + non-medical-advice disclaimer.
+//
+// EVERY EventDate here is an estimate, never fact (medical-safety invariant), so
+// every surface rendering one must carry the estimate qualifier and the
+// non-medical-advice disclaimer. That obligation used to be spelled as an
+// Estimate field set to a literal true by both producers and read by nothing: a
+// constant cannot distinguish a case, so no consumer could branch on it and the
+// invariant travelled as prose wearing the shape of data. It travels as data
+// where it is actually enforced — buildPayload sets WebhookPayload.Disclaimer on
+// every payload unconditionally, and reminderCopy words the date as an estimate.
+// Regression: TestNotifyDisclaimerPresentInEveryPayload.
 type DueReminder struct {
-	Type        string
-	EventDate   time.Time
-	CycleAnchor time.Time
-	LeadDays    int
-	Estimate    bool
+	Type         string
+	EventDate    time.Time
+	EventDateEnd time.Time
+	CycleAnchor  time.Time
+	LeadDays     int
 }
 
 // WebhookReminderSettings is the transport-free webhook decision input: the
@@ -110,24 +122,53 @@ func WebhookReminderSettingsFromNotifyRecord(record models.WebhookNotifyRecord) 
 // The decision, in order:
 //
 //   - Webhook delivery disabled ⇒ nothing.
+//
 //   - Build cycle stats from the owner's logs via the SAME path the dashboard
-//     uses (StatsService.BuildCycleStatsFromLogs, which needs no repositories).
-//   - In-app predictions suppressed (DashboardPredictionDisabled — the owner's
-//     unpredictable-cycle mode — or stats.PregnancyPaused) ⇒ nothing. This is
-//     the medical-safety gate: never emit a date the app itself refuses to show.
+//     uses (BuildCycleStatsFromLogs, which needs no repositories).
+//
+//   - In-app predictions suppressed (PredictionsSuppressed: unpredictable-cycle
+//     mode, a pregnancy pause, DashboardCycleOverdue — the running cycle is past
+//     the account's own cycle length by more than a week — or irregular-cycle
+//     mode with fewer than three completed cycles) ⇒ nothing. This is the
+//     medical-safety gate: never emit a date the app itself refuses to show.
+//
+//     The overdue disjunct also keeps the period reminder's watermark KEY still
+//     while the cycle stays unclosed: a next-period date rolled a whole cycle
+//     forward is an anchor no watermark covers, and it re-armed a fresh "period
+//     soon" send once per projected cycle. DashboardUpcomingPredictions keeps the
+//     period on the running cycle, and this gate is what holds every other date
+//     back once that period is more than a week late. Suppressing the
+//     reminder suppresses the write too: this decision emits nothing, the notify
+//     pass writes a watermark only after a 2xx delivery, so an overdue cycle
+//     leaves the watermarks exactly where the last real send left them. When the
+//     owner finally logs the real cycle start, the anchor is that new cycle's
+//     projected next-period date — different from the stale watermark — so the
+//     next legitimate reminder fires exactly once and its own watermark then
+//     covers it.
+//
 //   - Resolve "today" as the owner-local calendar day (DateAtLocation) and the
 //     median-first projection cycle length the dashboard feeds to its predictions
 //     (DashboardProjectionCycleLength — the same statistic as stats.NextPeriodStart,
 //     NOT the average-first staleness reference), then take the dashboard's own
 //     upcoming prediction (DashboardUpcomingPredictions) for the authoritative
 //     next-period and ovulation dates + flags.
+//
+//   - Shape each event the way the dashboard does (ResolveProjectionRanges):
+//     where the page shows a start window or an ovulation range, the reminder
+//     carries that range (EventDate..EventDateEnd), never the median day inside
+//     it.
+//
 //   - period-soon: emitted when NotifyPeriod is on, the next period start is
-//     known, and it falls within [today, today+leadDays] (inclusive) — i.e. not
-//     in the past and not beyond the window. Its cycle anchor is the next period
-//     start itself (definitionally the start of the next cycle). Skipped when the
-//     incoming period watermark already equals that anchor.
+//     known, and the event overlaps [today, today+leadDays] (inclusive) — for a
+//     single date, not in the past and not beyond the window. Its cycle anchor
+//     is the event's first day (the next period start itself, or the start
+//     window's first day). Skipped when the incoming period watermark already
+//     equals that anchor.
+//
 //   - ovulation-soon: emitted when NotifyOvulation is on and ovulation is
-//     calculable (not impossible, non-zero) and within the same window. Its cycle
+//     calculable (not impossible, non-zero), the fertility half is not withheld
+//     (FertilityProjectionSuppressed: fewer than three completed cycles withholds
+//     it for a regular owner as for an irregular one) and within the same window. Its cycle
 //     anchor is the start of the cycle the ovulation belongs to (derived with the
 //     same projection helpers the dashboard uses). Skipped when the incoming
 //     ovulation watermark already equals that anchor.
@@ -136,111 +177,224 @@ func WebhookReminderSettingsFromNotifyRecord(record models.WebhookNotifyRecord) 
 // banner): a webhook consumer can act on each independently. Period precedes
 // ovulation in the returned slice.
 func DecideDueReminders(user *models.User, settings WebhookReminderSettings, logs []models.DailyLog, now time.Time, location *time.Location) []DueReminder {
-	if !settings.Enabled {
-		return nil
-	}
-
-	// Reuse the exact dashboard prediction path. BuildCycleStatsFromLogs is a
-	// StatsService method but consults no repositories, so a zero-dependency
-	// service is the pure, allocation-cheap way to run precisely the dashboard's
-	// stats derivation (baseline + pregnancy-pause resolution) without a store.
-	stats := NewStatsService(nil, nil).BuildCycleStatsFromLogs(user, logs, now, location)
-
-	// Medical-safety gate: if the app suppresses predictions, emit nothing.
-	if DashboardPredictionDisabled(user) || stats.PregnancyPaused {
-		return nil
-	}
-
-	today := DateAtLocation(now, location)
-	leadDays := NormalizeReminderLeadDays(settings.ReminderLeadDays)
-	cycleLength := DashboardProjectionCycleLength(user, stats)
-	prediction := DashboardUpcomingPredictions(stats, user, today, cycleLength)
-
-	reminders := make([]DueReminder, 0, 2)
-
-	if due, ok := decidePeriodReminder(settings, prediction, today, leadDays); ok {
-		reminders = append(reminders, due)
-	}
-	if due, ok := decideOvulationReminder(stats, settings, prediction, today, cycleLength, leadDays); ok {
-		reminders = append(reminders, due)
-	}
-
-	if len(reminders) == 0 {
-		return nil
-	}
+	reminders, _ := decideDueReminders(user, settings, logs, now, location)
 	return reminders
 }
 
-// decidePeriodReminder applies the period-soon rule. The next period start is
-// the anchor of the upcoming cycle, so it doubles as the event date and the
-// watermark key.
-func decidePeriodReminder(settings WebhookReminderSettings, prediction DashboardUpcomingPrediction, today time.Time, leadDays int) (DueReminder, bool) {
-	if !settings.NotifyPeriod {
-		return DueReminder{}, false
+// decideDueReminders is the single traversal behind DecideDueReminders. It
+// returns the due set AND watermarkSuppressed: how many reminders this owner
+// would have received but for a watermark that already covers them — the count
+// the notify pass reports as SkippedIdempotent.
+//
+// The count comes from the same pass that builds the due set because the
+// traversal is not cheap: it rebuilds the owner's cycle statistics from their
+// logged history, so deriving the counter by deciding a second time with
+// the watermarks cleared made the observability cost equal the cost of the work
+// it observes. Nothing about the authoritative decision changes: a kind is
+// counted exactly when its own watermark is what withheld it, which is the
+// definition the second decision approximated by subtraction.
+func decideDueReminders(user *models.User, settings WebhookReminderSettings, logs []models.DailyLog, now time.Time, location *time.Location) ([]DueReminder, int) {
+	if !settings.Enabled {
+		return nil, 0
 	}
-	eventDate := prediction.NextPeriodStart
-	if !reminderWithinWindow(today, eventDate, leadDays) {
-		return DueReminder{}, false
+
+	// Reuse the exact dashboard prediction path. BuildCycleStatsFromLogs is
+	// package-level precisely because it consults no repositories, so this pass
+	// runs the dashboard's stats derivation (baseline + pregnancy-pause
+	// resolution) without constructing — and without depending on never
+	// dereferencing — a store-less service.
+	today := DateAtLocation(now, location)
+	// The history is cut to the window every in-app surface derives its stats
+	// from, through the same helper the dashboard calls. The notify pass is handed
+	// the owner's whole stored history, and the cycle lengths, the completed-cycle
+	// count and the overdue verdict all read it: an owner whose old cycles outlive
+	// the window would otherwise be paused in the app while a reminder, built from
+	// a different set of cycles, left the instance for a third-party endpoint.
+	//
+	// The cut also bounds what the phase and the confirmed-shift check below read,
+	// and that loses nothing they use: the window ends at today inclusive, the
+	// phase asks only about today's own row, and the thermal-shift series stops at
+	// today (currentCycleDetectionBound), so rows recorded for the days ahead are
+	// read by neither on the dashboard either. A test pins that equality.
+	logs = FilterLogsToStatsHistory(logs, now, location)
+	// Published through the one adapter every projection surface shares, so this
+	// pass holds the same cleared stats /stats and the JSON API publish, and reads
+	// the verdict it returns rather than asking the predicates a second time.
+	//
+	// The confirmed-shift substitution the dashboard applies between the build and
+	// the publication is deliberately not repeated here: it moves the ovulation
+	// day, the window and the fertility status of the current cycle, and nothing
+	// this pass reads comes from those. The verdict, the projection length, the
+	// next-period and ovulation projections and the cycle anchor are all rebuilt
+	// from the recorded start, the cycle lengths and the luteal phase, and a
+	// confirmed shift is honoured below by ConfirmedOvulationSupersedes. A test
+	// pins the verdict, the length and both projections as the same with and
+	// without the substitution.
+	stats, suppression := PublishedStats(user, BuildCycleStatsFromLogs(user, logs, now, location), logs, today, location)
+
+	// Medical-safety gate: if the app suppresses predictions, emit nothing. The
+	// signals are read through the predicate every surface shares.
+	if suppression.PredictionsSuppressed {
+		return nil, 0
+	}
+
+	leadDays := NormalizeReminderLeadDays(settings.ReminderLeadDays)
+	cycleLength := DashboardProjectionCycleLength(user, stats)
+	prediction := DashboardUpcomingPredictions(stats, user, today, cycleLength)
+	ranges := ResolveProjectionRanges(user, stats, prediction.NextPeriodStart, location)
+
+	reminders := make([]DueReminder, 0, 2)
+	watermarkSuppressed := 0
+
+	due, ok, watermarked := decidePeriodReminder(settings, prediction, ranges, today, leadDays)
+	if ok {
+		reminders = append(reminders, due)
+	}
+	if watermarked {
+		watermarkSuppressed++
+	}
+	// The ovulation reminder carries the extra completed-cycle floor: before
+	// three cycles have been observed its date rests on the onboarding slider
+	// or on one or two observed lengths, and this pass sends it to an endpoint
+	// outside the instance (FertilityProjectionSuppressed). The period reminder keeps its own path —
+	// it is anchored on a recorded cycle start and rides the estimate flag.
+	// A confirmed thermal shift outranks the projection it supersedes. This
+	// reminder says an ovulation is COMING; once the temperatures have named the
+	// day it happened on, sending the projected day puts a second date for one
+	// shift outside the instance, where the dashboard and the grid have already
+	// moved onto the day inferred from the temperature shift. ConfirmedOvulationSupersedes bounds that to
+	// the confirmation's own cycle, so a projection that has rolled into the next
+	// one still sends. A range is the current cycle's, so its gate is the
+	// confirmation itself: Supersedes compares the ROLLED projection and turns
+	// false the day the median passes, which would send the range the dashboard
+	// and the feed have withheld.
+	_, hasConfirmed := ConfirmedCurrentCycleOvulation(user, logs, stats, today, location)
+	if !suppression.FertilitySuppressed &&
+		(!ranges.OvulationUseRange || !hasConfirmed) &&
+		!ConfirmedOvulationSupersedes(user, logs, stats, prediction.OvulationDate, today, location) {
+		due, ok, watermarked := decideOvulationReminder(stats, settings, prediction, ranges, today, cycleLength, leadDays)
+		if ok {
+			reminders = append(reminders, due)
+		}
+		if watermarked {
+			watermarkSuppressed++
+		}
+	}
+
+	if len(reminders) == 0 {
+		return nil, watermarkSuppressed
+	}
+	return reminders, watermarkSuppressed
+}
+
+// decidePeriodReminder applies the period-soon rule. The event is the next
+// period start, or the start window around it where the dashboard shows one
+// (ranges.NextPeriodUseRange). The event's first day is the watermark key: for a
+// single date that is the next period start itself, as before; for a window it
+// is the window's first day, which — unlike the median inside an irregular
+// window — does not roll a cycle forward while the window is still open, so one
+// window is announced once.
+//
+// The second result says the reminder is due; the third says it was withheld by
+// its OWN watermark — an already-sent reminder, not an absent one. Only that
+// case is idempotency: a reminder outside the lead window, or of a kind the
+// owner turned off, is simply not due and must never be reported as skipped.
+func decidePeriodReminder(settings WebhookReminderSettings, prediction DashboardUpcomingPrediction, ranges ProjectionRanges, today time.Time, leadDays int) (reminder DueReminder, due bool, watermarkSuppressed bool) {
+	if !settings.NotifyPeriod {
+		return DueReminder{}, false, false
+	}
+	eventDate, eventDateEnd := prediction.NextPeriodStart, time.Time{}
+	if ranges.NextPeriodUseRange {
+		eventDate, eventDateEnd = ranges.NextPeriodStart, ranges.NextPeriodEnd
+	}
+	if !reminderWithinWindow(today, eventDate, eventDateEnd, leadDays) {
+		return DueReminder{}, false, false
 	}
 	anchor := CalendarDay(eventDate, today.Location())
-	if watermarkCoversAnchor(settings.PeriodWatermark, anchor) {
-		return DueReminder{}, false
+	// A watermark anywhere inside the window covers it too: a reminder sent
+	// before windows were keyed on their first day is keyed on the median inside
+	// the window, and announcing the same window again would be a second send for
+	// one cycle. A later window always starts after an earlier one's first day,
+	// so this never covers the next cycle.
+	if watermarkCoversAnchor(settings.PeriodWatermark, anchor) ||
+		(!eventDateEnd.IsZero() && watermarkWithin(settings.PeriodWatermark, eventDate, eventDateEnd)) {
+		return DueReminder{}, false, true
 	}
 	return DueReminder{
-		Type:        DueReminderTypePeriod,
-		EventDate:   eventDate,
-		CycleAnchor: anchor,
-		LeadDays:    leadDays,
-		Estimate:    true,
-	}, true
+		Type:         DueReminderTypePeriod,
+		EventDate:    eventDate,
+		EventDateEnd: eventDateEnd,
+		CycleAnchor:  anchor,
+		LeadDays:     leadDays,
+	}, true, false
 }
 
 // decideOvulationReminder applies the ovulation-soon rule. The ovulation's cycle
 // anchor is the start of the cycle it belongs to, derived with the same
 // projection helpers DashboardUpcomingPredictions uses so the two never drift.
-func decideOvulationReminder(stats CycleStats, settings WebhookReminderSettings, prediction DashboardUpcomingPrediction, today time.Time, cycleLength int, leadDays int) (DueReminder, bool) {
+// An ovulation range (ranges.OvulationUseRange) is always the current cycle's —
+// DashboardOvulationRange places it from the last recorded start — so that start
+// is its anchor, even once the median inside it has passed and the projection
+// has rolled on.
+//
+// Its three results carry the same meaning as decidePeriodReminder's: due, and
+// separately withheld by its own watermark.
+func decideOvulationReminder(stats CycleStats, settings WebhookReminderSettings, prediction DashboardUpcomingPrediction, ranges ProjectionRanges, today time.Time, cycleLength int, leadDays int) (reminder DueReminder, due bool, watermarkSuppressed bool) {
 	if !settings.NotifyOvulation || prediction.OvulationImpossible {
-		return DueReminder{}, false
+		return DueReminder{}, false, false
 	}
-	eventDate := prediction.OvulationDate
-	if !reminderWithinWindow(today, eventDate, leadDays) {
-		return DueReminder{}, false
+	eventDate, eventDateEnd := prediction.OvulationDate, time.Time{}
+	if ranges.OvulationUseRange {
+		eventDate, eventDateEnd = ranges.OvulationStart, ranges.OvulationEnd
+	}
+	if !reminderWithinWindow(today, eventDate, eventDateEnd, leadDays) {
+		return DueReminder{}, false, false
 	}
 	anchor := ovulationCycleAnchor(stats, today, cycleLength)
+	if ranges.OvulationUseRange {
+		anchor = CalendarDay(stats.LastPeriodStart, today.Location())
+	}
 	// codecov:ignore:start -- defensive and unreachable from this call path: an
 	// in-window ovulation (reminderWithinWindow true above ⇒ non-zero, and
-	// OvulationImpossible false) is only produced by DashboardUpcomingPredictions
+	// OvulationImpossible false) — a single date or a range — is only produced
 	// when LastPeriodStart is non-zero and cycleLength > 0, which is exactly what
-	// ovulationCycleAnchor needs to return a non-zero anchor. Kept so a reminder
-	// is never emitted without a watermark key the delivery slice can dedupe on.
+	// either anchor needs to be non-zero. Kept so a reminder is never emitted
+	// without a watermark key the delivery slice can dedupe on.
 	if anchor.IsZero() {
-		return DueReminder{}, false
+		return DueReminder{}, false, false
 	}
 	// codecov:ignore:end
 	if watermarkCoversAnchor(settings.OvulationWatermark, anchor) {
-		return DueReminder{}, false
+		return DueReminder{}, false, true
 	}
 	return DueReminder{
-		Type:        DueReminderTypeOvulation,
-		EventDate:   eventDate,
-		CycleAnchor: anchor,
-		LeadDays:    leadDays,
-		Estimate:    true,
-	}, true
+		Type:         DueReminderTypeOvulation,
+		EventDate:    eventDate,
+		EventDateEnd: eventDateEnd,
+		CycleAnchor:  anchor,
+		LeadDays:     leadDays,
+	}, true, false
 }
 
-// reminderWithinWindow reports whether eventDate falls in the inclusive lead
-// window [today, today+leadDays]: not in the past (>= 0 days out) and not
-// beyond the lead (<= leadDays). Both operands are calendar days; the distance
-// is measured with CalendarDaysBetween so it is immune to time-of-day and
-// timezone-midnight skew (never a raw time subtraction). A zero eventDate
-// (not yet calculable) is never in-window.
-func reminderWithinWindow(today time.Time, eventDate time.Time, leadDays int) bool {
+// reminderWithinWindow reports whether the event — the day eventDate, or the
+// range eventDate..eventDateEnd when eventDateEnd is set — overlaps the inclusive
+// lead window [today, today+leadDays]: it starts no later than the lead and has
+// not entirely passed. For a single date that is the original rule, not in the
+// past and not beyond the lead. A range already open today still counts, so a
+// window whose first day slid behind today (a lead of zero, or stats that moved
+// it earlier) is announced rather than skipped; the watermark keeps it to once.
+// Distances are CalendarDaysBetween, immune to time-of-day and timezone-midnight
+// skew (never a raw time subtraction). A zero eventDate (not yet calculable) is
+// never in-window.
+func reminderWithinWindow(today time.Time, eventDate time.Time, eventDateEnd time.Time, leadDays int) bool {
 	if eventDate.IsZero() {
 		return false
 	}
-	daysUntil := CalendarDaysBetween(today, eventDate)
-	return daysUntil >= 0 && daysUntil <= leadDays
+	lastDay := eventDate
+	if !eventDateEnd.IsZero() {
+		lastDay = eventDateEnd
+	}
+	return CalendarDaysBetween(today, eventDate) <= leadDays && CalendarDaysBetween(today, lastDay) >= 0
 }
 
 // watermarkCoversAnchor reports whether an incoming per-kind watermark already
@@ -252,6 +406,15 @@ func watermarkCoversAnchor(watermark *time.Time, anchor time.Time) bool {
 		return false
 	}
 	return CalendarDaysBetween(*watermark, anchor) == 0
+}
+
+// watermarkWithin reports whether an incoming watermark falls on or between
+// first and last, by calendar day.
+func watermarkWithin(watermark *time.Time, first time.Time, last time.Time) bool {
+	if watermark == nil || watermark.IsZero() {
+		return false
+	}
+	return CalendarDaysBetween(first, *watermark) >= 0 && CalendarDaysBetween(*watermark, last) >= 0
 }
 
 // ovulationCycleAnchor returns the cycle-start the predicted ovulation belongs
@@ -273,7 +436,12 @@ func ovulationCycleAnchor(stats CycleStats, today time.Time, cycleLength int) ti
 		return time.Time{}
 	}
 	window := PredictCycleWindow(cycleStart, cycleLength, stats.LutealPhase)
-	if window.Calculable && window.OvulationDate.Before(today) {
+	// The same calendar-day comparison DashboardUpcomingPredictions makes:
+	// window.OvulationDate is a UTC-midnight date-only value, today an owner
+	// location midnight, and comparing them as instants shifted the outbound
+	// reminder's anchor a full cycle on the ovulation day itself in every
+	// UTC-minus zone (issue #48 class).
+	if window.Calculable && CalendarDaysBetween(window.OvulationDate, today) > 0 {
 		cycleStart = ShiftCycleStartToFutureOvulation(cycleStart, window.OvulationDate, cycleLength, today)
 	}
 	return CalendarDay(cycleStart, today.Location())

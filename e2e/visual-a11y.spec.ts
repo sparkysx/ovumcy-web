@@ -1,5 +1,5 @@
-import { expect, test, type Locator, type Page } from '@playwright/test';
-import { fillDateField } from './support/date-field-helpers';
+import { expect, test, type Page } from './support/fixtures';
+import { mutatingRequestsDuring } from './support/confirm-dialog-helpers';
 import {
   completeOnboardingIfPresent,
   continueFromRecoveryCode,
@@ -8,16 +8,23 @@ import {
   readRecoveryCode,
   registerOwnerViaUI,
 } from './support/auth-helpers';
+import { applyTheme, expectTextContrastAA } from './support/contrast-helpers';
 import {
   assertNoHorizontalOverflow,
+  expectCalendarMonthFitsMobileViewport,
   expectElementAboveMobileTabbar,
+  expectOpaqueMobileTabbar,
+  expectPageBottomClearsMobileTabbar,
   expectVisibleFocusIndicator,
+  openLongestCalendarMonth,
 } from './support/mobile-layout-helpers';
 import {
   markCycleStart,
+  openCalendarDayEditor,
   registerOwnerAndEnableIrregularMode,
   saveBBTOnDay,
   saveCycleFactorOnDay,
+  saveDayEditorForm,
   shiftISODate,
   todayISOFromDashboard,
 } from './support/stats-helpers';
@@ -35,19 +42,10 @@ async function registerOwnerAndReachDashboard(page: Page, prefix: string): Promi
   await expect(page).toHaveURL(/\/dashboard$/);
 }
 
-async function setCurrentCycleStart(page: Page, isoDate: string): Promise<void> {
-  await page.goto('/settings');
-  await expect(page).toHaveURL(/\/settings$/);
-
-  const cycleForm = page.locator('section#settings-cycle form[action="/api/v1/users/current/cycle"]');
-  await expect(cycleForm).toBeVisible();
-  await fillDateField(cycleForm.locator('#settings-last-period-start'), isoDate);
-  await cycleForm.locator('button[data-save-button]').click();
-  await expect(page.locator('#settings-cycle-status .status-ok')).toBeVisible();
-}
-
 async function seedStatsInsightState(page: Page, prefix: string): Promise<void> {
-  await registerOwnerAndEnableIrregularMode(page, prefix);
+  // The current cycle opens at onboarding, 8 days back; see
+  // registerOwnerAndEnableIrregularMode for why it is not moved there later.
+  await registerOwnerAndEnableIrregularMode(page, prefix, 8);
 
   const today = await todayISOFromDashboard(page);
   const cycleStarts = [-112, -84, -56, -28].map((offset) => shiftISODate(today, offset));
@@ -61,13 +59,34 @@ async function seedStatsInsightState(page: Page, prefix: string): Promise<void> 
   await saveCycleFactorOnDay(page, shiftISODate(cycleStarts[2], 2), 'stress');
 
   const currentCycleStart = shiftISODate(today, -8);
-  await setCurrentCycleStart(page, currentCycleStart);
 
   const bbtDays = [0, 1, 2, 3, 4].map((offset) => shiftISODate(currentCycleStart, offset));
   const bbtValues = ['36.40', '36.45', '36.50', '36.55', '36.60'];
   for (let index = 0; index < bbtDays.length; index += 1) {
     await saveBBTOnDay(page, bbtDays[index], bbtValues[index]);
   }
+}
+
+async function assertHeadingStructure(page: Page, label: string): Promise<void> {
+  const result = await page.evaluate(() => {
+    const nodes = Array.from(
+      document.querySelectorAll('main h1, main h2, main h3, main h4, main h5, main h6'),
+    );
+    const levels = nodes.map((node) => Number(node.tagName[1]));
+    const h1Count = levels.filter((level) => level === 1).length;
+    let skipsLevel = false;
+    let previous = 0;
+    for (const level of levels) {
+      if (previous !== 0 && level > previous + 1) skipsLevel = true;
+      previous = level;
+    }
+    return { h1Count, skipsLevel, levels };
+  });
+  expect(result.h1Count, `${label} must have exactly one <h1> (levels: ${result.levels.join(',')})`).toBe(1);
+  expect(
+    result.skipsLevel,
+    `${label} must not skip a heading level (levels: ${result.levels.join(',')})`,
+  ).toBe(false);
 }
 
 test.describe('Visual and accessibility regressions', () => {
@@ -80,13 +99,24 @@ test.describe('Visual and accessibility regressions', () => {
     await page.goto('/dashboard');
     await expect(page).toHaveURL(/\/dashboard$/);
     await assertNoHorizontalOverflow(page);
-    const dashboardAutosave = page.locator('[data-dashboard-autosave-indicator]');
-    await dashboardAutosave.scrollIntoViewIfNeeded();
-    await expectElementAboveMobileTabbar(page, dashboardAutosave);
+    // The autosave row renders nothing while idle — the journal is autosave-only
+    // and says so only when it has something to report — so the lowest control
+    // of the day form is the anchor for the tabbar clearance.
+    const dashboardLowestAction = page.locator('[data-dashboard-cycle-start-button]');
+    await dashboardLowestAction.scrollIntoViewIfNeeded();
+    await expectElementAboveMobileTabbar(page, dashboardLowestAction);
 
     await page.goto('/settings');
     await expect(page).toHaveURL(/\/settings$/);
     await assertNoHorizontalOverflow(page);
+    // Settings cards are disclosures at this width and arrive closed, so the
+    // clearance is measured where it can actually fail: with the section open.
+    // Asserting it against a collapsed card would measure nothing and stay
+    // green through any amount of overlap.
+    const trackingSection = page.locator('#settings-tracking');
+    await expect(trackingSection).toHaveJSProperty('open', false);
+    await trackingSection.locator('summary').click();
+    await expect(trackingSection).toHaveJSProperty('open', true);
     const trackingSave = page.locator('[data-settings-tracking-save]');
     await trackingSave.scrollIntoViewIfNeeded();
     await expectElementAboveMobileTabbar(page, trackingSave);
@@ -97,6 +127,42 @@ test.describe('Visual and accessibility regressions', () => {
     const sourceLink = page.locator('a[href="https://github.com/ovumcy/ovumcy-web"]');
     await sourceLink.scrollIntoViewIfNeeded();
     await expectElementAboveMobileTabbar(page, sourceLink);
+  });
+
+  test('mobile calendar shows a whole month, header included, without scrolling', async ({
+    page,
+  }) => {
+    await registerOwnerAndReachDashboard(page, 'visual-calendar-density');
+    await page.setViewportSize({ width: 390, height: 844 });
+
+    await openLongestCalendarMonth(page);
+    await assertNoHorizontalOverflow(page);
+    await expectCalendarMonthFitsMobileViewport(page);
+  });
+
+  test('mobile tabbar paints opaquely in both themes and page bottoms clear it', async ({
+    page,
+  }) => {
+    await registerOwnerAndReachDashboard(page, 'visual-tabbar-opacity');
+    await page.setViewportSize({ width: 390, height: 844 });
+
+    const html = page.locator('html');
+    const footerPrivacyLink = page.locator('footer a[href^="/privacy"]');
+
+    for (const theme of ['light', 'dark'] as const) {
+      await page.evaluate((value) => {
+        window.localStorage.setItem('ovumcy_theme', value);
+      }, theme);
+
+      for (const path of ['/dashboard', '/calendar', '/stats']) {
+        await page.goto(path);
+        await expect(page).toHaveURL(new RegExp(`${path}$`));
+        await expect(html).toHaveAttribute('data-theme', theme);
+
+        await expectOpaqueMobileTabbar(page);
+        await expectPageBottomClearsMobileTabbar(page, footerPrivacyLink);
+      }
+    }
   });
 
   test('primary navigation and actions show visible focus indicators', async ({
@@ -176,11 +242,24 @@ test.describe('Visual and accessibility regressions', () => {
     await page.keyboard.press('Shift+Tab');
     await expect(page.locator('#confirm-modal-accept')).toBeFocused();
 
-    // Escape closes the dialog and returns focus to the invoking button.
-    await page.keyboard.press('Escape');
-    await expect(modal).toBeHidden();
-    await expect(logoutButton).toBeFocused();
-    await expect(page).toHaveURL(/\/dashboard$/);
+    // Escape closes the dialog, returns focus to the invoking button, and must
+    // not release the logout it gated. A URL assertion is already true the moment
+    // it runs, so record what the page puts on the wire across the whole window
+    // and close it on a reload: a surviving session still serves /dashboard,
+    // whereas an escaped logout would redirect to /login.
+    const escapedLogouts = await mutatingRequestsDuring(
+      page,
+      (pathname) => pathname === '/logout',
+      async () => {
+        await page.keyboard.press('Escape');
+        await expect(modal).toBeHidden();
+        await expect(logoutButton).toBeFocused();
+
+        await page.reload();
+        await expect(page).toHaveURL(/\/dashboard$/);
+      }
+    );
+    expect(escapedLogouts, 'dismissing the logout dialog must issue no logout').toEqual([]);
   });
 
   test('stats insight state stays readable on mobile and exposes accessible summaries', async ({
@@ -194,20 +273,50 @@ test.describe('Visual and accessibility regressions', () => {
     await page.goto('/stats');
     await expect(page).toHaveURL(/\/stats$/);
     await assertNoHorizontalOverflow(page);
-    await expect(page.locator('[data-usage-goal-summary]')).toBeVisible();
     await expect(page.locator('[data-stats-factor-context]')).toBeVisible();
     await expect(page.locator('#cycle-chart')).toBeVisible();
     await expect(page.locator('#cycle-chart')).toHaveAttribute('role', 'img');
     await expect(page.locator('#stats-cycle-trend-summary')).toBeVisible();
 
-    const bbtSummary = page.locator('#stats-bbt-summary');
-    if ((await bbtSummary.count()) > 0) {
-      await expect(bbtSummary).toBeVisible();
-    }
+    // Unconditional: the seed saves five BBT readings inside the current cycle,
+    // so HasCurrentCycleBBTChart is true and the summary the chart's
+    // aria-describedby points at must be there. Guarding it on count > 0 made a
+    // missing panel indistinguishable from a rendered one.
+    await expect(page.locator('#stats-bbt-summary')).toBeVisible();
 
     const cycleSummary = page.locator('#stats-cycle-trend-summary');
     await cycleSummary.scrollIntoViewIfNeeded();
     await expectElementAboveMobileTabbar(page, cycleSummary);
+
+    // Desktop, same seeded owner: no symptoms are logged in the last completed
+    // cycle, so the "Top symptoms in your last cycle" panel renders its empty
+    // state beside the BBT chart panel. The two share one `lg:grid-cols-2` row,
+    // and a stretched grid item made the empty card as tall as the chart — a
+    // card of white with one line in it. The card is sized to its own content,
+    // so it must stay well below the chart panel's height.
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.goto('/stats');
+    await expect(page).toHaveURL(/\/stats$/);
+    const symptomsPanel = page.locator('[data-stats-last-cycle-symptoms]');
+    const bbtPanel = page.locator('[data-stats-bbt-panel]');
+    await expect(symptomsPanel.locator('.stats-empty-state')).toBeVisible();
+    await expect(bbtPanel).toBeVisible();
+    // The populated page is the only state that renders a section heading below
+    // the factor-context h2, so the heading walk runs here too — the dedicated
+    // heading test registers a fresh owner and sees the empty state. Pin the
+    // nested heading itself: without it the walk would prove nothing new.
+    await expect(page.locator('[data-stats-factor-recent-cycles] h3')).toBeVisible();
+    await assertHeadingStructure(page, '/stats (populated)');
+    const symptomsBox = await symptomsPanel.boundingBox();
+    const bbtBox = await bbtPanel.boundingBox();
+    expect(symptomsBox, 'last-cycle symptoms panel must have a visible box').not.toBeNull();
+    expect(bbtBox, 'BBT chart panel must have a visible box').not.toBeNull();
+    // Same row: a stretched item shares the chart panel's top edge and height.
+    expect(Math.round(symptomsBox!.y)).toBe(Math.round(bbtBox!.y));
+    expect(
+      symptomsBox!.height,
+      `empty-state card ${symptomsBox!.height}px must not be stretched to the chart panel's ${bbtBox!.height}px`,
+    ).toBeLessThan(bbtBox!.height - 100);
   });
 
   test('mobile tap targets meet the minimum size (tabbar 44px, language pills 40px)', async ({
@@ -245,42 +354,131 @@ test.describe('Visual and accessibility regressions', () => {
     }
   });
 
+  test('primary actions clear WCAG AA text contrast in both themes', async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 900 });
+
+    // Pre-auth first: the login submit is the same `.btn-primary` component that
+    // carries every owner-facing primary action, and it needs no account.
+    await page.goto('/login');
+    await expect(page).toHaveURL(/\/login$/);
+
+    for (const theme of ['light', 'dark'] as const) {
+      await applyTheme(page, theme);
+      await expectTextContrastAA(page, '.btn-primary', `login primary action (${theme})`);
+
+      // The hover fill is a second painted background. Both endpoints of the
+      // transition must pass, so a reading taken mid-transition is bounded by
+      // them and cannot go under the bar.
+      await page.locator('form .btn-primary').first().hover();
+      await expectTextContrastAA(
+        page,
+        'form .btn-primary',
+        `login primary action, hovered (${theme})`
+      );
+    }
+
+    // The dashboard editor carries the owner-facing primary action, on a card
+    // rather than on the page canvas.
+    await registerOwnerAndReachDashboard(page, 'visual-contrast');
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.goto('/dashboard');
+    await expect(page).toHaveURL(/\/dashboard$/);
+
+    // With the journal on autosave there is no save button, so the dashboard's
+    // primary action is the manual cycle start — and it only paints as primary
+    // once today is a cycle start. Mark it, so the phase-tinted fill this test
+    // exists for is actually on screen.
+    await page.locator('[data-dashboard-cycle-start-button]').click();
+    await expect(page.locator('#confirm-modal')).toBeVisible();
+    await page.locator('#confirm-modal-accept').click();
+    await expect(page.locator('[data-dashboard-editor] .btn-primary')).toBeVisible();
+
+    const editor = page.locator('[data-dashboard-editor]');
+    await expect(editor).toHaveAttribute('data-phase', /.+/);
+
+    const primaryAction = page.locator('[data-dashboard-editor] .btn-primary');
+
+    for (const theme of ['light', 'dark'] as const) {
+      await applyTheme(page, theme);
+      await expectTextContrastAA(
+        page,
+        '[data-dashboard-editor] .btn-primary',
+        `dashboard primary action (${theme})`
+      );
+
+      // The primary role paints ONE fill. The editor used to re-tint its action
+      // per cycle phase and per fertile window, which is how a green button
+      // reached a rose/amber product; contrast alone cannot see that, because
+      // every tint cleared the bar on its own. `data-phase` and `data-fertility`
+      // are server-rendered, so setting them directly reaches every state
+      // without seeding a cycle per state, and the next applyTheme reload
+      // restores them.
+      const fills = new Set<string>();
+      for (const [phase, fertility] of [
+        ['menstrual', 'outside_estimated_window'],
+        ['follicular', 'outside_estimated_window'],
+        ['luteal', 'outside_estimated_window'],
+        ['luteal', 'fertile'],
+      ]) {
+        await editor.evaluate(
+          (node, value) => {
+            node.setAttribute('data-phase', value[0]);
+            node.setAttribute('data-fertility', value[1]);
+          },
+          [phase, fertility]
+        );
+        await expect(editor).toHaveAttribute('data-phase', phase);
+        await expect(editor).toHaveAttribute('data-fertility', fertility);
+        fills.add(
+          await primaryAction.evaluate((node) => {
+            const painted = getComputedStyle(node);
+            return `${painted.backgroundColor} | ${painted.backgroundImage}`;
+          })
+        );
+      }
+      expect(
+        [...fills],
+        `primary action must paint one fill across cycle phases (${theme})`
+      ).toHaveLength(1);
+    }
+
+    // The calendar day panel's edit action is the screen's primary, so it is a
+    // third surface painting `--action-primary` — here over a journal card
+    // rather than over the page canvas. A day needs an entry for the panel to
+    // render its read view, where that action lives.
+    const dayISO = shiftISODate(await todayISOFromDashboard(page), -2);
+    const dayMonth = dayISO.slice(0, 7);
+    const dayForm = await openCalendarDayEditor(page, dayISO);
+    await dayForm.locator('input[name="is_period"]').check();
+    await saveDayEditorForm(page, dayISO, dayForm);
+
+    const dayPanelPrimary = '#day-editor [data-action-weight="primary"]';
+    for (const theme of ['light', 'dark'] as const) {
+      await page.goto(`/calendar?month=${dayMonth}&day=${dayISO}`);
+      await applyTheme(page, theme);
+      await expect(page.locator(dayPanelPrimary)).toBeVisible();
+      await expectTextContrastAA(
+        page,
+        dayPanelPrimary,
+        `calendar day panel primary action (${theme})`
+      );
+    }
+  });
+
   test('owner pages expose a single h1 and never skip heading levels', async ({ page }) => {
     await registerOwnerAndReachDashboard(page, 'visual-heading-order');
 
-    const assertHeadingStructure = async (label: string): Promise<void> => {
-      const result = await page.evaluate(() => {
-        const nodes = Array.from(
-          document.querySelectorAll('main h1, main h2, main h3, main h4, main h5, main h6'),
-        );
-        const levels = nodes.map((node) => Number(node.tagName[1]));
-        const h1Count = levels.filter((level) => level === 1).length;
-        let skipsLevel = false;
-        let previous = 0;
-        for (const level of levels) {
-          if (previous !== 0 && level > previous + 1) skipsLevel = true;
-          previous = level;
-        }
-        return { h1Count, skipsLevel, levels };
-      });
-      expect(result.h1Count, `${label} must have exactly one <h1> (levels: ${result.levels.join(',')})`).toBe(1);
-      expect(
-        result.skipsLevel,
-        `${label} must not skip a heading level (levels: ${result.levels.join(',')})`,
-      ).toBe(false);
-    };
-
     await page.goto('/dashboard');
     await expect(page).toHaveURL(/\/dashboard$/);
-    await assertHeadingStructure('/dashboard');
+    await assertHeadingStructure(page, '/dashboard');
 
     await page.goto('/stats');
     await expect(page).toHaveURL(/\/stats$/);
-    await assertHeadingStructure('/stats');
+    await assertHeadingStructure(page, '/stats');
 
     await page.goto('/settings');
     await expect(page).toHaveURL(/\/settings$/);
-    await assertHeadingStructure('/settings');
+    await assertHeadingStructure(page, '/settings');
 
     // Calendar: open a day so the day panel heading (h2 under the page h1) renders.
     const today = await todayISOFromDashboard(page);
@@ -288,6 +486,6 @@ test.describe('Visual and accessibility regressions', () => {
     await expect(page).toHaveURL(/\/calendar/);
     await page.locator(`[data-day-editor-open="${today}"]`).first().click();
     await expect(page.locator('#day-editor h2')).toBeVisible();
-    await assertHeadingStructure('/calendar');
+    await assertHeadingStructure(page, '/calendar');
   });
 });

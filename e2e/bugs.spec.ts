@@ -1,20 +1,26 @@
-import { expect, test, type Page } from '@playwright/test';
-import { clearDateField, fillDateField } from './support/date-field-helpers';
+import { expect, test, type Page } from './support/fixtures';
+import { fillDateField, formatDisplayDate } from './support/date-field-helpers';
+import { selectOnboardingStartDate } from './support/onboarding-helpers';
 import { openCalendarDayEditor } from './support/stats-helpers';
 import { checkStyledControl } from './support/form-helpers';
+import { saveSettingsLanguage } from './support/language-helpers';
 import {
   dashboardCurrentCycleDay,
-  dashboardCurrentPhaseText,
-  dashboardCycleHero,
-  dashboardPrimarySummaryMode,
+  dashboardCurrentPhase,
+  dashboardStatusHeader,
+  dashboardStatusLine,
+  expectDashboardStatusHeader,
 } from './support/dashboard-helpers';
+import { everyLocaleText, localeKeysMatchingEnglish, localeText } from './support/locale-helpers';
 import {
   completeOnboardingIfPresent,
   continueFromRecoveryCode,
   createCredentials,
   expectInlineRegisterRecoveryStep,
+  logoutViaAPI,
   readRecoveryCode,
   registerOwnerViaUI,
+  apiOriginHeader,
 } from './support/auth-helpers';
 
 function shiftISODate(iso: string, days: number): string {
@@ -39,6 +45,55 @@ async function registerOwnerAndReachDashboard(page: Page, prefix: string) {
   await expect(page).toHaveURL(/\/dashboard(?:\?.*)?$/);
 
   return credentials;
+}
+
+async function onboardOwnerWithAutoPeriodFill(
+  page: Page,
+  prefix: string,
+  onboardingDate: string,
+  autoPeriodFill: boolean
+): Promise<void> {
+  await registerOwnerViaUI(page, createCredentials(prefix));
+  await expectInlineRegisterRecoveryStep(page);
+  await readRecoveryCode(page);
+  await continueFromRecoveryCode(page);
+  await expect(page).toHaveURL(/\/onboarding(?:\?.*)?$/);
+
+  await selectOnboardingStartDate(page, onboardingDate);
+  await page.locator('form[hx-post="/api/v1/onboarding/steps/1"] button[type="submit"]').click();
+  await expect(page.locator('form[hx-post="/api/v1/onboarding/steps/2"]')).toBeVisible();
+
+  const autoFillToggle = page.locator('label[data-binary-toggle]:has(input[name="auto_period_fill"])');
+  const autoFillCheckbox = page.locator('input[name="auto_period_fill"]');
+  // The toggle ships OFF for a new account, so this helper drives it to the
+  // state its caller asked for rather than inheriting a default and flipping
+  // once. The toggle label is clicked (not the input) so the binary-toggle
+  // wiring the owner actually uses is what changes the value, and the
+  // assertion below pins the resulting state either way.
+  const initiallyChecked = await autoFillCheckbox.isChecked();
+  if (initiallyChecked !== autoPeriodFill) {
+    await autoFillToggle.click();
+  }
+  await expect(autoFillCheckbox).toBeChecked({ checked: autoPeriodFill });
+  await expect(autoFillToggle).toHaveAttribute('data-active', String(autoPeriodFill));
+
+  await page.locator('[data-onboarding-step2-submit]').click();
+  await expect(page).toHaveURL(/\/dashboard(?:\?.*)?$/);
+}
+
+async function expectAutoFillWindowMarkers(
+  page: Page,
+  onboardingDate: string,
+  hasData: boolean
+): Promise<void> {
+  await page.goto(`/calendar?month=${onboardingDate.slice(0, 7)}&day=${onboardingDate}`);
+  for (let offset = 0; offset < 5; offset += 1) {
+    const iso = shiftISODate(onboardingDate, offset);
+    await expect(page.locator(`button[data-day="${iso}"]`)).toHaveAttribute(
+      'data-calendar-has-data',
+      hasData ? 'true' : 'false'
+    );
+  }
 }
 
 async function setRangeValue(selector: string, page: Page, value: number): Promise<void> {
@@ -106,8 +161,7 @@ async function setTimezoneCookie(page: Page, timezone: string): Promise<void> {
 async function timezoneToday(page: Page, timezone: string): Promise<{
   iso: string;
   day: string;
-  weekdayEN: string;
-  weekdayRU: string;
+  weekday: string;
 }> {
   return page.evaluate((tz) => {
     const now = new Date();
@@ -120,11 +174,15 @@ async function timezoneToday(page: Page, timezone: string): Promise<{
 
     const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
     const iso = `${byType.year}-${byType.month}-${byType.day}`;
+    // Derive the weekday in the language the page is actually rendering in,
+    // rather than testing an EN-or-RU disjunction: that branch passed whenever
+    // either language matched, so it could not notice a third language
+    // rendering the wrong day.
+    const lang = document.documentElement.lang || 'en';
     return {
       iso,
       day: String(Number(byType.day)),
-      weekdayEN: new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'long' }).format(now),
-      weekdayRU: new Intl.DateTimeFormat('ru-RU', { timeZone: tz, weekday: 'long' }).format(now),
+      weekday: new Intl.DateTimeFormat(lang, { timeZone: tz, weekday: 'long' }).format(now),
     };
   }, timezone);
 }
@@ -149,16 +207,7 @@ async function browserMonthYearsAgo(page: Page, years: number): Promise<string> 
   }, years);
 }
 
-async function formatEnglishDisplayDate(page: Page, iso: string): Promise<string> {
-  return page.evaluate((value) => {
-    const date = new Date(`${value}T00:00:00`);
-    return new Intl.DateTimeFormat('en-US', {
-      month: 'short',
-      day: 'numeric',
-      year: 'numeric',
-    }).format(date);
-  }, iso);
-}
+const UNPREDICTABLE_EXPLAINER_KEY = 'prediction.explainer.unpredictable';
 
 test.describe('Bug regressions', () => {
   test.describe('BUG-01: request-local date consistency', () => {
@@ -180,6 +229,7 @@ test.describe('Bug regressions', () => {
       // we set in cycle settings below.
       const csrfToken = (await page.locator('meta[name="csrf-token"]').getAttribute('content')) ?? '';
       const clearResponse = await page.request.post('/api/v1/users/current/data-wipe', {
+        headers: apiOriginHeader(page),
         form: {
           csrf_token: csrfToken,
           password: creds.password,
@@ -191,7 +241,7 @@ test.describe('Bug regressions', () => {
       await page.goto('/settings');
       await expect(page).toHaveURL(/\/settings$/);
 
-      const cycleForm = page.locator('section#settings-cycle form[action="/api/v1/users/current/cycle"]');
+      const cycleForm = page.locator('#settings-cycle form[action="/api/v1/users/current/cycle"]');
       await expect(cycleForm).toBeVisible();
       await fillDateField(
         cycleForm.locator('#settings-last-period-start'),
@@ -208,15 +258,27 @@ test.describe('Bug regressions', () => {
       expect(todayAction).toMatch(/^\/api\/v1\/days\/\d{4}-\d{2}-\d{2}$/);
       const actualTodayISO = String(todayAction || '').replace('/api/v1/days/', '');
 
-      const todayCard = page
-        .locator('form[hx-put^="/api/v1/days/"]')
-        .first()
-        .locator('xpath=ancestor::section[contains(@class,"journal-card")][1]');
-      const subtitleText = String((await todayCard.locator('p.journal-muted').first().textContent()) || '');
+      // The date subtitle has its own hook now: `p.journal-muted` + `.first()`
+      // picked whichever muted paragraph the card happened to render first.
+      const subtitleText = String(
+        (await page.locator('[data-dashboard-date-subtitle]').first().textContent()) || ''
+      );
       expect(subtitleText).toContain(expectedToday.day);
       expect(
-        subtitleText.includes(expectedToday.weekdayEN) || subtitleText.toLowerCase().includes(expectedToday.weekdayRU)
-      ).toBeTruthy();
+        subtitleText.toLowerCase(),
+        `date subtitle "${subtitleText}" should name ${expectedToday.weekday}`
+      ).toContain(expectedToday.weekday.toLowerCase());
+
+      // The visible journal date carries the ISO day it edits, and the quick
+      // switch offers the request-local yesterday — an evening entry made after
+      // midnight has to be able to see and correct the day it lands on.
+      await expect(page.locator('[data-dashboard-entry-date]').first()).toHaveAttribute(
+        'data-dashboard-entry-date',
+        actualTodayISO
+      );
+      await expect(
+        page.locator('[data-dashboard-entry-date-switch] [data-entry-date-choice="yesterday"]')
+      ).toHaveAttribute('data-entry-date', shiftISODate(actualTodayISO, -1));
 
       const expectedCycleDay = page.evaluate(({ todayISO, startISO }) => {
         const today = new Date(`${todayISO}T00:00:00`);
@@ -236,7 +298,7 @@ test.describe('Bug regressions', () => {
 
     });
 
-    test('calendar marks the current baseline period window before manual day logs exist', async ({
+    test('calendar marks the current baseline period window, and withholds the fertile half of it, before manual day logs exist', async ({
       page,
     }) => {
       const creds = await registerOwnerAndReachDashboard(page, 'bug01-baseline-period');
@@ -246,6 +308,7 @@ test.describe('Bug regressions', () => {
 
       const csrfToken = (await page.locator('meta[name="csrf-token"]').getAttribute('content')) ?? '';
       const clearResponse = await page.request.post('/api/v1/users/current/data-wipe', {
+        headers: apiOriginHeader(page),
         form: {
           csrf_token: csrfToken,
           password: creds.password,
@@ -257,7 +320,7 @@ test.describe('Bug regressions', () => {
       await page.goto('/settings');
       await expect(page).toHaveURL(/\/settings$/);
 
-      const cycleForm = page.locator('section#settings-cycle form[action="/api/v1/users/current/cycle"]');
+      const cycleForm = page.locator('#settings-cycle form[action="/api/v1/users/current/cycle"]');
       const todayISO = await browserLocalISODate(page);
       await fillDateField(cycleForm.locator('#settings-last-period-start'), shiftISODate(todayISO, -4));
       await setRangeValue('#settings-cycle-length', page, 28);
@@ -271,53 +334,57 @@ test.describe('Bug regressions', () => {
 
       await page.goto(`/calendar?month=${currentDay.slice(0, 7)}&day=${currentDay}`);
       await expect(page.locator(`button[data-day="${currentDay}"]`)).toHaveClass(/calendar-cell-predicted/);
-      await expect(page.locator(`button[data-day="${preFertileDay}"]`)).toHaveAttribute('data-calendar-state', 'pre-fertile');
+      // The account has recorded no cycle, so the fertile half of the projection
+      // is withheld: the day after the baseline period window would be shaded
+      // from the cycle-length slider alone, and a fertility claim with only a
+      // configuration default behind it is suppressed rather than qualified. The
+      // predicted period days asserted above stay — their anchor is the last
+      // period start the owner entered, and only the length falls back.
+      //
+      // preFertileDay is today+1, which crosses into the next month at month
+      // end — and a month whose last day closes the grid's final week renders
+      // no trailing cells at all (2026-02-28 is such a Saturday) — so the
+      // assertion runs in preFertileDay's OWN month view, which always
+      // renders it; with no logged days, the cell's state is the same in
+      // either view.
+      await page.goto(`/calendar?month=${preFertileDay.slice(0, 7)}`);
+      await expect(page.locator(`button[data-day="${preFertileDay}"]`)).toHaveAttribute('data-calendar-state', 'default');
     });
 
     test('onboarding with auto period fill disabled does not create logged-entry markers', async ({
       page,
     }) => {
-      const credentials = createCredentials('bug01-onboarding-no-autofill');
-
-      await registerOwnerViaUI(page, credentials);
-      await expectInlineRegisterRecoveryStep(page);
-      await readRecoveryCode(page);
-      await continueFromRecoveryCode(page);
-      await expect(page).toHaveURL(/\/onboarding(?:\?.*)?$/);
+      await page.goto('/login');
 
       // Pin onboardingDate to the 5th of a stable month so the +0..+4 window walked
       // below stays inside one calendar month — otherwise the loop crosses a month
       // boundary on early-month days and the rendered ?month=YYYY-MM grid has no
-      // buttons for the spillover days. Falls back to the 5th of the prior month
-      // when today's day-of-month is < 5 so the date stays in the past (onboarding
-      // step1 rejects future dates).
+      // buttons for the spillover days. The whole window must also lie on or
+      // before today: the auto-fill never records a period day the owner has not
+      // reached, so a window running past today leaves its future cells unmarked
+      // even with the toggle on. Falls back to the 5th of the prior month until
+      // today reaches the 9th.
       const todayISO = await browserLocalISODate(page);
       const [todayYear, todayMonth, todayDay] = todayISO.split('-').map((part) => Number(part));
       const monthAnchor =
-        todayDay >= 5 ? new Date(todayYear, todayMonth - 1, 5) : new Date(todayYear, todayMonth - 2, 5);
+        todayDay >= 9 ? new Date(todayYear, todayMonth - 1, 5) : new Date(todayYear, todayMonth - 2, 5);
       const onboardingDate = `${monthAnchor.getFullYear()}-${String(monthAnchor.getMonth() + 1).padStart(2, '0')}-05`;
 
-      await fillDateField(page.locator('#last-period-start'), onboardingDate);
-      await page.locator('form[hx-post="/api/v1/onboarding/steps/1"] button[type="submit"]').click();
-      await expect(page.locator('form[hx-post="/api/v1/onboarding/steps/2"]')).toBeVisible();
+      await onboardOwnerWithAutoPeriodFill(page, 'bug01-onboarding-no-autofill', onboardingDate, false);
+      await expectAutoFillWindowMarkers(page, onboardingDate, false);
 
-      const autoFillToggle = page.locator('label[data-binary-toggle]:has(input[name="auto_period_fill"])');
-      const autoFillCheckbox = page.locator('input[name="auto_period_fill"]');
-      await expect(autoFillCheckbox).toBeChecked();
-      await autoFillToggle.click();
-      await expect(autoFillCheckbox).not.toBeChecked();
-
-      await page.locator('form[hx-post="/api/v1/onboarding/steps/2"] button[type="submit"]').click();
-      await expect(page).toHaveURL(/\/dashboard(?:\?.*)?$/);
-
-      await page.goto(`/calendar?month=${onboardingDate.slice(0, 7)}&day=${onboardingDate}`);
-      for (let offset = 0; offset < 5; offset += 1) {
-        const iso = shiftISODate(onboardingDate, offset);
-        await expect(page.locator(`button[data-day="${iso}"]`)).toHaveAttribute('data-calendar-has-data', 'false');
-      }
+      // Positive anchor in the same test: a second owner onboarded with the
+      // toggle left ON must mark the very same five cells. Without it the
+      // "false" assertions above pass just as well when the marker attribute is
+      // dead — an instance where nothing ever renders data-calendar-has-data
+      // looks identical to auto-fill being correctly disabled. Owners are
+      // isolated by user_id, so the second account observes only its own grid.
+      await logoutViaAPI(page);
+      await onboardOwnerWithAutoPeriodFill(page, 'bug01-onboarding-autofill', onboardingDate, true);
+      await expectAutoFillWindowMarkers(page, onboardingDate, true);
     });
 
-    test('dashboard cycle hero next period stays aligned with calendar predicted start', async ({
+    test('dashboard status header next period stays aligned with calendar predicted start', async ({
       page,
     }) => {
       const creds = await registerOwnerAndReachDashboard(page, 'bug01-dashboard-calendar');
@@ -327,6 +394,7 @@ test.describe('Bug regressions', () => {
 
       const csrfToken = (await page.locator('meta[name="csrf-token"]').getAttribute('content')) ?? '';
       const clearResponse = await page.request.post('/api/v1/users/current/data-wipe', {
+        headers: apiOriginHeader(page),
         form: {
           csrf_token: csrfToken,
           password: creds.password,
@@ -338,7 +406,7 @@ test.describe('Bug regressions', () => {
       await page.goto('/settings');
       await expect(page).toHaveURL(/\/settings$/);
 
-      const cycleForm = page.locator('section#settings-cycle form[action="/api/v1/users/current/cycle"]');
+      const cycleForm = page.locator('#settings-cycle form[action="/api/v1/users/current/cycle"]');
       const todayISO = await browserLocalISODate(page);
       const lastPeriodStart = shiftISODate(todayISO, -14);
       const nextPeriodStart = shiftISODate(lastPeriodStart, 28);
@@ -353,14 +421,12 @@ test.describe('Bug regressions', () => {
       await page.goto('/dashboard');
       await expect(page).toHaveURL(/\/dashboard$/);
 
-      const hero = page.locator('[data-dashboard-cycle-hero]');
-      const heroFooter = hero.locator('[data-dashboard-cycle-hero-next-period]');
-      await expect(hero).toBeVisible();
-      await expect(page.locator('[data-dashboard-status-line]')).toHaveCount(0);
+      const header = await expectDashboardStatusHeader(page);
+      const nextPeriod = header.locator('[data-dashboard-next-period]');
 
-      const expectedStartLabel = await formatEnglishDisplayDate(page, nextPeriodStart);
-      const expectedEndLabel = await formatEnglishDisplayDate(page, nextPeriodEnd);
-      await expect(heroFooter).toContainText(`${expectedStartLabel} — ${expectedEndLabel}`);
+      const expectedStartLabel = await formatDisplayDate(page, nextPeriodStart);
+      const expectedEndLabel = await formatDisplayDate(page, nextPeriodEnd);
+      await expect(nextPeriod).toContainText(`${expectedStartLabel} — ${expectedEndLabel}`);
 
       await page.goto(`/calendar?month=${nextPeriodStart.slice(0, 7)}&day=${nextPeriodStart}`);
       await expect(page).toHaveURL(new RegExp(`/calendar\\?month=${nextPeriodStart.slice(0, 7)}&day=${nextPeriodStart}`));
@@ -375,6 +441,7 @@ test.describe('Bug regressions', () => {
       const creds = await registerOwnerAndReachDashboard(page, 'bug02-duplicate');
 
       await page.request.delete('/api/v1/sessions/current', {
+        headers: apiOriginHeader(page),
         form: {
           csrf_token:
             (await page.locator('meta[name="csrf-token"]').getAttribute('content')) ?? '',
@@ -392,21 +459,50 @@ test.describe('Bug regressions', () => {
       // Duplicate registration dispatches through the pickup-cookie flow:
       // POST /api/v1/users issues a decoy pickup cookie + 303 to
       // /register/welcome, the welcome handler fails to consume the decoy
-      // nonce, and the browser ends at /login with a neutral flash. The
-      // privacy invariant guarded here is that no URL params leak the
-      // attempted email/error and no page text reveals "already exists".
-      // The residual two-step landing-page oracle is documented in
-      // SECURITY.md "Register enumeration".
-      await expect(page).toHaveURL(/\/(register|login)$/);
+      // nonce, and the browser ends at /login with a neutral flash. That
+      // landing is the positive anchor — without it the URL and body checks
+      // below stay green even if the decoy branch never ran at all. The flash
+      // key is the one EVERY unusable pickup produces (decoy, expired,
+      // tampered, replayed), so pinning it reveals nothing about whether the
+      // address exists. The privacy invariant guarded here is that no URL
+      // params leak the attempted email/error and no page text reveals
+      // "already exists". The residual two-step landing-page oracle is
+      // documented in SECURITY.md "Register enumeration".
+      await expect(page).toHaveURL(/\/login$/);
+      await expect(
+        page.locator('[data-auth-server-error][data-error-key="auth.error.post_register_signin"]')
+      ).toBeVisible();
       const currentURL = page.url().toLowerCase();
       expect(currentURL).not.toContain('email=');
       expect(currentURL).not.toContain('error=');
 
+      // A privacy scan legitimately reads the whole body — the leak could be
+      // anywhere on the page. What it must not do is enumerate phrases by hand
+      // in two of six languages, which is what this checked before: a Spanish,
+      // French, German or Italian leak walked straight past it.
+      //
+      // Derive instead. English is the catalogue's source language, so one
+      // English phrase rule finds the KEYS that assert an account already
+      // exists; `everyLocaleText` then expands those keys into every shipped
+      // language, so a new locale is covered the day it lands.
+      const existenceKeys = localeKeysMatchingEnglish(
+        /already (exists|registered|in use|uses this email)/i
+      );
+      expect(
+        existenceKeys.length,
+        'the account-existence phrase rule must still match catalogue copy'
+      ).toBeGreaterThan(0);
+      const forbiddenPhrases = existenceKeys.flatMap((key) => everyLocaleText(key));
+
       const bodyText = String((await page.locator('body').textContent()) || '').toLowerCase();
-      expect(bodyText).not.toContain('already exists');
-      expect(bodyText).not.toContain('already registered');
-      expect(bodyText).not.toContain('already in use');
-      expect(bodyText).not.toContain('уже существует');
+      for (const phrase of forbiddenPhrases) {
+        expect(bodyText, `body must not reveal account existence: "${phrase}"`).not.toContain(
+          phrase.toLowerCase()
+        );
+      }
+      // Same rule applied to the raw body, so an English string hardcoded
+      // outside the catalogue cannot slip through either.
+      expect(bodyText).not.toMatch(/already (exists|registered|in use|uses this email)/i);
     });
 
     test('registration validation errors do not leak email or error in URL', async ({ page }) => {
@@ -416,10 +512,38 @@ test.describe('Bug regressions', () => {
       await page.locator('#register-confirm-password').fill('weak');
       await page.locator('form[action="/api/v1/users"] button[type="submit"]').click();
 
+      // Positive anchor: the weak password really was rejected. The client-side
+      // validator blocks this submit before it reaches the network, so without
+      // the visible-error assertion the URL checks below pass even when nothing
+      // validated anything.
+      await expect(page.locator('#register-client-status .status-error')).toBeVisible();
       await expect(page).toHaveURL(/\/register$/);
       const currentURL = page.url().toLowerCase();
       expect(currentURL).not.toContain('email=');
       expect(currentURL).not.toContain('error=');
+
+      // The client validator swallows the UI submit above, so the server-side
+      // error path — the surface this test is about — must be driven directly:
+      // a weak password POSTed to /api/v1/users comes back as a redirect whose
+      // Location must carry no email or error parameters.
+      const csrfToken =
+        (await page.locator('meta[name="csrf-token"]').getAttribute('content')) ?? '';
+      const response = await page.request.post('/api/v1/users', {
+        headers: apiOriginHeader(page),
+        form: {
+          csrf_token: csrfToken,
+          email: 'anyuser@ovumcy.lan',
+          password: 'weak',
+          confirm_password: 'weak',
+          consent: 'true',
+        },
+        maxRedirects: 0,
+      });
+      expect(response.status()).toBe(303);
+      const location = String(response.headers()['location'] ?? '').toLowerCase();
+      expect(location).not.toBe('');
+      expect(location).not.toContain('email=');
+      expect(location).not.toContain('error=');
     });
 
     test('login unknown email and wrong password produce identical message', async ({ page }) => {
@@ -427,6 +551,7 @@ test.describe('Bug regressions', () => {
 
       const csrf = (await page.locator('meta[name="csrf-token"]').getAttribute('content')) ?? '';
       await page.request.delete('/api/v1/sessions/current', {
+        headers: apiOriginHeader(page),
         form: { csrf_token: csrf },
         maxRedirects: 0,
       });
@@ -459,7 +584,13 @@ test.describe('Bug regressions', () => {
 
       const identityChip = page.locator('#nav-user-chip-desktop');
       await expect(identityChip).toBeVisible();
-      await expect(identityChip).toHaveAttribute('title', 'Profile settings');
+      // Before a display name is saved the chip falls back to the profile-name
+      // hint; take the expected string from the catalogue instead of pinning
+      // the English wording here.
+      await expect(identityChip).toHaveAttribute(
+        'title',
+        localeText('en', 'nav.profile_name_hint')
+      );
 
       const newName = `TestUser_${Date.now()}`;
       const nameInput = page.locator('#settings-display-name');
@@ -495,7 +626,7 @@ test.describe('Bug regressions', () => {
       await page.goto('/settings');
       await expect(page).toHaveURL(/\/settings$/);
 
-      const cycleForm = page.locator('section#settings-cycle form[action="/api/v1/users/current/cycle"]');
+      const cycleForm = page.locator('#settings-cycle form[action="/api/v1/users/current/cycle"]');
       await expect(cycleForm).toBeVisible();
 
       await setRangeValue('#settings-cycle-length', page, 15);
@@ -514,21 +645,39 @@ test.describe('Bug regressions', () => {
       await page.goto('/dashboard');
       await expect(page).toHaveURL(/\/dashboard$/);
 
-      const statusLine = page.locator('.dashboard-status-line');
-      await expect(statusLine).toContainText('Next period: unknown');
-      await expect(statusLine).toContainText('Predictions off');
-      await expect(statusLine).not.toContainText('Ovulation:');
-      await expect(page.locator('[data-dashboard-prediction-explainer]')).toHaveText(
-        'Predictions are off in unpredictable cycle mode. Ovumcy shows recorded facts only.'
+      // Unpredictable mode is a state the status header declares; assert it on
+      // the hook and the phase attribute rather than on three copy fragments,
+      // one of which ("Ovulation:") was a negated literal that any rewording
+      // or language switch satisfies.
+      const statusLine = dashboardStatusLine(page);
+      await expect(statusLine).toBeVisible();
+      await expect(dashboardStatusHeader(page)).toHaveAttribute('data-dashboard-phase', /.+/);
+      // [data-dashboard-next-period] exists only in the predictions-on branch
+      // of the status line — its absence is the
+      // structural proof that predictions are off, which the old
+      // `not.toContainText('Ovulation:')` only approximated in English.
+      await expect(page.locator('[data-dashboard-next-period]')).toHaveCount(0);
+      await expect(statusLine).not.toContainText(localeText('en', 'dashboard.ovulation'));
+      await expect(statusLine).toContainText(localeText('en', 'dashboard.next_period_unknown'));
+      await expect(statusLine).toContainText(
+        localeText('en', 'prediction.explainer.unpredictable_compact')
+      );
+
+      await expect(page.locator('[data-dashboard-prediction-explainer]')).toHaveAttribute(
+        'data-explainer-key',
+        UNPREDICTABLE_EXPLAINER_KEY
       );
 
       await page.goto('/calendar');
       await expect(page).toHaveURL(/\/calendar(?:\?.*)?$/);
       const calendarExplainer = page.locator('[data-calendar-prediction-explainer]');
       await expect(calendarExplainer).toBeVisible();
-      await expect(calendarExplainer).toHaveText(
-        'Predictions are off in unpredictable cycle mode. Ovumcy shows recorded facts only.'
+      await expect(calendarExplainer).toHaveAttribute(
+        'data-explainer-primary-key',
+        UNPREDICTABLE_EXPLAINER_KEY
       );
+      // One rendered-copy assertion for this state, from the catalogue.
+      await expect(calendarExplainer).toContainText(localeText('en', UNPREDICTABLE_EXPLAINER_KEY));
     });
   });
 
@@ -540,14 +689,15 @@ test.describe('Bug regressions', () => {
 
       await page.goto('/settings');
       await expect(page).toHaveURL(/\/settings$/);
-      const interfaceForm = page.locator('[data-settings-interface-form]');
-      await interfaceForm.locator('[data-settings-interface-language-option="ru"] .radio-tile').click();
-      await interfaceForm.locator('[data-settings-interface-save]').click();
-      await expect(page).toHaveURL(/\/settings$/);
+      // Bind the language save to its own PATCH before the data-wipe API call
+      // below — a bare save click races the in-flight request and can drop the
+      // just-chosen language (saveSettingsLanguage documents the mechanism).
+      await saveSettingsLanguage(page, 'ru');
       await expect(page.locator('html')).toHaveAttribute('lang', 'ru');
 
       const csrfToken = (await page.locator('meta[name="csrf-token"]').getAttribute('content')) ?? '';
       const clearResponse = await page.request.post('/api/v1/users/current/data-wipe', {
+        headers: apiOriginHeader(page),
         form: {
           csrf_token: csrfToken,
           password: creds.password,
@@ -563,8 +713,14 @@ test.describe('Bug regressions', () => {
       await checkStyledControl(dayEditorForm.locator('input[name="flow"][value="spotting"]'));
       await dayEditorForm.locator('button[data-save-button]').click();
 
+      // The toast copy travels in the X-Ovumcy-Notice response header, which
+      // carries no key — the client only ever sees the rendered sentence, so a
+      // data-toast-key would mean widening that API surface. Source the
+      // expected string from ru.json instead: this test is about the Russian
+      // text surviving the URL-encoded round trip intact, so the exact
+      // characters are the subject, and the catalogue owns them.
       await expect(page.locator('.toast-stack .toast-message').last()).toHaveText(
-        'Мажущие выделения могут быть не днём 1. Уточните завтра.'
+        localeText('ru', 'dashboard.spotting_cycle_warning')
       );
     });
   });
@@ -580,7 +736,7 @@ test.describe('Bug regressions', () => {
 
       for (let index = 0; index < 6; index += 1) {
         const navActions = page
-          .locator('section.space-y-6 > div.journal-card')
+          .locator('section.space-y-6 > div.card')
           .first()
           .locator('.flex.flex-wrap.items-center.gap-2')
           .first();
@@ -596,8 +752,14 @@ test.describe('Bug regressions', () => {
         if (!href) {
           break;
         }
+
+        // Name the month this iteration must land on: from the second iteration
+        // on, the bare /calendar?month= shape is already satisfied by the URL the
+        // click starts from, so the wait would not bind to the transition.
+        const targetMonth = new URL(href, page.url()).searchParams.get('month');
+        expect(targetMonth).toMatch(/^\d{4}-\d{2}$/);
         await previousControl.click();
-        await expect(page).toHaveURL(/\/calendar\?month=/);
+        await expect(page).toHaveURL(new RegExp(`/calendar\\?month=${targetMonth}$`));
       }
 
       const lowerBoundMonth = await browserMonthYearsAgo(page, 3);
@@ -605,14 +767,14 @@ test.describe('Bug regressions', () => {
       await expect(page).toHaveURL(new RegExp(`/calendar\\?month=${lowerBoundMonth}`));
 
       const navActions = page
-        .locator('section.space-y-6 > div.journal-card')
+        .locator('section.space-y-6 > div.card')
         .first()
         .locator('.flex.flex-wrap.items-center.gap-2')
         .first();
       const previousControl = navActions.locator(':scope > *').first();
 
       await expect(previousControl).toContainText(/\S+/);
-      await expect(previousControl).toHaveClass(/btn--disabled/);
+      await expect(previousControl).toHaveClass(/btn-disabled/);
       await expect(previousControl).not.toHaveAttribute('href', /.+/);
     });
   });
@@ -621,15 +783,19 @@ test.describe('Bug regressions', () => {
     test('dashboard menstrual phase stays clear in the primary summary', async ({ page }) => {
       await registerOwnerAndReachDashboard(page, 'improvement-menstrual-icon');
 
-      const mode = await dashboardPrimarySummaryMode(page);
-      expect(await dashboardCurrentPhaseText(page)).toMatch(/Menstrual|Менструальная|Menstrual/i);
+      // The phase is state, so assert the state attribute. The regex it
+      // replaces listed the EN and ES spellings as separate alternatives of the
+      // same word, which is what a per-language branch degenerates into.
+      expect(await dashboardCurrentPhase(page)).toBe('menstrual');
 
-      if (mode === 'hero') {
-        await expect(dashboardCycleHero(page)).toContainText(/Days 1-5|Tag 1-5|Дни 1-5/);
-      } else {
-        const phaseChip = page.locator('[data-dashboard-status-line] .dashboard-status-item').first();
-        await expect(phaseChip).toContainText('🩸');
-      }
+      // The one header always renders the phase first, icon included, and the
+      // cycle day sits inside the ring beside it. The icon is addressed by its
+      // name in the first-party set: it is drawn markup, so it carries no text
+      // for a copy assertion to find.
+      const phaseChip = dashboardStatusLine(page).locator('.dashboard-status-item').first();
+      await expect(phaseChip.locator('[data-icon="drop"]')).toHaveCount(1);
+      await expect(phaseChip).toContainText(localeText('en', 'phases.menstrual'));
+      expect(await dashboardCurrentCycleDay(page)).toBeGreaterThanOrEqual(1);
     });
 
     test('stats empty state includes illustration and progress affordance for a new owner', async ({

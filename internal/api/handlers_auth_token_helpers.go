@@ -13,6 +13,21 @@ import (
 var authCookieSpec = sealedCookieSpec{name: authCookieName, path: "/"}
 
 func (handler *Handler) setAuthCookie(c fiber.Ctx, user *models.User, rememberMe bool) (string, error) {
+	session, err := handler.prepareAuthCookie(user, rememberMe)
+	if err != nil {
+		return "", err
+	}
+	return handler.writeAuthCookie(c, user, session), nil
+}
+
+// preparedSession is a session minted and sealed but not yet handed to the
+// browser: everything in issuing one that can fail has already happened.
+type preparedSession struct {
+	cookie    sealedCookie
+	sessionID string
+}
+
+func (handler *Handler) prepareAuthCookie(user *models.User, rememberMe bool) (preparedSession, error) {
 	tokenTTL := defaultAuthTokenTTL
 	if rememberMe {
 		tokenTTL = rememberAuthTokenTTL
@@ -20,7 +35,7 @@ func (handler *Handler) setAuthCookie(c fiber.Ctx, user *models.User, rememberMe
 
 	token, sessionID, err := handler.buildTokenWithSessionID(user, tokenTTL)
 	if err != nil {
-		return "", err
+		return preparedSession{}, err
 	}
 	// Session-scoped unless remember-me: a zero expires keeps the cookie
 	// for the browser session while the token payload carries its own TTL.
@@ -28,22 +43,169 @@ func (handler *Handler) setAuthCookie(c fiber.Ctx, user *models.User, rememberMe
 	if rememberMe {
 		expires = time.Now().Add(tokenTTL)
 	}
-	if err := handler.writeSealedCookie(c, authCookieSpec, []byte(token), expires); err != nil {
-		return "", err
+	cookie, err := handler.sealCookie(authCookieSpec, []byte(token), expires)
+	if err != nil {
+		return preparedSession{}, err
 	}
-	return sessionID, nil
+	return preparedSession{cookie: cookie, sessionID: sessionID}, nil
+}
+
+func (handler *Handler) writeAuthCookie(c fiber.Ctx, user *models.User, session preparedSession) string {
+	handler.writeSealed(c, session.cookie)
+	handler.applyStoredLanguage(c, user)
+	return session.sessionID
+}
+
+// applyStoredLanguage re-issues the language cookie from the account's stored
+// interface language, so a device that has no cookie — a fresh browser, a
+// cleared cookie jar, a second machine — is served the language its owner chose
+// instead of falling back to Accept-Language.
+//
+// It sits inside writeAuthCookie on purpose. Every session-issue path writes
+// through that one helper — setAuthCookie (password login, TOTP challenge
+// completion, OIDC callback, register pickup, recovery sign-in, and the
+// in-place re-issue after a security-posture change) and the
+// recovery-code rotations that seal their session before committing — so the
+// preference cannot hold on one of them and silently not on the next one added.
+//
+// An empty column means the owner never chose a language: nothing is written,
+// and resolveRequestLanguage keeps deciding exactly as it did before the column
+// existed. An unsupported stored code is treated the same way rather than
+// normalized to the default — NormalizeLanguage would happily answer with the
+// operator default for it, which would pin an account to a language nobody
+// picked. Writing the cookie only for a value the shipped catalogue actually
+// carries keeps an unknown code a no-op instead of a 500 or a wrong locale.
+//
+// The caller has already refused a nil user: buildTokenWithSessionID runs
+// first and returns an error for one, so no session exists to attach a language
+// to. There is deliberately no second nil check here for a state that cannot
+// reach this line.
+func (handler *Handler) applyStoredLanguage(c fiber.Ctx, user *models.User) {
+	stored := strings.TrimSpace(user.InterfaceLanguage)
+	if stored == "" || !handler.i18n.IsSupportedLanguage(stored) {
+		return
+	}
+	// Normalize here rather than leaning on setLanguageCookie's own call: the
+	// value written into the cookie is then the one this function validated,
+	// and a later cookie writer that stops normalizing cannot turn a stored
+	// "ru-RU" into a cookie no locale matches.
+	handler.setLanguageCookie(c, handler.i18n.NormalizeLanguage(stored))
 }
 
 func (handler *Handler) clearAuthCookie(c fiber.Ctx) {
 	handler.clearSealedCookie(c, authCookieSpec)
 }
 
+// clearAuthRelatedCookies retracts every sealed cookie whose contents belong to
+// the session being ended: the session itself, the provider-logout bridge, and
+// each in-flight handoff carrying account-scoped state or a secret — recovery
+// code, reset token, pending 2FA challenge, the pending TOTP enrollment secret,
+// and the one-time calendar-feed subscribe URL.
+//
+// None of those is consumable without an authenticated session, so anything left
+// behind is exposure with no remaining purpose. Both TOTP cookies are
+// session-scoped (zero expires), so an abandoned enrollment would otherwise keep
+// shipping its sealed raw secret at `path: "/"` for the rest of the browser
+// session, and the feed URL stays a live capability the sign-out does not revoke.
+// Retracting them here is what bounds that window, rather than waiting for some
+// later request to happen to read and refuse the value.
+//
+// Cookies whose flow completes outside a session are deliberately absent: the
+// OIDC one-time state cookie and the register-pickup handle are consumed by
+// their own flow, and `ovumcy_flash` carries no secret. The OIDC STEP-UP cookie
+// is absent for a second reason on top of that one — this helper also runs on a
+// session REJECTION, and one of those can arrive on the callback itself, the
+// single request that still needs the cookie — so only a deliberate end
+// retracts it, through clearSessionEndCookies below. `ovumcy_lang`
+// and `ovumcy_tz` are absent for a different reason again, and it is not an oversight:
+// neither is sealed or session-scoped, and this helper also runs where a session
+// is REJECTED rather than ended — an expired cookie on an ordinary request, or an
+// unauthenticated probe. Retracting the language there would take the login
+// page's language away from a visitor whose session merely lapsed, and would let
+// anyone reset a browser's rendering language with one unauthenticated request.
+// The deliberate ends clear both through clearSessionEndCookies below.
 func (handler *Handler) clearAuthRelatedCookies(c fiber.Ctx) {
 	handler.clearAuthCookie(c)
 	handler.clearOIDCLogoutBridgeCookie(c)
 	handler.clearRecoveryCodePageCookie(c)
 	handler.clearResetPasswordCookie(c)
 	handler.clearTOTPPendingCookie(c)
+	handler.clearTOTPSetupCookie(c)
+	handler.clearCalendarFeedRevealCookie(c)
+}
+
+// clearSessionEndCookies retracts everything clearAuthRelatedCookies does, plus
+// the two plaintext preference caches `ovumcy_lang` and `ovumcy_tz` and any
+// pending flash. It is the
+// helper for the paths where the owner ends the session ON PURPOSE — logout and
+// account deletion — as opposed to the paths where the server refuses one it was
+// handed.
+//
+// The split is the whole point. Neither cookie is sealed or scoped to a session:
+// `ovumcy_lang` is a pre-auth cache of the account column, re-issued from it by
+// setAuthCookie at every session issue, and `ovumcy_tz` is the browser's own
+// timezone, re-issued by LanguageMiddleware from the request header. Left behind
+// by a sign-out they disclose, on a shared or borrowed browser, that this app is
+// used here, in which language, and from which region — before anyone has
+// authenticated. Cleared on a session REJECTION they would instead be a nuisance
+// an unauthenticated caller controls, and would cost a visitor whose session
+// expired mid-use the language of the page they are looking at. Deliberate end
+// clears them; refusal leaves them alone.
+//
+// The retraction of `ovumcy_tz` holds only because the client stops volunteering
+// the timezone while signed out: app.js writes the cookie and attaches the
+// X-Ovumcy-Timezone header only on a page rendered for a session (see
+// signedInPage in web/src/js/app/00-core.js). Without that half the next page
+// load — the login page this very sign-out redirects to — would put the cookie
+// straight back, and this retraction would be theatre.
+//
+// The OIDC step-up cookie is here rather than in clearAuthRelatedCookies for
+// the same reason: it names the owner a settings step-up would act for, and a
+// session that has deliberately ended cannot complete one — while a session
+// REJECTION may well arrive on the callback itself, which is the one request
+// that still needs the cookie.
+//
+// The continuation cookie is the second carrier of that same authority, not a
+// detail of the first: it seals the whole step-up state plus an authorization
+// code nobody has spent yet, so a minute-old hand-off left by a cross-site
+// return completes an erasure or a link for an owner who has since signed out.
+// Retracting one carrier and not the other states the rule above at one of two
+// places, which is not the rule.
+func (handler *Handler) clearSessionEndCookies(c fiber.Ctx) {
+	handler.clearAuthRelatedCookies(c)
+	handler.clearOIDCStepupCookie(c)
+	handler.clearOIDCStepupContinuationCookie(c)
+	handler.clearLanguageCookie(c)
+	handler.clearTimezoneCookie(c)
+	// A flash still riding from before the session ended (a settings message,
+	// a ForgotEmail prefill) belongs to the session that ended. A path that
+	// wants to show a message after ending the session sets its flash after
+	// this call, and the later Set-Cookie for the same name wins. Both flash
+	// channels are cleared here, not only the page slot: a token-less writer
+	// (WEB-40) can seal a message into the exempt channel before the session
+	// it named ever ends — the OIDC callback runs unauthenticated — and that
+	// message belongs to the ended session exactly as much as the page slot's.
+	handler.clearFlashCookie(c)
+	handler.clearCSRFExemptFlashCookie(c)
+}
+
+// sessionWasRemembered reads the owner's remember-me choice back off the session
+// that is being replaced. The choice is already recorded — it IS the token's
+// lifetime — so a re-issue carries it forward without a second source of truth,
+// a new claim, or asking again on a form that has no such control. Without this
+// every posture change (password, 2FA on or off, clear-data) silently demoted a
+// remembered device to a session cookie, which is the same defect as remembering
+// one nobody chose, pointing the other way.
+//
+// A token with no dates, or none on the request, is treated as not remembered:
+// the default is the one an unticked box gets, so an unreadable answer costs a
+// re-login at worst and never extends a session past what its owner asked for.
+func sessionWasRemembered(c fiber.Ctx) bool {
+	session, ok := currentAuthSession(c)
+	if !ok || session == nil || session.IssuedAt == nil || session.ExpiresAt == nil {
+		return false
+	}
+	return session.ExpiresAt.Sub(session.IssuedAt.Time) > defaultAuthTokenTTL
 }
 
 func (handler *Handler) buildTokenWithSessionID(user *models.User, ttl time.Duration) (string, string, error) {
@@ -55,6 +217,11 @@ func (handler *Handler) buildTokenWithSessionID(user *models.User, ttl time.Dura
 	}
 	if ttl <= 0 {
 		ttl = defaultAuthTokenTTL
+	}
+	if handler.sessionIssuanceFault != nil {
+		if err := handler.sessionIssuanceFault(); err != nil {
+			return "", "", err
+		}
 	}
 	return handler.authService.BuildAuthSessionTokenWithSessionID(handler.secretKey, user.ID, user.Role, user.AuthSessionVersion, ttl, time.Now())
 }
@@ -79,26 +246,44 @@ func (handler *Handler) rotateOIDCLogoutState(c fiber.Ctx, newSessionID string) 
 		return nil
 	}
 
-	logoutState, found, err := handler.oidcLogoutStateSvc.Load(c.Context(), oldSessionID, time.Now())
+	// The rotation acts for the session being replaced, so every call below is
+	// scoped to that session's owner; the loaded state carries the same owner
+	// forward into the new row rather than having it re-supplied here.
+	logoutState, found, err := handler.oidcLogoutStateSvc.Load(c.Context(), oldSessionID, currentSession.UserID, time.Now())
 	if err != nil || !found {
 		return err
 	}
-	if !validOIDCLogoutState(logoutState) {
-		return handler.oidcLogoutStateSvc.Delete(c.Context(), oldSessionID) // codecov:ignore -- OIDC logout-state rotation; covered by the e2e OIDC lanes
+	if !validOIDCLogoutState(logoutState, handler.oidcIssuerURL()) {
+		return handler.oidcLogoutStateSvc.Delete(c.Context(), oldSessionID, currentSession.UserID) // codecov:ignore -- OIDC logout-state rotation; covered by the e2e OIDC lanes
 	}
-	logoutState.UserID = currentSession.UserID
 	if err := handler.oidcLogoutStateSvc.Save(c.Context(), newSessionID, logoutState, time.Now()); err != nil { // codecov:ignore -- OIDC logout-state rotation; covered by the e2e OIDC lanes
 		return err
 	}
-	return handler.oidcLogoutStateSvc.Delete(c.Context(), oldSessionID) // codecov:ignore -- OIDC logout-state rotation; covered by the e2e OIDC lanes
+	return handler.oidcLogoutStateSvc.Delete(c.Context(), oldSessionID, currentSession.UserID) // codecov:ignore -- OIDC logout-state rotation; covered by the e2e OIDC lanes
 }
 
 // refreshCurrentSession re-issues the auth cookie for the request's user
 // after an operation that bumped auth_session_version, so the originating
 // device stays signed in while every other session is invalidated. The
 // `scope` argument is used for security-event logging only.
-func (handler *Handler) refreshCurrentSession(c fiber.Ctx, user *models.User, scope string) error {
-	sessionID, err := handler.setAuthCookie(c, user, false)
+//
+// The refusal is handed BACK as a spec instead of being written here, because
+// the callers do not answer on the same channel: the settings routes reply
+// through respondMappedError, while a caller running on /auth/oidc/callback has
+// to flash it through redirectSettingsRefusal — there the reply is a browser
+// navigation coming back from the identity provider, and every spec this can
+// raise renders either a JSON envelope (the global session-create spec) or a
+// redirect to /login (the unsupported-role spec) instead of the settings page
+// the step-up promised to return to.
+//
+// That is also why the wrapper this replaced is gone rather than kept for the
+// callers whose channel it did suit. It answered through respondMappedError and
+// returned respondMappedError's nil, so it returned nil on BOTH paths: every
+// `if err := ...; err != nil` around it was dead, and each caller ran on into
+// its success arm, writing a success toast, a redirect or a `data_cleared`
+// flash over the refusal that had just been written.
+func (handler *Handler) refreshCurrentSession(c fiber.Ctx, user *models.User, scope string) (APIErrorSpec, bool) {
+	session, err := handler.prepareAuthCookie(user, sessionWasRemembered(c))
 	if err != nil {
 		handler.clearAuthCookie(c)
 		spec := authSessionCreateErrorSpec()
@@ -106,25 +291,37 @@ func (handler *Handler) refreshCurrentSession(c fiber.Ctx, user *models.User, sc
 			spec = authWebSignInUnavailableErrorSpec()
 		}
 		handler.logSecurityError(c, scope, spec)
-		return handler.respondMappedError(c, spec)
+		return spec, false
 	}
+	handler.installRefreshedSession(c, user, session, scope)
+	return APIErrorSpec{}, true
+}
+
+// refuseSessionRevokedDuring answers a posture change that found this
+// request's session already revoked: another write (a password change, a TOTP
+// re-enrollment, a sign-out everywhere) moved the account's session version
+// after the request was authenticated, so the change was refused — or, for an
+// identity link or unlink, went in but can no longer be carried into a session
+// that would outlive that revocation. The session is cleared rather than
+// re-issued, the event is recorded as session_revoked_during_<action>, and the
+// returned spec is answered on whichever channel the caller uses.
+func (handler *Handler) refuseSessionRevokedDuring(c fiber.Ctx, scope string, action string) APIErrorSpec {
+	handler.clearAuthCookie(c)
+	handler.logSecurityEvent(c, scope, "session_revoked_during_"+action)
+	spec := authSessionCreateErrorSpec()
+	handler.logSecurityError(c, scope, spec)
+	return spec
+}
+
+// installRefreshedSession writes a session prepared for the request's own
+// user in place of the one it arrived with, and carries that session's
+// provider-logout state over to the new id. Nothing here can refuse: a failed
+// logout-state rotation is logged, and the device stays signed in.
+func (handler *Handler) installRefreshedSession(c fiber.Ctx, user *models.User, session preparedSession, scope string) {
+	sessionID := handler.writeAuthCookie(c, user, session)
 	if err := handler.rotateOIDCLogoutState(c, sessionID); err != nil {
 		handler.logSecurityEvent(c, scope, "provider_logout_state_rotation_failed")
 	}
-	return nil
-}
-
-func (handler *Handler) encodeAuthCookieToken(rawToken string) (string, error) {
-	rawToken = strings.TrimSpace(rawToken)
-	if rawToken == "" {
-		return "", errors.New("auth token is required")
-	}
-
-	codec, err := handler.cookieCodec()
-	if err != nil {
-		return "", err
-	}
-	return codec.seal(authCookieName, []byte(rawToken))
 }
 
 func (handler *Handler) decodeSealedAuthCookieToken(rawValue string) (string, error) {

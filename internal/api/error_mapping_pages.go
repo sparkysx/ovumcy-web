@@ -8,12 +8,18 @@ import (
 	"github.com/ovumcy/ovumcy-web/internal/services"
 )
 
+// mapCalendarViewError names every sentinel BuildCalendarPageViewData
+// declares, so `default` means "an error this mapper does not know" rather
+// than "the other one of the two". Regression:
+// TestMapCalendarViewErrorNamesEverySentinelItsProducerDeclares.
 func mapCalendarViewError(err error) APIErrorSpec {
 	switch {
 	case errors.Is(err, services.ErrCalendarViewLoadLogs):
 		return globalErrorSpec(fiber.StatusInternalServerError, APIErrorCategoryInternal, "failed to load calendar")
-	default:
+	case errors.Is(err, services.ErrCalendarViewLoadStats):
 		return globalErrorSpec(fiber.StatusInternalServerError, APIErrorCategoryInternal, "failed to load stats")
+	default:
+		return globalErrorSpec(fiber.StatusInternalServerError, APIErrorCategoryInternal, "failed to load calendar page")
 	}
 }
 
@@ -54,14 +60,14 @@ func statsFetchErrorSpec() APIErrorSpec {
 	return globalErrorSpec(fiber.StatusInternalServerError, APIErrorCategoryInternal, "failed to fetch stats")
 }
 
-func respondNotFoundMappedError(c fiber.Ctx) error {
+func (handler *Handler) respondNotFoundMappedError(c fiber.Ctx) error {
 	spec := notFoundErrorSpec()
 	if isHTMX(c) {
-		message := translateMessage(currentMessages(c), "not_found.title")
-		if message == "not_found.title" {
+		message, translated := lookupMessage(currentMessages(c), "not_found.title")
+		if !translated {
 			message = "Page not found"
 		}
-		return c.Status(spec.Status).SendString(httpx.StatusErrorMarkup(message, "not_found.title"))
+		return sendHTMLFragment(c.Status(spec.Status), httpx.StatusErrorMarkup(message, "not_found.title"))
 	}
-	return respondGlobalMappedError(c, spec)
+	return handler.respondGlobalMappedError(c, spec)
 }

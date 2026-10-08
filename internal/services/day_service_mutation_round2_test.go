@@ -27,7 +27,7 @@ func TestClearAutoFilledPeriodNeighbors_LoopBoundIsExclusive_DoesNotClearDayAtPe
 		Flow:     models.FlowLight,
 	}
 
-	if err := service.ClearAutoFilledPeriodNeighbors(context.Background(), 10, CalendarDay(start, time.UTC), 3, time.UTC); err != nil {
+	if err := service.ClearAutoFilledPeriodNeighbors(context.Background(), 10, CalendarDay(start, time.UTC), 3, models.FlowLight, time.UTC); err != nil {
 		t.Fatalf("ClearAutoFilledPeriodNeighbors: %v", err)
 	}
 
@@ -84,5 +84,28 @@ func TestAutoFillFollowingPeriodDays_NonUTCLocationNotOverwritten_FillsThroughLo
 	}
 	if !entry.IsPeriod {
 		t.Fatalf("expected 2026-02-12 to be a period day, got IsPeriod=%t", entry.IsPeriod)
+	}
+}
+
+func TestAutoFillFollowingPeriodDays_StopsAtTheOwnersLocalToday(t *testing.T) {
+	logs := newDayLogRepositoryStub()
+	service := NewDayService(logs, &dayUserRepositoryStub{})
+	tokyo := time.FixedZone("Asia/Tokyo", 9*60*60)
+
+	// A five-day period from 02-10; in Tokyo, now is 2026-02-12 05:00, so the
+	// owner's local today is 02-12 and 02-13, 02-14 have not been reached.
+	start := time.Date(2026, time.February, 10, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2026, time.February, 11, 20, 0, 0, 0, time.UTC)
+
+	if err := service.AutoFillFollowingPeriodDays(context.Background(), 10, start, 5, models.FlowLight, now, tokyo); err != nil {
+		t.Fatalf("AutoFillFollowingPeriodDays: %v", err)
+	}
+	if entry, ok := logs.entries["2026-02-12"]; !ok || !entry.IsPeriod {
+		t.Fatalf("expected the owner's local today 2026-02-12 to be filled, got ok=%t entry=%#v", ok, entry)
+	}
+	for _, key := range []string{"2026-02-13", "2026-02-14"} {
+		if entry, ok := logs.entries[key]; ok {
+			t.Fatalf("expected no period day written ahead of the owner's local today, got %s=%#v", key, entry)
+		}
 	}
 }

@@ -26,19 +26,46 @@ type dayserviceCovUserStub struct {
 	loadErr   error
 	updateErr error
 
+	// updateCalls counts UpdateByID calls so a test can assert a guard wrote
+	// nothing, rather than only that it did not panic.
+	updateCalls int
+
 	// AcknowledgePeriodTip persistence capture.
 	shownPeriodTipPersisted bool
 	shownPeriodTipValue     bool
+
+	// userIDs records the owner id of every user-repository call in arrival
+	// order. Without it, updateCalls counts that a write happened but says
+	// nothing about which account it landed on, and owner scoping
+	// (docs/SECURITY_INVARIANTS.md, privacy boundary) stays unfalsifiable here.
+	userIDs []uint
 }
 
-func (s *dayserviceCovUserStub) LoadSettingsByID(context.Context, uint) (models.User, error) {
+// assertUserRepositoryCallsTargetOwner mirrors the workflow stub's guard: at
+// least one call, and every recorded id is the acting owner.
+func (s *dayserviceCovUserStub) assertUserRepositoryCallsTargetOwner(t *testing.T, want uint) {
+	t.Helper()
+	if len(s.userIDs) == 0 {
+		t.Fatalf("expected at least one user-repository call for owner %d, saw none", want)
+	}
+	for index, got := range s.userIDs {
+		if got != want {
+			t.Fatalf("user-repository call %d targeted owner %d, want the acting owner %d", index+1, got, want)
+		}
+	}
+}
+
+func (s *dayserviceCovUserStub) LoadSettingsByID(_ context.Context, userID uint) (models.User, error) {
+	s.userIDs = append(s.userIDs, userID)
 	if s.loadErr != nil {
 		return models.User{}, s.loadErr
 	}
 	return s.settings, nil
 }
 
-func (s *dayserviceCovUserStub) UpdateByID(ctx context.Context, _ uint, updates map[string]any) error {
+func (s *dayserviceCovUserStub) UpdateByID(ctx context.Context, userID uint, updates map[string]any) error {
+	s.userIDs = append(s.userIDs, userID)
+	s.updateCalls++
 	if s.updateErr != nil {
 		return s.updateErr
 	}
@@ -249,27 +276,29 @@ func TestDayService_ShouldAutoFill_ReturnsFalseWhenWasPeriod(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Line 554 — ShouldAutoFillPeriodDays: previousDay offset
+// ShouldAutoFillPeriodDays with a period the day before
 //
-//   previousDay := dayStart.AddDate(0, 0, -1)
+//	return !previousEntry.IsPeriod && !hasRecentPeriod, nil
 //
-// A mutant changing -1 to 0 (or 1) would make the check look at the wrong
-// day. We need a test where the EXACT previous day is a period but no other
-// nearby day is, so the correct day being checked matters.
+// A period on day-1 makes BOTH terms refuse, so this fixture pins the
+// behaviour and not the previousDay offset that produces it: hasPeriodInRecentDays
+// already covers day-1..day-3, so it answers false whether the offset reads
+// -1, -2, -3 or 0. Any fixture that would separate -1 from -2 has to put a
+// period in that span, which re-arms the lookback and forces false on both
+// sides — -2 and -3 are equivalent mutants of this function. The offset is
+// pinned instead by TestDayService_ShouldAutoFill_UsesPreviousDayNotFollowingDay
+// (day_service_mutation_test.go), whose fixture keeps the lookback empty and
+// puts the periods on dayStart and day+1 so only offset -1 answers true.
 // ---------------------------------------------------------------------------
 
-// TestDayService_ShouldAutoFill_ChecksExactPreviousDay verifies that the
-// function looks at day-1 (not day itself or day-2) when deciding whether to
-// autofill.
-func TestDayService_ShouldAutoFill_ChecksExactPreviousDay(t *testing.T) {
+// TestDayService_ShouldAutoFill_RefusesWhenThePreviousDayIsAPeriod verifies
+// that a day whose predecessor is already a period day does not start a second
+// auto-fill run.
+func TestDayService_ShouldAutoFill_RefusesWhenThePreviousDayIsAPeriod(t *testing.T) {
 	logs := newDayLogRepositoryStub()
 	service := dayserviceCovNewService(logs, &dayserviceCovUserStub{})
 	day := time.Date(2026, time.February, 10, 0, 0, 0, 0, time.UTC)
 
-	// Put a period entry exactly one day before dayStart. If the function
-	// looks at the right day it should detect previousEntry.IsPeriod=true and
-	// return false. If it uses offset 0 (checks dayStart itself, which has no
-	// entry) or -2 it would return true.
 	logs.entries["2026-02-09"] = models.DailyLog{
 		ID:       1,
 		UserID:   10,
@@ -282,7 +311,7 @@ func TestDayService_ShouldAutoFill_ChecksExactPreviousDay(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if should {
-		t.Fatal("expected false because the exact previous day is a period day")
+		t.Fatal("expected false because the previous day is already a period day")
 	}
 }
 
@@ -388,14 +417,18 @@ func TestDayService_AutoFill_SaveErrorPropagatesForExistingEntry(t *testing.T) {
 		SexActivity: models.SexActivityNone,
 	}
 	// Inject the Save error for that day.
-	logs.saveErrByDay["2026-02-11"] = errors.New("save failed")
+	saveErr := errors.New("save failed")
+	logs.saveErrByDay["2026-02-11"] = saveErr
 
 	service := dayserviceCovNewService(logs, &dayserviceCovUserStub{})
 	now := start.AddDate(0, 0, 5)
 
 	err := service.AutoFillFollowingPeriodDays(context.Background(), 10, start, 3, models.FlowLight, now, time.UTC)
-	if err == nil {
-		t.Fatal("expected error to propagate from Save, got nil")
+	// The Save error itself, not merely some error: this path has a Fetch
+	// above it and a Create below it that can each fail too, and an opaque
+	// sentinel in its place would hide which one refused.
+	if !errors.Is(err, saveErr) {
+		t.Fatalf("expected the injected Save error to propagate, got: %v", err)
 	}
 }
 
@@ -550,40 +583,53 @@ func TestDayService_ClearCompetingCycleStarts_ClearsIsUncertain(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Line 667 — refreshDerivedCycleSettings: nil guard (side-effect function)
+// refreshDerivedCycleSettings: nil guard (side-effect function)
 //
 // The nil guard (service == nil || service.users == nil || service.logs == nil)
-// protects against panics. A mutant removing it would cause a nil-dereference.
-// We can test the observable behavior: calling the function on a service with
-// nil users must not panic and must not attempt any DB write.
+// protects against a nil dereference, so surviving the call at all already kills
+// the mutant that removes it. That is not the whole claim: the two tests below
+// assert the guard is also a NO-OP — no log read, no settings write — because
+// "did not panic" is equally true of a guard that fell through and did the work
+// against a live dependency.
 //
-// We cannot easily create service == nil (method on nil pointer would require
-// a pointer receiver trick that's implementation-dependent). Instead test the
-// users==nil and logs==nil branches by constructing a service with those fields.
+// service == nil is not constructed here: reaching it needs a typed-nil receiver
+// call, which is an implementation detail of the call sites rather than a state a
+// caller can produce. The users==nil and logs==nil branches are built directly.
 // ---------------------------------------------------------------------------
 
-// TestDayService_RefreshDerivedCycleSettings_NilUsersNoOp verifies that
-// refreshDerivedCycleSettings is a no-op when service.users is nil, and does
-// not panic.
+// TestDayService_RefreshDerivedCycleSettings_NilUsersNoOp verifies the nil-users
+// guard returns BEFORE touching the log repository — the "no-op" its name claims,
+// not merely the absence of a panic. Surviving the call proves the guard exists
+// (removing it nil-derefs); the listCalls assertion proves the guard is the reason
+// nothing happened.
 func TestDayService_RefreshDerivedCycleSettings_NilUsersNoOp(t *testing.T) {
-	// Build a service with nil users to trigger the nil-guard early return.
+	logs := newDayLogRepositoryStub()
 	service := &DayService{
-		logs:  newDayLogRepositoryStub(),
+		logs:  logs,
 		users: nil,
 	}
-	// Must not panic.
-	service.refreshDerivedCycleSettings(context.Background(), 10, time.UTC)
+
+	service.refreshDerivedCycleSettings(context.Background(), 10, time.Now(), time.UTC)
+
+	if logs.listCalls != 0 {
+		t.Fatalf("expected the nil-users guard to return before reading logs, got %d ListByUser call(s)", logs.listCalls)
+	}
 }
 
-// TestDayService_RefreshDerivedCycleSettings_NilLogsNoOp verifies that
-// refreshDerivedCycleSettings is a no-op when service.logs is nil, and does
-// not panic.
+// TestDayService_RefreshDerivedCycleSettings_NilLogsNoOp is the same for the
+// nil-logs guard: no settings write may be attempted.
 func TestDayService_RefreshDerivedCycleSettings_NilLogsNoOp(t *testing.T) {
+	users := &dayserviceCovUserStub{}
 	service := &DayService{
 		logs:  nil,
-		users: &dayserviceCovUserStub{},
+		users: users,
 	}
-	service.refreshDerivedCycleSettings(context.Background(), 10, time.UTC)
+
+	service.refreshDerivedCycleSettings(context.Background(), 10, time.Now(), time.UTC)
+
+	if users.updateCalls != 0 {
+		t.Fatalf("expected the nil-logs guard to write nothing, got %d UpdateByID call(s)", users.updateCalls)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -600,20 +646,31 @@ func TestDayService_RefreshDerivedCycleSettings_NilLogsNoOp(t *testing.T) {
 // NilXNoOp tests above. The happy path is smoke-tested below.
 // ---------------------------------------------------------------------------
 
-// TestDayService_RefreshDerivedCycleSettings_EmptyLogSetNoPanic is a happy-path
-// smoke test: with a valid users/logs pair and no stored logs,
-// refreshDerivedCycleSettings must run to completion without panicking. The
-// list-error branch is not injectable through dayLogRepositoryStub (no
-// ListByUser error hook), and the nil-guard early returns are covered by the
-// two NilXNoOp tests above.
-func TestDayService_RefreshDerivedCycleSettings_EmptyLogSetNoPanic(t *testing.T) {
+// TestDayService_RefreshDerivedCycleSettings_EmptyLogSetPersistsDefaultLutealPhase
+// drives the happy path with no stored logs, where the luteal inference cannot
+// conclude anything: the refresh must still persist the DEFAULT luteal phase.
+//
+// This replaces a version whose only assertion was "did not panic" — which held
+// equally for a refresh that read the logs and then wrote nothing at all. The
+// list-error branch remains uninjectable through dayLogRepositoryStub (no
+// ListByUser error hook); the nil-guard early returns are covered above.
+func TestDayService_RefreshDerivedCycleSettings_EmptyLogSetPersistsDefaultLutealPhase(t *testing.T) {
 	logs := newDayLogRepositoryStub()
 	users := &dayserviceCovUserStub{settings: models.User{PeriodLength: 5}}
 	service := dayserviceCovNewService(logs, users)
 
-	// Empty log set: exercises the normal control flow to completion.
-	service.refreshDerivedCycleSettings(context.Background(), 10, time.UTC)
-	// Reaching here without a panic is the assertion.
+	service.refreshDerivedCycleSettings(context.Background(), 10, time.Now(), time.UTC)
+
+	if logs.listCalls != 1 {
+		t.Fatalf("expected the refresh to read the log set exactly once, got %d call(s)", logs.listCalls)
+	}
+	if users.updateCalls != 1 {
+		t.Fatalf("expected the refresh to persist exactly one settings update, got %d", users.updateCalls)
+	}
+	if users.settings.LutealPhase != defaultLutealPhaseDays {
+		t.Fatalf("expected the default luteal phase %d to be persisted when inference has no data, got %d", defaultLutealPhaseDays, users.settings.LutealPhase)
+	}
+	users.assertUserRepositoryCallsTargetOwner(t, 10)
 }
 
 // ---------------------------------------------------------------------------
@@ -684,10 +741,13 @@ func TestDayService_MarkCycleStartManually_TxErrorPropagates(t *testing.T) {
 	service := NewDayServiceWithTx(logs, users, failingRunner)
 
 	err := service.MarkCycleStartManually(context.Background(), 10, targetDay, targetDay, time.UTC, ManualCycleStartOptions{})
-	// The error wraps txErr (via wrapManualCycleStartFailure if it reaches the
-	// inner return, or directly if it short-circuits earlier). Either way,
-	// we expect a non-nil error.
-	if err == nil {
-		t.Fatal("expected error from failing TxRunner, got nil")
+	// The injected error itself must come back. `err != nil` would also be
+	// satisfied by the pre-transaction refusals this function can return
+	// before the runner is ever reached (ErrManualCycleStartDateInvalid,
+	// ErrDayEntryLoadFailed, ErrManualCycleStartReplaceRequired), so it would
+	// pass on a fixture that never exercised the runner at all — and by any
+	// wrapping that drops the cause.
+	if !errors.Is(err, txErr) {
+		t.Fatalf("expected the injected TxRunner error to propagate, got: %v", err)
 	}
 }

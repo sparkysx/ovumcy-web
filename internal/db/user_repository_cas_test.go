@@ -18,7 +18,7 @@ import (
 //     ErrResetTokenAlreadyConsumed because the stored hash already changed.
 func TestUpdatePasswordRecoveryCodeAndRevokeSessionsCASRejectsReplay(t *testing.T) {
 	dir := t.TempDir()
-	database, err := OpenSQLite(filepath.Join(dir, "cas_test.db"))
+	database, err := OpenDatabase(migratedSQLiteConfig(t, filepath.Join(dir, "cas_test.db")))
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
@@ -48,7 +48,7 @@ func TestUpdatePasswordRecoveryCodeAndRevokeSessionsCASRejectsReplay(t *testing.
 
 	// First CAS call — must succeed and bump session version.
 	err = repo.UpdatePasswordRecoveryCodeAndRevokeSessionsCAS(
-		context.Background(), user.ID, "old-hash", "new-hash", "new-recovery",
+		context.Background(), user.ID, "old-hash", 1, "new-hash", "new-recovery", nil,
 	)
 	if err != nil {
 		t.Fatalf("first CAS call: unexpected error: %v", err)
@@ -70,7 +70,7 @@ func TestUpdatePasswordRecoveryCodeAndRevokeSessionsCASRejectsReplay(t *testing.
 
 	// Second CAS call with the SAME oldPasswordHash — must be rejected.
 	err = repo.UpdatePasswordRecoveryCodeAndRevokeSessionsCAS(
-		context.Background(), user.ID, "old-hash", "another-hash", "another-recovery",
+		context.Background(), user.ID, "old-hash", 1, "another-hash", "another-recovery", nil,
 	)
 	if !errors.Is(err, ErrResetTokenAlreadyConsumed) {
 		t.Fatalf("second CAS call: expected ErrResetTokenAlreadyConsumed, got %v", err)
@@ -86,6 +86,88 @@ func TestUpdatePasswordRecoveryCodeAndRevokeSessionsCASRejectsReplay(t *testing.
 	}
 	if got2.PasswordHash != "new-hash" {
 		t.Fatalf("expected password_hash to remain 'new-hash', got %q", got2.PasswordHash)
+	}
+}
+
+// TestUpdatePasswordRecoveryCodeAndRevokeSessionsCASLosesToASessionVersionBump
+// pins the auth_session_version term of the reset CAS: the reset token is
+// checked against the version when it is resolved, and a revocation or posture
+// change that bumps the column between that read and the UPDATE must make the
+// reset lose, even though the password hash is unchanged. A row stored at 0
+// can no longer match any expected version at all (WEB-50/WEB-65): migration
+// 041 backfills every such row to 1 at boot, so this predicate no longer
+// carries the legacy arm that used to read a stored 0 as version 1.
+func TestUpdatePasswordRecoveryCodeAndRevokeSessionsCASLosesToASessionVersionBump(t *testing.T) {
+	dir := t.TempDir()
+	database, err := OpenDatabase(migratedSQLiteConfig(t, filepath.Join(dir, "cas_version_test.db")))
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	t.Cleanup(func() {
+		if sqlDB, err := database.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	})
+	repo := NewUserRepository(database)
+	ctx := context.Background()
+
+	user := &models.User{
+		Email:              "cas-version@example.com",
+		PasswordHash:       "old-hash",
+		RecoveryCodeHash:   "old-recovery",
+		LocalAuthEnabled:   true,
+		AuthSessionVersion: 1,
+		Role:               models.RoleOwner,
+		CycleLength:        models.DefaultCycleLength,
+		PeriodLength:       models.DefaultPeriodLength,
+		AutoPeriodFill:     true,
+		CreatedAt:          time.Now().UTC(),
+	}
+	if err := repo.Create(ctx, user); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	// The reset read the row at version 1; a revocation lands before the write.
+	if err := repo.BumpAuthSessionVersion(ctx, user.ID); err != nil {
+		t.Fatalf("bump session version: %v", err)
+	}
+	err = repo.UpdatePasswordRecoveryCodeAndRevokeSessionsCAS(ctx, user.ID, "old-hash", 1, "new-hash", "new-recovery", nil)
+	if !errors.Is(err, ErrResetTokenAlreadyConsumed) {
+		t.Fatalf("expected a reset read before the version bump to lose, got %v", err)
+	}
+	got, err := repo.FindByID(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("find after lost CAS: %v", err)
+	}
+	if got.PasswordHash != "old-hash" || got.AuthSessionVersion != 2 {
+		t.Fatalf("a lost reset must write nothing, got hash %q version %d", got.PasswordHash, got.AuthSessionVersion)
+	}
+
+	// A version the caller never read is refused outright.
+	if err := repo.UpdatePasswordRecoveryCodeAndRevokeSessionsCAS(ctx, user.ID, "old-hash", 0, "new-hash", "new-recovery", nil); !errors.Is(err, ErrResetTokenAlreadyConsumed) {
+		t.Fatalf("expected a zero session version to be refused, got %v", err)
+	}
+
+	// A row forced to 0 by hand (the shape migration 041 backfills at boot,
+	// never a state a running instance's own writers produce) must not match
+	// ANY expected version any more: the legacy arm that used to read a stored
+	// 0 as version 1 is gone, so the predicate's plain equality can never see
+	// a 0 as a 1.
+	if err := database.Model(&models.User{}).Where("id = ?", user.ID).UpdateColumn("auth_session_version", 0).Error; err != nil {
+		t.Fatalf("seed legacy version: %v", err)
+	}
+	if err := repo.UpdatePasswordRecoveryCodeAndRevokeSessionsCAS(ctx, user.ID, "old-hash", 2, "new-hash", "new-recovery", nil); !errors.Is(err, ErrResetTokenAlreadyConsumed) {
+		t.Fatalf("expected a row at 0 not to match version 2, got %v", err)
+	}
+	if err := repo.UpdatePasswordRecoveryCodeAndRevokeSessionsCAS(ctx, user.ID, "old-hash", 1, "new-hash", "new-recovery", nil); !errors.Is(err, ErrResetTokenAlreadyConsumed) {
+		t.Fatalf("expected a row at 0 not to match version 1 either, now that the legacy arm is gone, got %v", err)
+	}
+	got, err = repo.FindByID(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("find after refused CAS: %v", err)
+	}
+	if got.PasswordHash != "old-hash" || got.AuthSessionVersion != 0 {
+		t.Fatalf("a refused CAS must write nothing, got hash %q version %d", got.PasswordHash, got.AuthSessionVersion)
 	}
 }
 
@@ -117,27 +199,55 @@ func TestOpenSQLiteConnectionPoolLimits(t *testing.T) {
 	}
 }
 
-// TestUpdatePasswordHashOnlyPreservesSessionVersion asserts the transparent
-// bcrypt-cost upgrade rewrites password_hash without bumping
-// auth_session_version and without disturbing the other credential columns —
-// the account's security posture is unchanged, so no active session may be
-// revoked by an internal storage upgrade.
-func TestUpdatePasswordHashOnlyPreservesSessionVersion(t *testing.T) {
-	dir := t.TempDir()
-	database, err := OpenSQLite(filepath.Join(dir, "rehash_test.db"))
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
-	t.Cleanup(func() {
-		if sqlDB, err := database.DB(); err == nil {
-			_ = sqlDB.Close()
-		}
+func TestUpgradePasswordHashCAS(t *testing.T) {
+	runCASCasesOnEachDriver(t, []casDriverCase{
+		{"preserves the session version", testUpgradePasswordHashCASPreservesSessionVersion},
+		{"loses to a credential write", testUpgradePasswordHashCASLosesToACredentialWrite},
 	})
+}
 
-	repo := NewUserRepository(database)
+type casDriverCase struct {
+	name string
+	run  func(t *testing.T, repo *UserRepository)
+}
+
+// runCASCasesOnEachDriver runs every case on both shipped drivers, one
+// database per driver: a compare-and-set's row count is the driver's to
+// report, so SQLite alone would not pin what a Postgres deployment does. Each
+// case seeds its own row.
+func runCASCasesOnEachDriver(t *testing.T, cases []casDriverCase) {
+	t.Helper()
+
+	configs := map[string]func(t *testing.T) Config{
+		"sqlite": func(t *testing.T) Config {
+			return migratedSQLiteConfig(t, filepath.Join(t.TempDir(), "cas_driver_test.db"))
+		},
+		"postgres": startPostgresTestConfig,
+	}
+	for _, driver := range []string{"sqlite", "postgres"} {
+		t.Run(driver, func(t *testing.T) {
+			database, err := OpenDatabase(configs[driver](t))
+			if err != nil {
+				t.Fatalf("open %s: %v", driver, err)
+			}
+			t.Cleanup(func() {
+				if sqlDB, err := database.DB(); err == nil {
+					_ = sqlDB.Close()
+				}
+			})
+			repo := NewUserRepository(database)
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) { tc.run(t, repo) })
+			}
+		})
+	}
+}
+
+func createUpgradePasswordHashCASUser(t *testing.T, repo *UserRepository, email string) *models.User {
+	t.Helper()
 
 	user := &models.User{
-		Email:              "rehash@example.com",
+		Email:              email,
 		PasswordHash:       "legacy-hash",
 		RecoveryCodeHash:   "recovery-hash",
 		LocalAuthEnabled:   true,
@@ -152,9 +262,23 @@ func TestUpdatePasswordHashOnlyPreservesSessionVersion(t *testing.T) {
 	if err := repo.Create(context.Background(), user); err != nil {
 		t.Fatalf("create user: %v", err)
 	}
+	return user
+}
 
-	if err := repo.UpdatePasswordHashOnly(context.Background(), user.ID, "upgraded-hash"); err != nil {
-		t.Fatalf("UpdatePasswordHashOnly: %v", err)
+// testUpgradePasswordHashCASPreservesSessionVersion asserts the transparent
+// bcrypt-cost upgrade rewrites password_hash without bumping
+// auth_session_version and without disturbing the other credential columns —
+// the account's security posture is unchanged, so no active session may be
+// revoked by an internal storage upgrade.
+func testUpgradePasswordHashCASPreservesSessionVersion(t *testing.T, repo *UserRepository) {
+	user := createUpgradePasswordHashCASUser(t, repo, "rehash-applied@example.com")
+
+	applied, err := repo.UpgradePasswordHashCAS(context.Background(), user.ID, "legacy-hash", "upgraded-hash")
+	if err != nil {
+		t.Fatalf("UpgradePasswordHashCAS: %v", err)
+	}
+	if !applied {
+		t.Fatal("the upgrade against the current hash reported not applied")
 	}
 
 	got, err := repo.FindByID(context.Background(), user.ID)
@@ -172,5 +296,52 @@ func TestUpdatePasswordHashOnlyPreservesSessionVersion(t *testing.T) {
 	}
 	if !got.LocalAuthEnabled {
 		t.Fatal("expected local_auth_enabled untouched (true)")
+	}
+}
+
+// testUpgradePasswordHashCASLosesToACredentialWrite is the predicate itself: a
+// password change that lands after the login read the hash must survive the
+// upgrade that login then attempts. Without the predicate the upgrade would
+// write the old password back, with no session-version bump.
+func testUpgradePasswordHashCASLosesToACredentialWrite(t *testing.T, repo *UserRepository) {
+	user := createUpgradePasswordHashCASUser(t, repo, "rehash-lost@example.com")
+	if err := repo.UpdatePasswordAndRevokeSessions(context.Background(), user.ID, storedSessionVersionForTest(t, repo, user.ID), "changed-hash", false); err != nil {
+		t.Fatalf("UpdatePasswordAndRevokeSessions: %v", err)
+	}
+
+	applied, err := repo.UpgradePasswordHashCAS(context.Background(), user.ID, "legacy-hash", "upgraded-legacy-hash")
+	if err != nil {
+		t.Fatalf("a lost race is not a database failure, got %v", err)
+	}
+	if applied {
+		t.Fatal("the upgrade reported applied against a hash the row no longer holds")
+	}
+
+	got, err := repo.FindByID(context.Background(), user.ID)
+	if err != nil {
+		t.Fatalf("find after lost upgrade: %v", err)
+	}
+	if got.PasswordHash != "changed-hash" {
+		t.Fatalf("password_hash = %q after the lost upgrade, want the changed credential kept", got.PasswordHash)
+	}
+	if got.AuthSessionVersion != 5 {
+		t.Fatalf("auth_session_version = %d, want 5: bumped once by the change, never by the upgrade", got.AuthSessionVersion)
+	}
+}
+
+// TestUpgradePasswordHashCASFailsClosedWhenTheUpdateErrors covers the error
+// arm: an upgrade that could not run must report the failure AND read as not
+// applied, or the caller would adopt a hash the row never received.
+func TestUpgradePasswordHashCASFailsClosedWhenTheUpdateErrors(t *testing.T) {
+	repo := openRevealMarkRepoForTest(t)
+	user := createUpgradePasswordHashCASUser(t, repo, "rehash-closed@example.com")
+	closeRevealMarkRepoHandle(t, repo)
+
+	applied, err := repo.UpgradePasswordHashCAS(context.Background(), user.ID, "legacy-hash", "upgraded-hash")
+	if err == nil {
+		t.Fatal("expected UpgradePasswordHashCAS against a closed database to surface an error")
+	}
+	if applied {
+		t.Fatal("an upgrade that errored must never read as applied")
 	}
 }

@@ -10,6 +10,7 @@
   var THEME_STORAGE_KEY = "ovumcy_theme";
   var THEME_LIGHT = "light";
   var THEME_DARK = "dark";
+  var THEME_SYSTEM = "system";
   var THEME_COLOR_LIGHT = "#fff9f0";
   var THEME_COLOR_DARK = "#18141f";
   var TIMEZONE_COOKIE_NAME = "ovumcy_tz";
@@ -50,12 +51,25 @@
     callback();
   }
 
+  // A rendered theme is always light or dark: `data-theme` never carries
+  // "system", so every stylesheet rule keeps matching on the two values it
+  // already knows.
   function normalizeTheme(value) {
     var theme = String(value || "").trim().toLowerCase();
     if (theme === THEME_DARK || theme === THEME_LIGHT) {
       return theme;
     }
     return "";
+  }
+
+  // A stored preference is light, dark, or "system" — the third one is a
+  // standing instruction to follow `prefers-color-scheme`, resolved at apply
+  // time rather than frozen into storage.
+  function normalizeThemePreference(value) {
+    if (String(value || "").trim().toLowerCase() === THEME_SYSTEM) {
+      return THEME_SYSTEM;
+    }
+    return normalizeTheme(value);
   }
 
   function supportsMatchMedia() {
@@ -75,14 +89,14 @@
 
   function readStoredTheme() {
     try {
-      return normalizeTheme(window.localStorage.getItem(THEME_STORAGE_KEY));
+      return normalizeThemePreference(window.localStorage.getItem(THEME_STORAGE_KEY));
     } catch {
       return "";
     }
   }
 
   function writeStoredTheme(theme) {
-    var normalized = normalizeTheme(theme);
+    var normalized = normalizeThemePreference(theme);
     if (!normalized) {
       return;
     }
@@ -125,17 +139,40 @@
     return applyTheme(readStoredTheme());
   }
 
-  function initThemePreference() {
-    applyTheme(readStoredTheme());
+  function currentThemePreference() {
+    return readStoredTheme() || currentTheme();
   }
 
-  function setThemePreference(theme) {
-    var normalized = normalizeTheme(theme);
-    if (!normalized) {
-      return currentTheme();
+  // "System" has to keep following the system after load: an owner who reads in
+  // bed sees the OS flip to dark at sunset, not at the next navigation.
+  function bindSystemThemeChanges() {
+    if (!supportsMatchMedia()) {
+      return;
     }
-    writeStoredTheme(normalized);
-    return applyTheme(normalized);
+
+    var query = window.matchMedia("(prefers-color-scheme: dark)");
+    var onSystemThemeChange = function () {
+      // An explicit light/dark preference outranks the system; the follow-live
+      // branch covers "system" and the never-chosen state, which resolves the
+      // same way.
+      if (normalizeTheme(readStoredTheme())) {
+        return;
+      }
+      applyTheme(THEME_SYSTEM);
+    };
+
+    if (typeof query.addEventListener === "function") {
+      query.addEventListener("change", onSystemThemeChange);
+      return;
+    }
+    if (typeof query.addListener === "function") {
+      query.addListener(onSystemThemeChange);
+    }
+  }
+
+  function initThemePreference() {
+    applyTheme(readStoredTheme());
+    bindSystemThemeChanges();
   }
 
   function isSafeClientTimezone(value) {
@@ -143,6 +180,18 @@
       return false;
     }
     return /^[A-Za-z0-9_+/-]+$/.test(value);
+  }
+
+  // The timezone is an owner-scoped rendering preference, so nothing about it
+  // is written or sent while nobody is signed in. base.html emits
+  // data-persisted-timezone only for a rendered session, and it is the only
+  // template that owns <body>, so its presence is the signed-in signal. Without
+  // this gate the server's retraction of ovumcy_tz at sign-out would be undone
+  // by the very next page load: the bootstrap re-wrote the cookie on every
+  // render, and every htmx request carried the header the middleware re-issues
+  // it from.
+  function signedInPage() {
+    return !!(document.body && document.body.hasAttribute("data-persisted-timezone"));
   }
 
   function detectClientTimezone() {
@@ -174,6 +223,9 @@
   }
 
   function initClientTimezone() {
+    if (!signedInPage()) {
+      return;
+    }
     var timezone = detectClientTimezone();
     if (!timezone) {
       return;
@@ -183,6 +235,9 @@
   }
 
   function currentClientTimezone() {
+    if (!signedInPage()) {
+      return "";
+    }
     var known = String(window.__ovumcyTimezone || "").trim();
     if (known && isSafeClientTimezone(known)) {
       return known;
@@ -918,16 +973,12 @@
   }
 
   function clearDataStatusTarget(form) {
-    if (!form || !form.querySelector) {
+    if (!form || !form.getAttribute) {
       return null;
     }
 
     var selector = String(form.getAttribute("data-clear-data-status-target") || "").trim();
-    if (selector) {
-      return document.querySelector(selector);
-    }
-
-    return form.querySelector("[data-clear-data-status]");
+    return selector ? document.querySelector(selector) : null;
   }
 
   function openClearDataConfirm(question, acceptLabel) {
@@ -1192,9 +1243,12 @@
   var pwaInstallDeferredEvent = null;
   var pwaInstallFallbackTimer = 0;
   var pwaInstallSubscribers = [];
+  // `dismissed` hides the one-time mobile offer only. Availability survives it so
+  // the settings entry can still install after the offer has been dismissed.
   var pwaInstallState = {
     available: false,
     busy: false,
+    dismissed: false,
     installed: false,
     mode: ""
   };
@@ -1283,6 +1337,7 @@
     return {
       available: !!pwaInstallState.available,
       busy: !!pwaInstallState.busy,
+      dismissed: !!pwaInstallState.dismissed,
       installed: !!pwaInstallState.installed,
       mode: String(pwaInstallState.mode || "")
     };
@@ -1299,6 +1354,7 @@
     var safeState = nextState || {};
     pwaInstallState.available = !!safeState.available;
     pwaInstallState.busy = !!safeState.busy;
+    pwaInstallState.dismissed = !!safeState.dismissed;
     pwaInstallState.installed = !!safeState.installed;
     pwaInstallState.mode = String(safeState.mode || "");
     emitPWAInstallState();
@@ -1312,8 +1368,11 @@
     pwaInstallFallbackTimer = 0;
   }
 
+  // A dismissed offer no longer suppresses the fallback or the deferred prompt:
+  // both keep resolving so the settings entry can describe (and, where the browser
+  // supports it, run) the install. Only the mobile offer reads `dismissed`.
   function schedulePWAInstallFallback() {
-    if (isStandalonePWA() || wasPWAInstallDismissed()) {
+    if (isStandalonePWA()) {
       return;
     }
 
@@ -1327,6 +1386,7 @@
         setPWAInstallState({
           available: true,
           busy: false,
+          dismissed: wasPWAInstallDismissed(),
           installed: false,
           mode: "ios"
         });
@@ -1337,6 +1397,7 @@
         setPWAInstallState({
           available: true,
           busy: false,
+          dismissed: wasPWAInstallDismissed(),
           installed: false,
           mode: "menu"
         });
@@ -1344,15 +1405,15 @@
     }, PWA_INSTALL_FALLBACK_DELAY_MS);
   }
 
-  function dismissPWAInstallPrompt() {
-    pwaInstallDeferredEvent = null;
+  function dismissPWAInstallOffer() {
     clearPWAInstallFallbackTimer();
     storePWAInstallDismissed();
     setPWAInstallState({
-      available: false,
+      available: pwaInstallState.available,
       busy: false,
-      installed: isStandalonePWA(),
-      mode: ""
+      dismissed: true,
+      installed: pwaInstallState.installed,
+      mode: pwaInstallState.mode
     });
   }
 
@@ -1363,6 +1424,7 @@
     setPWAInstallState({
       available: false,
       busy: false,
+      dismissed: false,
       installed: true,
       mode: ""
     });
@@ -1372,7 +1434,7 @@
     if (!event) {
       return;
     }
-    if (isStandalonePWA() || wasPWAInstallDismissed()) {
+    if (isStandalonePWA()) {
       return;
     }
 
@@ -1384,6 +1446,7 @@
     setPWAInstallState({
       available: true,
       busy: false,
+      dismissed: wasPWAInstallDismissed(),
       installed: false,
       mode: "prompt"
     });
@@ -1401,6 +1464,7 @@
     setPWAInstallState({
       available: false,
       busy: false,
+      dismissed: wasPWAInstallDismissed(),
       installed: isStandalonePWA(),
       mode: ""
     });
@@ -1417,6 +1481,7 @@
     setPWAInstallState({
       available: true,
       busy: true,
+      dismissed: pwaInstallState.dismissed,
       installed: false,
       mode: "prompt"
     });
@@ -1440,7 +1505,17 @@
           return true;
         }
 
-        dismissPWAInstallPrompt();
+        // The browser consumed the deferred event, so nothing can be prompted
+        // again on this page load; a reload re-arms `beforeinstallprompt` and the
+        // settings entry with it.
+        storePWAInstallDismissed();
+        setPWAInstallState({
+          available: false,
+          busy: false,
+          dismissed: true,
+          installed: false,
+          mode: ""
+        });
         return false;
       });
   }
@@ -1578,6 +1653,45 @@
         // Ignore storage errors.
       }
     });
+  }
+
+  // The status island is not always the swap target. A settings section that
+  // replaces itself (hx-swap="outerHTML" onto the card) targets the card, and the
+  // island lives inside it — so every handler below resolves the container rather
+  // than testing the target's own class. Before this, a card-level swap silently
+  // skipped the toast, the auto-clear AND the error rendering: the request
+  // succeeded or failed and the page said nothing either way.
+  function statusContainerFor(target) {
+    if (!target || !target.classList) {
+      return null;
+    }
+    if (target.classList.contains("save-status")) {
+      return target;
+    }
+    // Otherwise the island belongs to the nearest element that DECLARES itself
+    // its host — the element itself when it is one, else the closest such
+    // ancestor. Both directions are needed: a card that replaces itself is the
+    // swap target on success, while an error carries whichever element htmx
+    // resolved for the request, which can be inside the card. Walking ancestors
+    // rather than searching the document is what keeps a webhook error out of
+    // the symptoms card: the settings page carries several islands and a bare
+    // descendant search would return whichever came first.
+    //
+    // The host attribute is deliberately not data-success-toast. That one is an
+    // opt-in to a toast, declared on the island itself; a card borrowing it to
+    // be findable made one name mean two things, and the borrowed meaning was
+    // the silent one — the card declared "toast me" and no toast could fire,
+    // because the resolved island did not carry the attribute the toast reads.
+    var surface =
+      target.hasAttribute && target.hasAttribute("data-status-island-host")
+        ? target
+        : target.closest
+          ? target.closest("[data-status-island-host]")
+          : null;
+    if (!surface || !surface.querySelector) {
+      return null;
+    }
+    return surface.querySelector(".save-status");
   }
 
   function renderErrorStatus(target, text) {
@@ -1759,6 +1873,13 @@
       successStatusClearTimers.delete(successNode);
     }
 
+    // A status the server declares persistent carries safety guidance — the
+    // prediction pause with its red-flag line — and stays until the owner
+    // dismisses it. The server states the kind; nothing here reads the copy.
+    if (successNode.getAttribute("data-status-kind") === "persistent") {
+      return;
+    }
+
     var timer = window.setTimeout(function () {
       if (!target.contains(successNode)) {
         successStatusClearTimers.delete(successNode);
@@ -1778,6 +1899,59 @@
     successStatusClearTimers.set(successNode, timer);
   }
 
+  // Take down the success status a region holds, with its pending clear: a later
+  // save whose answer says nothing new must not leave an earlier answer standing.
+  // A failure notice in the same region is not a success status and stays.
+  function withdrawSuccessStatus(target) {
+    var successNode = target && target.querySelector ? target.querySelector(".status-ok") : null;
+    var timer;
+    while (successNode) {
+      timer = successStatusClearTimers.get(successNode);
+      if (timer) {
+        window.clearTimeout(timer);
+        successStatusClearTimers.delete(successNode);
+      }
+      successNode.remove();
+      successNode = target.querySelector(".status-ok");
+    }
+    clearStatusTargetIfEmpty(target);
+  }
+
+  // The message each island last raised, remembered by the island's id. The node
+  // is not stable: a card that replaces itself brings a NEW island element on
+  // every swap, so a key stored on the element resets exactly when the repeat it
+  // exists to suppress arrives. An island with no id keeps the per-node key,
+  // which is all that can be said about an element nothing can address twice.
+  //
+  // The registry hangs off window rather than off this closure so that it is one
+  // registry per page, not one per evaluation of this bundle.
+  function lastToastRegistry() {
+    if (!window.__ovumcyLastToastByIsland) {
+      window.__ovumcyLastToastByIsland = {};
+    }
+    return window.__ovumcyLastToastByIsland;
+  }
+
+  function lastToastFor(island) {
+    return island.id ? lastToastRegistry()[island.id] : island.dataset.toastShown;
+  }
+
+  function rememberToastFor(island, identity) {
+    if (island.id) {
+      lastToastRegistry()[island.id] = identity;
+      return;
+    }
+    island.dataset.toastShown = identity;
+  }
+
+  // What the repeat is judged by. The flash key names the message the server
+  // chose and survives everything done to the rendered node afterwards — the
+  // dismiss button appended below is already enough to change the node's text,
+  // so text alone identifies a message only until something decorates it.
+  function toastIdentity(successNode, message) {
+    return successNode.getAttribute("data-flash-key") || message;
+  }
+
   function maybeShowSuccessToast(target) {
     var successNode;
     var message;
@@ -1791,11 +1965,11 @@
     }
 
     message = String(successNode.textContent || "").trim();
-    if (!message || target.dataset.toastShown === message) {
+    if (!message || lastToastFor(target) === toastIdentity(successNode, message)) {
       return;
     }
 
-    target.dataset.toastShown = message;
+    rememberToastFor(target, toastIdentity(successNode, message));
     window.showToast(message, "ok");
   }
 
@@ -1832,6 +2006,126 @@
     }
   }
 
+  // Parses a server error response into the message the client may show. The
+  // fragment is parsed with DOMParser and only its TEXT is adopted: server
+  // templates already escape user-supplied values, so today this is purely
+  // defense-in-depth — any future regression that lets unescaped HTML into an
+  // error response would otherwise become an instant DOM-XSS through
+  // `target.innerHTML = responseText`.
+  function parseServerStatusError(responseText) {
+    if (!responseText || responseText.indexOf("status-error") === -1) {
+      return null;
+    }
+
+    var doc = new DOMParser().parseFromString(responseText, "text/html");
+    var fragment = doc.querySelector(".status-error");
+    return {
+      text: fragment ? fragment.textContent : responseText,
+      key: fragment ? fragment.getAttribute("data-flash-key") || "" : ""
+    };
+  }
+
+  // A day entry lives only in the form the owner typed it into: no draft is
+  // written to storage, no offline cache, no service worker. That live form is
+  // the whole recovery mechanism, so a save that does not land must leave every
+  // field untouched and hand back a control that resubmits the same node.
+  //
+  // A self-hosted instance is regularly unreachable — the owner is off the home
+  // network — so a failed save is a transport event, not a finding about the
+  // owner's body. It is rendered on the neutral status-notice surface rather
+  // than the red status-error one, inside the existing aria-live="polite"
+  // container, and never as a success.
+  //
+  // Both day forms answer to it: the calendar editor, which saves on an
+  // explicit press, and the dashboard journal, which saves itself. Two failure
+  // surfaces for one kind of event would drift apart, so the selector below is
+  // the single membership test — widened rather than duplicated.
+  var DAY_SAVE_FORM_SELECTOR = "[data-day-editor-form], [data-dashboard-save-form]";
+
+  function dayEditorFormFromEvent(event) {
+    var form = getSaveFeedbackFormFromEvent(event);
+    if (!form || !form.matches || !form.matches(DAY_SAVE_FORM_SELECTOR)) {
+      return null;
+    }
+    return form;
+  }
+
+  function renderDaySaveFailure(form, message, origin, messageKey) {
+    var target = form && form.querySelector ? form.querySelector(".save-status") : null;
+    if (!target || !message) {
+      return false;
+    }
+
+    var notice = document.createElement("div");
+    notice.className = "status-notice";
+    notice.setAttribute("data-day-save-failed", origin);
+
+    var text = document.createElement("span");
+    text.className = "status-notice-message";
+    text.textContent = message;
+    if (messageKey) {
+      text.setAttribute("data-notice-key", messageKey);
+    }
+    notice.appendChild(text);
+
+    var retry = document.createElement("button");
+    // Explicitly type="button": the status container sits inside the form, and
+    // a default submit button here would fire a second save on every click that
+    // reaches it.
+    retry.type = "button";
+    retry.className = "status-notice-action";
+    retry.setAttribute("data-day-save-retry", "true");
+    retry.textContent = form.getAttribute("data-day-save-retry-label") || "Try again";
+    notice.appendChild(retry);
+
+    target.replaceChildren(notice);
+    return true;
+  }
+
+  function renderDaySaveUnreachable(form) {
+    return renderDaySaveFailure(
+      form,
+      form.getAttribute("data-day-save-failed-text") || "Couldn't save. Your entry is still here.",
+      "unreachable",
+      ""
+    );
+  }
+
+  function handleDaySaveTransportFailure(event) {
+    var form = dayEditorFormFromEvent(event);
+    if (!form) {
+      return;
+    }
+    renderDaySaveUnreachable(form);
+    // htmx fires afterRequest before sendError, so the button is already back;
+    // re-assert it anyway, because a save button left disabled would take the
+    // retry with it.
+    setSaveButtonState(form, false);
+  }
+
+  function retryDaySave(form) {
+    // Resubmit the very same form node. Nothing was copied anywhere, so the
+    // retry carries exactly what is on screen.
+    //
+    // The dashboard journal has no submit button to fall back on: its saves go
+    // through the autosave runner, so the retry re-enters that runner instead
+    // of asking htmx for a second mechanism on the same form.
+    if (form.matches && form.matches("[data-dashboard-save-form]") && typeof window.__ovumcyRetryDashboardAutosave === "function") {
+      window.__ovumcyRetryDashboardAutosave(form);
+      return;
+    }
+
+    if (typeof form.requestSubmit === "function") {
+      form.requestSubmit();
+      return;
+    }
+
+    var saveButton = form.querySelector("[data-save-button]");
+    if (saveButton) {
+      saveButton.click();
+    }
+  }
+
   function initHTMXHooks() {
     document.body.addEventListener("htmx:configRequest", function (event) {
       var tokenMeta = document.querySelector('meta[name="csrf-token"]');
@@ -1864,9 +2158,9 @@
     });
 
     document.body.addEventListener("htmx:beforeRequest", function (event) {
-      var target = event && event.detail ? event.detail.target : null;
-      if (target && target.classList && target.classList.contains("save-status")) {
-        delete target.dataset.toastShown;
+      var statusTarget = statusContainerFor(event && event.detail ? event.detail.target : null);
+      if (statusTarget) {
+        delete statusTarget.dataset.toastShown;
       }
       setSaveButtonState(getSaveFeedbackFormFromEvent(event), true);
     });
@@ -1877,13 +2171,13 @@
       setSaveButtonState(form, false);
       showResponseNotice(xhr);
       if (form && form.matches && form.matches("[data-dashboard-save-form]") && typeof window.__ovumcyFinalizeDashboardManualSave === "function") {
-        window.__ovumcyFinalizeDashboardManualSave(form, !!(event && event.detail && event.detail.successful));
+        window.__ovumcyFinalizeDashboardManualSave(form);
       }
     });
 
     document.body.addEventListener("htmx:afterSwap", function (event) {
-      var target = event && event.detail ? event.detail.target : null;
-      if (!target || !target.classList || !target.classList.contains("save-status")) {
+      var target = statusContainerFor(event && event.detail ? event.detail.target : null);
+      if (!target) {
         return;
       }
 
@@ -1898,8 +2192,8 @@
     });
 
     document.body.addEventListener("htmx:afterSettle", function (event) {
-      var target = event && event.detail ? event.detail.target : null;
-      if (!target || !target.classList || !target.classList.contains("save-status")) {
+      var target = statusContainerFor(event && event.detail ? event.detail.target : null);
+      if (!target) {
         return;
       }
       scheduleClearSuccessStatus(target);
@@ -1921,31 +2215,64 @@
       clearStatusTargetIfEmpty(parent);
     });
 
+    document.body.addEventListener("htmx:sendError", handleDaySaveTransportFailure);
+    document.body.addEventListener("htmx:sendAbort", handleDaySaveTransportFailure);
+    document.body.addEventListener("htmx:timeout", handleDaySaveTransportFailure);
+
+    document.body.addEventListener("click", function (event) {
+      var retryButton = closestFromEvent(event, "[data-day-save-retry]");
+      if (!retryButton) {
+        return;
+      }
+
+      var form = retryButton.closest("form[data-day-editor-form], form[data-dashboard-save-form]");
+      if (!form) {
+        return;
+      }
+
+      event.preventDefault();
+      retryDaySave(form);
+    });
+
     document.body.addEventListener("htmx:responseError", function (event) {
       var target = event && event.detail ? event.detail.target : null;
       var form = getSaveFeedbackFormFromEvent(event);
-      if (!target || !target.classList || !target.classList.contains("save-status")) {
+      var dayForm = dayEditorFormFromEvent(event);
+
+      if (dayForm) {
+        // The server answered, but not with a save. Keep its own message when
+        // it sent one — it is more specific than any generic copy — and fall
+        // back to the neutral "could not save" line otherwise. Either way the
+        // owner gets the retry, and the typed entry is left alone.
+        var dayXHR = event.detail ? event.detail.xhr : null;
+        var serverError = parseServerStatusError(
+          dayXHR && typeof dayXHR.responseText === "string" ? dayXHR.responseText : ""
+        );
+        var serverMessage = serverError ? String(serverError.text || "").trim() : "";
+        var rendered = serverMessage
+          ? renderDaySaveFailure(dayForm, serverMessage, "rejected", serverError.key)
+          : renderDaySaveUnreachable(dayForm);
+        if (rendered) {
+          return;
+        }
+      }
+      target = statusContainerFor(target);
+      if (!target) {
         if (form && form.matches && form.matches("[data-dashboard-save-form]") && typeof window.__ovumcyFinalizeDashboardManualSave === "function") {
-          window.__ovumcyFinalizeDashboardManualSave(form, false);
+          window.__ovumcyFinalizeDashboardManualSave(form);
         }
         return;
       }
 
       var xhr = event.detail.xhr;
       var responseText = xhr && typeof xhr.responseText === "string" ? xhr.responseText : "";
-      if (responseText && responseText.indexOf("status-error") !== -1) {
-        // Safe-by-construction swap: parse the server's status-error
-        // fragment, but only adopt its text content. Server templates
-        // already escape user-supplied values, so today this is purely
-        // defense-in-depth — any future regression that lets unescaped
-        // HTML into an error response would otherwise become an instant
-        // DOM-XSS through `target.innerHTML = responseText`.
-        var doc = new DOMParser().parseFromString(responseText, "text/html");
-        var fragment = doc.querySelector(".status-error");
-        var messageText = fragment ? fragment.textContent : responseText;
+      var parsedError = parseServerStatusError(responseText);
+      if (parsedError) {
+        // Safe-by-construction swap: only the parsed fragment's text is
+        // adopted (see parseServerStatusError).
         var safeContainer = document.createElement("div");
         safeContainer.className = "status-error";
-        safeContainer.textContent = messageText;
+        safeContainer.textContent = parsedError.text;
         target.replaceChildren(safeContainer);
         return;
       }
@@ -1953,7 +2280,7 @@
       var fallback = document.body.getAttribute("data-request-failed") || "Request failed. Please try again.";
       renderErrorStatus(target, fallback);
       if (form && form.matches && form.matches("[data-dashboard-save-form]") && typeof window.__ovumcyFinalizeDashboardManualSave === "function") {
-        window.__ovumcyFinalizeDashboardManualSave(form, false);
+        window.__ovumcyFinalizeDashboardManualSave(form);
       }
     });
   }
@@ -2049,83 +2376,6 @@
     } catch {
       return value;
     }
-  }
-
-  function localizedRelativeDayFallback(dayOffset, locale) {
-    var resolvedLocale = String(locale || "en").trim() || "en";
-
-    try {
-      if (typeof Intl !== "undefined" && typeof Intl.RelativeTimeFormat === "function") {
-        if (dayOffset === 0) {
-          return new Intl.RelativeTimeFormat(resolvedLocale, { numeric: "auto" }).format(0, "day");
-        }
-        if (dayOffset === 1) {
-          return new Intl.RelativeTimeFormat(resolvedLocale, { numeric: "auto" }).format(-1, "day");
-        }
-        if (dayOffset === 2) {
-          return new Intl.RelativeTimeFormat(resolvedLocale, { numeric: "always" }).format(-2, "day");
-        }
-      }
-    } catch {
-      // Fall back to stable English copy below when Intl locale data is unavailable.
-    }
-
-    if (dayOffset === 0) {
-      return "Today";
-    }
-    if (dayOffset === 1) {
-      return "Yesterday";
-    }
-    if (dayOffset === 2) {
-      return "2 days ago";
-    }
-    return "";
-  }
-
-  function resolveRelativeDayLabel(dayOffset, locale, relativeLabels) {
-    var label = "";
-    if (dayOffset === 0) {
-      label = String(relativeLabels && relativeLabels.today || "").trim();
-    } else if (dayOffset === 1) {
-      label = String(relativeLabels && relativeLabels.yesterday || "").trim();
-    } else if (dayOffset === 2) {
-      label = String(relativeLabels && relativeLabels.twoDaysAgo || "").trim();
-    }
-
-    if (label) {
-      return label;
-    }
-
-    return localizedRelativeDayFallback(dayOffset, locale);
-  }
-
-  function buildDayOptions(minDateRaw, maxDateRaw, locale, relativeLabels) {
-    var minDate = parseDateValue(minDateRaw);
-    var maxDate = parseDateValue(maxDateRaw);
-    if (!minDate || !maxDate || minDate > maxDate) {
-      return [];
-    }
-
-    var result = [];
-    var formatter = new Intl.DateTimeFormat(locale || "en", {
-      day: "numeric",
-      month: "short"
-    });
-
-    for (var cursor = new Date(maxDate); cursor >= minDate; cursor.setDate(cursor.getDate() - 1)) {
-      var current = new Date(cursor);
-      var dayOffset = Math.round((maxDate.getTime() - current.getTime()) / 86400000);
-      var isToday = dayOffset === 0;
-      var relativeLabel = resolveRelativeDayLabel(dayOffset, locale, relativeLabels);
-      var formattedDate = formatter.format(current);
-      result.push({
-        value: formatDateValue(current),
-        label: relativeLabel || formattedDate,
-        secondaryLabel: relativeLabel ? formattedDate : "",
-        isToday: isToday
-      });
-    }
-    return result;
   }
 
   function sanitizeDateFieldDigits(raw, maxDigits) {
@@ -2482,33 +2732,6 @@
     return node ? String(node.textContent || "").trim() : "";
   }
 
-  function collectCheckedSymptomLabels(scope) {
-    if (!scope || !scope.querySelectorAll) {
-      return [];
-    }
-
-    var checked = scope.querySelectorAll("input[name='symptom_ids']:checked");
-    var labels = [];
-    for (var index = 0; index < checked.length; index++) {
-      var label = String(checked[index].dataset.symptomLabel || "").trim();
-      if (label) {
-        labels.push(label);
-      }
-    }
-    return labels;
-  }
-
-  function themeMessagesFromDataset() {
-    var body = document.body;
-    var dataset = body && body.dataset ? body.dataset : {};
-    return {
-      toggleToDark: String(dataset.themeLabelDark || "Switch to dark mode"),
-      toggleToLight: String(dataset.themeLabelLight || "Switch to light mode"),
-      modeDark: String(dataset.themeNameDark || "Dark"),
-      modeLight: String(dataset.themeNameLight || "Light")
-    };
-  }
-
   function clampInteger(value, fallback, minValue, maxValue) {
     var numeric = Number(value);
     if (!isFinite(numeric)) {
@@ -2560,47 +2783,6 @@
     setDisabledByPeriod(root, isPeriod);
   }
 
-  function syncThemeToggleButtons() {
-    var buttons = document.querySelectorAll("[data-theme-option]");
-    var theme = currentTheme();
-    var messages = themeMessagesFromDataset();
-
-    for (var index = 0; index < buttons.length; index++) {
-      var button = buttons[index];
-      var optionTheme = normalizeTheme(button.getAttribute("data-theme-option"));
-      var selected = optionTheme !== "" && optionTheme === theme;
-      var toggleLabel = optionTheme === THEME_DARK ? messages.toggleToDark : messages.toggleToLight;
-      var currentLabel = optionTheme === THEME_DARK ? messages.modeDark : messages.modeLight;
-
-      button.dataset.selected = selected ? "true" : "false";
-      button.setAttribute("aria-pressed", selected ? "true" : "false");
-      button.setAttribute("aria-label", selected ? currentLabel : toggleLabel);
-      button.setAttribute("title", selected ? currentLabel : toggleLabel);
-    }
-  }
-
-  function bindThemeToggleButtons() {
-    var buttons = document.querySelectorAll("[data-theme-option]");
-    for (var index = 0; index < buttons.length; index++) {
-      var button = buttons[index];
-      if (button.dataset.themeToggleBound === "1") {
-        continue;
-      }
-
-      button.dataset.themeToggleBound = "1";
-      button.addEventListener("click", function () {
-        var nextTheme = normalizeTheme(this.getAttribute("data-theme-option"));
-        if (!nextTheme) {
-          return;
-        }
-        setThemePreference(nextTheme);
-        syncThemeToggleButtons();
-      });
-    }
-
-    syncThemeToggleButtons();
-  }
-
   function syncMobileMenu(button, menu) {
     var expanded = button.getAttribute("aria-expanded") === "true";
     setNodeHidden(menu, !expanded);
@@ -2625,41 +2807,34 @@
     syncMobileMenu(button, menu);
   }
 
-  function syncPWAInstallBanner(banner, state) {
+  // The compact offer is a single row and only appears while the browser has a
+  // native prompt to run: the manual home-screen instructions live in settings,
+  // where they do not cost first-screen space.
+  function syncPWAInstallOffer(offer, state) {
     var safeState = state || {};
-    var visible = !!safeState.available && !safeState.installed;
-    var mode = String(safeState.mode || "");
-    var installButton = banner.querySelector("[data-pwa-install-action='install']");
-    var promptCopy = banner.querySelector("[data-pwa-install-copy='prompt']");
-    var iosCopy = banner.querySelector("[data-pwa-install-copy='ios']");
-    var menuCopy = banner.querySelector("[data-pwa-install-copy='menu']");
+    var visible = !!safeState.available &&
+      !safeState.installed &&
+      !safeState.dismissed &&
+      String(safeState.mode || "") === "prompt";
+    var installButton = offer.querySelector("[data-pwa-install-action='install']");
 
-    setNodeHidden(banner, !visible);
-    if (!visible) {
-      return;
-    }
-
+    setNodeHidden(offer, !visible);
     if (installButton) {
-      setNodeHidden(installButton, mode !== "prompt");
       installButton.disabled = !!safeState.busy;
     }
-
-    setNodeHidden(promptCopy, mode !== "prompt");
-    setNodeHidden(iosCopy, mode !== "ios");
-    setNodeHidden(menuCopy, mode !== "menu");
   }
 
-  function bindPWAInstallBanner() {
-    var banner = document.querySelector("[data-pwa-install-banner]");
-    if (!banner) {
+  function bindPWAInstallOffer() {
+    var offer = document.querySelector("[data-pwa-install-offer]");
+    if (!offer) {
       return;
     }
 
-    if (banner.dataset.pwaInstallBound !== "1") {
-      banner.dataset.pwaInstallBound = "1";
+    if (offer.dataset.pwaInstallBound !== "1") {
+      offer.dataset.pwaInstallBound = "1";
 
-      var installButton = banner.querySelector("[data-pwa-install-action='install']");
-      var dismissButton = banner.querySelector("[data-pwa-install-action='dismiss']");
+      var installButton = offer.querySelector("[data-pwa-install-action='install']");
+      var dismissButton = offer.querySelector("[data-pwa-install-action='dismiss']");
       if (installButton) {
         installButton.addEventListener("click", function () {
           requestPWAInstallation();
@@ -2667,12 +2842,58 @@
       }
       if (dismissButton) {
         dismissButton.addEventListener("click", function () {
-          dismissPWAInstallPrompt();
+          dismissPWAInstallOffer();
         });
       }
 
       subscribePWAInstallState(function (state) {
-        syncPWAInstallBanner(banner, state);
+        syncPWAInstallOffer(offer, state);
+      });
+    }
+  }
+
+  function syncPWAInstallSettingsRow(row, state) {
+    var safeState = state || {};
+    var mode = String(safeState.mode || "");
+    var installed = !!safeState.installed;
+    var installButton = row.querySelector("[data-pwa-install-action='install']");
+    var activeHint = "prompt";
+
+    if (installed) {
+      activeHint = "installed";
+    } else if (mode === "ios" || mode === "menu") {
+      activeHint = mode;
+    }
+
+    if (installButton) {
+      setNodeHidden(installButton, installed || !safeState.available || mode !== "prompt");
+      installButton.disabled = !!safeState.busy;
+    }
+
+    var hints = row.querySelectorAll("[data-pwa-install-hint]");
+    for (var index = 0; index < hints.length; index++) {
+      setNodeHidden(hints[index], hints[index].getAttribute("data-pwa-install-hint") !== activeHint);
+    }
+  }
+
+  function bindPWAInstallSettingsRow() {
+    var row = document.querySelector("[data-pwa-install-settings]");
+    if (!row) {
+      return;
+    }
+
+    if (row.dataset.pwaInstallBound !== "1") {
+      row.dataset.pwaInstallBound = "1";
+
+      var installButton = row.querySelector("[data-pwa-install-action='install']");
+      if (installButton) {
+        installButton.addEventListener("click", function () {
+          requestPWAInstallation();
+        });
+      }
+
+      subscribePWAInstallState(function (state) {
+        syncPWAInstallSettingsRow(row, state);
       });
     }
   }
@@ -2683,17 +2904,9 @@
     }
 
     var input = toggle.querySelector("[data-binary-toggle-input]");
-    var state = toggle.querySelector("[data-binary-toggle-state]");
     var active = !!(input && input.checked);
 
     toggle.setAttribute("data-active", active ? "true" : "false");
-    if (!state) {
-      return;
-    }
-
-    state.textContent = active
-      ? String(state.getAttribute("data-state-on") || "")
-      : String(state.getAttribute("data-state-off") || "");
   }
 
   function bindBinaryToggles(root) {
@@ -2717,6 +2930,46 @@
       }
 
       syncBinaryToggleState(toggle);
+    }
+  }
+
+  // The avoid-pregnancy warning follows the checked usage_goal radio of its
+  // scope. The server already renders it shown or hidden for the saved goal, so
+  // the page is right without this script; this keeps it in step while the
+  // choice changes before a save, after a draft reset, and when a skip clears it.
+  function syncUsageGoalWarning(scope) {
+    if (!scope || !scope.querySelector) {
+      return;
+    }
+
+    var warning = scope.querySelector("[data-usage-goal-avoid-warning]");
+    var checked = scope.querySelector("input[name='usage_goal']:checked");
+    setNodeHidden(warning, !checked || checked.value !== "avoid_pregnancy");
+  }
+
+  function bindUsageGoalWarnings(root) {
+    var scope = root && root.querySelectorAll ? root : document;
+    var scopes = [];
+    if (scope.matches && scope.matches("[data-usage-goal-warning-scope]")) {
+      scopes.push(scope);
+    }
+    var nested = scope.querySelectorAll("[data-usage-goal-warning-scope]");
+    for (var nestedIndex = 0; nestedIndex < nested.length; nestedIndex++) {
+      scopes.push(nested[nestedIndex]);
+    }
+
+    for (var index = 0; index < scopes.length; index++) {
+      var current = scopes[index];
+      if (current.dataset.usageGoalWarningBound !== "1") {
+        current.dataset.usageGoalWarningBound = "1";
+        current.addEventListener("change", function (event) {
+          if (event.target && event.target.matches && event.target.matches("input[name='usage_goal']")) {
+            syncUsageGoalWarning(this);
+          }
+        });
+      }
+
+      syncUsageGoalWarning(current);
     }
   }
 
@@ -2766,6 +3019,78 @@
       }
 
       syncSymptomNameCounter(field);
+    }
+  }
+
+  // Removing a saved pregnancy-test result is a button after the radiogroup,
+  // not a third radio: the group keeps exactly two results and announces them
+  // as two. The button does what the radio used to do — move the hidden "none"
+  // carrier — and then fires one change event from that carrier, which is the
+  // single signal both day forms already listen to: the dashboard marks itself
+  // dirty and autosaves, the calendar editor simply carries the new value into
+  // its explicit Save. Nothing here is keyed on which form it sits in.
+  function syncPregnancyTestField(field, recorded) {
+    var remove = field.querySelector("[data-pregnancy-test-remove]");
+    field.setAttribute("data-pregnancy-test-state", recorded ? "recorded" : "absent");
+    var empty = field.querySelector("[data-pregnancy-test-empty]");
+    if (remove) {
+      setNodeHidden(remove, !recorded);
+    }
+    if (empty) {
+      setNodeHidden(empty, recorded);
+    }
+  }
+
+  function clearPregnancyTestResult(field) {
+    var radios = field.querySelectorAll("input[name='pregnancy_test']");
+    var carrier = field.querySelector("[data-pregnancy-test-unset]");
+
+    for (var index = 0; index < radios.length; index++) {
+      radios[index].checked = false;
+    }
+    if (!carrier) {
+      return;
+    }
+    carrier.checked = true;
+    syncPregnancyTestField(field, false);
+    // The button the owner just pressed is now hidden, and focus on a hidden
+    // control falls back to the page body. It lands on the first result: the
+    // control the removal hands the field back to.
+    if (radios.length > 0 && typeof radios[0].focus === "function") {
+      radios[0].focus();
+    }
+    carrier.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  function bindPregnancyTestFields(root) {
+    var scope = root && root.querySelectorAll ? root : document;
+    var fields = scope.querySelectorAll("[data-pregnancy-test]");
+
+    for (var index = 0; index < fields.length; index++) {
+      var field = fields[index];
+      if (field.dataset.pregnancyTestBound === "1") {
+        continue;
+      }
+      field.dataset.pregnancyTestBound = "1";
+
+      field.addEventListener("click", function (event) {
+        var button = closestFromEvent(event, "[data-pregnancy-test-remove]");
+        if (!button || !this.contains(button)) {
+          return;
+        }
+        clearPregnancyTestResult(this);
+      });
+
+      // Picking a result again after a removal must offer the way back out
+      // once more, or the removal turns the control into a one-way door until
+      // the next page load.
+      field.addEventListener("change", function (event) {
+        var radio = event.target;
+        if (!radio || radio.name !== "pregnancy_test" || !radio.checked) {
+          return;
+        }
+        syncPregnancyTestField(this, radio.value !== "none");
+      });
     }
   }
 
@@ -2936,51 +3261,16 @@
     }
   }
 
-  function syncDashboardPreview(root) {
+  // Reveals the period-only fields and restates the toggle's own labels. This
+  // once also drove a journal preview block, but no template has rendered
+  // [data-dashboard-preview] or any of its seven sub-targets for a long time,
+  // so that half was building a summary nothing displayed.
+  function syncPeriodToggleState(root) {
     var periodToggle = root.querySelector("[data-period-toggle]");
-    var notesField = root.querySelector("[data-dashboard-notes]");
-    var preview = root.querySelector("[data-dashboard-preview]");
     var isPeriod = !!(periodToggle && periodToggle.checked);
-    var notes = notesField ? String(notesField.value || "") : "";
-    var trimmedNotes = notes.trim();
-    var symptoms = collectCheckedSymptomLabels(root);
-    var hasSymptoms = symptoms.length > 0;
-    var hasNotes = trimmedNotes.length > 0;
-    var showPreview = isPeriod || hasSymptoms || hasNotes;
-    var symptomList = root.querySelector("[data-dashboard-symptom-list]");
-    var symptomEmpty = root.querySelector("[data-dashboard-symptom-empty]");
-    var notesValue = root.querySelector("[data-dashboard-notes-value]");
-    var notesEmpty = root.querySelector("[data-dashboard-notes-empty]");
 
     syncPeriodFieldsets(root, isPeriod);
     syncPeriodToggleLabels(root, isPeriod);
-
-    if (!preview) {
-      return;
-    }
-
-    setNodeHidden(preview, !showPreview);
-    setNodeHidden(root.querySelector("[data-dashboard-preview-heading='period']"), !isPeriod);
-    setNodeHidden(root.querySelector("[data-dashboard-preview-heading='other']"), isPeriod);
-    setNodeHidden(root.querySelector("[data-dashboard-period-summary]"), !isPeriod);
-    setNodeHidden(root.querySelector("[data-dashboard-other-summary]"), isPeriod);
-
-    if (symptomList) {
-      symptomList.textContent = "";
-      for (var index = 0; index < symptoms.length; index++) {
-        var item = document.createElement("li");
-        item.textContent = symptoms[index];
-        symptomList.appendChild(item);
-      }
-      setNodeHidden(symptomList, !hasSymptoms);
-    }
-
-    setNodeHidden(symptomEmpty, hasSymptoms);
-    if (notesValue) {
-      notesValue.textContent = notes;
-      setNodeHidden(notesValue, !hasNotes);
-    }
-    setNodeHidden(notesEmpty, hasNotes);
   }
 
   function syncPeriodToggleLabels(root, isPeriod) {
@@ -2993,8 +3283,18 @@
       var label = labels[index];
       var onText = String(label.getAttribute("data-period-label-on") || "");
       var offText = String(label.getAttribute("data-period-label-off") || "");
-      var prefix = label.textContent && label.textContent.indexOf("🩸") === 0 ? "🩸 " : "";
-      label.textContent = prefix + (isPeriod ? onText : offText);
+      var text = isPeriod ? onText : offText;
+      // The glyph is decorative and carries aria-hidden, so it is moved rather
+      // than reprinted: rewriting textContent with a literal prefix would drop
+      // the wrapper and read the emoji out to assistive technology again.
+      var glyph = label.querySelector("[data-period-toggle-glyph]");
+      label.textContent = "";
+      if (glyph) {
+        label.appendChild(glyph);
+        label.appendChild(document.createTextNode(" " + text));
+      } else {
+        label.textContent = text;
+      }
     }
   }
 
@@ -3220,6 +3520,67 @@
     }, 1800);
   }
 
+  // A link into a collapsed disclosure lands on nothing: a target inside a
+  // closed <details> is not rendered, so the browser has nothing to scroll to
+  // and the jump silently does nothing. The journal's late-cycle actions point
+  // straight at fields that now live behind "More", so every same-page jump
+  // opens the disclosures above its target first. No inline handler and no
+  // markup of its own — the anchors stay plain links, and a browser without
+  // this script still submits and saves everything.
+  function openDisclosuresAbove(target) {
+    var node = target;
+    while (node && node !== document.body) {
+      if (node.tagName === "DETAILS" && !node.open) {
+        node.open = true;
+      }
+      node = node.parentNode;
+    }
+  }
+
+  function revealHashTarget(hash) {
+    var id = String(hash || "").replace(/^#/, "");
+    var target = id ? document.getElementById(id) : null;
+    if (!target) {
+      return null;
+    }
+    openDisclosuresAbove(target);
+    return target;
+  }
+
+  function scrollToHashTarget() {
+    var target = revealHashTarget(window.location.hash);
+    var reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (!target || typeof target.scrollIntoView !== "function") {
+      return;
+    }
+    target.scrollIntoView(reduceMotion ? { block: "start" } : { block: "start", behavior: "smooth" });
+  }
+
+  function bindHashDisclosureReveals() {
+    if (!document.body || document.body.dataset.hashDisclosureBound === "1") {
+      return;
+    }
+    document.body.dataset.hashDisclosureBound = "1";
+
+    // Opened synchronously on the click, before the browser acts on the link:
+    // by the time it looks for the target, the target is rendered and the
+    // default jump scrolls to it.
+    document.addEventListener("click", function (event) {
+      var link = closestFromEvent(event, "a[href^='#']");
+      if (!link) {
+        return;
+      }
+      revealHashTarget(link.getAttribute("href"));
+    });
+
+    // Arriving with the anchor already in the URL — a shared link, a reload,
+    // or a jump the browser could not make — needs the scroll as well.
+    window.addEventListener("hashchange", function () {
+      scrollToHashTarget();
+    });
+    scrollToHashTarget();
+  }
+
   function focusSectionControl(section, selector) {
     if (!section || !section.querySelector) {
       return;
@@ -3256,13 +3617,156 @@
     return String(form.getAttribute("data-autosave-" + key) || fallback || "");
   }
 
+  // The journal has no save button, so this row is the whole report on the
+  // save. Idle says nothing at all — a standing "auto-save is ready" line is
+  // noise — and the error state speaks through the neutral retry notice in the
+  // save-status region rather than adding a second, terser voice beside it.
+  function dashboardIndicatorMessageNode(indicator) {
+    var node = indicator.querySelector(".dashboard-autosave-message");
+    if (node) {
+      return node;
+    }
+    node = document.createElement("span");
+    node.className = "dashboard-autosave-message";
+    indicator.insertBefore(node, indicator.firstChild);
+    return node;
+  }
+
   function setDashboardAutosaveIndicator(form, key) {
     var indicator = dashboardAutosaveIndicator(form);
     if (!indicator) {
       return;
     }
-    indicator.textContent = dashboardAutosaveMessage(form, key, indicator.textContent);
+
     indicator.setAttribute("data-autosave-state", key);
+    dashboardIndicatorMessageNode(indicator).textContent =
+      key === "idle" || key === "error" ? "" : dashboardAutosaveMessage(form, key, "");
+    syncDashboardUndoControl(form, indicator);
+  }
+
+  // Depth one, in memory only: the snapshot lives on the form node and dies
+  // with the page. A day entry is health data — it is never written to
+  // localStorage, sessionStorage or any other client store, here or anywhere
+  // else in this bundle.
+  //
+  // The control is created once and left alone. Rebuilding the row on every
+  // state change tore it out from under the pointer: clicking Undo blurs
+  // whatever field was being typed in, the browser's own change event marks the
+  // form dirty, and the row would re-render — so the click landed on a node
+  // that no longer existed and the undo never ran (measured in the browser).
+  function syncDashboardUndoControl(form, indicator) {
+    var existing = indicator.querySelector("[data-dashboard-autosave-undo]");
+    var label = String(form.getAttribute("data-autosave-undo") || "").trim();
+    var button;
+
+    if (!label || !form.__ovumcyAutosaveUndo) {
+      if (existing) {
+        existing.remove();
+      }
+      return;
+    }
+    if (existing) {
+      return;
+    }
+
+    button = document.createElement("button");
+    // The indicator sits inside the form: a default-type button here would
+    // submit it.
+    button.type = "button";
+    button.className = "autosave-undo-button";
+    button.setAttribute("data-dashboard-autosave-undo", "true");
+    // Text, not a glyph: the control names itself for screen readers and for
+    // keyboard users who reach it by tabbing.
+    button.textContent = label;
+    indicator.appendChild(button);
+  }
+
+  function dashboardFormEntries(form) {
+    var entries = [];
+    if (!form || typeof window.FormData !== "function") {
+      return entries;
+    }
+    new window.FormData(form).forEach(function (value, name) {
+      if (name === "csrf_token") {
+        return;
+      }
+      entries.push([name, String(value)]);
+    });
+    return entries;
+  }
+
+  function dashboardFormState(form, empty) {
+    return { entries: dashboardFormEntries(form), empty: !!empty };
+  }
+
+  function dashboardStateKey(state) {
+    return state ? JSON.stringify(state.entries) : "";
+  }
+
+  function captureDashboardPersistedState(form) {
+    if (!form || form.__ovumcyPersistedState) {
+      return;
+    }
+    // What the server rendered is, by definition, what the server holds. A day
+    // with no saved entry can still render its period ticked from the stored
+    // onboarding start; that day is not empty, so undoing back to it must
+    // re-send the tick (with its hidden marker) rather than DELETE the day:
+    // a delete withdraws the stored start.
+    form.__ovumcyPersistedState = dashboardFormState(
+      form,
+      form.getAttribute("data-today-entry-exists") !== "true" &&
+        form.getAttribute("data-today-period-from-stored-start") !== "true"
+    );
+  }
+
+  function syncRestoredPregnancyTestFields(form) {
+    var fields = form.querySelectorAll("[data-pregnancy-test]");
+    var checked;
+
+    for (var index = 0; index < fields.length; index++) {
+      checked = fields[index].querySelector("input[name='pregnancy_test']:checked");
+      syncPregnancyTestField(fields[index], !!checked && checked.value !== "none");
+    }
+  }
+
+  function restoreDashboardFormState(form, entries) {
+    var selected = {};
+    var index;
+    var control;
+    var values;
+    var root;
+
+    for (index = 0; index < entries.length; index++) {
+      values = selected[entries[index][0]] || [];
+      values.push(entries[index][1]);
+      selected[entries[index][0]] = values;
+    }
+
+    for (index = 0; index < form.elements.length; index++) {
+      control = form.elements[index];
+      if (!control.name || control.name === "csrf_token" || control.type === "hidden") {
+        continue;
+      }
+
+      values = selected[control.name] || [];
+      if (control.type === "checkbox" || control.type === "radio") {
+        control.checked = values.indexOf(control.value) !== -1;
+        continue;
+      }
+      control.value = values.length > 0 ? values[0] : "";
+    }
+
+    // Restoring a radio does not fire change, so the pregnancy-test field's own
+    // wording and Remove button would keep describing the value that was just
+    // undone. Re-derive each from the radio that is checked now.
+    syncRestoredPregnancyTestFields(form);
+
+    root = typeof form.closest === "function" ? form.closest("[data-dashboard-editor]") : null;
+    root = root || form;
+    bindBinaryToggles(root);
+    bindDashboardNotesCounters(root);
+    syncPeriodToggleState(root);
+    syncNoteDisclosure(root);
   }
 
   function clearDashboardAutosaveTimers(form) {
@@ -3306,17 +3810,436 @@
     window.showToast(notice, "error");
   }
 
+  // A day save answers with the server's own sentence about the day: "Saved.",
+  // the self-care or fertile-window line, or — after a positive pregnancy test
+  // — the prediction pause with its red-flag guidance. The htmx path swaps that
+  // fragment into the status region; the autosave runs on fetch, so it reads
+  // the body itself and shows the sentence in the same region, the way the
+  // calendar editor's swap does. Only the TEXT is adopted: the fragment is
+  // parsed, never assigned as markup, and the node is rebuilt by the shared
+  // dismissible-status helper, so markup in a response renders as characters.
+  // The sentence is the server's; nothing here composes copy. Its kind is the
+  // server's too, read from data-status-kind, never inferred from the words.
+  function parseServerStatusSuccess(responseText) {
+    var doc;
+    var status;
+    var node;
+    if (!responseText || responseText.indexOf("status-ok") === -1 || typeof DOMParser !== "function") {
+      return null;
+    }
+    doc = new DOMParser().parseFromString(responseText, "text/html");
+    status = doc.querySelector(".status-ok");
+    if (!status) {
+      return null;
+    }
+    node = status.querySelector(".toast-message") || status;
+    return {
+      message: String(node.textContent || "").trim(),
+      kind: String(status.getAttribute("data-status-kind") || "")
+    };
+  }
+
+  function renderDashboardSaveFeedback(form, responseText) {
+    var target = form && form.querySelector ? form.querySelector(".save-status") : null;
+    var status = parseServerStatusSuccess(String(responseText || ""));
+    var node;
+    if (!target || !status || !status.message) {
+      return;
+    }
+    // A neutral status only says the day was saved, which the journal's own
+    // indicator has already said; the dashboard does not say it twice. It also
+    // says nothing about the earlier save, so whatever that one left in the
+    // region — the persistent pregnancy-pause sentence included, which no timer
+    // ever clears — is withdrawn: the region reflects the latest save.
+    if (status.kind === "neutral") {
+      withdrawSuccessStatus(target);
+      return;
+    }
+    node = document.createElement("div");
+    node.className = "status-ok";
+    // The rebuilt node keeps a persistent kind, so the shared clear scheduler
+    // leaves the safety sentence up until it is dismissed.
+    if (status.kind === "persistent") {
+      node.setAttribute("data-status-kind", "persistent");
+    }
+    node.textContent = status.message;
+    target.replaceChildren(node);
+    scheduleClearSuccessStatus(target);
+  }
+
+  function readDashboardSaveFeedback(response) {
+    if (!response || typeof response.text !== "function") {
+      return Promise.resolve("");
+    }
+    return response.text().catch(function () {
+      return "";
+    });
+  }
+
   function buildDashboardAutosaveBody(form) {
     return new URLSearchParams(new FormData(form));
   }
 
-  function runDashboardAutosave(form, keepalive) {
+  function dashboardRequestHeaders() {
+    var headers = {
+      "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+      "HX-Request": "true"
+    };
+    var tokenMeta = document.querySelector('meta[name="csrf-token"]');
+    var timezone = currentClientTimezone();
+
+    if (tokenMeta) {
+      headers["X-CSRF-Token"] = tokenMeta.getAttribute("content") || "";
+    }
+    if (timezone) {
+      headers[TIMEZONE_HEADER_NAME] = timezone;
+    }
+    return headers;
+  }
+
+  function clearDashboardSaveNotice(form) {
+    var target = form && form.querySelector ? form.querySelector(".save-status") : null;
+    var notice = target ? target.querySelector("[data-day-save-failed]") : null;
+    if (notice) {
+      notice.remove();
+    }
+  }
+
+  // A save that did not land is a transport event, not a finding about the
+  // owner's body: it reuses the day editor's neutral notice with its retry, and
+  // it leaves every typed value exactly where it is. Nothing is retried behind
+  // the owner's back — the runner stops until they press retry or type again,
+  // so an unreachable instance is not hammered every two seconds.
+  function failDashboardAutosave(form, responseText) {
+    var parsed = parseServerStatusError(String(responseText || ""));
+    var message = parsed ? String(parsed.text || "").trim() : "";
+
+    form.__ovumcyAutosaveFailed = true;
+    setDashboardAutosaveIndicator(form, "error");
+    if (message) {
+      renderDaySaveFailure(form, message, "rejected", parsed.key);
+      return;
+    }
+    renderDaySaveUnreachable(form);
+  }
+
+  // Pick the HTTP verb from whichever hx-* attribute the form uses so the
+  // autosave fetch tracks the canonical REST verb declared in the template
+  // (PUT for /api/v1/days/{date} upsert, falling back to POST / action for
+  // legacy or non-HTMX forms).
+  function dashboardAutosaveEndpoint(form) {
+    var hxVerbs = ["hx-put", "hx-patch", "hx-delete", "hx-post"];
+    var endpoint = {
+      method: "POST",
+      url: String(form.getAttribute("action") || "").trim()
+    };
+    var hxValue;
+
+    for (var verbIndex = 0; verbIndex < hxVerbs.length; verbIndex += 1) {
+      hxValue = form.getAttribute(hxVerbs[verbIndex]);
+      if (hxValue) {
+        endpoint.method = hxVerbs[verbIndex].substring(3).toUpperCase();
+        endpoint.url = String(hxValue).trim();
+        break;
+      }
+    }
+    return endpoint;
+  }
+
+  var dashboardStatusRefreshToken = 0;
+
+  function dashboardStateValue(state, name) {
+    var entries = state ? state.entries : [];
+    for (var index = 0; index < entries.length; index++) {
+      if (entries[index][0] === name) {
+        return entries[index][1];
+      }
+    }
+    return "";
+  }
+
+  // The blocks of the status header that are computed from the saved days, and
+  // so can change when a pregnancy-test result does: a positive result pauses
+  // the predictions (status line, ribbon, banner, warnings, explainer), and
+  // removing it resumes them. Each is addressed by its own hook and replaced on
+  // its own. The goal chip beside them is a live <details> with htmx-driven
+  // forms inside it, and a node cloned out of a fetched page is never
+  // htmx-processed — so nothing around these blocks is ever swapped. None of
+  // them holds a form or an hx-* control (only plain links), so the clones need
+  // no htmx.process() or re-initialisation. Order is the template's order: a
+  // block that appears or disappears is placed after the nearest block before it.
+  // The disclaimer is static and listed only as that anchor.
+  var DASHBOARD_PREGNANCY_ALWAYS_PRESENT = [
+    { selector: "[data-dashboard-cycle-day]", inPlace: false },
+    { selector: "[data-dashboard-status-line]", inPlace: true }
+  ];
+  var DASHBOARD_PREGNANCY_ORDERED = [
+    { selector: "[data-dashboard-cycle-ribbon]", anchorOnly: false },
+    { selector: "[data-dashboard-prediction-explainer]", anchorOnly: false },
+    { selector: "[data-dashboard-reminder-banner]", anchorOnly: false },
+    { selector: "[data-dashboard-cycle-warnings]", anchorOnly: false },
+    { selector: "[data-dashboard-prediction-disclaimer]", anchorOnly: true },
+    { selector: "[data-dashboard-factor-hint]", anchorOnly: false }
+  ];
+
+  function syncDashboardDataAttributes(current, next) {
+    var index;
+    var name;
+
+    for (index = current.attributes.length - 1; index >= 0; index--) {
+      name = current.attributes[index].name;
+      if (name.indexOf("data-") === 0 && !next.hasAttribute(name)) {
+        current.removeAttribute(name);
+      }
+    }
+    for (index = 0; index < next.attributes.length; index++) {
+      name = next.attributes[index].name;
+      if (name.indexOf("data-") === 0) {
+        current.setAttribute(name, next.attributes[index].value);
+      }
+    }
+  }
+
+  // A node taken out of a fetched page arrives with its entrance animation
+  // class: left on, the block would fade in again as if the page had loaded.
+  function importDashboardNode(node) {
+    var clone = document.importNode(node, true);
+    var revealed;
+
+    if (clone.classList) {
+      clone.classList.remove("reveal");
+    }
+    if (typeof clone.querySelectorAll === "function") {
+      revealed = clone.querySelectorAll(".reveal");
+      for (var index = 0; index < revealed.length; index++) {
+        revealed[index].classList.remove("reveal");
+      }
+    }
+    return clone;
+  }
+
+  function dashboardSwappableSelectors() {
+    var selectors = DASHBOARD_PREGNANCY_ALWAYS_PRESENT.map(function (block) {
+      return block.selector;
+    });
+    DASHBOARD_PREGNANCY_ORDERED.forEach(function (block) {
+      if (!block.anchorOnly) {
+        selectors.push(block.selector);
+      }
+    });
+    return selectors;
+  }
+
+  // What the swap is about to replace may hold the keyboard focus (a link in
+  // the warnings block); the replaced node takes focus with it to the body.
+  // Remember which block held it and what the focused element was, by its href
+  // or its data-* hooks, so the equivalent element in the new block can have it.
+  function captureDashboardBlockFocus(header) {
+    var active = document.activeElement;
+    var selectors = dashboardSwappableSelectors();
+    var block;
+    var hooks = [];
+
+    if (!active || active === document.body || !header.contains(active)) {
+      return null;
+    }
+    for (var index = 0; index < selectors.length; index++) {
+      block = header.querySelector(selectors[index]);
+      if (!block || !block.contains(active)) {
+        continue;
+      }
+      if (block !== active) {
+        for (var attrIndex = 0; attrIndex < active.attributes.length; attrIndex++) {
+          if (active.attributes[attrIndex].name.indexOf("data-") === 0) {
+            hooks.push({ name: active.attributes[attrIndex].name, value: active.attributes[attrIndex].value });
+          }
+        }
+      }
+      return {
+        selector: selectors[index],
+        tag: active.tagName,
+        href: block === active ? null : active.getAttribute("href"),
+        hooks: hooks
+      };
+    }
+    return null;
+  }
+
+  // The same href wins across every candidate first; only then a shared hook,
+  // by name AND value, because several links in one block can share a hook
+  // name (data-late-cycle-action) and differ only by what it says.
+  function equivalentDashboardFocusTarget(block, saved) {
+    var candidates = block.querySelectorAll("*");
+    var candidate;
+
+    for (var index = 0; index < candidates.length; index++) {
+      candidate = candidates[index];
+      if (
+        candidate.tagName === saved.tag &&
+        saved.href !== null &&
+        candidate.getAttribute("href") === saved.href
+      ) {
+        return candidate;
+      }
+    }
+    for (var hookPass = 0; hookPass < candidates.length; hookPass++) {
+      candidate = candidates[hookPass];
+      if (candidate.tagName !== saved.tag) {
+        continue;
+      }
+      for (var hookIndex = 0; hookIndex < saved.hooks.length; hookIndex++) {
+        if (candidate.getAttribute(saved.hooks[hookIndex].name) === saved.hooks[hookIndex].value) {
+          return candidate;
+        }
+      }
+    }
+    return null;
+  }
+
+  // Focus follows the owner's place: the same link, or the same hook, in the
+  // new block. With no equivalent, the block itself takes it (tabindex -1 only
+  // here, so it is focusable by script and never a tab stop); a block the
+  // server dropped hands it to the status line, which is always there.
+  function restoreDashboardBlockFocus(header, saved) {
+    var block;
+    var target;
+
+    if (!saved) {
+      return;
+    }
+    block = header.querySelector(saved.selector) || header.querySelector("[data-dashboard-status-line]");
+    if (!block) {
+      return;
+    }
+    target = block.matches(saved.selector) ? equivalentDashboardFocusTarget(block, saved) : null;
+    if (!target) {
+      target = block;
+      if (!block.hasAttribute("tabindex")) {
+        block.setAttribute("tabindex", "-1");
+        block.addEventListener(
+          "blur",
+          function () {
+            block.removeAttribute("tabindex");
+          },
+          { once: true }
+        );
+      }
+    }
+    if (typeof target.focus === "function") {
+      target.focus();
+    }
+  }
+
+  function swapDashboardPregnancyBlocks(header, nextHeader) {
+    var previous = null;
+    var savedFocus = captureDashboardBlockFocus(header);
+
+    syncDashboardDataAttributes(header, nextHeader);
+
+    // The status line is a live region: it keeps its node and takes the new
+    // content, because a region that is itself inserted is not announced.
+    DASHBOARD_PREGNANCY_ALWAYS_PRESENT.forEach(function (block) {
+      var existing = header.querySelector(block.selector);
+      var fresh = nextHeader.querySelector(block.selector);
+      if (!existing || !fresh) {
+        return;
+      }
+      if (!block.inPlace) {
+        existing.replaceWith(importDashboardNode(fresh));
+        return;
+      }
+      syncDashboardDataAttributes(existing, fresh);
+      while (existing.firstChild) {
+        existing.removeChild(existing.firstChild);
+      }
+      for (var child = fresh.firstChild; child; child = child.nextSibling) {
+        existing.appendChild(importDashboardNode(child));
+      }
+    });
+
+    DASHBOARD_PREGNANCY_ORDERED.forEach(function (block) {
+      var existing = header.querySelector(block.selector);
+      var fresh = block.anchorOnly ? null : nextHeader.querySelector(block.selector);
+      var clone;
+
+      if (!block.anchorOnly) {
+        if (fresh) {
+          clone = importDashboardNode(fresh);
+          if (existing) {
+            existing.replaceWith(clone);
+          } else if (previous) {
+            previous.after(clone);
+          } else {
+            header.appendChild(clone);
+          }
+          existing = clone;
+        } else if (existing) {
+          existing.remove();
+          existing = null;
+        }
+      }
+      previous = existing || previous;
+    });
+
+    restoreDashboardBlockFocus(header, savedFocus);
+  }
+
+  // The status header is computed server-side from the saved days, and a
+  // pregnancy-test result is one of the inputs. The journal itself updates as
+  // the owner clicks, so the dashboard page is fetched again and only the
+  // dependent blocks above are swapped: the form, its focus and the goal chip
+  // stay as they are. Newest request wins; a failed refresh leaves the header as
+  // it was, since the save itself already succeeded.
+  function refreshDashboardStatusHeader() {
+    var current = document.querySelector("[data-dashboard-status-header]");
+    var headers;
+    var token;
+
+    if (!current || typeof window.fetch !== "function" || typeof window.DOMParser !== "function") {
+      return Promise.resolve(false);
+    }
+
+    dashboardStatusRefreshToken += 1;
+    token = dashboardStatusRefreshToken;
+    headers = dashboardRequestHeaders();
+    delete headers["Content-Type"];
+    delete headers["HX-Request"];
+    headers.Accept = "text/html";
+
+    return window.fetch(window.location.pathname + window.location.search, {
+      method: "GET",
+      credentials: "same-origin",
+      headers: headers
+    }).then(function (response) {
+      return response.ok ? response.text() : "";
+    }).then(function (text) {
+      var next;
+      var latest;
+
+      if (!text || dashboardStatusRefreshToken !== token) {
+        return false;
+      }
+      next = new window.DOMParser().parseFromString(text, "text/html").querySelector("[data-dashboard-status-header]");
+      latest = document.querySelector("[data-dashboard-status-header]");
+      if (!next || !latest) {
+        return false;
+      }
+      swapDashboardPregnancyBlocks(latest, next);
+      return true;
+    }).catch(function () {
+      return false;
+    });
+  }
+
+  function runDashboardAutosave(form, mode) {
     var requestVersion;
+    var endpoint;
     var url;
     var method;
     var headers;
     var body;
-    var timezone;
+    var previousState;
+    var sentState;
 
     if (!form || form.dataset.autosaveDirty !== "true") {
       return Promise.resolve(true);
@@ -3331,64 +4254,78 @@
       scheduleDashboardAutosaveIdleReset(form);
       return Promise.resolve(false);
     }
+    clearDashboardSaveNotice(form);
     setDashboardAutosaveIndicator(form, "saving");
 
     requestVersion = form.__ovumcyAutosaveVersion || 0;
-    // Pick the HTTP verb from whichever hx-* attribute the form uses so the
-    // autosave fetch tracks the canonical REST verb declared in the template
-    // (PUT for /api/v1/days/{date} upsert, falling back to POST / action for
-    // legacy or non-HTMX forms).
-    var hxVerbs = ["hx-put", "hx-patch", "hx-delete", "hx-post"];
-    method = "POST";
-    url = String(form.getAttribute("action") || "").trim();
-    for (var verbIndex = 0; verbIndex < hxVerbs.length; verbIndex += 1) {
-      var hxValue = form.getAttribute(hxVerbs[verbIndex]);
-      if (hxValue) {
-        method = hxVerbs[verbIndex].substring(3).toUpperCase();
-        url = String(hxValue).trim();
-        break;
-      }
-    }
-    headers = {
-      "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-      "HX-Request": "true"
-    };
+    captureDashboardPersistedState(form);
+    previousState = form.__ovumcyPersistedState;
+    endpoint = dashboardAutosaveEndpoint(form);
+    method = endpoint.method;
+    url = endpoint.url;
+    headers = dashboardRequestHeaders();
     body = buildDashboardAutosaveBody(form);
-    timezone = currentClientTimezone();
+    // What is on the wire is what the server will hold: snapshot it here, and
+    // promote it to "persisted" only once the server has said yes.
+    sentState = dashboardFormState(form, false);
 
-    if (document.querySelector('meta[name="csrf-token"]')) {
-      headers["X-CSRF-Token"] = document.querySelector('meta[name="csrf-token"]').getAttribute("content") || "";
-    }
-    if (timezone) {
-      headers[TIMEZONE_HEADER_NAME] = timezone;
-    }
-
+    // Which edit is on the wire, readable from outside this call: the unload
+    // flush has to know whether the open request already carries the newest
+    // body or an older one.
+    form.__ovumcyAutosaveInFlightVersion = requestVersion;
+    // Every save rides a keepalive request, not only the unload flush: a save
+    // the debounce already put on the wire is one the owner has seen start, and
+    // a reload or a closed tab must not cancel it. One request carries the
+    // edit; nothing is re-sent behind it. The body stays well inside the
+    // browser's 64 KiB keepalive budget — the note is capped at 2000
+    // characters, under 18 KiB URL-encoded.
     form.__ovumcyAutosaveInFlight = window.fetch(url, {
       method: method,
       credentials: "same-origin",
-      keepalive: !!keepalive,
+      keepalive: true,
       headers: headers,
       body: body.toString()
     }).then(function (response) {
       if (!response.ok) {
-        throw new Error("autosave_failed");
+        return response.text().catch(function () {
+          return "";
+        }).then(function (text) {
+          failDashboardAutosave(form, text);
+          return false;
+        });
       }
       notifyAutosaveNotice(response);
       if ((form.__ovumcyAutosaveVersion || 0) === requestVersion) {
         delete form.dataset.autosaveDirty;
       }
+      // Undo goes back one step, to the state the server held before this
+      // save. Undoing an undo is not offered: depth stays at one. A save that
+      // carried no change — a blur can fire one — is not a step, so it leaves
+      // the existing step back alone instead of collapsing it onto itself.
+      if (mode === "undo") {
+        form.__ovumcyAutosaveUndo = null;
+      } else if (previousState && dashboardStateKey(sentState) !== dashboardStateKey(previousState)) {
+        form.__ovumcyAutosaveUndo = previousState;
+      }
+      form.__ovumcyPersistedState = sentState;
+      form.__ovumcyAutosaveFailed = false;
       setDashboardAutosaveIndicator(form, "saved");
-      scheduleDashboardAutosaveIdleReset(form);
-      return true;
+      if (previousState && dashboardStateValue(sentState, "pregnancy_test") !== dashboardStateValue(previousState, "pregnancy_test")) {
+        refreshDashboardStatusHeader();
+      }
+      return readDashboardSaveFeedback(response).then(function (text) {
+        renderDashboardSaveFeedback(form, text);
+        return true;
+      });
     }).catch(function () {
-      setDashboardAutosaveIndicator(form, "error");
-      scheduleDashboardAutosaveIdleReset(form);
+      failDashboardAutosave(form, "");
       return false;
     }).finally(function () {
       form.__ovumcyAutosaveInFlight = null;
-      if (form.dataset.autosaveDirty === "true") {
+      form.__ovumcyAutosaveInFlightVersion = 0;
+      if (form.dataset.autosaveDirty === "true" && !form.__ovumcyAutosaveFailed) {
         form.__ovumcyAutosaveTimer = window.setTimeout(function () {
-          runDashboardAutosave(form, false);
+          runDashboardAutosave(form);
         }, 2000);
       }
     });
@@ -3396,20 +4333,32 @@
     return form.__ovumcyAutosaveInFlight;
   }
 
+  // The item-32 safety rail: only a control the owner actually touched marks
+  // the form dirty, and only a dirty form is ever sent. An untouched dashboard
+  // therefore issues no request at all, and no default value is ever recorded
+  // as an observation about the day.
   function markDashboardAutosaveDirty(form) {
     if (!form) {
       return;
     }
+    captureDashboardPersistedState(form);
     form.__ovumcyAutosaveVersion = (form.__ovumcyAutosaveVersion || 0) + 1;
     form.dataset.autosaveDirty = "true";
+    form.__ovumcyAutosaveFailed = false;
     if (form.__ovumcyAutosaveInFlight) {
       return;
     }
+    // The row reports saves, not keystrokes: an edit leaves the last outcome
+    // standing until the next save replaces it. Rewriting it on every change
+    // reflowed the row under the pointer — clicking Undo blurs the field being
+    // typed in, the browser's change event lands first, the row re-laid out and
+    // the click hit the container instead of the button (measured in the
+    // browser: the click's target was the indicator DIV).
     if (form.__ovumcyAutosaveTimer) {
       window.clearTimeout(form.__ovumcyAutosaveTimer);
     }
     form.__ovumcyAutosaveTimer = window.setTimeout(function () {
-      runDashboardAutosave(form, false);
+      runDashboardAutosave(form);
     }, 2000);
   }
 
@@ -3438,20 +4387,205 @@
     }
   }
 
-  function finalizeDashboardManualSave(form, successful) {
+  // Outcome-independent by design: the indicator row reports save state, and a
+  // failure is reported by the save-status swap instead. The finalizer only
+  // stands the row down.
+  function finalizeDashboardManualSave(form) {
     if (!form) {
       return;
     }
     clearDashboardAutosaveTimers(form);
     delete form.dataset.autosaveDirty;
-    if (!successful) {
-      setDashboardAutosaveIndicator(form, "idle");
-      return;
-    }
     setDashboardAutosaveIndicator(form, "idle");
   }
 
   window.__ovumcyFinalizeDashboardManualSave = finalizeDashboardManualSave;
+
+  // The retry the failure notice offers re-enters this runner rather than
+  // asking htmx to submit the form: one save mechanism per form.
+  function retryDashboardAutosave(form) {
+    if (!form) {
+      return Promise.resolve(false);
+    }
+    clearDashboardAutosaveTimers(form);
+    form.__ovumcyAutosaveFailed = false;
+    form.dataset.autosaveDirty = "true";
+    return runDashboardAutosave(form);
+  }
+
+  window.__ovumcyRetryDashboardAutosave = retryDashboardAutosave;
+
+  // Undoing the first save of a day that was empty cannot be expressed as
+  // another upsert: an empty entry is an absent entry, so the undo issues the
+  // same DELETE the "clear today" action does.
+  function runDashboardUndoClear(form, undoState) {
+    var url = String(form.getAttribute("data-autosave-clear-url") || "").trim();
+    if (!url) {
+      return Promise.resolve(false);
+    }
+
+    setDashboardAutosaveIndicator(form, "saving");
+    form.__ovumcyAutosaveInFlight = window.fetch(url, {
+      method: "DELETE",
+      credentials: "same-origin",
+      // Started is started: like every autosave, the undo outlives the page.
+      keepalive: true,
+      headers: dashboardRequestHeaders()
+    }).then(function (response) {
+      if (!response.ok) {
+        return response.text().catch(function () {
+          return "";
+        }).then(function (text) {
+          failDashboardAutosave(form, text);
+          return false;
+        });
+      }
+      delete form.dataset.autosaveDirty;
+      form.__ovumcyPersistedState = undoState;
+      form.__ovumcyAutosaveFailed = false;
+      setDashboardAutosaveIndicator(form, "saved");
+      // The day is gone server-side, and the page around the journal (cycle
+      // day, warnings, the clear action itself) was rendered against it. The
+      // clear endpoint asks for the dashboard back; honor it.
+      reloadDashboardAfterUndo(response);
+      return true;
+    }).catch(function () {
+      failDashboardAutosave(form, "");
+      return false;
+    }).finally(function () {
+      form.__ovumcyAutosaveInFlight = null;
+    });
+
+    return form.__ovumcyAutosaveInFlight;
+  }
+
+  function reloadDashboardAfterUndo(response) {
+    var target = response && response.headers && typeof response.headers.get === "function"
+      ? String(response.headers.get("HX-Redirect") || "").trim()
+      : "";
+    if (!target || typeof window.location.assign !== "function") {
+      return;
+    }
+    window.location.assign(target);
+  }
+
+  function runDashboardUndo(form) {
+    var undoState = form ? form.__ovumcyAutosaveUndo : null;
+    if (!undoState) {
+      return Promise.resolve(false);
+    }
+
+    clearDashboardAutosaveTimers(form);
+    clearDashboardSaveNotice(form);
+    // Depth one: the step back is consumed by taking it.
+    form.__ovumcyAutosaveUndo = null;
+    restoreDashboardFormState(form, undoState.entries);
+
+    if (undoState.empty) {
+      return runDashboardUndoClear(form, undoState);
+    }
+
+    form.__ovumcyAutosaveVersion = (form.__ovumcyAutosaveVersion || 0) + 1;
+    form.dataset.autosaveDirty = "true";
+    form.__ovumcyAutosaveFailed = false;
+    // Same path, same status surface: an undo that fails is reported exactly
+    // like a save that fails.
+    return runDashboardAutosave(form, "undo");
+  }
+
+  function isDashboardSaveForm(form) {
+    return !!(form && form.matches && form.matches("[data-dashboard-save-form]"));
+  }
+
+  // One request that outlives the page. Nothing is sent from `beforeunload`:
+  // it fires before the owner answers the leave prompt, and a body sent from a
+  // page that then stays is on the wire unordered against every save made
+  // after it — an older body landing last reverts a newer commit. Every unload
+  // write goes out from `pagehide`, which fires only once the page is really
+  // going (a cancelled leave never reaches it).
+  function sendKeepaliveOnPageHide(request) {
+    window.fetch(request.url, {
+      method: request.method,
+      credentials: "same-origin",
+      keepalive: true,
+      headers: request.headers,
+      body: request.body
+    }).catch(function () {
+      // The page is leaving; there is no surface left to report to.
+    });
+  }
+
+  // The page going away is the last chance the newest journal value gets, and
+  // the ordinary runner cannot take it: while a save is open it hands back that
+  // pending promise, which carries the older body. An edit made in that window
+  // bumps the version and queues nothing — the only thing that would ever send
+  // it is the re-arm in the runner's `finally`, a 2 s timer no unload survives.
+  // So a newer version leaves on its own keepalive request.
+  //
+  // This is the dashboard form's ONLY unload writer. The form carries hx-put,
+  // so an htmx submit (Enter in a field) can be open too, carrying the form as
+  // it stood when it went out; that XMLHttpRequest dies with the page. What
+  // goes out in its place is the form as it stands now — the journal autosaves,
+  // so the newest value typed is the one owed — on one request, never the htmx
+  // snapshot beside it: two unordered writes let the older one land last.
+  //
+  // The day upsert is idempotent, so a version this flush already sent is not
+  // taken off the dirty ledger: should the page come back from the
+  // back/forward cache, the normal path re-sending the same body costs
+  // nothing, while clearing dirty here against a request whose outcome nobody
+  // will see could lose the edit twice.
+  function flushDashboardAutosaveOnPageHide(form) {
+    var htmxSave;
+    var version;
+    var endpoint;
+    var request;
+
+    if (!form) {
+      return;
+    }
+    htmxSave = form.__ovumcyDaySaveInFlight || null;
+    if (form.dataset.autosaveDirty !== "true" && !htmxSave) {
+      return;
+    }
+    if (!htmxSave && !form.__ovumcyAutosaveInFlight) {
+      runDashboardAutosave(form);
+      return;
+    }
+
+    version = form.__ovumcyAutosaveVersion || 0;
+    // The open autosave already carries this edit, and it is a keepalive one:
+    // it outlives the page on its own.
+    if (form.__ovumcyAutosaveInFlight && version === (form.__ovumcyAutosaveInFlightVersion || 0)) {
+      return;
+    }
+    // pagehide fires again after a back/forward-cache restore: send once.
+    if (form.__ovumcyAutosaveUnloadFlushedVersion === version) {
+      return;
+    }
+
+    // The same refusal the ordinary runner makes: a body it would not send is
+    // not one to smuggle out on the unload path. The open htmx request's body
+    // was accepted for sending, so it is the newest one left to keep.
+    if (validateTemperatureInputs(form, false)) {
+      endpoint = dashboardAutosaveEndpoint(form);
+      request = {
+        method: endpoint.method,
+        url: endpoint.url,
+        headers: dashboardRequestHeaders(),
+        body: buildDashboardAutosaveBody(form).toString()
+      };
+    } else if (htmxSave) {
+      request = htmxSave;
+    } else {
+      return;
+    }
+
+    form.__ovumcyAutosaveUnloadFlushedVersion = version;
+    if (htmxSave) {
+      htmxSave.resent = true;
+    }
+    sendKeepaliveOnPageHide(request);
+  }
 
   function bindDashboardAutosaveBeforeUnload() {
     if (document.body && document.body.dataset.dashboardAutosaveBeforeUnloadBound === "1") {
@@ -3461,12 +4595,119 @@
       document.body.dataset.dashboardAutosaveBeforeUnloadBound = "1";
     }
 
-    window.addEventListener("beforeunload", function () {
+    // Decides the prompt, sends nothing: the owner may yet stay.
+    window.addEventListener("beforeunload", function (event) {
+      var forms = document.querySelectorAll("[data-dashboard-save-form]");
+      var saving = false;
+      for (var index = 0; index < forms.length; index++) {
+        if (forms[index].__ovumcyAutosaveInFlight || forms[index].__ovumcyDaySaveInFlight) {
+          saving = true;
+        }
+      }
+      if (saving) {
+        warnBeforeLeavingDuringSave(event);
+      }
+    });
+
+    window.addEventListener("pagehide", function () {
       var forms = document.querySelectorAll("[data-dashboard-save-form]");
       for (var index = 0; index < forms.length; index++) {
-        if (forms[index].dataset.autosaveDirty === "true") {
-          runDashboardAutosave(forms[index], true);
+        flushDashboardAutosaveOnPageHide(forms[index]);
+      }
+    });
+  }
+
+  // The keepalive request is what keeps the edit; the browser's own leave
+  // prompt is the second rail, for whatever the network does to a request
+  // that has to outlive its page.
+  function warnBeforeLeavingDuringSave(event) {
+    event.preventDefault();
+    event.returnValue = "";
+  }
+
+  // An explicit Save goes out through htmx on an XMLHttpRequest, which the
+  // browser cancels with the page. The body that request carries is noted
+  // when it is sent, so the unload path can hand that same body — not
+  // whatever the form holds by then — to a keepalive request that outlives
+  // the page. The day upsert is a full-form, idempotent PUT: should the
+  // original also land, the second write changes nothing.
+  function rememberDaySaveInFlight(event) {
+    var form = dayEditorFormFromEvent(event);
+    var config = event && event.detail ? event.detail.requestConfig : null;
+    var verb;
+
+    if (!form || !config || config.elt !== form) {
+      return;
+    }
+    verb = String(config.verb || "").toUpperCase();
+    if (!verb || verb === "GET") {
+      return;
+    }
+    form.__ovumcyDaySaveInFlight = {
+      method: verb,
+      url: String(config.path || ""),
+      headers: Object.assign({}, config.headers || {}),
+      body: new URLSearchParams(config.formData).toString(),
+      resent: false
+    };
+  }
+
+  function forgetDaySaveInFlight(event) {
+    var form = dayEditorFormFromEvent(event);
+    if (form) {
+      form.__ovumcyDaySaveInFlight = null;
+    }
+  }
+
+  // What the calendar owner expects kept is the explicit Save they pressed —
+  // the noted body, never an edit typed after it and not saved.
+  function resendDaySaveOnPageHide(form) {
+    var pending = form.__ovumcyDaySaveInFlight;
+    // pagehide fires again after a back/forward-cache restore: send once.
+    if (!pending || pending.resent) {
+      return;
+    }
+    pending.resent = true;
+    sendKeepaliveOnPageHide(pending);
+  }
+
+  // Every day-save form gets exactly one unload writer. The dashboard form
+  // matches the selector too (it carries hx-put), but its own pagehide flush
+  // owns it — it sends the newer of the htmx body and the form — so this guard
+  // only notes its htmx request and leaves the writing alone.
+  function daySaveFormsOwnedByUnloadGuard() {
+    var forms = document.querySelectorAll(DAY_SAVE_FORM_SELECTOR);
+    var owned = [];
+    for (var index = 0; index < forms.length; index++) {
+      if (!isDashboardSaveForm(forms[index])) {
+        owned.push(forms[index]);
+      }
+    }
+    return owned;
+  }
+
+  function bindDaySaveUnloadGuard() {
+    if (!document.body || document.body.dataset.daySaveUnloadGuardBound === "1") {
+      return;
+    }
+    document.body.dataset.daySaveUnloadGuardBound = "1";
+
+    document.body.addEventListener("htmx:beforeSend", rememberDaySaveInFlight);
+    document.body.addEventListener("htmx:afterRequest", forgetDaySaveInFlight);
+    // Decides the prompt, sends nothing: the owner may yet stay.
+    window.addEventListener("beforeunload", function (event) {
+      var forms = daySaveFormsOwnedByUnloadGuard();
+      for (var index = 0; index < forms.length; index++) {
+        if (forms[index].__ovumcyDaySaveInFlight) {
+          warnBeforeLeavingDuringSave(event);
+          return;
         }
+      }
+    });
+    window.addEventListener("pagehide", function () {
+      var forms = daySaveFormsOwnedByUnloadGuard();
+      for (var index = 0; index < forms.length; index++) {
+        resendDaySaveOnPageHide(forms[index]);
       }
     });
   }
@@ -3483,7 +4724,7 @@
           var currentForm = this.querySelector("[data-dashboard-save-form]");
           var periodToggle = event.target && event.target.matches && event.target.matches("[data-period-toggle]") ? event.target : null;
           if (periodToggle || (event.target && (event.target.name === "symptom_ids" || event.target.name === "mood"))) {
-            syncDashboardPreview(this);
+            syncPeriodToggleState(this);
           }
           if (periodToggle && periodToggle.checked) {
             maybeAcknowledgePeriodTip(this);
@@ -3496,7 +4737,7 @@
         root.addEventListener("input", function (event) {
           var currentForm = this.querySelector("[data-dashboard-save-form]");
           if (event.target && event.target.matches && event.target.matches("[data-dashboard-notes]")) {
-            syncDashboardPreview(this);
+            syncPeriodToggleState(this);
             syncNoteDisclosure(this);
           }
           if (currentForm && event.target && event.target.name !== "csrf_token") {
@@ -3507,6 +4748,12 @@
         root.addEventListener("click", function (event) {
           var actionButton = closestFromEvent(event, "[data-quick-action]");
           var cycleStartButton = closestFromEvent(event, "[data-dashboard-cycle-start-button]");
+          var undoButton = closestFromEvent(event, "[data-dashboard-autosave-undo]");
+          if (undoButton && this.contains(undoButton)) {
+            event.preventDefault();
+            runDashboardUndo(this.querySelector("[data-dashboard-save-form]"));
+            return;
+          }
           if (actionButton && this.contains(actionButton)) {
             event.preventDefault();
             handleDashboardQuickAction(this, actionButton.getAttribute("data-quick-action"));
@@ -3527,8 +4774,9 @@
       bindNoteDisclosures(root);
       bindAutosizeNoteFields(root);
       revealOnceTips(root);
-      syncDashboardPreview(root);
+      syncPeriodToggleState(root);
       syncNoteDisclosure(root);
+      captureDashboardPersistedState(form);
       setDashboardAutosaveIndicator(form, "idle");
     }
 
@@ -3575,6 +4823,8 @@
       revealOnceTips(form);
       syncDayEditorForm(form);
     }
+
+    bindDaySaveUnloadGuard();
   }
 
   function syncSettingsCycleForm(root) {
@@ -3802,7 +5052,7 @@
     }
 
     button.disabled = !enabled;
-    button.classList.toggle("btn--disabled", !enabled);
+    button.classList.toggle("btn-disabled", !enabled);
     button.setAttribute("aria-disabled", enabled ? "false" : "true");
   }
 
@@ -3908,6 +5158,44 @@
     }
   }
 
+  // The settings draft shell prompts on the way out and sends nothing. That is
+  // the opposite of what the dashboard journal does on unload
+  // (`flushDashboardAutosaveBeforeUnload`), and deliberately so — the two
+  // surfaces make opposite promises:
+  //
+  //   - The journal has no save button at all. Everything typed there is
+  //     already destined for the server, so the page leaving is the last chance
+  //     the newest value gets and a keepalive flush only keeps a promise the
+  //     surface already made.
+  //   - A settings card has a Save button that stays disabled until a control
+  //     differs from what the server rendered, a Discard beside it, and a
+  //     dirty/`navigating` state machine whose whole purpose is to make
+  //     "nothing is written until Save" true. Sending on unload would make Save
+  //     decorative.
+  //
+  // Three further reasons a flush would be wrong here, not merely redundant:
+  //
+  //   - The prompt is a question whose "yes" means discard, and its outcome is
+  //     not observable to the page. A flush could not be conditioned on the
+  //     answer, so it would persist exactly what the owner had just chosen to
+  //     throw away.
+  //   - A draft is not a partial record of a fact, the way a half-typed journal
+  //     entry is; it is a configuration under edit. The cycle card's fields are
+  //     read together — `cycleGuidanceState` clamps and cross-checks the two
+  //     lengths, and the submit handler refuses an invalid combination and an
+  //     incomplete `last_period_start`. Those three values move every ovulation
+  //     and next-period surface, so a value the owner never confirmed would
+  //     change a health display. The interface card previews the theme live and
+  //     records it only on Save, so a flush there would store a theme that was
+  //     merely being looked at.
+  //   - Membership in this shell is one attribute wide. Keeping the unload path
+  //     request-free means `data-settings-draft-form` never carries the power to
+  //     write, so nothing destructive or credential-bearing — password change,
+  //     data wipe, account deletion, webhook URL, calendar feed — can acquire
+  //     auto-submission on navigation by being given the marker later.
+  //
+  // Pinned by `web/src/js/__tests__/settings-unsaved-leave.test.mjs`, which
+  // asserts that no request leaves through any channel while the page unwinds.
   function bindSettingsDraftLeaveGuard() {
     if (document.body.dataset.settingsDraftLeaveGuardBound === "1") {
       return;
@@ -3919,6 +5207,11 @@
         return;
       }
 
+      // Cancelling the event is what raises the browser's own dialog; the
+      // wording is the browser's and cannot be set from here. The in-app link
+      // and submit interceptors below carry the localized prompt instead, so
+      // this handler covers only the exits they cannot see (tab close, address
+      // bar, history).
       event.preventDefault();
       event.returnValue = "";
     });
@@ -3993,6 +5286,7 @@
     form.reset();
     syncSettingsDraftDateFields(form);
     bindBinaryToggles(root);
+    bindUsageGoalWarnings(root);
     syncSettingsCycleForm(root);
     syncSettingsCycleDraftState(root);
   }
@@ -4079,6 +5373,127 @@
     }
   }
 
+  // Settings sections collapse on a phone, and only on a phone.
+  //
+  // Measured at 390px: the page ran 8856 px before the copy pass and 8499 px
+  // after it. The length is structural — ten cards open at once — so trimming
+  // inside them cannot reach it. Collapsed, the same page is its ten headings.
+  //
+  // The disclosure is a native <details> rendered OPEN by the server, and this
+  // module only closes them, and only while the phone query matches. Three
+  // things follow from that shape, and they are the reason for it:
+  //   * Without JS, and on every wider screen, the page is what it always was.
+  //     Collapsing is an enhancement; it is never a gate in front of a setting.
+  //   * The section index above the cards keeps working for free. A link into a
+  //     closed card is opened by openDisclosuresAbove, which already walks the
+  //     ancestors of a hash target for exactly this — no second mechanism, and
+  //     no chance of the index quietly ceasing to navigate.
+  //   * A section holding unsaved edits is never closed by this module. Which
+  //     forms are dirty is read from dirtySettingsDraftForms rather than
+  //     tracked again here.
+
+  var SETTINGS_SECTION_MEDIA = "(max-width: 640px)";
+
+  function settingsSectionDisclosures() {
+    var root = document.querySelector("[data-settings-sections]");
+    if (!root) {
+      return [];
+    }
+    var found = [];
+    // Direct children only: the account card holds a nested section of its own,
+    // and folding that one would hide a control inside a control.
+    for (var index = 0; index < root.children.length; index++) {
+      var node = root.children[index];
+      if (node.tagName === "DETAILS" && node.hasAttribute("data-settings-section")) {
+        found.push(node);
+      }
+    }
+    return found;
+  }
+
+  function settingsSectionHoldsDirtyForm(section) {
+    var dirty = typeof dirtySettingsDraftForms === "function" ? dirtySettingsDraftForms() : [];
+    for (var index = 0; index < dirty.length; index++) {
+      if (section.contains(dirty[index])) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function settingsSectionHoldsHashTarget(section) {
+    var id = String(window.location.hash || "").replace(/^#/, "");
+    if (!id) {
+      return false;
+    }
+    var target = document.getElementById(id);
+    return !!target && (target === section || section.contains(target));
+  }
+
+  function applySettingsSectionMode(collapse) {
+    var sections = settingsSectionDisclosures();
+    for (var index = 0; index < sections.length; index++) {
+      var section = sections[index];
+      if (!collapse) {
+        section.open = true;
+        continue;
+      }
+      if (settingsSectionHoldsDirtyForm(section) || settingsSectionHoldsHashTarget(section)) {
+        section.open = true;
+        continue;
+      }
+      section.open = false;
+    }
+  }
+
+  // The summary is pointer-inert above 640px, but it stays focusable, so Enter
+  // on it would still close a section on a screen meant to have none closed.
+  // `toggle` does NOT bubble, so this cannot be delegated to the root and is
+  // attached per node — idempotently, because the symptoms card replaces
+  // itself through htmx and arrives as a different element each time.
+  function bindSettingsSectionToggleGuard(section, query) {
+    if (section.dataset.settingsSectionBound === "true") {
+      return;
+    }
+    section.dataset.settingsSectionBound = "true";
+    section.addEventListener("toggle", function (event) {
+      if (!query.matches && !event.target.open) {
+        event.target.open = true;
+      }
+    });
+  }
+
+  function bindSettingsSectionDisclosures() {
+    var sections = settingsSectionDisclosures();
+    if (!sections.length || !window.matchMedia) {
+      return;
+    }
+
+    var query = window.matchMedia(SETTINGS_SECTION_MEDIA);
+    for (var index = 0; index < sections.length; index++) {
+      bindSettingsSectionToggleGuard(sections[index], query);
+    }
+
+    // Re-entered after every htmx swap (initCSPFriendlyComponents is the swap
+    // hook), and collapsing is a LOAD-time decision: re-applying it here would
+    // shut every section the owner had opened, each time a symptom is added.
+    if (document.body.dataset.settingsSectionsBound === "true") {
+      return;
+    }
+    document.body.dataset.settingsSectionsBound = "true";
+
+    applySettingsSectionMode(query.matches);
+
+    var onChange = function (event) {
+      applySettingsSectionMode(event.matches);
+    };
+    if (typeof query.addEventListener === "function") {
+      query.addEventListener("change", onChange);
+    } else if (typeof query.addListener === "function") {
+      query.addListener(onChange);
+    }
+  }
+
   function readCheckedRadioValue(root, name) {
     if (!root || !root.querySelector) {
       return "";
@@ -4114,7 +5529,7 @@
     }
 
     var language = readCheckedRadioValue(root, "language");
-    var theme = normalizeTheme(readCheckedRadioValue(root, "theme"));
+    var theme = normalizeThemePreference(readCheckedRadioValue(root, "theme"));
     var languageOptions = root.querySelectorAll("[data-settings-interface-language-option]");
     var themeOptions = root.querySelectorAll("[data-settings-interface-theme-option]");
 
@@ -4127,7 +5542,7 @@
 
     for (var themeIndex = 0; themeIndex < themeOptions.length; themeIndex++) {
       var themeOption = themeOptions[themeIndex];
-      themeOption.dataset.selected = normalizeTheme(themeOption.getAttribute("data-settings-interface-theme-option")) === theme
+      themeOption.dataset.selected = normalizeThemePreference(themeOption.getAttribute("data-settings-interface-theme-option")) === theme
         ? "true"
         : "false";
     }
@@ -4136,7 +5551,7 @@
   function currentSettingsInterfaceSelection(root) {
     return {
       language: readCheckedRadioValue(root, "language"),
-      theme: normalizeTheme(readCheckedRadioValue(root, "theme"))
+      theme: normalizeThemePreference(readCheckedRadioValue(root, "theme"))
     };
   }
 
@@ -4202,7 +5617,11 @@
     for (var index = 0; index < roots.length; index++) {
       var root = roots[index];
       var initialLanguage = readCheckedRadioValue(root, "language") || String(document.documentElement.getAttribute("lang") || "").trim();
-      var initialTheme = currentTheme();
+      // The stored preference, not the rendered theme: an owner on "system"
+      // must find the system tile selected, not whichever of light/dark the
+      // system happens to be resolving to right now. With nothing stored the
+      // rendered theme stays the initial selection, as before.
+      var initialTheme = currentThemePreference();
 
       if (!root.__ovumcySettingsInterfaceState) {
         root.__ovumcySettingsInterfaceState = {
@@ -4406,45 +5825,171 @@
     }
   }
 
+  function onboardingMonthKey(value) {
+    return String(value.getFullYear()) + "-" + String(value.getMonth() + 1).padStart(2, "0");
+  }
+
+  function onboardingMonthStart(value) {
+    return new Date(value.getFullYear(), value.getMonth(), 1);
+  }
+
+  function onboardingMonthOffset(value, months) {
+    return new Date(value.getFullYear(), value.getMonth() + months, 1);
+  }
+
+  function onboardingMonthAllowed(state, month) {
+    if (!state.minDate || !state.maxDate) {
+      return false;
+    }
+    return month >= onboardingMonthStart(state.minDate) && month <= onboardingMonthStart(state.maxDate);
+  }
+
+  function clampOnboardingMonth(state, month) {
+    if (!state.minDate || !state.maxDate) {
+      return month;
+    }
+    if (month < onboardingMonthStart(state.minDate)) {
+      return onboardingMonthStart(state.minDate);
+    }
+    if (month > onboardingMonthStart(state.maxDate)) {
+      return onboardingMonthStart(state.maxDate);
+    }
+    return month;
+  }
+
+  function onboardingDateAllowed(state, value) {
+    if (!value || !state.minDate || !state.maxDate) {
+      return false;
+    }
+    return value >= state.minDate && value <= state.maxDate;
+  }
+
+  function renderOnboardingWeekdays(state) {
+    if (!state.weekdaysContainer) {
+      return;
+    }
+
+    state.weekdaysContainer.textContent = "";
+    for (var weekday = 0; weekday < 7; weekday++) {
+      // Jan 1 2023 was a Sunday, so 1 + weekday is Sunday-first; adding the
+      // shift rotates the first column to Monday for a Monday-first owner.
+      var sample = new Date(2023, 0, 1 + weekday + state.weekStartShift);
+      var cell = document.createElement("span");
+      cell.textContent = state.weekdayFormatter.format(sample);
+      state.weekdaysContainer.appendChild(cell);
+    }
+  }
+
   function renderOnboardingDayOptions(state) {
     var container = state.dayOptionsContainer;
-    if (!container) {
+    if (!container || !state.visibleMonth) {
       return;
     }
 
     container.textContent = "";
-    for (var index = 0; index < state.dayOptions.length; index++) {
-      var day = state.dayOptions[index];
-      var button = document.createElement("button");
-      var title;
-      button.type = "button";
-      button.className = "check-chip check-chip-sm justify-center onboarding-day-chip";
-      button.setAttribute("data-onboarding-day-option", "true");
-      button.setAttribute("data-onboarding-day-value", day.value);
-      button.setAttribute("aria-pressed", state.selectedDate === day.value ? "true" : "false");
-      title = day.secondaryLabel ? day.label + " " + day.secondaryLabel : day.label;
-      button.setAttribute("title", title);
-      if (day.isToday) {
-        button.classList.add("onboarding-day-chip-today");
-      }
-      if (state.selectedDate === day.value) {
-        button.classList.add("choice-chip-active");
-      }
-      if (day.secondaryLabel) {
-        var primary = document.createElement("span");
-        primary.className = "onboarding-day-chip-primary";
-        primary.textContent = day.label;
-        button.appendChild(primary);
 
-        var secondary = document.createElement("span");
-        secondary.className = "onboarding-day-chip-secondary";
-        secondary.textContent = day.secondaryLabel;
-        button.appendChild(secondary);
+    var year = state.visibleMonth.getFullYear();
+    var month = state.visibleMonth.getMonth();
+    // Leading blanks before day 1: the day-of-week index inside the owner's week.
+    var firstWeekday = (new Date(year, month, 1).getDay() + 7 - state.weekStartShift) % 7;
+    var daysInMonth = new Date(year, month + 1, 0).getDate();
+
+    for (var blank = 0; blank < firstWeekday; blank++) {
+      var placeholder = document.createElement("span");
+      placeholder.className = "onboarding-day-blank";
+      placeholder.setAttribute("aria-hidden", "true");
+      container.appendChild(placeholder);
+    }
+
+    for (var day = 1; day <= daysInMonth; day++) {
+      var dayDate = new Date(year, month, day);
+      var value = formatDateValue(dayDate);
+      var button = document.createElement("button");
+
+      button.type = "button";
+      button.className = "onboarding-day-cell";
+      button.textContent = String(day);
+      button.setAttribute("data-onboarding-day-option", "true");
+      button.setAttribute("data-onboarding-day-value", value);
+      button.setAttribute("aria-label", state.dayNameFormatter.format(dayDate));
+
+      if (!onboardingDateAllowed(state, dayDate)) {
+        // A period cannot start in the future, and the server accepts nothing
+        // older than the window it published, so both edges are inert here.
+        button.disabled = true;
+        button.classList.add("onboarding-day-cell-disabled");
+        button.setAttribute("aria-pressed", "false");
       } else {
-        button.textContent = day.label;
+        button.setAttribute("aria-pressed", state.selectedDate === value ? "true" : "false");
+        if (state.selectedDate === value) {
+          button.classList.add("onboarding-day-cell-selected");
+        }
+        if (state.maxDate && value === formatDateValue(state.maxDate)) {
+          button.classList.add("onboarding-day-cell-today");
+        }
       }
+
       container.appendChild(button);
     }
+  }
+
+  function syncOnboardingMonthNav(state) {
+    if (state.monthTitle && state.visibleMonth) {
+      state.monthTitle.textContent = state.monthFormatter.format(state.visibleMonth);
+    }
+    if (state.picker && state.visibleMonth) {
+      state.picker.setAttribute("data-onboarding-visible-month", onboardingMonthKey(state.visibleMonth));
+    }
+    if (state.previousMonthButton) {
+      state.previousMonthButton.disabled = !state.visibleMonth
+        || !onboardingMonthAllowed(state, onboardingMonthOffset(state.visibleMonth, -1));
+    }
+    if (state.nextMonthButton) {
+      state.nextMonthButton.disabled = !state.visibleMonth
+        || !onboardingMonthAllowed(state, onboardingMonthOffset(state.visibleMonth, 1));
+    }
+  }
+
+  function syncOnboardingShortcuts(state) {
+    for (var index = 0; index < state.shortcutButtons.length; index++) {
+      var button = state.shortcutButtons[index];
+      var shortcutDate = onboardingShortcutDate(state, button.getAttribute("data-onboarding-shortcut"));
+      button.disabled = !onboardingDateAllowed(state, shortcutDate);
+      button.setAttribute(
+        "aria-pressed",
+        shortcutDate && state.selectedDate === formatDateValue(shortcutDate) ? "true" : "false"
+      );
+    }
+  }
+
+  function onboardingShortcutDate(state, shortcut) {
+    if (!state.maxDate) {
+      return null;
+    }
+    if (shortcut === "today") {
+      return new Date(state.maxDate);
+    }
+    if (shortcut === "yesterday") {
+      var yesterday = new Date(state.maxDate);
+      yesterday.setDate(yesterday.getDate() - 1);
+      return yesterday;
+    }
+    return null;
+  }
+
+  function syncOnboardingSelectedReadout(state) {
+    if (!state.selectedReadout) {
+      return;
+    }
+
+    var selected = parseDateValue(state.selectedDate);
+    if (!selected) {
+      state.selectedReadout.textContent = "";
+      return;
+    }
+    state.selectedReadout.textContent = state.selectedLabel
+      ? state.selectedLabel.replace("%s", state.dayNameFormatter.format(selected))
+      : state.dayNameFormatter.format(selected);
   }
 
   function syncOnboardingStepUI(state) {
@@ -4463,14 +6008,65 @@
 
   function syncOnboardingStartDate(state) {
     var selectedDate = parseDateValue(state.selectedDate);
+    if (selectedDate && !onboardingDateAllowed(state, selectedDate)) {
+      selectedDate = null;
+    }
 
     state.selectedDate = selectedDate ? formatDateValue(selectedDate) : "";
-    if (state.startDateField) {
-      state.startDateField.setValue(state.selectedDate);
-    } else if (state.startDateInput) {
+    if (state.startDateInput) {
       state.startDateInput.value = state.selectedDate;
     }
+
+    var reference = selectedDate || state.maxDate;
+    if (!state.visibleMonth && reference) {
+      state.visibleMonth = onboardingMonthStart(reference);
+    }
+    if (state.visibleMonth) {
+      state.visibleMonth = clampOnboardingMonth(state, state.visibleMonth);
+    }
+
+    syncOnboardingMonthNav(state);
+    syncOnboardingShortcuts(state);
     renderOnboardingDayOptions(state);
+    syncOnboardingSelectedReadout(state);
+  }
+
+  function selectOnboardingDate(state, value) {
+    var selected = parseDateValue(value);
+    if (!onboardingDateAllowed(state, selected)) {
+      return;
+    }
+
+    state.selectedDate = formatDateValue(selected);
+    state.visibleMonth = onboardingMonthStart(selected);
+    clearOnboardingStatus(state, "1");
+    syncOnboardingStartDate(state);
+  }
+
+  function moveOnboardingMonth(state, step) {
+    if (!state.visibleMonth) {
+      return;
+    }
+
+    var target = onboardingMonthOffset(state.visibleMonth, step);
+    if (!onboardingMonthAllowed(state, target)) {
+      return;
+    }
+
+    state.visibleMonth = target;
+    syncOnboardingMonthNav(state);
+    renderOnboardingDayOptions(state);
+  }
+
+  function validateOnboardingStartDate(state) {
+    var selected = parseDateValue(state.selectedDate);
+    if (!selected) {
+      return state.requiredMessage;
+    }
+    if (!onboardingDateAllowed(state, selected)) {
+      return state.outOfRangeMessage;
+    }
+    return "";
   }
 
   function syncOnboardingTimezoneFields(state) {
@@ -4513,10 +6109,26 @@
 
     if (state.stepTwoSubmit) {
       state.stepTwoSubmit.disabled = guidance.invalid;
-      state.stepTwoSubmit.classList.toggle("btn--disabled", guidance.invalid);
+      state.stepTwoSubmit.classList.toggle("btn-disabled", guidance.invalid);
     }
 
     return guidance;
+  }
+
+  // Skipping the mode question answers nothing: every usage_goal radio is
+  // cleared so the submit carries no value at all and the server applies the
+  // neutral default. The skip control stays a submit button, so a browser
+  // without this script still completes onboarding on the same default.
+  function clearOnboardingUsageGoalChoice(root) {
+    if (!root || !root.querySelectorAll) {
+      return;
+    }
+
+    var choices = root.querySelectorAll("input[name='usage_goal']");
+    for (var index = 0; index < choices.length; index++) {
+      choices[index].checked = false;
+    }
+    bindUsageGoalWarnings(root);
   }
 
   function goToOnboardingStep(state, nextStep) {
@@ -4533,28 +6145,38 @@
       var state = root.__ovumcyOnboardingState;
 
       if (!state) {
+        var picker = root.querySelector("[data-onboarding-picker]");
+        var lang = String(root.getAttribute("data-lang") || "en") || "en";
+
         state = {
           root: root,
           step: normalizeOnboardingStep(root.getAttribute("data-initial-step")),
-          minDate: String(root.getAttribute("data-min-date") || ""),
-          maxDate: String(root.getAttribute("data-max-date") || ""),
+          minDate: parseDateValue(root.getAttribute("data-min-date")),
+          maxDate: parseDateValue(root.getAttribute("data-max-date")),
           selectedDate: String(root.getAttribute("data-last-period-start") || ""),
           cycleLength: clampInteger(root.getAttribute("data-cycle-length"), 28, 15, 90),
           periodLength: clampInteger(root.getAttribute("data-period-length"), 5, 1, 14),
           periodExceedsCycleMessage: String(root.getAttribute("data-period-exceeds-cycle-message") || "Period length must not exceed cycle length."),
-          relativeDayLabels: {
-            today: String(root.getAttribute("data-today-label") || ""),
-            yesterday: String(root.getAttribute("data-yesterday-label") || ""),
-            twoDaysAgo: String(root.getAttribute("data-two-days-ago-label") || "")
-          },
-          lang: String(root.getAttribute("data-lang") || "en"),
+          lang: lang,
+          weekStartShift: root.getAttribute("data-week-start") === "monday" ? 1 : 0,
+          monthFormatter: new Intl.DateTimeFormat(lang, { month: "long", year: "numeric" }),
+          weekdayFormatter: new Intl.DateTimeFormat(lang, { weekday: "short" }),
+          dayNameFormatter: new Intl.DateTimeFormat(lang, { day: "numeric", month: "long", year: "numeric" }),
+          visibleMonth: null,
           progress: root.querySelector("[data-onboarding-progress]"),
           progressBar: root.querySelector("[data-onboarding-progress-bar]"),
-          startDateField: typeof window.__ovumcyGetDateFieldController === "function"
-            ? window.__ovumcyGetDateFieldController(root.querySelector("#last-period-start"))
-            : null,
-          startDateInput: root.querySelector("#last-period-start"),
+          picker: picker,
+          selectedLabel: picker ? String(picker.getAttribute("data-selected-label") || "") : "",
+          requiredMessage: picker ? String(picker.getAttribute("data-required-message") || "") : "",
+          outOfRangeMessage: picker ? String(picker.getAttribute("data-out-of-range-message") || "") : "",
+          startDateInput: root.querySelector("[data-onboarding-start-date]"),
+          monthTitle: root.querySelector("[data-onboarding-month-title]"),
+          previousMonthButton: root.querySelector("[data-onboarding-month-prev]"),
+          nextMonthButton: root.querySelector("[data-onboarding-month-next]"),
+          weekdaysContainer: root.querySelector("[data-onboarding-weekdays]"),
           dayOptionsContainer: root.querySelector("[data-onboarding-day-options]"),
+          selectedReadout: root.querySelector("[data-onboarding-selected-date]"),
+          shortcutButtons: root.querySelectorAll("[data-onboarding-shortcut]"),
           cycleInput: root.querySelector("[data-onboarding-cycle-length]"),
           periodInput: root.querySelector("[data-onboarding-period-length]"),
           cycleValue: root.querySelector("[data-onboarding-cycle-length-value]"),
@@ -4579,37 +6201,50 @@
           statusTargets: {
             "1": root.querySelector("#onboarding-step1-status"),
             "2": root.querySelector("#onboarding-step2-status")
-          },
-          dayOptions: []
+          }
         };
-        state.dayOptions = buildDayOptions(state.minDate, state.maxDate, state.lang, state.relativeDayLabels);
         root.__ovumcyOnboardingState = state;
+        renderOnboardingWeekdays(state);
 
         root.addEventListener("click", function (event) {
+          var currentState = this.__ovumcyOnboardingState;
+
+          var skipUsageGoalButton = closestFromEvent(event, "[data-onboarding-usage-goal-skip]");
+          if (skipUsageGoalButton && this.contains(skipUsageGoalButton)) {
+            clearOnboardingUsageGoalChoice(this);
+            return;
+          }
+
           var stepButton = closestFromEvent(event, "[data-onboarding-go-step]");
           if (stepButton && this.contains(stepButton)) {
-            goToOnboardingStep(this.__ovumcyOnboardingState, stepButton.getAttribute("data-onboarding-go-step"));
+            goToOnboardingStep(currentState, stepButton.getAttribute("data-onboarding-go-step"));
+            return;
+          }
+
+          var monthButton = closestFromEvent(event, "[data-onboarding-month-prev], [data-onboarding-month-next]");
+          if (monthButton && this.contains(monthButton)) {
+            moveOnboardingMonth(currentState, monthButton.hasAttribute("data-onboarding-month-next") ? 1 : -1);
+            return;
+          }
+
+          var shortcutButton = closestFromEvent(event, "[data-onboarding-shortcut]");
+          if (shortcutButton && this.contains(shortcutButton)) {
+            var shortcutDate = onboardingShortcutDate(currentState, shortcutButton.getAttribute("data-onboarding-shortcut"));
+            if (shortcutDate) {
+              selectOnboardingDate(currentState, formatDateValue(shortcutDate));
+            }
             return;
           }
 
           var dayButton = closestFromEvent(event, "button[data-onboarding-day-option]");
           if (dayButton && this.contains(dayButton)) {
-            this.__ovumcyOnboardingState.selectedDate = String(dayButton.getAttribute("data-onboarding-day-value") || "");
-            clearOnboardingStatus(this.__ovumcyOnboardingState, "1");
-            syncOnboardingStartDate(this.__ovumcyOnboardingState);
+            selectOnboardingDate(currentState, dayButton.getAttribute("data-onboarding-day-value"));
           }
         });
 
         root.addEventListener("input", function (event) {
           var currentState = this.__ovumcyOnboardingState;
           if (!event.target || !event.target.matches) {
-            return;
-          }
-
-          if (currentState.startDateInput && event.target === currentState.startDateInput) {
-            currentState.selectedDate = String(event.target.value || "");
-            clearOnboardingStatus(currentState, "1");
-            syncOnboardingStartDate(currentState);
             return;
           }
 
@@ -4633,16 +6268,13 @@
           var guidance;
           if (form && form.matches && form.matches("form[data-onboarding-form-step='1']")) {
             syncOnboardingTimezoneFields(currentState);
-            if (currentState.startDateField && !currentState.startDateField.validate()) {
+            var startDateError = validateOnboardingStartDate(currentState);
+            if (startDateError) {
               event.preventDefault();
               clearOnboardingStatus(currentState, "1");
               if (currentState.statusTargets["1"]) {
-                renderErrorStatus(
-                  currentState.statusTargets["1"],
-                  currentState.startDateField.validationMessage()
-                );
+                renderErrorStatus(currentState.statusTargets["1"], startDateError);
               }
-              currentState.startDateField.reportValidity();
             }
             return;
           }
@@ -4902,20 +6534,33 @@
     }
   }
 
+  // Controls marked data-nojs-only stand in for a JS feature (hx-confirm); with
+  // scripting running they are dropped, since a required one would block htmx.
+  function dropNoJSOnlyControls(root) {
+    root.querySelectorAll("[data-nojs-only]").forEach(function (node) {
+      node.remove();
+    });
+  }
+
   function initCSPFriendlyComponents() {
-    bindThemeToggleButtons();
+    dropNoJSOnlyControls(document);
     bindMobileMenu();
-    bindPWAInstallBanner();
+    bindPWAInstallOffer();
+    bindPWAInstallSettingsRow();
     if (typeof window.__ovumcyBindLocalizedDateFields === "function") {
       window.__ovumcyBindLocalizedDateFields(document);
     }
     bindBinaryToggles(document);
+    bindUsageGoalWarnings(document);
     bindSymptomNameCounters(document);
     bindTemperatureInputs(document);
+    bindPregnancyTestFields(document);
+    bindHashDisclosureReveals();
     bindDashboardNotesCounters(document);
     bindSettingsCycleForms();
     bindSettingsTrackingForms();
     bindSettingsInterfaceForms();
+    bindSettingsSectionDisclosures();
     bindIconControls();
     bindDashboardEditors();
     bindDayEditorForms();

@@ -24,11 +24,46 @@ import (
 // owner's row. One owner's health data is therefore never carried into a request
 // aimed at another owner.
 //
-// Idempotency: the watermark is written only after a 2xx delivery. A failed POST
-// leaves the watermark unchanged, so the next pass (a same-day re-run or a
-// concurrent operator cron) retries it; a succeeded POST advances the watermark,
-// so a re-run skips it. This write-on-success is the coordination point with
-// slice-1's watermark columns.
+// Idempotency: the watermark is CLAIMED before the POST and released when the
+// POST fails. A pass takes the claim by compare-and-set on the same watermark
+// column the decision reads, so at most one pass can own a given (owner, kind,
+// cycle anchor); a failed POST hands the claim back, leaving the watermark where
+// the pass found it, so the next pass (a same-day re-run or a concurrent
+// operator cron) still retries it, and a succeeded POST leaves the claim
+// standing, so a re-run skips it.
+//
+// Claiming BEFORE delivery rather than writing after it is what makes the pass
+// safe against OVERLAP. The due-set is computed from the record snapshot taken by
+// ListAllForNotify, so two passes that both list before either writes — the
+// scheduler goroutine and an operator `ovumcy notify` process, which is a
+// separate OS process and therefore beyond any in-process lock — each see an
+// uncovered anchor and each decide the reminder is due. With the write deferred
+// to after Deliver, both delivered. The claim is the coordination point with
+// slice-1's watermark columns; it is the only mutual exclusion the pass has.
+//
+// The claim carries a second job the watermark cannot do: REVOCATION. The
+// snapshot is minutes old by the time a POST leaves, and in that window the
+// owner can disable delivery, replace or remove the endpoint, narrow the shared
+// reminder lead window, or clear their data — none of which moves a watermark (a
+// settings save deliberately leaves them alone) and one of which, clear-data,
+// NULLs them and so re-opens the first-ever-claim branch. Each of those writes
+// advances the owner's webhook_config_version in the same statement, and the
+// claim pins the epoch its own snapshot carried, so a revoked configuration can
+// no longer win a claim. The line this holds is "no NEW request begins under a
+// revoked configuration"; a request already on the wire when the revocation
+// lands cannot be recalled, which is documented for operators rather than
+// papered over here.
+//
+// The cost, stated plainly: claiming first turns a returned delivery error into a
+// retry but a HARD KILL between claim and release into a permanent skip. A pass
+// that dies mid-POST — host reboot, OOM kill, container eviction, an interrupted
+// `ovumcy notify` — leaves the claim standing with nothing delivered, and no
+// counter records it (the process that would have counted it is gone). That is
+// at-most-once for this window, deliberately: a missed reminder is a convenience
+// lost, a duplicate reminder about health data at an owner's endpoint is not.
+// Narrowing it further needs a claim that is distinguishable from a completed
+// send, which the single date column cannot express — a schema decision, not a
+// change to make here. Stated for operators in docs/notifications.md.
 //
 // No-secret discipline: the pass logs counts and at most owner ids — never the
 // URL, token, decrypted health specifics, or payload.
@@ -39,9 +74,42 @@ type NotifyUserRepository interface {
 	// ListAllForNotify returns the per-owner notify projection (webhook_url is
 	// CIPHERTEXT). Ordered by id for a deterministic pass.
 	ListAllForNotify(ctx context.Context) ([]models.WebhookNotifyRecord, error)
-	// UpdateWebhookWatermark advances the per-kind watermark for one owner after a
-	// successful send. cycleAnchor is canonicalized to UTC-midnight by the repo.
-	UpdateWebhookWatermark(ctx context.Context, userID uint, reminderType string, cycleAnchor time.Time) error
+	// ClaimWebhookWatermark takes an exclusive claim on one (owner, kind, cycle
+	// anchor) send by compare-and-set on the per-kind watermark, and reports
+	// whether this caller won it. previous is the watermark the caller's record
+	// snapshot carried and is the value the set is compared against, so a claim is
+	// lost whenever the column moved at all since that snapshot — not only when it
+	// moved to this same anchor. false means another pass owns the send.
+	// cycleAnchor is canonicalized to UTC-midnight by the repo.
+	//
+	// configVersion is the revocation epoch the SAME snapshot carried, and the
+	// claim is lost when the stored epoch has moved since. That is the thing a
+	// watermark cannot express: an owner disabling delivery, replacing or
+	// removing the endpoint, narrowing the shared reminder lead window, or
+	// clearing their data moves none of the values above, yet must stop a pass
+	// that read the old configuration from reaching the old endpoint. false
+	// therefore means "another pass owns this send OR the configuration this pass
+	// read is no longer the owner's" — the caller treats both the same way, by
+	// not delivering.
+	ClaimWebhookWatermark(ctx context.Context, userID uint, reminderType string, cycleAnchor time.Time, previous *time.Time, configVersion int) (bool, error)
+	// ReleaseWebhookWatermark restores the watermark to previous after the delivery
+	// a claim covered failed, conditional on the column still holding cycleAnchor.
+	// previous must be the same value handed to ClaimWebhookWatermark, which is
+	// what that claim replaced.
+	ReleaseWebhookWatermark(ctx context.Context, userID uint, reminderType string, cycleAnchor time.Time, previous *time.Time) error
+	// MarkWebhookDelivered records that a delivery to this owner's endpoint was
+	// ACCEPTED, at deliveredAt. It is called ONLY after Deliver returns nil, and
+	// it is the pass's only statement about delivery a later reader can trust:
+	// the claim above is taken before the request leaves and holds a cycle
+	// anchor, so it says a send was attempted under some configuration, never
+	// that one arrived.
+	//
+	// configVersion is the same revocation epoch the claim pinned, so a
+	// configuration the owner withdrew while the request was on the wire is not
+	// credited with a delivery. The write does not advance that epoch and moves
+	// no watermark. An error here is a lost ledger entry, never a lost delivery:
+	// the caller logs it and leaves the report alone.
+	MarkWebhookDelivered(ctx context.Context, userID uint, deliveredAt time.Time, configVersion int) error
 }
 
 // NotifyLogReader is the narrow read surface for an owner's day logs (the
@@ -59,18 +127,50 @@ type WebhookURLDecryptor interface {
 }
 
 // DisclaimerProvider yields the medical-safety disclaimer for a language. It is
-// satisfied by an i18n adapter; the notify pass uses it so every payload carries
-// the owner-localized (or server-default) "estimates, not medical advice"
-// string without importing the whole i18n Manager.
+// satisfied by an i18n adapter; the egress surfaces use it so every payload
+// carries the owner-localized "estimates, not medical advice" string without
+// importing the whole i18n Manager.
 type DisclaimerProvider interface {
 	Disclaimer(language string) string
 }
 
-// NotifyReport is the transport-free result of one notify pass. It carries only
-// aggregate counts — never a URL, token, health specific, or payload — so it is
-// safe to print from the CLI. OwnerIDsFailed lets an operator see WHICH owners
-// failed (an id is not a secret) without exposing why in a way that leaks the
-// endpoint.
+// NotifyCopyProvider is the whole localized-copy seam of the notify pass: the
+// medical-safety disclaimer plus any catalogue entry by key. The reminder
+// headline and sentence are catalogue entries rather than Go literals precisely
+// so they follow the same language the disclaimer does — a payload written half
+// in the owner's language and half in the server's is what the split produced.
+// Both halves resolve at the owner's users.interface_language.
+type NotifyCopyProvider interface {
+	DisclaimerProvider
+	// Message returns the catalogue entry for key at language, or "" when the key
+	// is unknown. An empty or unsupported language yields the server default (the
+	// i18n Manager merges the default over the target).
+	Message(language string, key string) string
+}
+
+// The reminder copy keys. They are whole literals on purpose: the locale
+// reachability sweep recognises a key only by the literal that names it, so a
+// key assembled from parts would read as unreachable and be deleted by the next
+// catalogue cleanup.
+const (
+	reminderPeriodTitleKey           = "webhook.reminder.period.title"
+	reminderPeriodMessageKey         = "webhook.reminder.period.message"
+	reminderPeriodRangeMessageKey    = "webhook.reminder.period.message_range"
+	reminderOvulationTitleKey        = "webhook.reminder.ovulation.title"
+	reminderOvulationMessageKey      = "webhook.reminder.ovulation.message"
+	reminderOvulationRangeMessageKey = "webhook.reminder.ovulation.message_range"
+)
+
+// NotifyReport is the transport-free result of one notify pass. It never carries
+// a URL, token, or payload — a destination appears as a HOST at most.
+// OwnerIDsFailed lets an operator see WHICH owners failed (an id is not a secret)
+// without exposing why in a way that leaks the endpoint.
+//
+// On a dry run DryRunPreview additionally carries each reminder's type and
+// estimated date. Those ARE health specifics about an identified owner, so a
+// caller that renders the report keeps them behind an explicit opt-in (the CLI's
+// --show-health-details) instead of printing them by default; everything else in
+// the report is safe to print unconditionally.
 type NotifyReport struct {
 	// OwnersScanned is the number of owner records the pass examined.
 	OwnersScanned int
@@ -80,13 +180,18 @@ type NotifyReport struct {
 	// Sent is the number of reminders successfully delivered (2xx). Always 0 on a
 	// dry run.
 	Sent int
-	// SkippedIdempotent is the number of due reminders skipped because the incoming
-	// watermark already covered them (they were sent on an earlier pass). The pure
-	// decision layer excludes these, so this counts owners whose decision returned
-	// nothing purely due to watermarks — surfaced for observability.
+	// SkippedIdempotent is the number of due reminders skipped because a watermark
+	// already covered them (they were sent on an earlier — or an overlapping —
+	// pass). Two moments contribute: the pure decision layer excludes reminders
+	// whose incoming watermark covers them, and a claim lost to a concurrent pass
+	// is skipped at delivery time. A lost claim is a skip, never a failure: the
+	// reminder IS being delivered, by the pass that won it.
 	SkippedIdempotent int
-	// Failed is the number of reminders whose delivery failed (non-2xx, timeout,
-	// refused redirect, bad scheme). Their watermark was NOT advanced.
+	// Failed is the number of reminders that could not be delivered: the POST
+	// failed (non-2xx, timeout, refused redirect, bad scheme) and its claim was
+	// released, or the claim itself could not be taken because the watermark write
+	// errored. Either way the watermark is left where the pass found it, so the
+	// next pass retries.
 	Failed int
 	// DryRun records whether this pass computed-only (no delivery, no watermark).
 	DryRun bool
@@ -112,11 +217,11 @@ type NotifyPreviewLine struct {
 // WebhookNotifyService runs the notify pass. It holds only narrow seams so it is
 // fully unit-testable with stubs and never reaches for a real socket or clock.
 type WebhookNotifyService struct {
-	users      NotifyUserRepository
-	logs       NotifyLogReader
-	decryptor  WebhookURLDecryptor
-	deliverer  WebhookDeliverer
-	disclaimer DisclaimerProvider
+	users     NotifyUserRepository
+	logs      NotifyLogReader
+	decryptor WebhookURLDecryptor
+	deliverer WebhookDeliverer
+	localized NotifyCopyProvider
 }
 
 // NewWebhookNotifyService assembles the notify service from its collaborators.
@@ -125,14 +230,14 @@ func NewWebhookNotifyService(
 	logs NotifyLogReader,
 	decryptor WebhookURLDecryptor,
 	deliverer WebhookDeliverer,
-	disclaimer DisclaimerProvider,
+	localized NotifyCopyProvider,
 ) *WebhookNotifyService {
 	return &WebhookNotifyService{
-		users:      users,
-		logs:       logs,
-		decryptor:  decryptor,
-		deliverer:  deliverer,
-		disclaimer: disclaimer,
+		users:     users,
+		logs:      logs,
+		decryptor: decryptor,
+		deliverer: deliverer,
+		localized: localized,
 	}
 }
 
@@ -200,16 +305,14 @@ func (service *WebhookNotifyService) processOwner(
 
 	user := userFromNotifyRecord(record)
 	settings := WebhookReminderSettingsFromNotifyRecord(record)
-	due := DecideDueReminders(&user, settings, dayLogs, now, ownerLocation)
-
-	// Idempotency observability: the pure decision already hides reminders whose
-	// watermark covers them, so re-run the SAME decision with the watermarks
-	// cleared to learn how many candidates existed, and attribute the difference
-	// (candidates that were suppressed purely by an existing watermark) to
-	// SkippedIdempotent. This is a second pure, I/O-free decision call — no store,
-	// no clock — kept so the Report can prove "sent once, then skipped" without
-	// changing the authoritative (watermarked) decision above.
-	report.SkippedIdempotent += countWatermarkSuppressed(&user, settings, dayLogs, now, ownerLocation, due)
+	// One traversal yields both the authoritative due set and the idempotency
+	// counter: the decision already knows which reminders its own watermark
+	// withheld, so the Report can prove "sent once, then skipped" without the pass
+	// deciding a second time. That second decision was pure and I/O-free but not
+	// cheap — it rebuilt the owner's cycle statistics from their logged
+	// history, so the counter cost as much as the work it counted.
+	due, watermarkSuppressed := decideDueReminders(&user, settings, dayLogs, now, ownerLocation)
+	report.SkippedIdempotent += watermarkSuppressed
 
 	// Destination HOST only, for the dry-run preview and any host-scoped logging.
 	// Never keep or print more of the URL than this.
@@ -217,7 +320,7 @@ func (service *WebhookNotifyService) processOwner(
 
 	for _, reminder := range due {
 		report.Due++
-		payload := service.buildPayload(reminder)
+		payload := service.buildPayload(reminder, record.InterfaceLanguage)
 
 		if dryRun {
 			// Compute-only: no outbound request, no watermark. Record what WOULD be
@@ -226,39 +329,118 @@ func (service *WebhookNotifyService) processOwner(
 			report.DryRunPreview = append(report.DryRunPreview, NotifyPreviewLine{
 				OwnerID:   record.ID,
 				Type:      reminder.Type,
-				EventDate: reminder.EventDate.Format("2006-01-02"),
+				EventDate: previewEventDate(payload),
 				Host:      host,
 			})
 			continue
 		}
 
-		if err := service.deliverer.Deliver(ctx, decryptedURL, payload); err != nil {
-			// Delivery already logged host-only inside Deliver. Leave the watermark
-			// unchanged so the next pass retries.
+		// Claim the send BEFORE the request leaves. previousWatermark is the value
+		// this pass's snapshot carried: it is what the claim compares against — so a
+		// pass whose snapshot has been overtaken loses rather than writing the column
+		// backwards — and it is what a failed delivery restores.
+		//
+		// record.WebhookConfigVersion is pinned alongside it, and it is the SAME
+		// snapshot's value on purpose: everything this loop is about to send was
+		// decided from that snapshot — the enabled flag, the per-kind opt-in, the
+		// decrypted URL above — so the claim has to ask whether THAT configuration
+		// is still the owner's, not whether some configuration is. Re-reading the
+		// row here to get a fresher epoch would defeat the check by agreeing with
+		// whatever the revocation just wrote.
+		previousWatermark := watermarkForReminderType(settings, reminder.Type)
+		claimed, err := service.users.ClaimWebhookWatermark(ctx, record.ID, reminder.Type, reminder.CycleAnchor, previousWatermark, record.WebhookConfigVersion)
+		if err != nil {
+			// Owner id only: the reminder type is a health specific, and this line
+			// lands in whatever log the pass was started from. Nothing was delivered
+			// and no watermark moved, so the reminder is still pending — counted as
+			// failed so an operator sees it, and retried by the next pass.
+			log.Printf("webhook notify: watermark claim failed, owner id=%d", record.ID)
 			report.Failed++
 			report.OwnerIDsFailed = appendUniqueID(report.OwnerIDsFailed, record.ID)
 			continue
 		}
+		if !claimed {
+			// Either a concurrent pass owns this send — the reminder is being
+			// delivered, just not by us — or the owner revoked the configuration this
+			// pass read, and there is nothing left to deliver to. Both are a skip
+			// rather than a failure, and in both cases sending anyway is exactly the
+			// egress the claim exists to prevent: a duplicate in the first case, a
+			// POST to a revoked endpoint in the second. The pass deliberately does not
+			// distinguish them, because the log line it could write would have to name
+			// the owner whose endpoint was revoked, and the correct action is
+			// identical.
+			report.SkippedIdempotent++
+			continue
+		}
 
-		// Success: advance the watermark for this kind so a re-run skips it. A
-		// watermark write failure is logged but not counted as a delivery failure —
-		// the reminder WAS delivered; a stuck watermark would at worst re-send next
-		// pass, never lose data.
-		if err := service.users.UpdateWebhookWatermark(ctx, record.ID, reminder.Type, reminder.CycleAnchor); err != nil {
-			log.Printf("webhook notify: watermark write failed after send, owner id=%d type=%s", record.ID, reminder.Type)
+		if err := service.deliverer.Deliver(ctx, decryptedURL, payload); err != nil {
+			// Delivery already logged host-only inside Deliver. Give the claim back so
+			// the watermark is left where this pass found it and the next pass retries;
+			// a claim kept after a failed POST would read exactly like a successful send
+			// and suppress the reminder for good.
+			report.Failed++
+			report.OwnerIDsFailed = appendUniqueID(report.OwnerIDsFailed, record.ID)
+			if releaseErr := service.users.ReleaseWebhookWatermark(ctx, record.ID, reminder.Type, reminder.CycleAnchor, previousWatermark); releaseErr != nil {
+				log.Printf("webhook notify: watermark release failed after a failed delivery, owner id=%d", record.ID)
+			}
+			continue
+		}
+
+		// Success. Two different facts are now true and they need two different
+		// columns. The claim stands as the watermark for this kind, so a re-run
+		// skips the reminder — that is idempotency, and it was already written,
+		// before the request left, against a cycle anchor. It is NOT a record that
+		// anything arrived: the same value stands for a send that failed until the
+		// release above puts it back, and it holds an anchor rather than a clock
+		// reading. Reading it as a delivery time is the misreading the second
+		// write below exists to make unnecessary.
+		//
+		// So this is where — and the only place where — an accepted delivery is
+		// recorded, after a 2xx and never at the claim. It pins the SAME epoch the
+		// claim did, so a configuration the owner revoked while the request was on
+		// the wire is not credited with a delivery, and it deliberately does not
+		// advance that epoch: doing so would lose this very pass's ovulation claim
+		// a few lines from now (migration 039 corrects migration 038 on the point).
+		//
+		// now is the pass's injected clock, not a fresh reading — this service
+		// holds no clock on purpose. The mark is therefore "the pass that accepted
+		// this delivery began at", accurate to the length of a pass, and it is a
+		// record of acceptance rather than a latency measurement.
+		//
+		// A failed mark is not a failed delivery. The POST was accepted, so the
+		// reminder counts as sent and the report is left alone; the cost is one
+		// missing ledger entry. Counting it as failed would be the expensive
+		// mistake, because nothing would then stop the next pass re-sending it.
+		if err := service.users.MarkWebhookDelivered(ctx, record.ID, now, record.WebhookConfigVersion); err != nil {
+			log.Printf("webhook notify: delivery mark write failed after an accepted delivery, owner id=%d", record.ID)
 		}
 		report.Sent++
 	}
 }
 
+// watermarkForReminderType returns the incoming watermark of the kind a reminder
+// belongs to, as the pass's record snapshot carried it. It is both the value the
+// claim's compare-and-set is taken against and the value a released claim
+// restores, so "unchanged after a failed delivery" means exactly the value this
+// pass decided against.
+func watermarkForReminderType(settings WebhookReminderSettings, reminderType string) *time.Time {
+	if reminderType == DueReminderTypeOvulation {
+		return settings.OvulationWatermark
+	}
+	return settings.PeriodWatermark
+}
+
 // buildPayload turns a due reminder into the transport-free notification body.
-// It resolves the disclaimer at the server-default language (no per-owner
-// language is persisted) and minimizes health specifics to type + estimated date
-// + lead days.
-func (service *WebhookNotifyService) buildPayload(reminder DueReminder) WebhookPayload {
-	disclaimer := service.disclaimer.Disclaimer("")
-	title, message := reminderCopy(reminder)
-	return WebhookPayload{
+// Every localized field — the headline, the sentence, and the medical-safety
+// disclaimer — resolves at ONE language: the owner's persisted
+// users.interface_language, which the projection carries because a request-free
+// pass has no browser to ask. An owner who never chose a language stores "",
+// which the provider answers at the server default. Health specifics stay
+// minimized to type + estimated date + lead days.
+func (service *WebhookNotifyService) buildPayload(reminder DueReminder, language string) WebhookPayload {
+	disclaimer := service.localized.Disclaimer(language)
+	title, message := service.reminderCopy(reminder, language)
+	payload := WebhookPayload{
 		Title:      title,
 		Message:    message,
 		Disclaimer: disclaimer,
@@ -266,75 +448,104 @@ func (service *WebhookNotifyService) buildPayload(reminder DueReminder) WebhookP
 		EventDate:  reminder.EventDate.Format("2006-01-02"),
 		LeadDays:   reminder.LeadDays,
 	}
+	if !reminder.EventDateEnd.IsZero() {
+		payload.EventDateEnd = reminder.EventDateEnd.Format("2006-01-02")
+	}
+	return payload
 }
 
-// reminderCopy returns a neutral, secret-free title and message for a reminder.
-// The copy is intentionally minimal and English-neutral machine text; the
-// disclaimer field carries the localized medical-safety string.
-func reminderCopy(reminder DueReminder) (string, string) {
-	date := reminder.EventDate.Format("2006-01-02")
-	switch reminder.Type {
-	case DueReminderTypeOvulation:
-		return "Ovulation reminder", fmt.Sprintf("Estimated ovulation around %s.", date)
-	default:
-		return "Period reminder", fmt.Sprintf("Estimated next period around %s.", date)
+// previewEventDate is the dry-run spelling of the payload's date: the day, or
+// first..last for a range, so the preview never shows one day where the payload
+// carries a range.
+func previewEventDate(payload WebhookPayload) string {
+	if payload.EventDateEnd == "" {
+		return payload.EventDate
 	}
+	return payload.EventDate + ".." + payload.EventDateEnd
 }
 
-// countWatermarkSuppressed reports how many reminders WOULD be due for this
-// owner if no watermark existed but are absent from due (i.e. were suppressed
-// purely because an incoming watermark already covered them). It re-runs the
-// pure decision with both watermarks cleared and subtracts, by type, the
-// reminders that actually surfaced. It performs no I/O.
-func countWatermarkSuppressed(
-	user *models.User,
-	settings WebhookReminderSettings,
-	logs []models.DailyLog,
-	now time.Time,
-	location *time.Location,
-	due []DueReminder,
-) int {
-	unwatermarked := settings
-	unwatermarked.PeriodWatermark = nil
-	unwatermarked.OvulationWatermark = nil
-	candidates := DecideDueReminders(user, unwatermarked, logs, now, location)
-
-	dueTypes := make(map[string]bool, len(due))
-	for _, reminder := range due {
-		dueTypes[reminder.Type] = true
+// reminderCopy returns the minimal, secret-free title and message for a
+// reminder, resolved at language. Both come from the locale catalogue: the copy
+// used to be English literals here, which put the reminder body outside the
+// six-file locale contract (no translator ever saw a key for it) and sent an
+// owner a headline in one language beside a disclaimer in another. The sentence
+// template carries a single %s for the ISO event date; a range is worded by
+// reminderRangeCopy, never as one day.
+func (service *WebhookNotifyService) reminderCopy(reminder DueReminder, language string) (string, string) {
+	if !reminder.EventDateEnd.IsZero() {
+		return service.reminderRangeCopy(reminder, language)
 	}
-
-	suppressed := 0
-	for _, candidate := range candidates {
-		if !dueTypes[candidate.Type] {
-			suppressed++
-		}
+	titleKey, messageKey := reminderPeriodTitleKey, reminderPeriodMessageKey
+	if reminder.Type == DueReminderTypeOvulation {
+		titleKey, messageKey = reminderOvulationTitleKey, reminderOvulationMessageKey
 	}
-	return suppressed
+	title := service.localized.Message(language, titleKey)
+	template := service.localized.Message(language, messageKey)
+	if template == "" {
+		// No catalogue entry (a provider without the key): send the headline alone
+		// rather than a body of formatting-verb residue.
+		return title, ""
+	}
+	return title, fmt.Sprintf(template, reminder.EventDate.Format("2006-01-02"))
 }
 
-// hostOnly returns the hostname of a URL and nothing else — no scheme, path,
-// query, or userinfo (which may carry a notification token). It is the only form
-// of a webhook URL that may appear in a preview or log. Returns "" when the URL
-// cannot be parsed.
+// reminderRangeCopy is reminderCopy for a reminder carrying a range: the
+// *_range sentences take the first and the last ISO day.
+func (service *WebhookNotifyService) reminderRangeCopy(reminder DueReminder, language string) (string, string) {
+	titleKey, messageKey := reminderPeriodTitleKey, reminderPeriodRangeMessageKey
+	if reminder.Type == DueReminderTypeOvulation {
+		titleKey, messageKey = reminderOvulationTitleKey, reminderOvulationRangeMessageKey
+	}
+	title := service.localized.Message(language, titleKey)
+	template := service.localized.Message(language, messageKey)
+	if template == "" {
+		return title, ""
+	}
+	return title, fmt.Sprintf(template, reminder.EventDate.Format("2006-01-02"), reminder.EventDateEnd.Format("2006-01-02"))
+}
+
+// hostOnly returns the hostname of a URL and nothing else — no scheme, port,
+// path, query, or userinfo (which may carry a notification token). It is the
+// only form of a webhook URL that may appear in a preview, a settings page, or a
+// log, and it is the package's ONLY implementation of that rule: the notify
+// pass, the CLI status view, and BuildWebhookURLDisplay all print through it, so
+// a hardening of "what is safe to show" reaches every surface at once. Returns
+// "" when the URL cannot be parsed, which the settings display renders as
+// configured-but-hostless rather than as an error.
 func hostOnly(rawURL string) string {
 	parsed, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil {
-		// codecov:ignore -- unreachable from the notify path: processOwner only
-		// reaches here for a URL the decryptor returned, which slice-1 save-time
-		// validation already parsed; kept as a fail-safe so a malformed value yields
-		// an empty host rather than leaking anything.
 		return ""
 	}
 	return parsed.Hostname()
 }
 
 // resolveOwnerLocation prefers the owner's persisted IANA timezone and falls
-// back to the injected server location when it is empty or invalid. It never
-// calls time.Now(); it only resolves a zone.
+// back to the injected location when it is empty or unusable. It never calls
+// time.Now(); it only resolves a zone.
+//
+// It is the single owner-timezone resolver for every request-free pass — the two
+// egress passes (the webhook notify pass and the .ics calendar feed) and the
+// one-shot boot recompute of the derived luteal-phase cache
+// (LutealPhaseRecomputer) — so none of them can disagree about which calendar day
+// an owner is on. None carries a request timezone worth trusting (a cron pass has
+// no request at all, a calendar client sends neither the timezone header nor the
+// cookie, and a boot pass runs before a listener exists), which is exactly the
+// case users.timezone is persisted for.
+//
+// The "Local" token is rejected by INPUT, mirroring api.parseRequestTimezone:
+// time.LoadLocation("Local") returns the server's own zone (time.Local) with no
+// error, so a stored "Local" would silently pin an owner to the server's
+// timezone instead of falling back. Only validated IANA names are ever written to
+// the column, so this is defense in depth against a hand-edited or restored row —
+// and it is checked on the input, not on the loaded zone's String(), because
+// time.Local stringifies to its real name (e.g. "UTC") whenever TZ is set.
 func resolveOwnerLocation(timezone string, fallback *time.Location) *time.Location {
 	name := strings.TrimSpace(timezone)
 	if name == "" {
+		return fallback
+	}
+	if strings.EqualFold(name, "Local") {
 		return fallback
 	}
 	loaded, err := time.LoadLocation(name)

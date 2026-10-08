@@ -26,7 +26,13 @@ func TestSettingsPageForOIDCOnlyAccountShowsLocalPasswordSetup(t *testing.T) {
 	assertBodyContainsAll(t, rendered,
 		bodyStringMatch{fragment: "Set a local password", message: "expected local password setup title for oidc-only account"},
 		bodyStringMatch{fragment: "Recovery codes become available after you set a local password", message: "expected recovery-code guidance for oidc-only account"},
-		bodyStringMatch{fragment: "Set a local password first if you want password-confirmed safety actions", message: "expected danger-zone guidance for oidc-only account"},
+		// The danger zone offers the step-up route rather than a password form:
+		// an account with no local password confirms an erasure at the provider.
+		// Addressed by hook, not by copy, per the markup-contract rule.
+		bodyStringMatch{fragment: "data-clear-data-stepup", message: "expected the clear-data step-up panel for oidc-only account"},
+		bodyStringMatch{fragment: `action="/api/v1/users/current/data-wipe/step-up"`, message: "expected the clear-data step-up form action"},
+		bodyStringMatch{fragment: "data-delete-account-stepup", message: "expected the delete-account step-up panel for oidc-only account"},
+		bodyStringMatch{fragment: `action="/api/v1/users/current/deletion/step-up"`, message: "expected the delete-account step-up form action"},
 	)
 	assertBodyNotContainsAll(t, rendered,
 		bodyStringMatch{fragment: `name="current_password"`, message: "did not expect current-password field before local auth is enabled"},
@@ -34,38 +40,41 @@ func TestSettingsPageForOIDCOnlyAccountShowsLocalPasswordSetup(t *testing.T) {
 	)
 }
 
+// TestOIDCOnlySettingsSensitiveActionsRequireLocalPassword pins WEB-54: an
+// OIDC-only account submitting a password to a password-gated settings action
+// gets the SAME refusal a wrong password on a local-auth account gets — 401
+// "invalid password" — never the old, distinct 403 "local password required"
+// that told the caller outright it had no local password to check against.
+// Regression: TestSettingsReauthMergesNoLocalPasswordIntoInvalidPassword pins
+// the same invariant at the mapper level; this one pins it end to end.
 func TestOIDCOnlySettingsSensitiveActionsRequireLocalPassword(t *testing.T) {
 	t.Parallel()
 
 	ctx := newOIDCOnlySettingsSecurityTestContext(t, "settings-oidc-guard@example.com")
 
 	testCases := []struct {
-		name      string
-		method    string
-		path      string
-		form      url.Values
-		wantError string
+		name   string
+		method string
+		path   string
+		form   url.Values
 	}{
 		{
-			name:      "recovery regeneration",
-			method:    http.MethodPost,
-			path:      "/api/v1/users/current/recovery-code",
-			form:      url.Values{},
-			wantError: "local password required",
+			name:   "recovery regeneration",
+			method: http.MethodPost,
+			path:   "/api/v1/users/current/recovery-code",
+			form:   url.Values{"password": {"unused"}},
 		},
 		{
-			name:      "clear-data validation",
-			method:    http.MethodPost,
-			path:      "/api/v1/users/current/data-wipe/validate",
-			form:      url.Values{"password": {"unused"}},
-			wantError: "local password required",
+			name:   "clear-data validation",
+			method: http.MethodPost,
+			path:   "/api/v1/users/current/data-wipe/validate",
+			form:   url.Values{"password": {"unused"}},
 		},
 		{
-			name:      "delete account",
-			method:    http.MethodDelete,
-			path:      "/api/v1/users/current",
-			form:      url.Values{"password": {"unused"}},
-			wantError: "local password required",
+			name:   "delete account",
+			method: http.MethodDelete,
+			path:   "/api/v1/users/current",
+			form:   url.Values{"password": {"unused"}},
 		},
 	}
 
@@ -77,9 +86,9 @@ func TestOIDCOnlySettingsSensitiveActionsRequireLocalPassword(t *testing.T) {
 			})
 			defer func() { _ = response.Body.Close() }()
 
-			assertStatusCode(t, response, http.StatusForbidden)
-			if got := readAPIError(t, response.Body); got != testCase.wantError {
-				t.Fatalf("expected %q, got %q", testCase.wantError, got)
+			assertStatusCode(t, response, http.StatusUnauthorized)
+			if got := readAPIError(t, response.Body); got != "invalid password" {
+				t.Fatalf("expected %q, got %q", "invalid password", got)
 			}
 		})
 	}

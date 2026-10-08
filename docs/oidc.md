@@ -8,14 +8,21 @@ Use this page together with [README.md](../README.md) and [docs/self-hosted.md](
 - `docs/self-hosted.md` defines the supported deployment contract.
 - this page explains the OIDC-specific operator setup, provider recipes, rollout guidance, and troubleshooting.
 
+## Contents
+
+- **Understand it first:** [Current Contract](#current-contract) · [How Sign-In Works](#how-sign-in-works) · [Response mode](#response-mode) · [How Auto-Provision Works](#how-auto-provision-works) · [How Logout Works](#how-logout-works) · [Accepted Signing Algorithms](#accepted-signing-algorithms)
+- **Configure it:** [Required Environment](#required-environment) · [Provider Recipes](#provider-recipes) · [Rollout Checklist](#rollout-checklist)
+- **Pick your provider:** [Compatibility Matrix](#provider-compatibility-matrix) — [Keycloak](#keycloak), [Authentik](#authentik), [Authelia](#authelia), [Pocket ID](#pocket-id), [ZITADEL](#zitadel), [query-only providers](#query-only-providers-dex-better-auth-older-pocket-id) ([Dex](#dex), [better-auth](#better-auth))
+- **Fix it:** [Troubleshooting](#troubleshooting)
+
 ## Current Contract
 
 Ovumcy's OIDC support is optional, but the contract is broader than the first hybrid release:
 
 - sign-in uses server-side Authorization Code + PKCE; `OIDC_RESPONSE_MODE=form_post` (the default) has the provider auto-POST the code, while `OIDC_RESPONSE_MODE=query` is an opt-in for providers that can only return the code as a URL query redirect (see [Response mode](#response-mode));
 - `OIDC_LOGIN_MODE=hybrid` keeps local username/password available alongside SSO;
-- `OIDC_LOGIN_MODE=oidc_only` removes public local login, register, and forgot-password entry points from the browser UX;
-- the first successful OIDC sign-in uses an existing `(issuer, subject)` link when present, otherwise it falls back to a verified email match;
+- `OIDC_LOGIN_MODE=oidc_only` closes the public local login, register, and forgot-password routes server-side — `Login`, `Register`, and `ForgotPassword` refuse the request (`403` for JSON/HTMX, a flash-carrying redirect to `/login` for a page load) before doing anything else, so this is a closed route, not merely a button removed from the page;
+- the first successful OIDC sign-in uses an existing `(issuer, subject)` link when present; a verified email claim that matches an existing local account does **not** link automatically — the callback refuses and redirects to `/login`; completing the link needs the account's current password to start a Settings step-up and a fresh interactive re-authentication at the provider to finish (no separate TOTP challenge — the provider re-authentication substitutes for it; see [How Sign-In Works](#how-sign-in-works)), because otherwise any provider able to assert someone's email address could take over their account;
 - `OIDC_AUTO_PROVISION=true` may create a new `owner` account only when `REGISTRATION_MODE=open`;
 - `OIDC_AUTO_PROVISION_ALLOWED_DOMAINS` can restrict auto-provisioning to a comma-separated domain allowlist;
 - auto-provisioned accounts start without a local password or recovery code;
@@ -48,6 +55,23 @@ Notes:
 - `COOKIE_SECURE=true` is mandatory when `OIDC_ENABLED=true`.
 - `OIDC_REDIRECT_URL` must be an absolute `https://` URL and its path must be exactly `/auth/oidc/callback`.
 - `OIDC_ISSUER_URL` must be the issuer URL itself, not a browser login page URL and not a URL with query parameters or fragments.
+- Every configured OIDC URL must name a host. `https://:8443`, `https://0.0.0.0:8443` and `https://[::]:8443` are rejected at startup: they parse as valid
+  URLs but resolve to the machine Ovumcy runs on, which would send the client secret and the authorization code to whatever listens on that port. A real
+  hostname or a concrete address — `127.0.0.1` included — is required, written in plain dotted-quad form: a numeric host such as `0`, `0.1`, `00.0.0.0`,
+  `0x0` or `192.168.001.010` is rejected too, because a platform resolver may read it as a different address than it appears to name. A host
+  containing any non-ASCII character (for example the full-width `０.０.０.０`) is rejected as well: HTTP clients and browsers map such a host to ASCII
+  before connecting, so what it reaches cannot be checked from its spelling. An internationalized domain works in its ASCII `xn--` form.
+  The same requirement applies to the `authorization_endpoint` your provider advertises
+  in its discovery document, which must additionally be present and an absolute `https://` URL; a document that omits it or fails the check leaves SSO
+  unavailable rather than sending the browser to that URL.
+- Every endpoint the provider's discovery document advertises and Ovumcy uses — `authorization_endpoint`, `token_endpoint`, `jwks_uri` and
+  `end_session_endpoint` — must be on the issuer's origin: the same scheme, host and port as `OIDC_ISSUER_URL`. A provider whose sign-in page
+  lives on another host (for example a separate `login.` subdomain) is refused when Ovumcy loads its discovery document, and SSO stays
+  unavailable until `OIDC_ISSUER_URL` names an issuer whose endpoints share its origin. An `end_session_endpoint` on another origin is dropped, so
+  sign-out stays local. A stored provider-logout target is checked against the issuer configured now, so after the issuer's origin (scheme, host or port)
+  changes, a sign-out from a session started before the change is local only; a change that keeps the origin (for example another
+  realm on the same host) does not affect it. The address the provider returns the browser to after sign-out is always the one
+  configured now (`OIDC_POST_LOGOUT_REDIRECT_URL`, or `/login` on the `OIDC_REDIRECT_URL` origin), never one saved with the session.
 - `OIDC_CA_FILE` is optional. Use it only when the provider certificate chain is signed by a private or internal CA that the Ovumcy runtime does not already trust.
 - `OIDC_LOGIN_MODE` must be `hybrid` or `oidc_only`.
 - `OIDC_RESPONSE_MODE` must be `form_post` (default) or `query`. Leave it at `form_post` unless your provider cannot form-post the callback (see [Response mode](#response-mode)).
@@ -58,16 +82,27 @@ Notes:
 
 ## How Sign-In Works
 
-1. The login page shows a `Sign in with SSO` button when `OIDC_ENABLED=true`.
+1. The login page shows a `Log in with SSO` button when `OIDC_ENABLED=true`.
 2. Ovumcy starts a server-side Authorization Code flow with PKCE and writes a sealed one-time state cookie containing the OIDC `state`, `nonce`, PKCE verifier, and expiry timestamp.
 3. The identity provider authenticates the user and returns the browser to `/auth/oidc/callback` — an auto-POST of the `code` and `state` in the request body (`form_post`, the default) or a `GET` redirect carrying them in the URL query (`query`). Ovumcy reads the callback from exactly one source keyed by the mode; it never reads both.
 4. Ovumcy validates the sealed state, exchanges the authorization code for tokens, and verifies the ID token plus `nonce`.
 5. If the `(issuer, subject)` identity link already exists, the linked local account is used immediately.
-6. Otherwise, Ovumcy checks for a verified email match against an existing local account.
-7. If no account exists and auto-provisioning is enabled, Ovumcy can create a new `owner` account, subject to `REGISTRATION_MODE=open` and any configured domain allowlist.
-8. Ovumcy finishes sign-in by issuing the normal local `ovumcy_auth` session cookie.
+6. Otherwise, if a verified email claim matches an existing local account, Ovumcy **neither links the two nor signs the user in**. It redirects to `/login` with a message pointing the account holder at Settings: sign in with your existing method, then link the new identity from there.
+   There is no unauthenticated way to complete this link — the public `/auth/oidc/link-confirm` route that used to accept a password on this page was removed for good (WEB-77). Without this gate, any provider able to assert an existing user's email address could take over their account.
+   The invariant itself — why an email claim is never enough, the two authorised linking paths (Settings step-up, operator CLI), and why the old public route is gone rather than merely closed — is owned by [docs/security/oidc-and-sessions.md](security/oidc-and-sessions.md); this page keeps the operator-facing flow.
+7. If no account exists and auto-provisioning is enabled, Ovumcy can create a new `owner` account, subject to `REGISTRATION_MODE=open` and any configured domain allowlist. A brand-new account has nothing to take over, so no confirmation applies.
+8. Ovumcy finishes sign-in by issuing the normal local `ovumcy_auth` session cookie for a path that resolved to a session (steps 5 and 7); step 6 never mints one on its own.
 
 Provider and auth errors are intentionally kept out of query strings and fragments. Browser-facing failures return through the existing flash-based login UX instead. (In `query` response mode the provider itself puts the successful `code`/`state` in the callback URL — see [Response mode](#response-mode) — but Ovumcy still never emits its own error state into a URL.)
+
+### Linking and unlinking from Settings
+
+- **Link:** `Settings` → the connected sign-in identity card. Enter the account's current password, then confirm at the provider. An account without a local password cannot link another identity until it sets one.
+- **Unlink:** the same card lists every linked identity by issuer and link date; each row has an **Unlink** button that asks for the current password and a confirmation. The last way into an account cannot be removed: an account's only identity stays linked unless local password sign-in is set up and allowed (`OIDC_LOGIN_MODE=hybrid`).
+- Linking and unlinking both sign out every other session of the account.
+- `email_verified` plays no part in linking: the identity is the `(issuer, subject)` pair, bound from a password-confirmed session.
+- A password change or reset does not remove linked identities; unlink one explicitly.
+- A provider whose ID tokens lack `sub` or `iss` cannot sign anyone in.
 
 ## Response mode
 
@@ -84,6 +119,23 @@ Why `query` is safe despite putting the code in the URL: Ovumcy's sign-in is Aut
 
 Prefer `form_post`; reach for `query` only when the provider gives you no choice.
 
+### A provider on another site
+
+Nothing has to be configured for this, but it is worth knowing what happens. When the provider is served from a different registrable site than Ovumcy — the usual case for a hosted IdP — the browser treats the `form_post` callback as a cross-site `POST` and withholds the session cookie from it, which is exactly what `SameSite=Lax` is for. A step-up (linking an identity, setting a first local password, clearing data, deleting the account) has to know *whose* re-authentication just came back, so the callback answers with a small same-origin page that immediately navigates to `/auth/oidc/callback/continue`, where the session cookie is delivered and the action finishes.
+
+What this means in practice:
+
+- the hop is internal — there is no extra redirect URI to register with the provider, and `OIDC_REDIRECT_URL` is unchanged;
+- the hand-off between the two legs is a sealed, `HttpOnly`, `Secure` cookie scoped to that one path, usable once, and expiring after a minute;
+- if a reverse proxy in front of Ovumcy filters paths, `/auth/oidc/callback/continue` has to reach the app like the rest of `/auth/oidc/`;
+- an ordinary sign-in is unaffected, and so is any callback from a provider on the same site as Ovumcy: both complete on the callback itself;
+- a cross-site step-up takes the hop in `query` mode too: the return is classified by where it came from, not by response mode;
+- a refusal takes the same hop, so where the owner lands does not depend on how her browser treats a redirect begun on another site.
+
+The hop is chosen from the `Sec-Fetch-Site` request header, which the browser sets and page script cannot forge. A proxy in front of Ovumcy that strips `Sec-` headers therefore hides a cross-site return: the step-up then refuses with "that re-authentication does not match the account signed in here". If step-ups fail that way against a cross-site provider, check that the proxy passes `Sec-Fetch-Site` through.
+
+A browser that never sends the header reaches the same dead end for the same reason — anything older than Chrome 76, Firefox 90 or Safari 16.4. An absent header is read as *nothing stated*, never as *cross-site*, which is the rule Ovumcy applies to Fetch Metadata everywhere: a missing header may not be the thing that decides, because a proxy forwarding part of the family and dropping the rest would otherwise change how requests are handled rather than merely how they are labelled. The consequence is worth stating plainly: on such a browser, a step-up against a provider on another site cannot complete. Signing in is unaffected, and so is every step-up against a provider on Ovumcy's own site.
+
 ## How Auto-Provision Works
 
 Auto-provision is intentionally narrow:
@@ -98,27 +150,45 @@ That last point is important. An auto-provisioned OIDC-only account can use the 
 
 - local password recovery is not available yet;
 - recovery-code regeneration is not available yet;
-- password-confirmed sensitive actions such as `clear data` or `delete account` stay blocked until the user sets a local password in `Settings`.
+- password-confirmed sensitive actions such as recovery-code regeneration stay blocked until the user sets a local password in `Settings`. **Erasure is the exception**: `clear data` and `delete account` are available without one, confirmed at the provider through the step-up flow described below.
 
 To enable a local password, OIDC-only users go through a **step-up re-authentication flow**:
 
 1. The user fills the "set local password" form in `Settings`. The browser submits to `POST /api/v1/users/current/password/step-up`, which validates the password, prepares its bcrypt hash without touching the database, and redirects the browser to the provider's authorize endpoint with `prompt=login` and `max_age=0` so the provider is forced to re-authenticate the user interactively.
-2. The provider posts the result back to the existing `/auth/oidc/callback` endpoint. Ovumcy detects the step-up flow (via a sealed cookie issued in step 1), runs the OIDC code exchange, and requires the resulting ID token's `auth_time` claim (or, if the provider omits it, `iat`) to lie within the last five minutes and the returned `(issuer, subject)` pair to already be linked to the current session's user.
+2. The provider posts the result back to the existing `/auth/oidc/callback` endpoint. Ovumcy detects the step-up flow (via a sealed cookie issued in step 1), runs the OIDC code exchange, and requires the resulting ID token's `auth_time` claim to lie within the last five minutes (see [Provider requirement for step-up](#provider-requirement-for-step-up-auth_time)) and the returned `(issuer, subject)` pair to already be linked to the current session's user.
 3. Only after both checks succeed does Ovumcy persist the prepared password hash, mint a fresh recovery code, and present it on the dedicated `/recovery-code` page. A stale or mismatched re-auth leaves the account untouched.
 
 The `PUT /api/v1/users/current/password` endpoint still works for accounts that already have local auth enabled (ordinary password rotation). For accounts with `LocalAuthEnabled=false` it returns `403 oidc reauth required` so the step-up flow above is the only path to enrol a local password.
+
+### Erasure without a local password
+
+Erasing health data always costs a fresh re-authentication. An account provisioned through OIDC has no password to satisfy that with, so it satisfies it at the provider instead, through the same step-up primitive:
+
+1. The owner confirms the action in `Settings → Danger zone`. The browser submits to `POST /api/v1/users/current/data-wipe/step-up` or `POST /api/v1/users/current/deletion/step-up`, which seals **which** erasure was confirmed into the step-up cookie and redirects to the provider exactly as step 1 above does. Nothing is erased at this point.
+2. The provider posts back to `/auth/oidc/callback`, which runs the same freshness and identity checks as the local-password flow.
+3. Only then does the erasure run — the operation taken from the sealed state, never from the callback request, which arrives from the provider carrying no body of its own.
+
+An account that **has** a local password is refused both endpoints with `400 invalid settings input`: its erasure gate is the password, and the SSO route must never become a way around it.
+
+### Provider requirement for step-up: `auth_time`
+
+All three step-ups — erasure, enrolling a local password, and linking an identity from `Settings` — accept the provider's answer only if its ID token carries an `auth_time` claim from the last five minutes. `iat` is never used in its place: it dates the token, not the sign-in, so a provider that answers `prompt=login` from a cached session would mint a fresh `iat` over a stale authentication. OpenID Connect Core makes `auth_time` required whenever `max_age` is requested, and Ovumcy always sends `max_age=0` on a step-up, so a conformant provider is unaffected. There is no setting to relax this.
+
+Consequence: **a provider that omits `auth_time` under `max_age=0` cannot complete any of the three step-ups.** On such a provider an OIDC-only account cannot clear its data, delete itself or enrol a local password, and no account — with a local password or without — can link another identity from `Settings`; every attempt returns to `Settings` and changes nothing. That refusal is its own message — it says the provider did not report when the sign-in happened and that retrying cannot help — and it is distinct from the "too old, sign in again" refusal a provider that *does* send `auth_time` produces. The audit stream separates them the same way: the same `denied` outcome on the step-up's action, with `reason="oidc reauth auth_time missing"` for this case and `reason="oidc reauth stale"` for a sign-in that simply took too long, so a non-conforming provider is visible in the log without asking the owner what she saw. Ordinary SSO sign-in is unaffected — it never checks `auth_time`. None of the rows in the [compatibility matrix](#provider-compatibility-matrix) has been verified against this requirement; check your provider by decoding an ID token it issues for a `max_age=0` request. The operator commands need no step-up: `ovumcy link-oidc-identity` links an identity, and `ovumcy users delete` erases an account on its owner's behalf (see [GDPR](gdpr.md)).
 
 ## How Logout Works
 
 `OIDC_LOGOUT_MODE` controls what happens after Ovumcy clears its own auth cookies:
 
 - `local`: clear Ovumcy cookies only, then return to `/login`;
-- `provider`: if the provider session metadata includes `end_session_endpoint`, redirect there with `id_token_hint` and `post_logout_redirect_uri`; otherwise Ovumcy falls back to local logout;
+- `provider`: if the provider session metadata includes `end_session_endpoint`, redirect there with `id_token_hint` and `post_logout_redirect_uri`; otherwise Ovumcy falls back to local logout. The post-logout address must be on the same origin (scheme, host, port) as `OIDC_REDIRECT_URL`; one that is not is never sent to the provider, and sign-out completes locally;
 - `auto`: same behavior as `provider`, but intended as the default "best effort" setting for operators who want provider logout when available without breaking logout on providers that do not publish an end-session endpoint.
 
 If you want provider logout, keep `OIDC_POST_LOGOUT_REDIRECT_URL` on the same public origin as the callback URL. If you leave it empty, Ovumcy defaults to your public `/login` URL.
 
-Ovumcy host-pins the discovery-supplied `end_session_endpoint` to the configured `OIDC_ISSUER_URL` (same scheme, host, and effective port). If a provider advertises an end-session endpoint on a different origin — for example a compromised or look-alike discovery document — Ovumcy rejects it at provider load and silently falls back to local logout, regardless of `OIDC_LOGOUT_MODE`. This prevents a malicious metadata response from redirecting the logout flow (including any `id_token_hint` carried in the URL) to an attacker-controlled host.
+A change to `OIDC_LOGOUT_MODE` takes effect on the next sign-out, including for sessions that began before the change. Ovumcy stores the provider material a sign-out would need (the `end_session_endpoint` and the `id_token_hint`) with the session, and that record can outlive the setting by up to seven days — but it is only the data for the hop, never the decision to make it. After you switch to `local`, or turn OIDC off, every sign-out is local and the stored record is discarded as the session ends.
+
+Ovumcy host-pins the discovery-supplied `end_session_endpoint` to the configured `OIDC_ISSUER_URL` (same scheme, host, and effective port). If a provider advertises an end-session endpoint on a different origin — for example a compromised or look-alike discovery document — Ovumcy rejects it at provider load and silently falls back to local logout, regardless of `OIDC_LOGOUT_MODE`. This prevents a malicious metadata response from redirecting the logout flow (including any `id_token_hint` carried in the URL) to an attacker-controlled host. The pin also applies to a discovery document that Ovumcy can only decode in part: sign-in still works, and an end-session endpoint that fails the pin degrades to local logout exactly as a missing one does.
 
 ## Accepted Signing Algorithms
 
@@ -330,7 +400,8 @@ Check:
 - `OIDC_ISSUER_URL` points to the real issuer, not to a login form URL;
 - the provider is reachable from the Ovumcy host or container;
 - the provider certificate chain is trusted by the Ovumcy runtime, or `OIDC_CA_FILE` points to a readable PEM bundle for your private CA;
-- reverse-proxy DNS and firewall rules allow Ovumcy to reach the provider.
+- reverse-proxy DNS and firewall rules allow Ovumcy to reach the provider;
+- the provider's discovery document, key set (JWKS) and token response each stay under 512 KiB, with under 64 KiB of response headers. Ovumcy refuses a larger response outright rather than truncating it. Real providers answer in a few KiB, so hitting either limit points at a proxy or captive portal answering in the provider's place, or at a misbehaving provider.
 
 ### Auto-provision does not happen
 
@@ -340,6 +411,37 @@ Check:
 - `REGISTRATION_MODE=open`;
 - the provider marks the email as verified;
 - `OIDC_AUTO_PROVISION_ALLOWED_DOMAINS` is empty, or the email domain is listed there exactly.
+
+### SSO resolves to an existing account but does not sign the user in
+
+This is the account-link hand-off, not a failure. It happens once for each new
+provider identity being attached to an existing account: the provider asserted an
+email that matches an existing local account, and Ovumcy refuses to link a fresh
+`(issuer, subject)` to an existing account on the strength of an email claim alone.
+The user lands back on `/login` with a message pointing them at Settings.
+
+To finish the link:
+
+- **With a working sign-in already** (local password, or a different already-linked
+  OIDC identity): sign in normally, open **Settings**, and use **Link an OIDC
+  identity**. This starts a fresh interactive re-authentication at the provider
+  (`prompt=login`) — the same step-up primitive local-password enrollment and the
+  clear-data/delete-account flows already use — and links on return.
+- **With no working sign-in at all** (an OIDC-only account whose provider changed,
+  for example): the operator runs `ovumcy link-oidc-identity <email>|--id <id>
+  --issuer <issuer> --subject <subject>` from the machine `docker compose exec` reaches.
+  A new link signs out every session the account had open, on this path as on
+  the Settings one.
+
+Things worth knowing before treating it as a bug:
+
+- There is no unauthenticated page that completes this link, at any password
+  strength. That page (`/auth/oidc/link-confirm`) existed once and was removed for
+  good (WEB-77) — see [docs/security/oidc-and-sessions.md](security/oidc-and-sessions.md).
+- The link is refused outright if another account claimed the same
+  `(issuer, subject)` in the meantime, on both paths above.
+- There is no configuration switch that skips this. Auto-linking by asserted email
+  is the account-takeover vector the gate exists to close.
 
 ### The user can sign in but cannot regenerate a recovery code or use password-confirmed danger-zone actions
 

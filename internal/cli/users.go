@@ -11,17 +11,20 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"strconv"
+
 	"github.com/ovumcy/ovumcy-web/internal/db"
+	"github.com/ovumcy/ovumcy-web/internal/models"
 	"github.com/ovumcy/ovumcy-web/internal/services"
 )
 
 func RunUsersCommand(databaseConfig db.Config, args []string) error {
-	return runUsersCommand(databaseConfig, args, os.Stdin, os.Stdout)
+	return runUsersCommand(databaseConfig, args, calendarFeedFencePath(), os.Stdin, os.Stdout)
 }
 
-func runUsersCommand(databaseConfig db.Config, args []string, input io.Reader, output io.Writer) error {
+func runUsersCommand(databaseConfig db.Config, args []string, fencePath string, input io.Reader, output io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: ovumcy users <list|delete|create>")
+		return errors.New("usage: ovumcy users <list|delete|create|set-email>")
 	}
 
 	subcommand := strings.ToLower(strings.TrimSpace(args[0]))
@@ -31,41 +34,40 @@ func runUsersCommand(databaseConfig db.Config, args []string, input io.Reader, o
 			return errors.New("usage: ovumcy users list")
 		}
 	case "delete":
-		if _, _, err := parseUsersDeleteArgs(args[1:]); err != nil {
+		if _, err := parseUsersDeleteArgs(args[1:]); err != nil {
 			return err
 		}
 	case "create":
 		if _, err := parseUsersCreateArgs(args[1:]); err != nil {
 			return err
 		}
+	case "set-email":
+		if _, err := parseUsersSetEmailArgs(args[1:]); err != nil {
+			return err
+		}
 	default:
-		return errors.New("usage: ovumcy users <list|delete|create>")
+		return errors.New("usage: ovumcy users <list|delete|create|set-email>")
 	}
 
-	database, err := db.OpenDatabase(databaseConfig)
+	repositories, fence, closeDatabase, err := openOperatorRepositories(databaseConfig, fencePath)
 	if err != nil {
-		return fmt.Errorf("database init failed: %w", err)
+		return err
 	}
-	sqlDB, err := database.DB()
-	if err != nil {
-		return fmt.Errorf("database init failed: %w", err)
-	}
-	defer func() {
-		_ = sqlDB.Close()
-	}()
+	defer closeDatabase()
 
-	repositories := db.NewRepositories(database)
 	service := services.NewOperatorUserService(repositories.Users, services.NewAuthService(repositories.Users))
 
 	switch subcommand {
 	case "list":
 		return runUsersList(service, output)
 	case "delete":
-		return runUsersDelete(service, args[1:], input, output)
+		return runUsersDelete(service, fencePath, fence, args[1:], input, output)
 	case "create":
 		return runUsersCreate(service, args[1:], input, output)
+	case "set-email":
+		return runUsersSetEmail(service, args[1:], output)
 	default:
-		return errors.New("usage: ovumcy users <list|delete|create>") // codecov:ignore -- unreachable: the subcommand is validated in the switch above
+		return errors.New("usage: ovumcy users <list|delete|create|set-email>") // codecov:ignore -- unreachable: the subcommand is validated in the switch above
 	}
 }
 
@@ -108,22 +110,34 @@ func runUsersList(service *services.OperatorUserService, output io.Writer) error
 	return writer.Flush()
 }
 
-func runUsersDelete(service *services.OperatorUserService, args []string, input io.Reader, output io.Writer) error {
-	email, skipConfirm, err := parseUsersDeleteArgs(args)
+func runUsersDelete(service *services.OperatorUserService, fencePath string, fence *services.CalendarFeedRestoreFence, args []string, input io.Reader, output io.Writer) error {
+	opts, err := parseUsersDeleteArgs(args)
 	if err != nil {
 		return err
 	}
 
-	user, err := service.GetUserByEmail(context.Background(), email)
+	normalizedEmail := ""
+	if opts.userID == 0 {
+		normalizedEmail, err = normalizeOperatorEmailArgument(opts.email)
+		if err != nil {
+			return err
+		}
+	}
+
+	user, err := resolveOperatorUser(service, opts.userID, normalizedEmail)
 	if err != nil {
-		return err
+		return mapUsersDeleteError(err, opts.userID, normalizedEmail)
 	}
 
 	if output == nil {
 		output = os.Stdout
 	}
-	if !skipConfirm {
-		_, _ = fmt.Fprintf(output, "Delete account %s (id=%d, role=%s) and all related health data? Type DELETE to continue: ", user.Email, user.ID, user.Role)
+	if !opts.skipConfirm {
+		// %q, not %s: an account addressed by id may be one of the legacy rows
+		// the boot repair had to leave standing, whose stored value carries a
+		// display name and looks nothing like the address the operator has in
+		// mind. Quoting it is what makes the confirmation a real check.
+		_, _ = fmt.Fprintf(output, "Delete account %q (id=%d, role=%s) and all related health data? Type DELETE to continue: ", user.Email, user.ID, user.Role)
 		confirmed, confirmErr := readDeleteConfirmation(input)
 		if confirmErr != nil {
 			return confirmErr
@@ -133,40 +147,113 @@ func runUsersDelete(service *services.OperatorUserService, args []string, input 
 		}
 	}
 
-	deletedUser, err := service.DeleteUserByEmail(context.Background(), email)
-	if err != nil {
+	// The erasure takes the account row and its calendar feed with it, so this
+	// process must confirm and advance the SAME fence the server does before
+	// that happens — never merely warn about it. Raised here, past the
+	// confirmation and immediately before the write, so a cancelled deletion
+	// never reaches it and a refusal here means the row is never touched.
+	if err := confirmOperatorFeedRevocation(context.Background(), fencePath, fence, output); err != nil {
 		return err
 	}
-	_, _ = fmt.Fprintf(output, "Deleted account %s (id=%d).\n", deletedUser.Email, deletedUser.ID)
+
+	deletedUser, err := opts.delete(service)
+	if err != nil {
+		return operatorFeedRevocationCommitted(mapUsersDeleteError(err, opts.userID, normalizedEmail))
+	}
+	_, _ = fmt.Fprintf(output, "Deleted account %q (id=%d).\n", deletedUser.Email, deletedUser.ID)
 	return nil
 }
 
-func parseUsersDeleteArgs(args []string) (string, bool, error) {
-	if len(args) == 0 {
-		return "", false, errors.New("usage: ovumcy users delete <email> [--yes]")
+// mapUsersDeleteError adds the one refusal the shared lookup mapper cannot
+// name — the erasure itself failing — and leaves every other shape to it. The
+// delete re-resolves the row internally, so a row removed in the window
+// between this command's own resolve and its write arrives here as the same
+// not-found the resolve would have reported.
+func mapUsersDeleteError(err error, userID uint, normalizedEmail string) error {
+	if errors.Is(err, services.ErrOperatorUserDeleteFailed) {
+		return fmt.Errorf("delete account: %w", err)
 	}
+	return mapOperatorUserLookupError(err, userID, normalizedEmail)
+}
 
-	email := ""
-	skipConfirm := false
-	for _, arg := range args {
-		value := strings.TrimSpace(arg)
-		switch value {
-		case "":
+const usersDeleteUsage = "usage: ovumcy users delete <email>|--id <id> [--yes]"
+
+// usersDeleteOptions carries exactly one handle, resolved by
+// resolveOperatorUser, whose doc comment carries why the id form has to exist
+// beside the address one.
+type usersDeleteOptions struct {
+	email       string
+	userID      uint
+	skipConfirm bool
+}
+
+func (opts usersDeleteOptions) delete(service *services.OperatorUserService) (models.OperatorUserSummary, error) {
+	if opts.userID != 0 {
+		return service.DeleteUserByID(context.Background(), opts.userID)
+	}
+	return service.DeleteUserByEmail(context.Background(), opts.email)
+}
+
+func parseUsersDeleteArgs(args []string) (usersDeleteOptions, error) {
+	opts := usersDeleteOptions{}
+	for index := 0; index < len(args); index++ {
+		value := strings.TrimSpace(args[index])
+		switch {
+		case value == "":
 			continue
-		case "--yes":
-			skipConfirm = true
-		default:
-			if email != "" {
-				return "", false, errors.New("usage: ovumcy users delete <email> [--yes]")
+		case value == "--yes":
+			opts.skipConfirm = true
+		case isUsersIDFlag(value):
+			userID, consumed, err := parseUsersIDFlag(args, index, usersDeleteUsage)
+			if err != nil {
+				return usersDeleteOptions{}, err
 			}
-			email = value
+			if opts.userID != 0 {
+				return usersDeleteOptions{}, errors.New(usersDeleteUsage)
+			}
+			opts.userID = userID
+			index += consumed
+		case strings.HasPrefix(value, "--"):
+			return usersDeleteOptions{}, errors.New(usersDeleteUsage)
+		default:
+			if opts.email != "" {
+				return usersDeleteOptions{}, errors.New(usersDeleteUsage)
+			}
+			opts.email = value
 		}
 	}
 
-	if email == "" {
-		return "", false, errors.New("usage: ovumcy users delete <email> [--yes]")
+	if (opts.email == "") == (opts.userID == 0) {
+		return usersDeleteOptions{}, errors.New(usersDeleteUsage)
 	}
-	return email, skipConfirm, nil
+	return opts, nil
+}
+
+func isUsersIDFlag(value string) bool {
+	return value == "--id" || strings.HasPrefix(value, "--id=")
+}
+
+// parseUsersIDFlag accepts both `--id 7` and `--id=7`, and reports how many
+// FOLLOWING arguments it consumed. The id is the one printed by `users list`,
+// so anything that is not a positive whole number is a typo, not a row.
+func parseUsersIDFlag(args []string, index int, usage string) (uint, int, error) {
+	raw := ""
+	consumed := 0
+	if after, found := strings.CutPrefix(strings.TrimSpace(args[index]), "--id="); found {
+		raw = strings.TrimSpace(after)
+	} else {
+		if index+1 >= len(args) {
+			return 0, 0, errors.New(usage)
+		}
+		raw = strings.TrimSpace(args[index+1])
+		consumed = 1
+	}
+
+	userID, err := strconv.ParseUint(raw, 10, 32)
+	if err != nil || userID == 0 {
+		return 0, 0, fmt.Errorf("invalid account id %q (see ovumcy users list)", raw)
+	}
+	return uint(userID), consumed, nil
 }
 
 func readDeleteConfirmation(input io.Reader) (bool, error) {
@@ -296,6 +383,99 @@ func stdinIsTerminal(file *os.File) bool {
 		return false
 	}
 	return info.Mode()&os.ModeCharDevice != 0
+}
+
+const usersSetEmailUsage = "usage: ovumcy users set-email --id <id> <email>"
+
+// runUsersSetEmail is the non-destructive half of the leftover runbook: it
+// re-homes ONE account, addressed by the id `users list` prints, to an address
+// a later sign-in can actually reproduce. Deleting such a row was never a
+// repair — the account's health history goes with it — and until this command
+// existed the runbook's "remove or re-home it deliberately" had no re-home to
+// name.
+func runUsersSetEmail(service *services.OperatorUserService, args []string, output io.Writer) error {
+	opts, err := parseUsersSetEmailArgs(args)
+	if err != nil {
+		return err
+	}
+
+	before, after, err := service.SetEmailByID(context.Background(), opts.userID, opts.email)
+	if err != nil {
+		return mapUsersSetEmailError(err, opts.userID)
+	}
+
+	if output == nil {
+		output = os.Stdout
+	}
+	if before.Email == after.Email {
+		_, _ = fmt.Fprintf(output, "Account id=%d (role=%s) already answers to %s; nothing was changed and no session was revoked.\n", before.ID, before.Role, after.Email)
+		return nil
+	}
+	// %q on the stored value: a legacy row's decorated form differs from the
+	// address it contains, and the operator needs to see which one moved.
+	_, _ = fmt.Fprintf(output, "Account id=%d (role=%s) re-homed: %q → %s\n", before.ID, before.Role, before.Email, after.Email)
+	_, _ = fmt.Fprintln(output, "Every session of this account was revoked; its health data is untouched. Sign in with the new address.")
+	return nil
+}
+
+type usersSetEmailOptions struct {
+	userID uint
+	email  string
+}
+
+func parseUsersSetEmailArgs(args []string) (usersSetEmailOptions, error) {
+	opts := usersSetEmailOptions{}
+	for index := 0; index < len(args); index++ {
+		value := strings.TrimSpace(args[index])
+		switch {
+		case value == "":
+			continue
+		case isUsersIDFlag(value):
+			userID, consumed, err := parseUsersIDFlag(args, index, usersSetEmailUsage)
+			if err != nil {
+				return usersSetEmailOptions{}, err
+			}
+			if opts.userID != 0 {
+				return usersSetEmailOptions{}, errors.New(usersSetEmailUsage)
+			}
+			opts.userID = userID
+			index += consumed
+		case strings.HasPrefix(value, "--"):
+			return usersSetEmailOptions{}, errors.New(usersSetEmailUsage)
+		default:
+			if opts.email != "" {
+				return usersSetEmailOptions{}, errors.New(usersSetEmailUsage)
+			}
+			opts.email = value
+		}
+	}
+
+	if opts.userID == 0 || opts.email == "" {
+		return usersSetEmailOptions{}, errors.New(usersSetEmailUsage)
+	}
+	return opts, nil
+}
+
+// mapUsersSetEmailError takes the id it was addressed by so the two refusals
+// it shares with every other account subcommand — an absent id, an id that
+// names no row — can be answered by mapOperatorUserLookupError in the one
+// wording all of them use. The rest are this command's own: here the address
+// is the NEW value being written, not a handle a lookup failed on.
+func mapUsersSetEmailError(err error, userID uint) error {
+	switch {
+	case errors.Is(err, services.ErrOperatorUserIDRequired), errors.Is(err, services.ErrOperatorUserNotFound):
+		return mapOperatorUserLookupError(err, userID, "")
+	case errors.Is(err, services.ErrOperatorUserEmailRequired):
+		return errors.New("email is required")
+	case errors.Is(err, services.ErrOperatorUserEmailInvalid):
+		return errors.New("invalid email address: pass the bare address, with no display name or angle brackets")
+	case errors.Is(err, services.ErrOperatorUserEmailExists):
+		return errors.New("another account already answers to this email address")
+	case errors.Is(err, services.ErrOperatorUserChangedUnderRepair):
+		return errors.New("this account's email changed while the repair ran — re-read ovumcy users list and retry")
+	default:
+		return fmt.Errorf("set email: %w", err)
+	}
 }
 
 func mapUsersCreateError(err error) error {

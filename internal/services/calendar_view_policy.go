@@ -10,11 +10,18 @@ import (
 
 var ErrCalendarMonthInvalid = errors.New("calendar invalid month")
 
-func ResolveCalendarMonthAndSelectedDate(monthQueryRaw string, selectedDayRaw string, now time.Time, location *time.Location) (time.Time, string, error) {
-	return ResolveCalendarMonthAndSelectedDateWithinBounds(monthQueryRaw, selectedDayRaw, now, location, time.Time{})
-}
-
-func ResolveCalendarMonthAndSelectedDateWithinBounds(monthQueryRaw string, selectedDayRaw string, now time.Time, location *time.Location, minMonth time.Time) (time.Time, string, error) {
+// ResolveCalendarMonthAndSelectedDateWithinBounds resolves the active month and
+// the selected day. A zero minMonth means no lower bound: calendarMonthBefore
+// reports false for every month, so neither the clamp nor the selected-date
+// reset fires. A zero maxMonth means no upper bound, symmetrically, via
+// calendarMonthAfter. The upper clamp is WEB-14 SEC-H5: with no upper bound, an
+// arbitrary ?month= (e.g. "9999-12") reached buildCalendarPredictionMaps'
+// appendPredictedCycles, whose loop chains forward from "now" to the requested
+// grid one cycle at a time — cost proportional to the distance between the two,
+// unbounded by request size. Clamping the month here keeps that distance
+// bounded for every caller of this function; appendPredictedCycles also gained
+// its own hard cap as defense-in-depth (calendar_days.go).
+func ResolveCalendarMonthAndSelectedDateWithinBounds(monthQueryRaw string, selectedDayRaw string, now time.Time, location *time.Location, minMonth time.Time, maxMonth time.Time) (time.Time, string, error) {
 	if location == nil {
 		location = time.UTC
 	}
@@ -31,7 +38,7 @@ func ResolveCalendarMonthAndSelectedDateWithinBounds(monthQueryRaw string, selec
 		if selectedDay, parseErr := parseCalendarDayParam(selectedDayRaw, location); parseErr == nil {
 			selectedDate = selectedDay.Format("2006-01-02")
 			if monthQuery == "" {
-				activeMonth = time.Date(selectedDay.Year(), selectedDay.Month(), 1, 0, 0, 0, 0, location)
+				activeMonth = calendarMonthAnchor(selectedDay, location)
 			}
 		}
 	}
@@ -40,9 +47,10 @@ func ResolveCalendarMonthAndSelectedDateWithinBounds(monthQueryRaw string, selec
 	}
 
 	activeMonth = clampCalendarMonthToMinimum(activeMonth, minMonth, location)
+	activeMonth = clampCalendarMonthToMaximum(activeMonth, maxMonth, location)
 	if selectedDate != "" {
 		selectedDay, parseErr := parseCalendarDayParam(selectedDate, location)
-		if parseErr == nil && calendarMonthBefore(selectedDay, minMonth) {
+		if parseErr == nil && (calendarMonthBefore(selectedDay, minMonth) || calendarMonthAfter(selectedDay, maxMonth)) {
 			selectedDate = ""
 		}
 	}
@@ -50,17 +58,53 @@ func ResolveCalendarMonthAndSelectedDateWithinBounds(monthQueryRaw string, selec
 	return activeMonth, selectedDate, nil
 }
 
-func CalendarAdjacentMonthValues(monthStart time.Time) (string, string) {
-	return CalendarAdjacentMonthValuesWithinBounds(monthStart, time.Time{})
-}
-
-func CalendarAdjacentMonthValuesWithinBounds(monthStart time.Time, minMonth time.Time) (string, string) {
-	prevMonth := monthStart.AddDate(0, -1, 0)
+// CalendarAdjacentMonthValuesWithinBounds returns the previous and next month
+// values for the navigation controls; the previous one is empty when it would
+// fall before minMonth, and the next one is empty when it would fall after
+// maxMonth. A zero bound means no bound on that side.
+func CalendarAdjacentMonthValuesWithinBounds(monthStart time.Time, minMonth time.Time, maxMonth time.Time) (string, string) {
+	// Stepping a month sideways is pure calendar arithmetic, so it runs on a
+	// UTC-anchored copy — the convention calendarGridBounds already follows. Run
+	// in the request zone instead, AddDate lands on a wall clock that a DST jump
+	// on the target month's FIRST does not have, and resolves it backward into
+	// the month before: the "previous month" link then skips a month entirely,
+	// and the "next" link points back at the page the reader is already on.
+	base := CalendarDay(monthStart, time.UTC)
+	prevMonth := base.AddDate(0, -1, 0)
 	prevValue := prevMonth.Format("2006-01")
 	if calendarMonthBefore(prevMonth, minMonth) {
 		prevValue = ""
 	}
-	return prevValue, monthStart.AddDate(0, 1, 0).Format("2006-01")
+	nextMonth := base.AddDate(0, 1, 0)
+	nextValue := nextMonth.Format("2006-01")
+	if calendarMonthAfter(nextMonth, maxMonth) {
+		nextValue = ""
+	}
+	return prevValue, nextValue
+}
+
+// CalendarMaximumNavigableMonth bounds how far into the future the calendar
+// page may be navigated: three years from now, the forward mirror of
+// CalendarMinimumNavigableMonth's three-year look-back from account creation.
+// It is not a medical-relevance bound — the app's own forward projection
+// horizon (calendarFeedProjectionCycles, ~90 days) is far shorter than this —
+// it is a COST bound: appendPredictedCycles chains forward from "now" to the
+// requested grid one cycle at a time, so the distance this function allows is
+// the distance that loop can ever be asked to cross for a legitimately
+// clamped request (WEB-14 SEC-H5). It never passes 9999-12 (WEB-108): a month
+// key for year 10000 is five digits, which parseCalendarMonthQuery refuses, so
+// a "next" link to it would lead to an invalid-month answer.
+func CalendarMaximumNavigableMonth(now time.Time, location *time.Location) time.Time {
+	if location == nil {
+		location = time.UTC
+	}
+
+	today := CalendarDay(DateAtLocation(now, location), time.UTC)
+	horizon := today.AddDate(3, 0, 0)
+	if pastLastProjectableYear(horizon) {
+		horizon = time.Date(lastProjectableYear, time.December, 1, 0, 0, 0, 0, time.UTC)
+	}
+	return calendarMonthAnchor(horizon, location)
 }
 
 func CalendarMinimumNavigableMonth(user *models.User, location *time.Location) time.Time {
@@ -71,29 +115,55 @@ func CalendarMinimumNavigableMonth(user *models.User, location *time.Location) t
 		location = time.UTC
 	}
 
-	minDate := DateAtLocation(user.CreatedAt, location).AddDate(-3, 0, 0)
-	return time.Date(minDate.Year(), minDate.Month(), 1, 0, 0, 0, 0, location)
+	// The three-year step is calendar arithmetic on a date, so it too runs
+	// UTC-anchored: taken in the request zone it can land on a first-of-month
+	// whose local midnight a DST jump skipped and slide the bound a month
+	// earlier than the account's own history justifies.
+	createdDay := CalendarDay(DateAtLocation(user.CreatedAt, location), time.UTC)
+	return calendarMonthAnchor(createdDay.AddDate(-3, 0, 0), location)
 }
 
 func parseCalendarMonthQuery(raw string, now time.Time, location *time.Location) (time.Time, error) {
 	if raw == "" {
-		current := DateAtLocation(now, location)
-		return time.Date(current.Year(), current.Month(), 1, 0, 0, 0, 0, location), nil
+		return calendarMonthAnchor(DateAtLocation(now, location), location), nil
 	}
-	parsed, err := time.ParseInLocation("2006-01", raw, location)
+	// Parsed in UTC, which has no transitions, so the requested year and month
+	// survive the parse untouched — the same reason ParseDayDate parses there.
+	// time.ParseInLocation resolves a nonexistent local midnight exactly as
+	// time.Date does, so in a UTC-minus zone whose DST jump lands on the first
+	// of the requested month it returned the LAST day of the previous month, and
+	// the whole page then rendered that month instead.
+	parsed, err := time.Parse("2006-01", raw)
 	if err != nil {
 		return time.Time{}, err
 	}
-	return time.Date(parsed.Year(), parsed.Month(), 1, 0, 0, 0, 0, location), nil
+	return calendarMonthAnchor(parsed, location), nil
+}
+
+// calendarMonthAnchor returns the first day of value's calendar month, resolved
+// in location through the package's single day-construction point
+// (startOfCalendarDay, via CalendarDay): midnight, or the day's first existing
+// instant when a DST jump skipped it. The month step itself is taken on a
+// UTC-anchored copy, where no midnight is ever missing, so the year and month
+// of the result always equal those of value. A zero value stays zero: CalendarDay
+// passes it through, and the day step is a no-op on it.
+func calendarMonthAnchor(value time.Time, location *time.Location) time.Time {
+	utcDay := CalendarDay(value, time.UTC)
+	return CalendarDay(utcDay.AddDate(0, 0, 1-utcDay.Day()), location)
 }
 
 func parseCalendarDayParam(raw string, location *time.Location) (time.Time, error) {
 	return ParseDayDate(raw, location)
 }
 
+// clampCalendarMonthToMinimum raises monthStart to minMonth when it falls
+// before it. location is always non-nil: the sole caller,
+// ResolveCalendarMonthAndSelectedDateWithinBounds, substitutes time.UTC for a
+// nil one before any of this runs, so the clamped month is anchored in the
+// request zone and never in minMonth's own.
 func clampCalendarMonthToMinimum(monthStart time.Time, minMonth time.Time, location *time.Location) time.Time {
 	if calendarMonthBefore(monthStart, minMonth) {
-		return time.Date(minMonth.Year(), minMonth.Month(), 1, 0, 0, 0, 0, resolveCalendarLocation(location, minMonth))
+		return calendarMonthAnchor(minMonth, location)
 	}
 	return monthStart
 }
@@ -111,12 +181,25 @@ func calendarMonthBefore(month time.Time, minMonth time.Time) bool {
 	return monthNumber < minNumber
 }
 
-func resolveCalendarLocation(location *time.Location, fallback time.Time) *time.Location {
-	if location != nil {
-		return location
+// clampCalendarMonthToMaximum lowers monthStart to maxMonth when it falls
+// after it. location is always non-nil, for the same reason
+// clampCalendarMonthToMinimum's is.
+func clampCalendarMonthToMaximum(monthStart time.Time, maxMonth time.Time, location *time.Location) time.Time {
+	if calendarMonthAfter(monthStart, maxMonth) {
+		return calendarMonthAnchor(maxMonth, location)
 	}
-	if fallback.Location() != nil {
-		return fallback.Location()
+	return monthStart
+}
+
+func calendarMonthAfter(month time.Time, maxMonth time.Time) bool {
+	if maxMonth.IsZero() {
+		return false
 	}
-	return time.UTC
+
+	monthYear, monthNumber, _ := month.Date()
+	maxYear, maxNumber, _ := maxMonth.Date()
+	if monthYear != maxYear {
+		return monthYear > maxYear
+	}
+	return monthNumber > maxNumber
 }

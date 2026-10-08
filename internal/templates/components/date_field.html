@@ -2,6 +2,9 @@
 {{$dayLabel := t .Messages "date_field.day"}}
 {{$monthLabel := t .Messages "date_field.month"}}
 {{$yearLabel := t .Messages "date_field.year"}}
+{{$dayPlaceholder := t .Messages "date_field.day_placeholder"}}
+{{$monthPlaceholder := t .Messages "date_field.month_placeholder"}}
+{{$yearPlaceholder := t .Messages "date_field.year_placeholder"}}
 {{$invalidMessage := .InvalidMessage}}
 {{if not $invalidMessage}}{{$invalidMessage = t .Messages "date_field.invalid"}}{{end}}
 {{$requiredMessage := .RequiredMessage}}
@@ -34,9 +37,9 @@
     {{if .Required}}data-date-field-required="true"{{end}}
     {{if .Min}}min="{{.Min}}"{{end}}
     {{if .Max}}max="{{.Max}}"{{end}}>
-  <div class="grid grid-cols-3 gap-2">
-    <div class="space-y-1">
-      <label class="field-label text-xs" for="{{.FieldID}}-day">{{$dayLabel}}</label>
+  <div class="date-field-parts">
+    <div class="space-y-1 date-field-part">
+      <label class="field-label field-label-sm" for="{{.FieldID}}-day">{{$dayLabel}}</label>
       <input
         id="{{.FieldID}}-day"
         type="text"
@@ -44,13 +47,13 @@
         pattern="[0-9]*"
         maxlength="2"
         autocomplete="off"
-        placeholder="DD"
+        placeholder="{{$dayPlaceholder}}"
         class="input-field"
         aria-label="{{$dayLabel}}"
         data-date-field-part="day">
     </div>
-    <div class="space-y-1">
-      <label class="field-label text-xs" for="{{.FieldID}}-month">{{$monthLabel}}</label>
+    <div class="space-y-1 date-field-part">
+      <label class="field-label field-label-sm" for="{{.FieldID}}-month">{{$monthLabel}}</label>
       <input
         id="{{.FieldID}}-month"
         type="text"
@@ -58,13 +61,13 @@
         pattern="[0-9]*"
         maxlength="2"
         autocomplete="off"
-        placeholder="MM"
+        placeholder="{{$monthPlaceholder}}"
         class="input-field"
         aria-label="{{$monthLabel}}"
         data-date-field-part="month">
     </div>
-    <div class="space-y-1">
-      <label class="field-label text-xs" for="{{.FieldID}}-year">{{$yearLabel}}</label>
+    <div class="space-y-1 date-field-part date-field-part-year">
+      <label class="field-label field-label-sm" for="{{.FieldID}}-year">{{$yearLabel}}</label>
       <input
         id="{{.FieldID}}-year"
         type="text"
@@ -72,7 +75,7 @@
         pattern="[0-9]*"
         maxlength="4"
         autocomplete="off"
-        placeholder="YYYY"
+        placeholder="{{$yearPlaceholder}}"
         class="input-field"
         aria-label="{{$yearLabel}}"
         data-date-field-part="year">
@@ -86,7 +89,7 @@
       data-date-field-open
       aria-label="{{$openPickerLabel}}"
       title="{{$openPickerLabel}}">
-      <span aria-hidden="true">📅</span>
+      <span aria-hidden="true">{{template "icon" "calendar"}}</span>
     </button>
   </div>
   {{end}}

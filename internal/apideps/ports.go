@@ -24,6 +24,9 @@ type RegistrationWorkflowService interface {
 
 type LoginWorkflowService interface {
 	Authenticate(ctx context.Context, secretKey []byte, clientKey string, email string, password string, resetTokenTTL time.Duration, now time.Time) (services.LoginResult, error)
+	// ResetAttempts clears the signing-in client's failure count; the caller
+	// runs it only once the sign-in's cookie has been issued.
+	ResetAttempts(clientKey string)
 }
 
 // RegisterPickupTokenStore persists and atomically consumes the nonces that
@@ -31,6 +34,10 @@ type LoginWorkflowService interface {
 // substitute an in-memory implementation without spinning up a database.
 type RegisterPickupTokenStore interface {
 	Issue(ctx context.Context, nonce string, userID uint, expiresAt time.Time) error
+	// Peek resolves a live token's user_id without spending it, so a caller
+	// can seal what it must hand over before the single-use grant is spent
+	// (WEB-64, the WEB-58 shape).
+	Peek(ctx context.Context, nonce string, now time.Time) (uint, bool, error)
 	Consume(ctx context.Context, nonce string, now time.Time) (uint, bool, error)
 }
 
@@ -38,9 +45,27 @@ type OIDCWorkflowService interface {
 	Enabled() bool
 	LocalPublicAuthEnabled() bool
 	ResponseMode() security.OIDCResponseMode
+	IssuerURL() string
+	PostLogoutRedirectURL() string
+	// ProviderLogoutEnabled is asked at LOGOUT time, not only when the
+	// end-session material is stored: the transport layer composes a provider
+	// redirect from a stored row only while the configuration in force still
+	// asks for one.
+	ProviderLogoutEnabled() bool
 	StartAuth(ctx context.Context, state string, nonce string, codeVerifier string) (string, error)
 	StartReauth(ctx context.Context, state string, nonce string, codeVerifier string) (string, error)
 	Authenticate(ctx context.Context, code string, codeVerifier string, expectedNonce string, now time.Time) (services.OIDCLoginResult, error)
 	ValidateReauthExchange(ctx context.Context, code string, codeVerifier string, expectedNonce string, expectedUserID uint, maxAuthAge time.Duration, now time.Time) error
-	ConfirmAndLinkIdentity(ctx context.Context, targetUserID uint, claims security.OIDCClaims, linkTime time.Time) error
+	// CompleteIdentityLinkReauth links through ConfirmAndLinkIdentity and
+	// returns the session version it left the account at, with the same
+	// contract.
+	CompleteIdentityLinkReauth(ctx context.Context, code string, codeVerifier string, expectedNonce string, targetUserID uint, expectedSessionVersion int, maxAuthAge time.Duration, now time.Time) (int, error)
+	// UnlinkIdentity removes one identity from the account and bumps its
+	// AuthSessionVersion in the same write — only from the version user
+	// carries — and returns the version it left the account at; the caller
+	// has already verified the current local password.
+	UnlinkIdentity(ctx context.Context, user models.User, identityID uint) (int, error)
+	// ListLinkedIdentities returns the identities bound to userID, for the
+	// owner's own settings page.
+	ListLinkedIdentities(ctx context.Context, userID uint) ([]services.LinkedOIDCIdentity, error)
 }

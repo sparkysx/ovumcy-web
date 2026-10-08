@@ -21,10 +21,10 @@ func (handler *Handler) DeleteDay(c fiber.Ctx) error {
 	location := handler.requestLocation(c)
 	day, err := services.ParseDayDate(c.Params("date"), location)
 	if err != nil {
-		return handler.failMutation(c, dayDeleteMutation, invalidDateErrorSpec())
+		return handler.failDayMutation(c, dayDeleteMutation, invalidDateErrorSpec())
 	}
 	if err := handler.dayService.DeleteDayEntry(c.Context(), user.ID, day, location); err != nil {
-		return handler.failMutation(c, dayDeleteMutation, mapDayDeleteError(err))
+		return handler.failDayMutation(c, dayDeleteMutation, mapDayDeleteError(err))
 	}
 
 	handler.logMutationSuccess(c, dayDeleteMutation)
@@ -43,6 +43,9 @@ func (handler *Handler) DeleteDay(c fiber.Ctx) error {
 
 	if source == "dashboard" {
 		return redirectOrJSON(c, "/dashboard")
+	}
+	if source == "calendar" && dayFormNavigation(c) {
+		return redirectOrJSON(c, calendarDayPath(day))
 	}
 	return c.SendStatus(204)
 }

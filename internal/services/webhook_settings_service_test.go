@@ -22,6 +22,10 @@ type stubWebhookRepo struct {
 	loadUser     models.User
 	loadErr      error
 	loadCalls    int
+
+	removedUserID uint
+	removeErr     error
+	removeCalls   int
 }
 
 func (s *stubWebhookRepo) SaveWebhookSettings(_ context.Context, userID uint, settings models.WebhookSettingsColumns) error {
@@ -34,6 +38,12 @@ func (s *stubWebhookRepo) SaveWebhookSettings(_ context.Context, userID uint, se
 func (s *stubWebhookRepo) LoadSettingsByID(_ context.Context, _ uint) (models.User, error) {
 	s.loadCalls++
 	return s.loadUser, s.loadErr
+}
+
+func (s *stubWebhookRepo) RemoveWebhookDestination(_ context.Context, userID uint) error {
+	s.removeCalls++
+	s.removedUserID = userID
+	return s.removeErr
 }
 
 const webhookTestSecretKey = "test-secret-key-32-bytes-padding!"
@@ -68,6 +78,21 @@ func TestValidateWebhookURL(t *testing.T) {
 		// escape), so it exercises the parse-error branch rather than the
 		// scheme/host checks.
 		{name: "unparseable url rejected", raw: "http://example.com/%zz", wantErr: true},
+		// A port-only authority parses with a NON-EMPTY Host (":8080") while
+		// Hostname() is empty, so a Host != "" test accepts it — and Go's dialer
+		// reads an empty host as the unspecified address, i.e. the local machine.
+		{name: "port-only authority rejected", raw: "http://:8080/hook", wantErr: true},
+		{name: "port-only authority with port zero rejected", raw: "http://:0/hook", wantErr: true},
+		{name: "userinfo without host rejected", raw: "http://user:pass@/hook", wantErr: true},
+		// url.Parse accepts any digit string as a port and defers the complaint to
+		// the transport, so the range is pinned here with both boundaries.
+		{name: "port above range rejected", raw: "http://example.com:99999/hook", wantErr: true},
+		{name: "port zero rejected", raw: "http://example.com:0/hook", wantErr: true},
+		{name: "lowest port accepted", raw: "http://example.com:1/hook", wantErr: false},
+		{name: "highest port accepted", raw: "http://example.com:65535/hook", wantErr: false},
+		// Opaque URLs carry no authority at all. Already refused today by the empty
+		// Host, pinned so the Opaque/Hostname check cannot regress it.
+		{name: "opaque url rejected", raw: "http:opaque", wantErr: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -533,24 +558,26 @@ func TestSaveWebhookSettingsFromFormLoadErrorPropagates(t *testing.T) {
 	}
 }
 
-// TestBuildWebhookURLDisplay covers the render-safe status/host projection: it
-// exposes the hostname only (never the path/query/userinfo secret), reports
-// not-configured for an empty value, and reports configured-but-hostless for a
-// ciphertext that will not open.
+// TestBuildWebhookURLDisplay covers the render-safe readability/host projection:
+// it exposes the hostname only (never the path/query/userinfo secret), reports
+// absent for an empty value, and reports UNREADABLE — not merely hostless — for
+// a ciphertext that will not open. The last distinction is the point: a stored
+// value this instance cannot read and one it can read but that names no host are
+// different situations with different remedies.
 func TestBuildWebhookURLDisplay(t *testing.T) {
 	const userID = 31
 	svc, _ := newWebhookServiceForTest()
 
 	// Not configured.
-	if got := svc.BuildWebhookURLDisplay(userID, ""); got.Configured || got.Host != "" {
-		t.Fatalf("empty stored value should be not-configured, got %+v", got)
+	if got := svc.BuildWebhookURLDisplay(userID, ""); got.Readability != WebhookURLAbsent || got.Host != "" {
+		t.Fatalf("empty stored value should be absent, got %+v", got)
 	}
 
 	// Configured: host only, secret path/query/userinfo dropped.
 	ciphertext := storeWebhookURLForForm(t, userID, "https://user:s3cr3t@ntfy.example.com:8443/topic?token=abc123")
 	got := svc.BuildWebhookURLDisplay(userID, ciphertext)
-	if !got.Configured {
-		t.Fatal("expected configured=true for a stored endpoint")
+	if got.Readability != WebhookURLReadable {
+		t.Fatalf("expected a readable endpoint, got %q", got.Readability)
 	}
 	if got.Host != "ntfy.example.com" {
 		t.Fatalf("expected host-only 'ntfy.example.com', got %q", got.Host)
@@ -559,37 +586,52 @@ func TestBuildWebhookURLDisplay(t *testing.T) {
 		t.Fatalf("host projection leaked non-host components: %q", got.Host)
 	}
 
-	// Configured but un-openable (wrong-aad ciphertext): configured, no host.
+	// Stored but un-openable (wrong-aad ciphertext): unreadable, no host. It must
+	// NOT report the same readability as the parse-failure case below, which is
+	// what a single boolean made it do.
 	otherOwnerCiphertext := storeWebhookURLForForm(t, userID+1, "https://ntfy.example.com/topic")
 	unopenable := svc.BuildWebhookURLDisplay(userID, otherOwnerCiphertext)
-	if !unopenable.Configured || unopenable.Host != "" {
-		t.Fatalf("un-openable ciphertext should be configured-but-hostless, got %+v", unopenable)
+	if unopenable.Readability != WebhookURLUnreadable || unopenable.Host != "" {
+		t.Fatalf("un-openable ciphertext should be unreadable and hostless, got %+v", unopenable)
 	}
 }
 
 // TestBuildWebhookURLDisplayUnparseableStoredURLHasNoHost covers the
-// webhookURLHost parse-error branch: a stored (decryptable) value that url.Parse
-// rejects yields configured-but-hostless rather than leaking or crashing. A
-// control character makes url.Parse fail.
+// hostOnly parse-error branch: a stored value that DECRYPTS but that url.Parse
+// rejects is readable-with-no-host, which the ledger renders as "unusable" —
+// distinct from the unreadable case above. A control character makes url.Parse
+// fail.
 func TestBuildWebhookURLDisplayUnparseableStoredURLHasNoHost(t *testing.T) {
 	const userID = 33
 	svc, _ := newWebhookServiceForTest()
 	// Seal a value that decrypts fine but is not a parseable URL (control char).
 	ciphertext := storeWebhookURLForForm(t, userID, "http://ntfy.example.com/\x7f")
 	got := svc.BuildWebhookURLDisplay(userID, ciphertext)
-	if !got.Configured {
-		t.Fatal("expected configured=true for a stored (decryptable) value")
+	if got.Readability != WebhookURLReadable {
+		t.Fatalf("expected a readable value for a stored decryptable URL, got %q", got.Readability)
 	}
 	if got.Host != "" {
 		t.Fatalf("expected empty host for an unparseable stored URL, got %q", got.Host)
 	}
 }
 
-// TestSaveWebhookSettingsFromFormUndecryptableStoredURLDisabledClears covers the
-// decrypt-break branch: with the URL omitted (URLProvided=false) and delivery
-// being turned OFF, a stored ciphertext that will not open is cleared to empty
-// (the empty URL is accepted while disabled) rather than erroring.
-func TestSaveWebhookSettingsFromFormUndecryptableStoredURLDisabledClears(t *testing.T) {
+// TestSaveWebhookSettingsKeepsAnUnreadableEndpointAndStillSavesTheToggles pins
+// the behaviour that replaced a silent deletion.
+//
+// A blank URL field means "keep the stored endpoint". When the stored ciphertext
+// will not open there is no plaintext to re-encrypt, and this path used to
+// substitute the empty string -- which DELETED the endpoint, but only on the
+// branch where the owner happened to be switching delivery off. So the
+// destructive outcome was reached by the least destructive-looking action
+// available: an owner reading "this instance can no longer read it" and
+// unchecking the enable toggle.
+//
+// Refusing the whole save was the first answer and it was too wide: the per-kind
+// reminder toggles share this form, and blocking them makes the card unusable
+// until the endpoint is dealt with. The column is kept instead. The toggles
+// persist, the endpoint waits for a deliberate withdrawal, and the delivery mark
+// is not touched either -- it still describes the column the row still holds.
+func TestSaveWebhookSettingsKeepsAnUnreadableEndpointAndStillSavesTheToggles(t *testing.T) {
 	const userID = 34
 	svc, repo := newWebhookServiceForTest()
 	// A ciphertext sealed under a different owner's aad will not open under userID.
@@ -598,23 +640,36 @@ func TestSaveWebhookSettingsFromFormUndecryptableStoredURLDisabledClears(t *test
 	if err := svc.SaveWebhookSettingsFromForm(context.Background(), userID, WebhookSettingsFormUpdate{
 		Enabled:         false,
 		NotifyPeriod:    true,
-		NotifyOvulation: true,
+		NotifyOvulation: false,
 		URLProvided:     false,
 	}); err != nil {
-		t.Fatalf("SaveWebhookSettingsFromForm (disabled, undecryptable stored): %v", err)
+		t.Fatalf("expected the toggle save to land over an unreadable endpoint, got %v", err)
+	}
+	if repo.saveCalls != 1 {
+		t.Fatalf("expected exactly one save, got %d", repo.saveCalls)
+	}
+	if !repo.savedColumns.KeepEncryptedURL {
+		t.Fatal("the save rewrote webhook_url for a row whose ciphertext it could not read")
+	}
+	if repo.savedColumns.EncryptedURL != "" {
+		t.Fatalf("a keeping save must carry no endpoint of its own, got %q", repo.savedColumns.EncryptedURL)
+	}
+	if repo.savedColumns.ClearLastDeliveredAt {
+		t.Fatal("the delivery mark was cleared by a save that changed no endpoint")
+	}
+	if !repo.savedColumns.NotifyPeriod || repo.savedColumns.NotifyOvulation {
+		t.Fatal("the owner's reminder-kind choices did not persist")
 	}
 	if repo.savedColumns.Enabled {
 		t.Fatal("expected delivery persisted as disabled")
 	}
-	if repo.savedColumns.EncryptedURL != "" {
-		t.Fatalf("expected the un-openable stored endpoint cleared to empty, got %q", repo.savedColumns.EncryptedURL)
-	}
 }
 
 // TestSaveWebhookSettingsFromFormUndecryptableStoredURLEnableRejected covers the
-// same decrypt-break branch when the owner is ENABLING delivery: the cleared
-// empty URL is rejected by SaveWebhookSettings, so a webhook is never armed
-// against an endpoint the server can no longer read.
+// same decrypt-break branch when the owner is ENABLING delivery. It is refused
+// for the same reason as the disabling case above, and the assertion is kept
+// separate so the two remedies stay pinned independently: a webhook is never
+// armed against an endpoint the server can no longer read.
 func TestSaveWebhookSettingsFromFormUndecryptableStoredURLEnableRejected(t *testing.T) {
 	const userID = 35
 	svc, repo := newWebhookServiceForTest()
@@ -626,8 +681,8 @@ func TestSaveWebhookSettingsFromFormUndecryptableStoredURLEnableRejected(t *test
 		NotifyOvulation: true,
 		URLProvided:     false,
 	})
-	if !errors.Is(err, ErrWebhookURLInvalid) {
-		t.Fatalf("expected ErrWebhookURLInvalid enabling over an un-openable stored URL, got %v", err)
+	if !errors.Is(err, ErrWebhookURLUnreadable) {
+		t.Fatalf("expected ErrWebhookURLUnreadable enabling over an un-openable stored URL, got %v", err)
 	}
 	if repo.saveCalls != 0 {
 		t.Fatalf("expected no persistence, got %d save calls", repo.saveCalls)

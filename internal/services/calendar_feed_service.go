@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/ovumcy/ovumcy-web/internal/models"
-	"golang.org/x/crypto/bcrypt"
+	"github.com/ovumcy/ovumcy-web/internal/security"
 )
 
 // CalendarFeedService resolves a calendar-feed bearer token to its owner and
@@ -24,17 +24,32 @@ import (
 // a disabled feed are ALL reported the same way (ok=false, no body), so a caller
 // (and thus the HTTP surface) gets no oracle distinguishing them.
 type CalendarFeedService struct {
-	users      CalendarFeedUserReader
+	users      CalendarFeedUserStore
 	days       CalendarFeedDayReader
 	disclaimer DisclaimerProvider
+	secretKey  []byte
 }
 
-// CalendarFeedUserReader resolves the single owner whose calendar_feed_selector
-// equals selector. It returns (user, false, nil) for no match — the same shape
-// FindByCalendarFeedSelector uses — so the service keeps an unknown selector and
-// a wrong verifier observationally identical.
-type CalendarFeedUserReader interface {
+// CalendarFeedUserStore resolves the single owner whose calendar_feed_selector
+// equals selector, and writes the keyed verifier MAC into a row that predates
+// migration 032. The lookup returns (user, false, nil) for no match — the same
+// shape the repository's FindByCalendarFeedSelector uses — so the service keeps
+// an unknown selector and a wrong verifier observationally identical.
+//
+// It is a store rather than a reader because the one write it carries is not a
+// domain decision: the MAC can only be computed while the correct verifier
+// plaintext is in hand, which happens exactly once per legacy row, on the read
+// path. See BackfillCalendarFeedVerifierMAC for the compare-and-set that keeps
+// that write safe against a concurrent rotation.
+type CalendarFeedUserStore interface {
 	FindByCalendarFeedSelector(ctx context.Context, selector string) (models.User, bool, error)
+	BackfillCalendarFeedVerifierMAC(ctx context.Context, userID uint, selector string, verifierMAC string) error
+	// MarkCalendarFeedPolled records, at most once per owner calendar day, that
+	// a successful token-verified poll served the feed for `day` (WEB-46,
+	// rendered on the settings card). The caller (ResolveFeed) drops the
+	// error: a missed write costs one calendar day of staleness on the "last
+	// checked" indicator, never a failed poll.
+	MarkCalendarFeedPolled(ctx context.Context, userID uint, selector string, day time.Time) error
 }
 
 // CalendarFeedDayReader loads the resolved owner's day logs for the prediction
@@ -44,19 +59,16 @@ type CalendarFeedDayReader interface {
 	FetchLogsForUser(ctx context.Context, userID uint, from time.Time, to time.Time, location *time.Location) ([]models.DailyLog, error)
 }
 
-// calendarFeedStatsWindowYears bounds the log history loaded to compute the
-// feed's predictions. It mirrors the dashboard/stats 2-year window so the feed's
-// cycle baseline is derived from the same span the in-app surfaces use.
-const calendarFeedStatsWindowYears = 2
-
-// NewCalendarFeedService wires the feed service from the user + day readers and
-// the localized-disclaimer provider (the same seam the webhook notify pass
-// uses). All three are required in production; tests may pass stubs.
-func NewCalendarFeedService(users CalendarFeedUserReader, days CalendarFeedDayReader, disclaimer DisclaimerProvider) *CalendarFeedService {
+// NewCalendarFeedService wires the feed service from the user store + day reader,
+// the localized-disclaimer provider (the same seam the webhook notify pass uses),
+// and the application secret that keys verifier MACs. All are required in
+// production; tests may pass stubs.
+func NewCalendarFeedService(users CalendarFeedUserStore, days CalendarFeedDayReader, disclaimer DisclaimerProvider, secretKey []byte) *CalendarFeedService {
 	return &CalendarFeedService{
 		users:      users,
 		days:       days,
 		disclaimer: disclaimer,
+		secretKey:  secretKey,
 	}
 }
 
@@ -68,17 +80,38 @@ func NewCalendarFeedService(users CalendarFeedUserReader, days CalendarFeedDayRe
 // generic 500 — never a body that distinguishes it from the 404 path in a way
 // that leaks token state.
 //
-// Timing-equalization (mirrors equalizeAuthCredentialsTiming): the happy path
-// pays exactly one bcrypt compare inside VerifyCalendarFeedToken. The
-// selector-miss path would otherwise short-circuit before any bcrypt work and
+// location is the FALLBACK zone only: the resolved owner's persisted timezone
+// decides which calendar day the feed renders, and the caller's location is used
+// only when that column is empty or unusable (see the resolution comment below).
+//
+// Timing-equalization (mirrors equalizeAuthCredentialsTiming): the verify path
+// pays exactly one keyed-MAC compare inside VerifyCalendarFeedToken. The
+// selector-miss path would otherwise short-circuit before any verifier work and
 // leak — through response latency — that no row bears the presented selector
-// (CWE-208). So on a selector miss the service performs one dummy bcrypt against
-// a fixed placeholder hash, matching the happy path's single compare and leaving
-// no timing signal that separates "unknown selector" from "known selector, wrong
-// verifier". A malformed token (wrong length) is rejected before any lookup and
-// is not timing-sensitive: it reveals nothing about which selectors exist.
+// (CWE-208). So on a selector miss the service performs one dummy MAC compare
+// against a fixed placeholder, matching the verify path's single compare and
+// leaving no timing signal that separates "unknown selector" from "known
+// selector, wrong verifier". A malformed token (wrong length) is rejected before
+// any lookup and is not timing-sensitive: it reveals nothing about which
+// selectors exist.
+//
+// The equalization must track whatever primitive the verify path actually runs,
+// or it stops equalizing anything. That is why it moved off bcrypt in lockstep
+// with the verifier: a MAC-based verify path paired with a bcrypt-based dummy
+// would have kept the exact CPU cost this design removes — every random token
+// would still burn ~265 ms on the miss path — while a bcrypt verify path paired
+// with a MAC-based dummy would hand back the enumeration oracle.
+//
+// ONE transitional exception, bounded and self-healing: a row minted before
+// migration 032 has no MAC, so verifying it costs one bcrypt. Until its first
+// successful poll writes the MAC in, that row's wrong-verifier latency is
+// distinguishable from a selector miss. Reaching that signal requires already
+// holding a valid 80-bit selector (a leaked subscribe URL carries both halves, so
+// there is no realistic path to the selector alone), and the feed's own per-IP
+// budget caps the attempt rate. Documented in SECURITY.md and
+// docs/SECURITY_INVARIANTS.md rather than papered over.
 func (service *CalendarFeedService) ResolveFeed(ctx context.Context, token string, now time.Time, location *time.Location) (body []byte, ok bool, err error) {
-	selector, _, split := SplitCalendarFeedToken(token)
+	selector, verifier, split := SplitCalendarFeedToken(token)
 	if !split {
 		return nil, false, nil
 	}
@@ -88,37 +121,72 @@ func (service *CalendarFeedService) ResolveFeed(ctx context.Context, token strin
 		return nil, false, err
 	}
 	if !found {
-		// Selector resolves no row: spend the same single bcrypt the happy path
-		// spends so an unknown selector is timing-indistinguishable from a known
-		// one with a bad verifier.
-		equalizeCalendarFeedTiming(token)
+		// Selector resolves no row: spend the same single MAC compare the verify
+		// path spends so an unknown selector is timing-indistinguishable from a
+		// known one with a bad verifier.
+		equalizeCalendarFeedTiming(service.secretKey, selector, verifier)
 		return nil, false, nil
 	}
 
-	if !VerifyCalendarFeedToken(token, user.CalendarFeedSelector, user.CalendarFeedVerifierHash) {
+	stored := models.CalendarFeedTokenColumns{
+		Selector:     user.CalendarFeedSelector,
+		VerifierHash: user.CalendarFeedVerifierHash,
+		VerifierMAC:  user.CalendarFeedVerifierMAC,
+	}
+	if !VerifyCalendarFeedToken(service.secretKey, token, stored) {
 		return nil, false, nil
+	}
+	if stored.VerifierMAC == "" {
+		// The row verified through the pre-032 bcrypt path, which means this is the
+		// only moment its MAC can be derived: the correct verifier plaintext is in
+		// hand and is never persisted. Write it in so the next poll takes the fast
+		// path. A failure here is a missed optimization, not a reason to refuse a
+		// token that just verified — the feed is served either way and the next
+		// poll retries.
+		service.backfillVerifierMAC(ctx, user.ID, selector, verifier)
 	}
 
 	// Verified. Every read below is scoped strictly to the resolved user.ID —
 	// the request carried no user id, only the token, so the owner boundary is
 	// exactly the row the token resolved to.
-	feedLocation := location
-	if feedLocation == nil {
-		feedLocation = time.UTC
+	//
+	// "Today" resolves in the OWNER's persisted timezone, not the transport's.
+	// The location the caller passes in for this route is the server zone: the
+	// transport layer resolves no request language or timezone for this route,
+	// so no header or cookie the poller presents ever reaches it — a calendar
+	// client sends neither anyway — and the server zone alone would render an
+	// owner in a distant timezone a day off. users.timezone exists for exactly
+	// these request-free passes, and the sibling egress subsystem (the webhook
+	// notify pass) already resolves the owner's day through the same helper;
+	// sharing it keeps the two from disagreeing about which calendar day the
+	// owner is on. The passed-in location stays the fallback for an owner whose
+	// timezone was never captured.
+	requestLocation := location
+	if requestLocation == nil {
+		requestLocation = time.UTC
 	}
+	feedLocation := resolveOwnerLocation(user.Timezone, requestLocation)
 	today := DateAtLocation(now, feedLocation)
-	from := today.AddDate(-calendarFeedStatsWindowYears, 0, 0)
-	logs, err := service.days.FetchLogsForUser(ctx, user.ID, from, today, feedLocation)
+	// The feed's cycle baseline is derived from the span every in-app surface
+	// uses, read from the one function that defines it rather than from a second
+	// copy of its arithmetic.
+	from, to := StatsOverviewRange(today)
+	logs, err := service.days.FetchLogsForUser(ctx, user.ID, from, to, feedLocation)
 	if err != nil {
 		return nil, false, err
 	}
 
 	disclaimer := ""
 	if service.disclaimer != nil {
-		// No per-owner language is persisted (mirrors the webhook notify pass):
-		// resolve the disclaimer at the server-default language. Messages merges
-		// the default over an empty/unknown target, so "" yields the default copy.
-		disclaimer = service.disclaimer.Disclaimer("")
+		// Resolve at the OWNER's chosen language (users.interface_language, the
+		// durable carrier of that choice), not at the server default: a calendar
+		// client sends no Accept-Language and no cookie, so the stored column is the
+		// only thing that knows which language this owner reads — exactly as
+		// users.timezone is the only thing that knows their calendar day. The
+		// webhook notify pass resolves the same field the same way. An owner who
+		// never chose a language stores "", and Messages merges the default over an
+		// empty or unknown target, so "" still yields the server-default copy.
+		disclaimer = service.disclaimer.Disclaimer(user.InterfaceLanguage)
 	}
 
 	feedUser := user
@@ -129,18 +197,99 @@ func (service *CalendarFeedService) ResolveFeed(ctx context.Context, token strin
 		Location:   feedLocation,
 		Disclaimer: disclaimer,
 	})
+	// The build succeeded: this is a successful, token-verified poll. Record
+	// the coarse day mark (WEB-46) synchronously, AFTER the body the caller
+	// will answer with is already built — the write can never turn this
+	// success into a failure, and its error (dropped in markPolled) can never
+	// change what is returned here.
+	//
+	// `today` is anchored to feedLocation's own midnight, not UTC's, so it is
+	// re-canonicalized to the repo's UTC-midnight DATE form (CalendarDay(...,
+	// time.UTC), the one form every date-only stored value is kept in) before
+	// it is compared against or written over the stored mark. Comparing `today`
+	// itself against a UTC-anchored `loaded` value would mix a location's
+	// midnight with UTC's: correct on many days, silently wrong in every zone
+	// on the day the offset crosses midnight.
+	service.markPolled(ctx, user.ID, selector, CalendarDay(today, time.UTC), user.CalendarFeedLastPolledOn)
 	return feed, true, nil
 }
 
-// equalizeCalendarFeedTiming performs the single dummy bcrypt compare that keeps
-// the selector-miss path's latency indistinguishable from a real verification.
-// It is declared as a var so tests can replace it with an invocation counter and
-// assert "a dummy bcrypt occurred on the selector-miss path" without measuring
-// wall-clock time — the same test-substitution idiom as
-// equalizeAuthCredentialsTiming. Production never reassigns it. It reuses the
-// fixed placeholder hash whose embedded cost is pinned to passwordHashCost, so
-// the equalized path is never cheaper than the real bcrypt in
-// VerifyCalendarFeedToken.
-var equalizeCalendarFeedTiming = func(token string) {
-	_ = bcrypt.CompareHashAndPassword([]byte(credentialsTimingEqualizationHash), []byte(token))
+// markPolled records that `day` (the owner's calendar day this poll served,
+// already resolved by the caller) was successfully polled, skipping the write
+// entirely — no query at all — when the row loaded earlier in this same
+// request already holds it: a calendar client polling every few minutes must
+// not cost a DB write on every request, only the first one on a new owner-day.
+// `loaded` may also be AFTER `day` (clock skew, a concurrent later poll that
+// already landed); that is skipped too; the repository's own compare-and-set
+// enforces the same monotonic rule as a second line of defense.
+//
+// The write is best-effort: its error is ignored and never logged, because a
+// poll answers the identical 200 whether or not the mark lands, and no failure
+// path ever reaches this call in the first place.
+func (service *CalendarFeedService) markPolled(ctx context.Context, userID uint, selector string, day time.Time, loaded *time.Time) {
+	if loaded != nil && !loaded.Before(day) {
+		return
+	}
+	_ = service.users.MarkCalendarFeedPolled(ctx, userID, selector, day)
 }
+
+// backfillVerifierMAC derives the keyed verifier MAC for a row minted before
+// migration 032 and hands it to the repository's compare-and-set write. It is
+// reached only after VerifyCalendarFeedToken has already accepted the presented
+// token through the bcrypt path, so the verifier is known-correct here.
+//
+// Every failure is swallowed on purpose, and each one is benign: a derivation
+// error means no secret key (the row simply stays on the bcrypt path), and a
+// write error or a zero-row CAS outcome means the feed was rotated or revoked
+// underneath this request — in which case NOT writing is the correct result. The
+// caller has already decided the token is valid, and none of these outcomes may
+// turn a valid feed into a 404 or a 500.
+func (service *CalendarFeedService) backfillVerifierMAC(ctx context.Context, userID uint, selector string, verifier string) {
+	verifierMAC, err := security.CalendarFeedVerifierMAC(service.secretKey, selector, verifier)
+	if err != nil {
+		return
+	}
+	_ = service.users.BackfillCalendarFeedVerifierMAC(ctx, userID, selector, verifierMAC)
+}
+
+// calendarFeedMACTimingEqualizationValue is a fixed placeholder authenticator of
+// the same hex width a real verifier MAC has. It must stay non-empty: an empty MAC
+// is the marker for a pre-032 row, and the stand-in row below carries no bcrypt
+// hash, so an empty placeholder would make verification refuse before doing any
+// work — silently turning the equalized path free.
+const calendarFeedMACTimingEqualizationValue = "9f2b7c41d8e6053a1cbf47d92e80a5361f4c8b0d75e29a3612bd0c8f47e5a9d3"
+
+// equalizeCalendarFeedTiming performs the single dummy verifier compare that
+// keeps the selector-miss path's latency indistinguishable from a real
+// verification. It is declared as a var so tests can replace it with an
+// invocation counter and assert "a dummy verifier compare occurred on the
+// selector-miss path" without measuring wall-clock time — the same
+// test-substitution idiom as equalizeAuthCredentialsTiming. Production never
+// reassigns it.
+//
+// It calls VerifyCalendarFeedToken itself, against a stand-in row that carries the
+// placeholder MAC and no bcrypt hash. That is deliberate: the equalization cannot
+// approximate the verify path's cost, it re-executes it, so whatever primitive
+// verification uses the dummy uses too and the two can never drift apart. An
+// equalization that hardcoded its own primitive would silently stop equalizing the
+// day the verifier changed — which is exactly what happened when the verifier moved
+// from bcrypt to a keyed MAC.
+//
+// The comparison can never succeed — and if it somehow did, nothing observes the
+// result: the caller has already resolved no row and returns not-found.
+var equalizeCalendarFeedTiming = func(secretKey []byte, selector string, verifier string) {
+	_ = calendarFeedEqualizerVerify(secretKey, selector+verifier, models.CalendarFeedTokenColumns{
+		Selector:    selector,
+		VerifierMAC: calendarFeedMACTimingEqualizationValue,
+	})
+}
+
+// calendarFeedEqualizerVerify is the seam through which the equalizer above
+// re-executes the verify path. Its counterpart in auth_service.go
+// (authTimingEqualizerCompare) says why the seam is needed: the two tests that
+// name equalizeCalendarFeedTiming replace the whole var with a call counter and
+// never reach the original, so an emptied body — a selector miss refused with
+// no verifier work at all, the exact oracle this helper closes — leaves both of
+// them green. Swapping this drives the shipped body and observes the row it
+// verifies against. Production code never reassigns this.
+var calendarFeedEqualizerVerify = VerifyCalendarFeedToken

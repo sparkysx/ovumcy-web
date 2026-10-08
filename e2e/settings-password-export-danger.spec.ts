@@ -1,10 +1,12 @@
-import { expect, test, type Locator, type Page } from '@playwright/test';
+import { expect, test, type Locator, type Page } from './support/fixtures';
+import { saveDashboardEntry } from './support/dashboard-helpers';
 import { clearDateField, fillDateField } from './support/date-field-helpers';
 import { ensureNotesFieldVisible } from './support/note-helpers';
 import { setRequestTimezoneFromBrowser } from './support/timezone-helpers';
-import { openCalendarDayEditor } from './support/stats-helpers';
+import { openCalendarDayEditor, saveDayEditorForm } from './support/stats-helpers';
 import { checkStyledControl } from './support/form-helpers';
 import {
+  apiOriginHeader,
   completeOnboardingIfPresent,
   confirmRecoveryCode,
   continueFromRecoveryCode,
@@ -63,12 +65,6 @@ async function registerOwnerAndOpenSettings(page: Page, prefix: string) {
   return { ...creds, recoveryCode };
 }
 
-async function readCSRFToken(page: Page): Promise<string> {
-  const csrfToken = await page.locator('meta[name="csrf-token"]').getAttribute('content');
-  expect(csrfToken).toBeTruthy();
-  return csrfToken ?? '';
-}
-
 async function todayISOFromCalendar(page: Page): Promise<string> {
   const todayButton = page.locator('button[data-day]:has(.calendar-today-pill)').first();
   await expect(todayButton).toBeVisible();
@@ -85,17 +81,18 @@ async function saveTodayEntry(page: Page, note: string): Promise<void> {
   await page.goto('/dashboard');
   await expect(page).toHaveURL(/\/dashboard$/);
 
-  await page.locator('input[name="is_period"]').check();
-  await checkStyledControl(page.locator('input[name="flow"][value="medium"]'));
-  await ensureNotesFieldVisible(page, '#today-notes');
-  await page.locator('#today-notes').fill(note);
-
-  await page.locator('[data-dashboard-save-form] button[data-save-button]').click();
-  await expect(page.locator('#save-status .status-ok')).toBeVisible();
+  // The dashboard is autosave-only: the seeding edits go through the shared
+  // helper, which waits on the autosave request they trigger.
+  await saveDashboardEntry(page, async () => {
+    await page.locator('input[name="is_period"]').check();
+    await checkStyledControl(page.locator('input[name="flow"][value="medium"]'));
+    await ensureNotesFieldVisible(page, '#today-notes');
+    await page.locator('#today-notes').fill(note);
+  });
 }
 
 async function createCustomSymptom(page: Page, name: string): Promise<void> {
-  const section = page.locator('#settings-symptoms-section');
+  const section = page.locator('#settings-symptoms');
   const form = section.locator('[data-symptom-create-form]');
 
   await form.locator('#settings-new-symptom-name').fill(name);
@@ -221,7 +218,7 @@ test.describe('Settings: password, export, clear data, delete account', () => {
     page,
   }) => {
     const state = await registerOwnerAndOpenSettings(page, 'settings-recovery-regenerate');
-    const cycleForm = page.locator('section#settings-cycle form[action="/api/v1/users/current/cycle"]');
+    const cycleForm = page.locator('#settings-cycle form[action="/api/v1/users/current/cycle"]');
 
     await expect(cycleForm).toBeVisible();
     await setRangeValue(page.locator('#settings-cycle-length'), 29);
@@ -264,10 +261,12 @@ test.describe('Settings: password, export, clear data, delete account', () => {
 
     await page.goto('/settings');
     await expect(page).toHaveURL(/\/settings$/);
-    const csrfToken = await readCSRFToken(page);
 
+    // GET-only route: CSRF gates state-changing methods, so no token is sent.
+    // The explicit Origin keeps the call valid under the HTTPS posture, where
+    // the CSRF middleware rejects mutating requests without one.
     const csvResponse = await page.request.get('/api/v1/exports/csv', {
-      form: { csrf_token: csrfToken },
+      headers: apiOriginHeader(page),
     });
 
     expect(csvResponse.status()).toBe(200);
@@ -276,7 +275,7 @@ test.describe('Settings: password, export, clear data, delete account', () => {
     expect(await csvResponse.text()).toContain(exportNote);
 
     const jsonResponse = await page.request.get('/api/v1/exports/json', {
-      form: { csrf_token: csrfToken },
+      headers: apiOriginHeader(page),
     });
 
     expect(jsonResponse.status()).toBe(200);
@@ -301,11 +300,12 @@ test.describe('Settings: password, export, clear data, delete account', () => {
     const todayISO = await todayISOFromCalendar(page);
     const futureISO = shiftISODate(todayISO, 4);
 
+    // A note, not a period: a period is an observation and is refused past
+    // today+2, while a future entry of any other kind is still stored.
     const dayEditorForm = await openCalendarDayEditor(page, futureISO);
-    await dayEditorForm.locator('input[name="is_period"]').check();
     await openCalendarNotes(dayEditorForm);
     await dayEditorForm.locator('#calendar-notes').fill(`future-export-${Date.now()}`);
-    await dayEditorForm.locator('button[data-save-button]').click();
+    await saveDayEditorForm(page, futureISO, dayEditorForm);
 
     await page.goto('/settings');
     await expect(page).toHaveURL(/\/settings$/);
@@ -364,11 +364,11 @@ test.describe('Settings: password, export, clear data, delete account', () => {
     const todayISO = await todayISOFromCalendar(page);
     const futureISO = shiftISODate(todayISO, 4);
 
+    // A note, not a period: see the test above.
     const dayEditorForm = await openCalendarDayEditor(page, futureISO);
-    await dayEditorForm.locator('input[name="is_period"]').check();
     await openCalendarNotes(dayEditorForm);
     await dayEditorForm.locator('#calendar-notes').fill(`future-preset-${Date.now()}`);
-    await dayEditorForm.locator('button[data-save-button]').click();
+    await saveDayEditorForm(page, futureISO, dayEditorForm);
 
     await page.goto('/settings');
     await expect(page).toHaveURL(/\/settings$/);
@@ -387,16 +387,25 @@ test.describe('Settings: password, export, clear data, delete account', () => {
   test('clear data removes tracked entry and resets cycle defaults', async ({ page }) => {
     const creds = await registerOwnerAndOpenSettings(page, 'settings-clear-data');
 
-    const dangerZone = page.locator('section.settings-danger-zone');
+    // Addressed by id, not by tag+class: these cards are disclosures now, and a
+    // selector naming the tag stops matching the day the tag changes.
+    const dangerZone = page.locator('#settings-danger-zone');
     await expect(dangerZone.locator('form[action="/api/v1/users/current/data-wipe"]')).toHaveCount(1);
     await expect(page.locator('#settings-data form[action="/api/v1/users/current/data-wipe"]')).toHaveCount(0);
 
     await setRangeValue(page.locator('#settings-cycle-length'), 35);
     await setRangeValue(page.locator('#settings-period-length'), 7);
     await fillDateField(page.locator('#settings-last-period-start'), isoDaysAgo(12));
-    await page.locator('section#settings-cycle input[name="auto_period_fill"]').uncheck();
+    // Auto-period-fill is off by default for a new account, and clear-data
+    // resets it to that same default. So the state that makes the reset
+    // observable is ON before the wipe — the mirror of the
+    // show_historical_phases note below, and of what this line asserted while
+    // the default was the other way round.
+    const autoPeriodFill = page.locator('#settings-cycle input[name="auto_period_fill"]');
+    await autoPeriodFill.check();
+    await expect(autoPeriodFill).toBeChecked();
     await page
-      .locator('section#settings-cycle form[action="/api/v1/users/current/cycle"] button[data-save-button]')
+      .locator('#settings-cycle form[action="/api/v1/users/current/cycle"] button[data-save-button]')
       .click();
     await expect(page.locator('#settings-cycle-status .status-ok')).toBeVisible();
 
@@ -417,11 +426,14 @@ test.describe('Settings: password, export, clear data, delete account', () => {
     await page.goto('/settings');
     await expect(page).toHaveURL(/\/settings$/);
     await createCustomSymptom(page, 'Reset me');
-    const symptomSection = page.locator('#settings-symptoms-section');
-    await expect(symptomSection).not.toContainText('Shown in new entries.');
-    await expect(symptomSection).not.toContainText('No custom symptoms yet.');
-    await expect(symptomSection).not.toContainText('Kept in history and export.');
-    await expect(symptomSection).not.toContainText('Built-in symptoms always stay available.');
+    // State before the wipe, asserted structurally: one active custom symptom
+    // and no empty-state panel. The four `not.toContainText(...)` phrase checks
+    // this replaces named copy that no longer exists anywhere in the app, so
+    // they held no matter what the section rendered — including nothing.
+    const symptomSection = page.locator('#settings-symptoms');
+    await expect(symptomSection.locator('[data-custom-symptom-row]')).toHaveCount(1);
+    await expect(symptomSection.locator('[data-symptom-group="active"]')).toBeVisible();
+    await expect(symptomSection.locator('[data-symptom-empty-state]')).toHaveCount(0);
 
     await dangerZone.locator('#settings-clear-data-password').fill('WrongPass1');
     await dangerZone.locator('form[action="/api/v1/users/current/data-wipe"] button[type="submit"]').click();
@@ -440,14 +452,14 @@ test.describe('Settings: password, export, clear data, delete account', () => {
 
     await expect(page.locator('#settings-cycle-length')).toHaveValue('28');
     await expect(page.locator('#settings-period-length')).toHaveValue('5');
-    await expect(page.locator('section#settings-cycle input[name="auto_period_fill"]')).toBeChecked();
+    await expect(page.locator('#settings-cycle input[name="auto_period_fill"]')).not.toBeChecked();
     await expect(page.locator('#settings-last-period-start')).toHaveValue('');
 
     // #229 regression: show_historical_phases was loaded by LoadSettingsByID
     // but missing from the clear-data reset map, so it stayed stuck on
     // instead of visibly returning to its default (false/off) like every
     // sibling preference.
-    await expect(page.locator('section#settings-tracking input[name="show_historical_phases"]')).not.toBeChecked();
+    await expect(page.locator('#settings-tracking input[name="show_historical_phases"]')).not.toBeChecked();
     await expect(showHistoricalPhasesToggle).toHaveAttribute('data-active', 'false');
 
     await page.goto('/dashboard');
@@ -457,7 +469,13 @@ test.describe('Settings: password, export, clear data, delete account', () => {
 
     await page.goto('/settings');
     await expect(page.locator('[data-export-summary-total]')).toContainText('0');
-    await expect(page.locator('#settings-symptoms-section [data-custom-symptom-row]')).toHaveCount(0);
+    // After the wipe the section is back to its empty state: no rows, no
+    // groups, and the "empty" panel rather than the "no active ones left" one.
+    await expect(page.locator('#settings-symptoms [data-custom-symptom-row]')).toHaveCount(0);
+    await expect(page.locator('#settings-symptoms [data-symptom-group]')).toHaveCount(0);
+    await expect(
+      page.locator('#settings-symptoms [data-symptom-empty-state="empty"]')
+    ).toBeVisible();
   });
 
   test('delete account requires valid password and removes account on success', async ({ page }) => {

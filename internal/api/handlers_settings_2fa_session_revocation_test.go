@@ -28,7 +28,7 @@ func TestVerifyTOTP2FAEnrollment_BumpsSessionVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateSetupKey: %v", err)
 	}
-	setupCookie := sealTOTPSetupCookieForTest(t, []byte("test-secret-key"), key.Secret())
+	setupCookie := sealTOTPSetupCookieForTest(t, []byte("test-secret-key"), ctx.user.ID, key.Secret())
 
 	code, err := totp.GenerateCode(key.Secret(), time.Now())
 	if err != nil {
@@ -79,7 +79,7 @@ func TestVerifyTOTP2FAEnrollment_BumpsSessionVersion(t *testing.T) {
 // gated.
 func TestDisableTOTP2FA_BumpsSessionVersion(t *testing.T) {
 	ctx := newTOTPSettingsContext(t, "totp-disable-bumps-sv@example.com")
-	if err := getTOTPServiceForTest(ctx.database).EnableTOTP(context.Background(), ctx.user.ID, "JBSWY3DPEHPK3PXP"); err != nil {
+	if err := getTOTPServiceForTest(ctx.database).EnableTOTP(context.Background(), ctx.user.ID, ctx.user.AuthSessionVersion, "JBSWY3DPEHPK3PXP", verifiedEnrollmentStepForTest(t, "JBSWY3DPEHPK3PXP")); err != nil {
 		t.Fatalf("EnableTOTP setup: %v", err)
 	}
 	ctx.refreshAuthCookie(t)

@@ -17,14 +17,24 @@ type stubWebhookReader struct {
 	found    bool
 	lookErr  error
 	gotEmail string
+	// findAllByEmailUsers overrides the single-row [s.user] shape
+	// FindAllByNormalizedEmail otherwise derives from s.found, for the one case
+	// that shape cannot express: more than one row on the same address.
+	findAllByEmailUsers []models.User
 }
 
-func (s *stubWebhookReader) FindByNormalizedEmailOptional(_ context.Context, email string) (models.User, bool, error) {
+func (s *stubWebhookReader) FindAllByNormalizedEmail(_ context.Context, email string) ([]models.User, error) {
 	s.gotEmail = email
 	if s.lookErr != nil {
-		return models.User{}, false, s.lookErr
+		return nil, s.lookErr
 	}
-	return s.user, s.found, nil
+	if s.findAllByEmailUsers != nil {
+		return s.findAllByEmailUsers, nil
+	}
+	if s.found {
+		return []models.User{s.user}, nil
+	}
+	return nil, nil
 }
 
 // encryptTestWebhookURL produces a ciphertext for a plaintext endpoint bound to
@@ -65,7 +75,7 @@ func TestResolveWebhookSettingsHostOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveWebhookSettings: %v", err)
 	}
-	if !view.Configured || !view.Enabled {
+	if view.Readability != WebhookURLReadable || !view.Enabled {
 		t.Fatalf("expected configured+enabled, got %+v", view)
 	}
 	if view.Host != "ntfy.example.io" {
@@ -187,7 +197,7 @@ func TestApplyWebhookSettingsClearURL(t *testing.T) {
 	if repo.savedColumns.EncryptedURL != "" {
 		t.Fatalf("expected cleared endpoint, got %q", repo.savedColumns.EncryptedURL)
 	}
-	if view.Configured {
+	if view.Readability != WebhookURLAbsent {
 		t.Fatalf("expected view not configured after clear, got %+v", view)
 	}
 }
@@ -281,6 +291,29 @@ func TestResolveWebhookSettingsNotFound(t *testing.T) {
 	}
 }
 
+// TestResolveWebhookSettingsRefusesAnAmbiguousAddress pins the shared
+// resolveUniqueUserByEmail behaviour at this call site: two rows on one
+// mailbox must be refused, naming both ids, rather than resolved to
+// whichever the reader happens to return first.
+func TestResolveWebhookSettingsRefusesAnAmbiguousAddress(t *testing.T) {
+	reader := &stubWebhookReader{
+		findAllByEmailUsers: []models.User{
+			{ID: 5, Email: "owner@example.com"},
+			{ID: 18, Email: "owner@example.com"},
+		},
+	}
+	svc, _ := newWebhookCLIServiceForTest(reader)
+
+	_, err := svc.ResolveWebhookSettings(context.Background(), "owner@example.com")
+	var ambiguous *AmbiguousEmailError
+	if !errors.As(err, &ambiguous) {
+		t.Fatalf("expected *AmbiguousEmailError, got %v", err)
+	}
+	if got, want := ambiguous.IDs, []uint{5, 18}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("expected ambiguous ids %v, got %v", want, got)
+	}
+}
+
 // TestResolveWebhookSettingsEmailValidation proves blank/invalid emails are
 // rejected before any lookup.
 func TestResolveWebhookSettingsEmailValidation(t *testing.T) {
@@ -303,7 +336,7 @@ func TestResolveWebhookSettingsLookupError(t *testing.T) {
 }
 
 // TestApplyWebhookSettingsNotConfiguredView proves a not-configured owner's view
-// reports Configured=false with an empty host.
+// reports an absent endpoint with an empty host.
 func TestApplyWebhookSettingsNotConfiguredView(t *testing.T) {
 	reader := &stubWebhookReader{found: true, user: models.User{ID: 20, WebhookNotifyPeriod: true, WebhookNotifyOvulation: true, ReminderLeadDays: 3}}
 	svc, _ := newWebhookCLIServiceForTest(reader)
@@ -314,7 +347,7 @@ func TestApplyWebhookSettingsNotConfiguredView(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ApplyWebhookSettings: %v", err)
 	}
-	if view.Configured || view.Host != "" {
+	if view.Readability != WebhookURLAbsent || view.Host != "" {
 		t.Fatalf("expected not-configured empty-host view, got %+v", view)
 	}
 }
@@ -347,36 +380,70 @@ func TestApplyWebhookSettingsEmailValidation(t *testing.T) {
 	}
 }
 
-// TestResolveWebhookSettingsDecryptFailure proves that a stored ciphertext which
-// fails to open (e.g. after a SECRET_KEY rotation, modeled here by an aad
-// bound to a different user id) surfaces as an error rather than leaking or
-// panicking — the status view fails closed.
-func TestResolveWebhookSettingsDecryptFailure(t *testing.T) {
+// TestResolveWebhookSettingsReportsAnUnreadableEndpointInsteadOfFailing proves
+// that a stored ciphertext which fails to open (e.g. after a SECRET_KEY
+// rotation, modeled here by an aad bound to a different user id) is REPORTED,
+// not raised. It used to abort the whole `webhook show`, which left the operator
+// unable to see the one row that needs their attention and — because the same
+// resolve runs first on the apply path — unable to clear it either. The view
+// still leaks nothing: no host, no ciphertext, no decrypt error text.
+func TestResolveWebhookSettingsReportsAnUnreadableEndpointInsteadOfFailing(t *testing.T) {
 	const userID = uint(31)
 	// Encrypt under a DIFFERENT user id so the aad binding mismatches at decrypt.
 	badCiphertext := encryptTestWebhookURL(t, "https://ntfy.example/topic", userID+1)
 	reader := &stubWebhookReader{found: true, user: models.User{ID: userID, WebhookEnabled: true, WebhookURL: badCiphertext, WebhookNotifyPeriod: true, WebhookNotifyOvulation: true, ReminderLeadDays: 3}}
 	svc, _ := newWebhookCLIServiceForTest(reader)
 
-	if _, err := svc.ResolveWebhookSettings(context.Background(), "owner@example.com"); err == nil || !strings.Contains(err.Error(), "decrypt current webhook url") {
-		t.Fatalf("expected a decrypt failure on resolve, got %v", err)
+	view, err := svc.ResolveWebhookSettings(context.Background(), "owner@example.com")
+	if err != nil {
+		t.Fatalf("expected the unreadable row to be reported, got error %v", err)
+	}
+	if view.Readability != WebhookURLUnreadable {
+		t.Fatalf("expected an unreadable endpoint, got %q", view.Readability)
+	}
+	if view.Host != "" {
+		t.Fatalf("expected no host for an endpoint that could not be opened, got %q", view.Host)
+	}
+	if !view.Enabled || !view.NotifyPeriod || !view.NotifyOvulation {
+		t.Fatal("expected the stored toggles to still be reported beside the unreadable endpoint")
 	}
 }
 
-// TestApplyWebhookSettingsDecryptFailure proves the same fail-closed behavior on
-// the apply path (it decrypts the current URL to support a URL-keeping merge).
-func TestApplyWebhookSettingsDecryptFailure(t *testing.T) {
+// TestApplyWebhookSettingsRefusesOnlyTheMergeThatNeedsThePlaintext proves the
+// apply path still fails closed where it must. A URL-keeping merge has nothing
+// to keep on a row this instance cannot open, and re-persisting the empty string
+// would delete the endpoint the operator asked to leave alone — so that one
+// refuses, by sentinel rather than by a wrapped decrypt error whose text is not
+// operator output.
+func TestApplyWebhookSettingsRefusesOnlyTheMergeThatNeedsThePlaintext(t *testing.T) {
 	const userID = uint(33)
 	badCiphertext := encryptTestWebhookURL(t, "https://ntfy.example/topic", userID+1)
 	reader := &stubWebhookReader{found: true, user: models.User{ID: userID, WebhookEnabled: true, WebhookURL: badCiphertext, WebhookNotifyPeriod: true, WebhookNotifyOvulation: true, ReminderLeadDays: 3}}
 	svc, repo := newWebhookCLIServiceForTest(reader)
 
 	falseVal := false
-	if _, err := svc.ApplyWebhookSettings(context.Background(), "owner@example.com", WebhookSettingsPatch{NotifyPeriod: &falseVal}, false); err == nil || !strings.Contains(err.Error(), "decrypt current webhook url") {
-		t.Fatalf("expected a decrypt failure on apply, got %v", err)
+	if _, err := svc.ApplyWebhookSettings(context.Background(), "owner@example.com", WebhookSettingsPatch{NotifyPeriod: &falseVal}, false); !errors.Is(err, ErrWebhookURLUnreadable) {
+		t.Fatalf("expected ErrWebhookURLUnreadable on a keep-merge, got %v", err)
 	}
 	if repo.saveCalls != 0 {
 		t.Fatalf("expected no save when the current URL cannot be decrypted, got %d", repo.saveCalls)
+	}
+
+	// Clearing it, by contrast, must work: an endpoint this instance cannot read
+	// is still one the operator may withdraw, and refusing here would leave the
+	// row permanently stuck. Delivery is switched off in the same patch because
+	// the shared validator refuses an enabled webhook with no endpoint, which is
+	// the rule that keeps a row from claiming it can deliver to nowhere.
+	clearPatch := WebhookSettingsPatch{Enabled: &falseVal}
+	clearPatch.ClearURL()
+	if _, err := svc.ApplyWebhookSettings(context.Background(), "owner@example.com", clearPatch, false); err != nil {
+		t.Fatalf("expected clearing an unreadable endpoint to succeed, got %v", err)
+	}
+	if repo.saveCalls != 1 {
+		t.Fatalf("expected exactly one save for the clear, got %d", repo.saveCalls)
+	}
+	if repo.savedColumns.EncryptedURL != "" {
+		t.Fatal("expected the clear to persist an empty endpoint")
 	}
 }
 
@@ -395,7 +462,66 @@ func TestApplyWebhookSettingsDryRunDisabledNoURL(t *testing.T) {
 	if repo.saveCalls != 0 {
 		t.Fatalf("dry-run must not save, got %d", repo.saveCalls)
 	}
-	if view.Configured || view.Enabled {
+	if view.Readability != WebhookURLAbsent || view.Enabled {
 		t.Fatalf("expected a disabled, not-configured view, got %+v", view)
+	}
+}
+
+// TestWebhookSettingsViewsReportTheLeadWindowInForce pins that `show` and `set`
+// print the SAME lead window, the clamped one the decision layer actually uses.
+// The show path used to publish the raw stored column, so a value outside
+// [MinReminderLeadDays, MaxReminderLeadDays] — a hand-edited row, a restored
+// backup, a row written before the bound existed — made `show` report a window
+// no reminder would ever fire on, and a no-op `set` look like a change.
+func TestWebhookSettingsViewsReportTheLeadWindowInForce(t *testing.T) {
+	testCases := []struct {
+		name   string
+		stored int
+		want   int
+	}{
+		{name: "below the lower bound", stored: -5, want: MinReminderLeadDays},
+		{name: "above the upper bound", stored: 90, want: MaxReminderLeadDays},
+		{name: "inside the bound is untouched", stored: 3, want: 3},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			const userID = uint(77)
+			reader := &stubWebhookReader{
+				found: true,
+				user: models.User{
+					ID:                  userID,
+					WebhookEnabled:      true,
+					WebhookURL:          encryptTestWebhookURL(t, "https://ntfy.example.io/topic", userID),
+					WebhookNotifyPeriod: true,
+					ReminderLeadDays:    testCase.stored,
+				},
+			}
+			svc, _ := newWebhookCLIServiceForTest(reader)
+
+			shown, err := svc.ResolveWebhookSettings(context.Background(), "owner@example.com")
+			if err != nil {
+				t.Fatalf("ResolveWebhookSettings: %v", err)
+			}
+			if shown.ReminderLeadDays != testCase.want {
+				t.Fatalf("show reported lead window %d, want the clamped %d", shown.ReminderLeadDays, testCase.want)
+			}
+			// The value in force, straight from the decision layer's own clamp.
+			inForce := NormalizeReminderLeadDays(reader.user.ReminderLeadDays)
+			if shown.ReminderLeadDays != inForce {
+				t.Fatalf("show reported %d, but the lead window in force is %d", shown.ReminderLeadDays, inForce)
+			}
+
+			// A flag-only patch that leaves the lead day alone must print the same
+			// number the show path just printed.
+			enabled := true
+			applied, err := svc.ApplyWebhookSettings(context.Background(), "owner@example.com", WebhookSettingsPatch{Enabled: &enabled}, true)
+			if err != nil {
+				t.Fatalf("ApplyWebhookSettings: %v", err)
+			}
+			if applied.ReminderLeadDays != shown.ReminderLeadDays {
+				t.Fatalf("set reported lead window %d, show reported %d", applied.ReminderLeadDays, shown.ReminderLeadDays)
+			}
+		})
 	}
 }

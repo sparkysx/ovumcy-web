@@ -25,7 +25,16 @@ func BuildPrivacyBackNavigation(backQuery string, isAuthenticated bool) PrivacyB
 		breadcrumbBackLabelKey = "nav.dashboard"
 	}
 
-	backPath := SanitizeRedirectPath(backQuery, backFallback)
+	// The back path is rendered into the page's own back link, so it is the
+	// second surface that echoes a caller-supplied value into the markup and
+	// into an outgoing URL. It runs through the same single decision the `back`
+	// parameter of a rendered current path does — fragment stripped, own query
+	// filtered by the allowlist, and required to be a redirect-safe path built
+	// from the characters this app's routes use — falling back when it is not.
+	backPath := backFallback
+	if sanitized, ok := SanitizeBackNavigationValue(backQuery); ok {
+		backPath = sanitized
+	}
 	if labelKey := privacyBackLabelKeyForPath(backPath, isAuthenticated); labelKey != "" {
 		breadcrumbBackLabelKey = labelKey
 	}

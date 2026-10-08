@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page } from './support/fixtures';
 import {
   completeOnboardingIfPresent,
   continueFromRecoveryCode,
@@ -8,7 +8,7 @@ import {
   registerOwnerViaUI,
 } from './support/auth-helpers';
 import { ensureNotesFieldVisible } from './support/note-helpers';
-import { openCalendarDayEditor } from './support/stats-helpers';
+import { openCalendarDayEditor, saveDayEditorForm } from './support/stats-helpers';
 import { setRequestTimezoneFromBrowser } from './support/timezone-helpers';
 
 function shiftISODate(iso: string, days: number): string {
@@ -44,34 +44,19 @@ async function todayISOFromCalendar(page: Page): Promise<string> {
   return todayISO!;
 }
 
-async function saveDayEditorForm(page: Page, isoDate: string, form: import('@playwright/test').Locator): Promise<void> {
-  // Bind the wait to the request this click issues, not to any PUT response for
-  // the date. waitForResponse would resolve on the first matching response to
-  // arrive after registration — under CPU contention a still-in-flight earlier
-  // PUT's response can land inside this window and satisfy the predicate before
-  // the actual save lands. The `request` event only fires for requests issued
-  // after registration, so this captures exactly the click's PUT; awaiting that
-  // request's own response then blocks until this save has truly committed.
-  const [request] = await Promise.all([
-    page.waitForRequest(
-      (candidate) =>
-        candidate.method() === 'PUT' && candidate.url().includes(`/api/v1/days/${isoDate}`),
-    ),
-    form.locator('button[data-save-button]').click(),
-  ]);
-  const response = await request.response();
-  expect(response, `expected a response for PUT /api/v1/days/${isoDate}`).not.toBeNull();
-  expect(response!.ok(), `PUT /api/v1/days/${isoDate} failed with ${response!.status()}`).toBeTruthy();
-
-  // The PUT response only means the write committed. Its htmx afterSwap then
-  // fires `calendar-day-updated`, which reloads the whole calendar grid
-  // (GET /calendar) and re-lazy-loads the day editor — a cascade that outlives
-  // this click. If the caller navigates (openCalendarDayEditor → page.goto)
-  // while that cascade is still hitting the server, the next page's own
-  // hx-trigger="load" editor fetch competes with it and, under CPU contention,
-  // can miss the 5s visibility window. Let the app go quiescent first so the
-  // save is fully settled — not just committed — before returning.
-  await page.waitForLoadState('networkidle');
+// Anchor on the 5th of the month that holds today-30: far from both
+// lastPeriodStart=today-3 (set by completeOnboardingIfPresent) and the
+// predicted next period, so the new period block has no interference — and,
+// because the whole auto-fill window (anchor..anchor+4) then sits mid-month,
+// never split across a month boundary. The previous bare today-30 anchor was
+// a date bomb: near month end (the 28th onward in a 31-day month, as early
+// as the 25th in February) its +1..+4 neighbors spill into the next month,
+// whose day cells the anchor month's grid does not always render
+// (2026-08-28: anchor Jul 29, neighbor Aug 2 — July's Sunday-start grid
+// ends Aug 1, so the neighbor's button does not exist and every retry fails
+// the same way).
+function autofillAnchorISO(todayISO: string): string {
+  return `${shiftISODate(todayISO, -30).slice(0, 7)}-05`;
 }
 
 test.describe('calendar auto-fill clear-on-toggle-off', () => {
@@ -79,9 +64,7 @@ test.describe('calendar auto-fill clear-on-toggle-off', () => {
     await registerOwnerOnCalendar(page, 'calendar-autofill-clear');
 
     const todayISO = await todayISOFromCalendar(page);
-    // Pick a date far from both lastPeriodStart=today-3 (set by completeOnboardingIfPresent)
-    // and the predicted next period so the new period block has no interference.
-    const anchorISO = shiftISODate(todayISO, -30);
+    const anchorISO = autofillAnchorISO(todayISO);
     const neighborISOs = [1, 2, 3, 4].map((offset) => shiftISODate(anchorISO, offset));
 
     const onForm = await openCalendarDayEditor(page, anchorISO);
@@ -113,7 +96,7 @@ test.describe('calendar auto-fill clear-on-toggle-off', () => {
     await registerOwnerOnCalendar(page, 'calendar-autofill-preserve');
 
     const todayISO = await todayISOFromCalendar(page);
-    const anchorISO = shiftISODate(todayISO, -30);
+    const anchorISO = autofillAnchorISO(todayISO);
     const manualISO = shiftISODate(anchorISO, 2);
     const earlyNeighborISO = shiftISODate(anchorISO, 1);
     const lateNeighborISOs = [3, 4].map((offset) => shiftISODate(anchorISO, offset));

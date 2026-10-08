@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/ovumcy/ovumcy-web/internal/models"
@@ -31,6 +32,14 @@ const (
 // through an error string into a log or response.
 var ErrWebhookURLInvalid = errors.New("webhook url invalid")
 
+// ErrWebhookURLUnreadable is returned when an operation needs the plaintext of a
+// stored endpoint that this instance can no longer open -- the usual cause being
+// a rotated or replaced SECRET_KEY. It is deliberately NOT raised by the paths
+// that REMOVE or REPLACE the endpoint: a destination the instance cannot read is
+// still one the owner may withdraw, and refusing there would leave the row
+// permanently stuck. It never carries the ciphertext or the decrypt error text.
+var ErrWebhookURLUnreadable = errors.New("webhook url unreadable")
+
 // aadForWebhookURL returns the additional-authenticated-data binding an
 // encrypted webhook URL to a single user's row. It parallels aadForTOTPSecret
 // (a deliberately separate helper, not a shared one): including the user id
@@ -50,6 +59,13 @@ type WebhookSettingsUpdate struct {
 	NotifyPeriod     bool
 	NotifyOvulation  bool
 	ReminderLeadDays int
+	// KeepStoredURL asks the save to leave the stored endpoint column untouched
+	// instead of writing URL. It is set only where there is no honest value to
+	// write: the stored ciphertext will not open, so the plaintext this save
+	// would re-encrypt does not exist. Enabled must be false alongside it -- an
+	// endpoint the instance cannot read cannot be armed -- and the service
+	// refuses the combination rather than trusting the caller.
+	KeepStoredURL bool
 }
 
 // WebhookSettingsFormUpdate is the transport-free input to
@@ -85,6 +101,10 @@ type WebhookSettingsFormUpdate struct {
 type WebhookSettingsRepository interface {
 	SaveWebhookSettings(ctx context.Context, userID uint, settings models.WebhookSettingsColumns) error
 	LoadSettingsByID(ctx context.Context, userID uint) (models.User, error)
+	// RemoveWebhookDestination withdraws the endpoint WITHOUT touching the
+	// per-kind opt-ins or the shared lead window, which SaveWebhookSettings
+	// cannot express: it writes all three unconditionally.
+	RemoveWebhookDestination(ctx context.Context, userID uint) error
 }
 
 // WebhookSettingsService owns the business logic for persisting an owner's
@@ -117,9 +137,10 @@ func NormalizeReminderLeadDays(value int) int {
 }
 
 // ValidateWebhookURL trims and parses a candidate webhook URL, returning the
-// cleaned value on success. It accepts ONLY absolute http/https URLs with a
-// host; every other scheme (file, gopher, javascript, data, ftp, …) and any
-// relative or hostless value is rejected with ErrWebhookURLInvalid. The error
+// cleaned value on success. It accepts ONLY absolute http/https URLs naming a
+// host and, when one is given, an in-range port; every other scheme (file,
+// gopher, javascript, data, ftp, …), any relative, opaque or hostless value, and
+// any port outside 1..65535 is rejected with ErrWebhookURLInvalid. The error
 // never embeds the candidate, so an invalid URL cannot leak into logs.
 //
 // This is a save-time scheme/shape guard only. Outbound SSRF defenses
@@ -143,10 +164,33 @@ func ValidateWebhookURL(raw string) (string, error) {
 	if scheme != "http" && scheme != "https" {
 		return "", ErrWebhookURLInvalid
 	}
-	if parsed.Host == "" {
-		return "", ErrWebhookURLInvalid
+	if err := validateWebhookAuthority(parsed); err != nil {
+		return "", err
 	}
 	return candidate, nil
+}
+
+// validateWebhookAuthority rejects an authority that parses but names no host to
+// connect to. It is shared with the delivery boundary, which re-runs it: save-time
+// validation never revisits a URL already in the database, so a row stored before
+// this check existed would otherwise keep being delivered.
+//
+// A non-empty Host is NOT enough. url.Parse gives "http://:8080/" a Host of
+// ":8080" with an empty Hostname(), so a port-only authority passes a Host != ""
+// test; Go's dialer then reads the empty host as the unspecified address and
+// connects to the local machine. Likewise Parse accepts any digits as a port, so
+// the range is checked here rather than left to a late transport error.
+func validateWebhookAuthority(parsed *url.URL) error {
+	if parsed.Opaque != "" || parsed.Hostname() == "" {
+		return ErrWebhookURLInvalid
+	}
+	if port := parsed.Port(); port != "" {
+		number, err := strconv.Atoi(port)
+		if err != nil || number < 1 || number > 65535 {
+			return ErrWebhookURLInvalid
+		}
+	}
+	return nil
 }
 
 // SaveWebhookSettings validates and persists an owner's webhook notification
@@ -159,6 +203,9 @@ func ValidateWebhookURL(raw string) (string, error) {
 //   - The URL is encrypted with security.EncryptField, aad-bound to userID, and
 //     only the ciphertext is handed to persistence. An empty URL (disabled with
 //     no endpoint) is stored as an empty string, not encrypted.
+//   - The delivery mark's fate travels with the write: unless this save can
+//     prove the destination is unchanged, it asks the same UPDATE to NULL
+//     webhook_last_delivered_at. See destinationNotProvablyUnchanged.
 //
 // It does not bump auth_session_version: a notification-preference change is not
 // a security-posture change.
@@ -170,7 +217,22 @@ func (service *WebhookSettingsService) SaveWebhookSettings(ctx context.Context, 
 		ReminderLeadDays: NormalizeReminderLeadDays(update.ReminderLeadDays),
 	}
 
+	if update.KeepStoredURL {
+		// Nothing to validate and nothing to encrypt. ClearLastDeliveredAt stays
+		// false deliberately rather than by omission: the mark's rule is that it
+		// may not outlive the endpoint it describes, and this save leaves that
+		// endpoint exactly where it is, so there is nothing for the rule to do.
+		if update.Enabled {
+			return fmt.Errorf("%w: delivery cannot be enabled over an endpoint this instance cannot read", ErrWebhookURLUnreadable)
+		}
+		columns.KeepEncryptedURL = true
+		return service.users.SaveWebhookSettings(ctx, userID, columns)
+	}
+
 	trimmedURL := strings.TrimSpace(update.URL)
+	// destination is the PLAINTEXT this save will store, in the same validated
+	// form the previous save stored its own, so the two are comparable below.
+	destination := ""
 	switch {
 	case update.Enabled:
 		validated, err := ValidateWebhookURL(trimmedURL)
@@ -182,6 +244,7 @@ func (service *WebhookSettingsService) SaveWebhookSettings(ctx context.Context, 
 			return fmt.Errorf("webhook url encrypt failed: %w", err)
 		}
 		columns.EncryptedURL = ciphertext
+		destination = validated
 	case trimmedURL == "":
 		// Disabled and no endpoint supplied: clear any stored ciphertext.
 		columns.EncryptedURL = ""
@@ -199,9 +262,46 @@ func (service *WebhookSettingsService) SaveWebhookSettings(ctx context.Context, 
 			return fmt.Errorf("webhook url encrypt failed: %w", err)
 		}
 		columns.EncryptedURL = ciphertext
+		destination = validated
 	}
+	columns.ClearLastDeliveredAt = service.destinationNotProvablyUnchanged(ctx, userID, destination)
 
 	return service.users.SaveWebhookSettings(ctx, userID, columns)
+}
+
+// destinationNotProvablyUnchanged decides the fate of the delivery mark for the
+// save about to run: true asks persistence to NULL webhook_last_delivered_at in
+// the same UPDATE that writes the new webhook_url.
+//
+// The question is deliberately asked in the negative. The mark says "a delivery
+// to your endpoint was accepted", so keeping it is a claim about one specific
+// destination and may only survive where this instance can PROVE the destination
+// is the one the mark was about. Everything else clears it: a replaced URL, a
+// removed one, a row that could not be read, and a stored ciphertext that no
+// longer opens — after a SECRET_KEY rotation the previous destination is not
+// merely different, it is unknowable, and the ledger must not assert about it.
+//
+// The comparison is on PLAINTEXT because ciphertext cannot answer it: every save
+// re-encrypts under a fresh nonce, so a toggle-only save that re-stores the very
+// same endpoint yields bytes that differ from the stored ones. Keeping the mark
+// across exactly that save is the whole reason this comparison exists instead of
+// a blanket clear on every write of the column.
+//
+// It reads the row itself rather than taking the verdict from its callers: this
+// is the one choke point every webhook save passes through, and a rule placed in
+// the callers would hold at the two that exist today and be missed by the third.
+// A read error clears rather than fails the save — an owner's save is not
+// refused over the fate of a display mark.
+func (service *WebhookSettingsService) destinationNotProvablyUnchanged(ctx context.Context, userID uint, destination string) bool {
+	current, err := service.users.LoadSettingsByID(ctx, userID)
+	if err != nil {
+		return true
+	}
+	stored, err := service.DecryptWebhookURL(userID, current.WebhookURL)
+	if err != nil {
+		return true
+	}
+	return stored != destination
 }
 
 // SaveWebhookSettingsFromForm applies a write-only-field save from the settings
@@ -247,11 +347,18 @@ func (service *WebhookSettingsService) SaveWebhookSettingsFromForm(ctx context.C
 		update.Enabled = form.Enabled
 		storedURL, decryptErr := service.DecryptWebhookURL(userID, current.WebhookURL)
 		if decryptErr != nil {
-			// The stored ciphertext will not open. If the owner is enabling
-			// delivery we must fail loudly (SaveWebhookSettings rejects an empty
-			// URL when enabled) so they re-enter it; if disabling, an empty URL
-			// is fine and clears the un-openable value.
-			update.URL = ""
+			// The stored ciphertext will not open, and a blank field means "keep
+			// the stored endpoint" -- so there is no plaintext to re-encrypt. This
+			// used to substitute the empty string, which DELETED an endpoint the
+			// request had asked to keep, and it did so on the branch that looks
+			// least destructive: an owner reading "this instance can no longer
+			// read it" and switching delivery off.
+			//
+			// Keeping the column is the answer that costs nothing else. The
+			// toggles on the same form still save, the endpoint waits for a
+			// deliberate withdrawal, and arming it is refused below because an
+			// endpoint the instance cannot read cannot deliver.
+			update.KeepStoredURL = true
 			break
 		}
 		update.URL = storedURL
@@ -278,46 +385,70 @@ func (service *WebhookSettingsService) DecryptWebhookURL(userID uint, encryptedU
 	return plaintext, nil
 }
 
-// WebhookURLDisplay is the ONLY webhook-endpoint projection the settings surface
-// may render. The stored URL is a secret (it can embed an ntfy/Gotify token), so
-// it is never echoed back into an HTML value/attribute: Configured says whether a
-// deliverable endpoint exists, and Host carries at most the hostname
-// (u.Hostname() — never scheme, path, query, or userinfo). A ciphertext that
-// fails to open still counts as Configured=true (an endpoint is stored) but with
-// an empty Host, so the UI shows "configured" without leaking or fabricating a
-// host.
+// WebhookURLReadability names what this instance can honestly say about a stored
+// endpoint ciphertext, and it is a THREE-valued answer because the row admits
+// three genuinely different situations. Collapsing the last two into one boolean
+// is what let an endpoint the instance can no longer open render beside the word
+// "configured": the owner reads a capability the instance does not have.
+type WebhookURLReadability string
+
+const (
+	// WebhookURLAbsent -- no ciphertext is stored.
+	WebhookURLAbsent WebhookURLReadability = "absent"
+	// WebhookURLUnreadable -- a ciphertext is stored and this instance cannot
+	// open it. The usual cause is a rotated or replaced SECRET_KEY. Delivery
+	// cannot happen and no host can be named.
+	WebhookURLUnreadable WebhookURLReadability = "unreadable"
+	// WebhookURLReadable -- the ciphertext opened. Host carries the result, and
+	// an EMPTY Host here is its own fact (a stored value that names no host), not
+	// the same fact as an unopenable ciphertext.
+	WebhookURLReadable WebhookURLReadability = "readable"
+)
+
+// WebhookURLDisplay is the ONLY webhook-endpoint projection any surface may
+// render. The stored URL is a secret (it can embed an ntfy/Gotify token), so it
+// is never echoed back into an HTML value/attribute, a JSON body, or operator
+// output: Readability says what the instance knows about the stored value, and
+// Host carries at most the hostname (u.Hostname() -- never scheme, path, query,
+// or userinfo).
 type WebhookURLDisplay struct {
-	Configured bool
-	Host       string
+	Readability WebhookURLReadability
+	Host        string
 }
 
-// BuildWebhookURLDisplay derives the render-safe status/host projection for a
-// stored webhook_url ciphertext, scoped to userID (the AAD binds the ciphertext
-// to the owner). It decrypts only to extract the hostname and deliberately
-// discards the rest of the URL, so no caller can obtain the full secret through
-// this seam. An empty stored value yields the zero value (not configured). A
-// ciphertext that fails to open is reported as configured-but-hostless rather
-// than as an error: the settings page must still render, and the owner can
-// re-save to restore a decryptable endpoint.
+// BuildWebhookURLDisplay derives the render-safe projection for a stored
+// webhook_url ciphertext, scoped to userID (the AAD binds the ciphertext to the
+// owner). It decrypts only to extract the hostname and deliberately discards the
+// rest of the URL, so no caller can obtain the full secret through this seam.
+//
+// A ciphertext that fails to open reports WebhookURLUnreadable rather than an
+// error: the settings page must still render, and the owner needs to be told
+// which of the two situations they are in -- re-save to restore a decryptable
+// endpoint, or withdraw it. The failure is never surfaced as an error VALUE
+// either, because the decrypt error's text is not something a page or an
+// operator log may carry.
 func (service *WebhookSettingsService) BuildWebhookURLDisplay(userID uint, encryptedURL string) WebhookURLDisplay {
 	if strings.TrimSpace(encryptedURL) == "" {
-		return WebhookURLDisplay{}
+		return WebhookURLDisplay{Readability: WebhookURLAbsent}
 	}
 	plaintext, err := service.DecryptWebhookURL(userID, encryptedURL)
 	if err != nil {
-		return WebhookURLDisplay{Configured: true}
+		return WebhookURLDisplay{Readability: WebhookURLUnreadable}
 	}
-	return WebhookURLDisplay{Configured: true, Host: webhookURLHost(plaintext)}
+	// hostOnly is the package's single URL-hostname redaction rule -- the same one
+	// the notify pass and the CLI print through. Keeping one implementation is
+	// what makes a hardening of "what is safe to show" reach every surface at
+	// once; this display used to carry its own byte-identical copy.
+	return WebhookURLDisplay{Readability: WebhookURLReadable, Host: hostOnly(plaintext)}
 }
 
-// webhookURLHost returns the hostname component of a stored webhook URL and
-// nothing else — no scheme, port, path, query, or userinfo — so a token embedded
-// anywhere but the host can never reach a render surface. An unparseable value
-// yields an empty host (the caller still shows "configured").
-func webhookURLHost(raw string) string {
-	parsed, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil {
-		return ""
-	}
-	return parsed.Hostname()
+// RemoveWebhookDestination withdraws the owner's endpoint and leaves the
+// per-kind opt-ins and the shared lead window exactly where the owner set them.
+// It never decrypts the ciphertext it clears, which is what keeps an unreadable
+// endpoint revocable, and it is the only write path that expresses "remove the
+// destination" on its own -- SaveWebhookSettings always writes the kinds and the
+// lead window too, so a thin caller reaching for it would silently narrow the
+// window to zero.
+func (service *WebhookSettingsService) RemoveWebhookDestination(ctx context.Context, userID uint) error {
+	return service.users.RemoveWebhookDestination(ctx, userID)
 }

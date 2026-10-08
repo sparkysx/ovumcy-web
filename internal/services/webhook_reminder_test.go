@@ -41,6 +41,23 @@ func enabledWebhookSettings(leadDays int) WebhookReminderSettings {
 	}
 }
 
+// webhookReminderCycleLogs seeds the cycle start under test plus the previous
+// start three 28-day cycles earlier, one cycle apart. The ovulation reminder
+// rides the completed-cycle floor (FertilityProjectionSuppressed), so the
+// decision path needs three completed cycles behind it; starts a full cycle
+// apart are the same 28 days the account settings carry, which leaves every
+// projected date exactly where these cases pin it.
+func webhookReminderCycleLogs(t *testing.T, start string) []models.DailyLog {
+	t.Helper()
+	startDay := mustParseWebhookReminderDay(t, start, time.UTC)
+	return []models.DailyLog{
+		{Date: startDay.AddDate(0, 0, -84), IsPeriod: true, CycleStart: true},
+		{Date: startDay.AddDate(0, 0, -56), IsPeriod: true, CycleStart: true},
+		{Date: startDay.AddDate(0, 0, -28), IsPeriod: true, CycleStart: true},
+		{Date: startDay, IsPeriod: true, CycleStart: true},
+	}
+}
+
 // findDueReminder returns the reminder of the given type, or false when absent.
 func findDueReminder(reminders []DueReminder, reminderType string) (DueReminder, bool) {
 	for _, reminder := range reminders {
@@ -83,7 +100,7 @@ func TestReminderWithinWindowBoundaries(t *testing.T) {
 			if !tc.zeroDate {
 				eventDate = mustParseWebhookReminderDay(t, tc.eventDate, time.UTC)
 			}
-			if got := reminderWithinWindow(today, eventDate, leadDays); got != tc.want {
+			if got := reminderWithinWindow(today, eventDate, time.Time{}, leadDays); got != tc.want {
 				t.Fatalf("reminderWithinWindow(%s, %s, %d) = %v, want %v",
 					today.Format("2006-01-02"), tc.eventDate, leadDays, got, tc.want)
 			}
@@ -96,11 +113,11 @@ func TestReminderWithinWindowBoundaries(t *testing.T) {
 func TestReminderWithinWindowZeroLeadOnlyToday(t *testing.T) {
 	today := mustParseWebhookReminderDay(t, "2026-03-10", time.UTC)
 
-	if !reminderWithinWindow(today, today, 0) {
+	if !reminderWithinWindow(today, today, time.Time{}, 0) {
 		t.Fatalf("expected event today to be due with a zero lead window")
 	}
 	tomorrow := mustParseWebhookReminderDay(t, "2026-03-11", time.UTC)
-	if reminderWithinWindow(today, tomorrow, 0) {
+	if reminderWithinWindow(today, tomorrow, time.Time{}, 0) {
 		t.Fatalf("expected event tomorrow to be excluded by a zero lead window")
 	}
 }
@@ -116,9 +133,7 @@ func TestReminderWithinWindowZeroLeadOnlyToday(t *testing.T) {
 func TestDecideDueRemindersOvulationWindowBoundaries(t *testing.T) {
 	const leadDays = 3
 	user := regularWebhookUser()
-	logs := []models.DailyLog{
-		{Date: mustParseWebhookReminderDay(t, "2026-03-01", time.UTC), IsPeriod: true, CycleStart: true},
-	}
+	logs := webhookReminderCycleLogs(t, "2026-03-01")
 
 	cases := []struct {
 		name       string
@@ -153,9 +168,6 @@ func TestDecideDueRemindersOvulationWindowBoundaries(t *testing.T) {
 			}
 			if ovulation.LeadDays != leadDays {
 				t.Fatalf("ovulation lead days = %d, want %d", ovulation.LeadDays, leadDays)
-			}
-			if !ovulation.Estimate {
-				t.Fatalf("expected Estimate=true (a predicted date is never fact)")
 			}
 		})
 	}
@@ -201,9 +213,6 @@ func TestDecideDueRemindersPeriodWindow(t *testing.T) {
 			if got := period.CycleAnchor.Format("2006-01-02"); got != tc.wantEvent {
 				t.Fatalf("period cycle anchor = %s, want %s (anchor is the next cycle start)", got, tc.wantEvent)
 			}
-			if !period.Estimate {
-				t.Fatalf("expected Estimate=true")
-			}
 		})
 	}
 }
@@ -219,9 +228,7 @@ func TestDecideDueRemindersPeriodWindow(t *testing.T) {
 func TestDecideDueRemindersIdempotencyByWatermark(t *testing.T) {
 	const leadDays = 14
 	user := regularWebhookUser()
-	logs := []models.DailyLog{
-		{Date: mustParseWebhookReminderDay(t, "2026-03-01", time.UTC), IsPeriod: true, CycleStart: true},
-	}
+	logs := webhookReminderCycleLogs(t, "2026-03-01")
 	now := mustParseWebhookReminderDay(t, "2026-03-28", time.UTC)
 
 	// Baseline (no watermarks): both kinds fire. Capture their anchors.
@@ -324,6 +331,84 @@ func TestDecideDueRemindersSuppression(t *testing.T) {
 	})
 }
 
+// regularWebhookCycleStartLogs is a stable 28-day history: four cycle starts a
+// cycle apart, so the observed average and median are both 28 and the account is
+// neither sparse nor irregular. The last start is 2026-02-26, which is the anchor
+// every overdue case below runs from.
+func regularWebhookCycleStartLogs(t *testing.T) []models.DailyLog {
+	t.Helper()
+	logs := make([]models.DailyLog, 0, 4)
+	for _, day := range []string{"2025-12-04", "2026-01-01", "2026-01-29", "2026-02-26"} {
+		logs = append(logs, models.DailyLog{
+			Date:       mustParseWebhookReminderDay(t, day, time.UTC),
+			IsPeriod:   true,
+			CycleStart: true,
+		})
+	}
+	return logs
+}
+
+// TestDecideDueRemindersSuppressesOverdueCycle covers the third medical-safety
+// gate: an account whose cycle has run past its own reference length by more than
+// a week (DashboardCycleOverdue) gets no reminder at all.
+//
+// The projection is what makes this necessary. From the 2026-02-26 anchor with a
+// 28-day cycle, the next period stays on the running cycle (2026-03-26, long
+// behind), but the ovulation still rolls forward a whole cycle at a time, so on
+// 2026-04-06 — cycle day 40 against a 28-day reference — it yields 2026-04-08,
+// two days out and inside the lead window. Nothing in the account's data
+// supports that date: no period was logged since, and the reminder would have
+// announced an ovulation of a cycle that never started. The in-window assertion
+// below is the point of the test — it proves the reminder is withheld by the
+// overdue gate and not merely by the window, so the case cannot go quietly green
+// if the gate is removed.
+func TestDecideDueRemindersSuppressesOverdueCycle(t *testing.T) {
+	const leadDays = 3
+	user := regularWebhookUser()
+	logs := regularWebhookCycleStartLogs(t)
+
+	t.Run("a cycle inside its reference length still reminds", func(t *testing.T) {
+		// Cycle day 26 of a 28-day reference: the estimate is honest, and the
+		// reminder for 2026-03-26 fires. Positive anchor for the case below.
+		now := mustParseWebhookReminderDay(t, "2026-03-23", time.UTC)
+		reminders := DecideDueReminders(user, enabledWebhookSettings(leadDays), logs, now, time.UTC)
+		period, ok := findDueReminder(reminders, DueReminderTypePeriod)
+		if !ok {
+			t.Fatalf("expected a period reminder inside the reference length, got %#v", reminders)
+		}
+		if got := period.EventDate.Format("2006-01-02"); got != "2026-03-26" {
+			t.Fatalf("period event date = %s, want 2026-03-26", got)
+		}
+	})
+
+	t.Run("an overdue cycle emits nothing", func(t *testing.T) {
+		now := mustParseWebhookReminderDay(t, "2026-04-06", time.UTC)
+		stats := NewStatsService(nil, nil).BuildCycleStatsFromLogs(user, logs, now, time.UTC)
+
+		if !DashboardCycleOverdue(user, stats) {
+			t.Fatalf("test setup expects an overdue cycle: cycle day %d against reference %d",
+				stats.CurrentCycleDay, DashboardCycleReferenceLength(user, stats))
+		}
+
+		// The rolled-forward ovulation IS inside the lead window here: without the
+		// overdue gate this decision emits an "ovulation soon" reminder for a date
+		// the account's own data does not support.
+		prediction := DashboardUpcomingPredictions(stats, user, now, DashboardProjectionCycleLength(user, stats))
+		if got := prediction.NextPeriodStart.Format("2006-01-02"); got != "2026-03-26" {
+			t.Fatalf("test setup expects the running cycle's period 2026-03-26, got %s", got)
+		}
+		if !reminderWithinWindow(now, prediction.OvulationDate, time.Time{}, leadDays) {
+			t.Fatalf("test setup expects the phantom ovulation %s inside the %d-day window from %s",
+				prediction.OvulationDate.Format("2006-01-02"), leadDays, now.Format("2006-01-02"))
+		}
+
+		reminders := DecideDueReminders(user, enabledWebhookSettings(leadDays), logs, now, time.UTC)
+		if len(reminders) != 0 {
+			t.Fatalf("expected no reminders for an overdue cycle, got %#v", reminders)
+		}
+	})
+}
+
 // TestDecideDueRemindersToggles covers the enable switches: the master
 // webhook-enabled flag off suppresses everything, and each per-kind flag off
 // omits exactly that kind while leaving the other in place. today=2026-03-28
@@ -332,9 +417,7 @@ func TestDecideDueRemindersSuppression(t *testing.T) {
 func TestDecideDueRemindersToggles(t *testing.T) {
 	const leadDays = 14
 	user := regularWebhookUser()
-	logs := []models.DailyLog{
-		{Date: mustParseWebhookReminderDay(t, "2026-03-01", time.UTC), IsPeriod: true, CycleStart: true},
-	}
+	logs := webhookReminderCycleLogs(t, "2026-03-01")
 	now := mustParseWebhookReminderDay(t, "2026-03-28", time.UTC)
 
 	t.Run("webhook disabled emits nothing", func(t *testing.T) {
@@ -393,9 +476,7 @@ func TestDecideDueRemindersTimezoneResolvesOnOwnerLocalDay(t *testing.T) {
 	user := regularWebhookUser()
 	// Period log built as a plain calendar day (UTC-midnight), matching how
 	// stored date-only values persist.
-	logs := []models.DailyLog{
-		{Date: mustParseWebhookReminderDay(t, "2026-03-01", time.UTC), IsPeriod: true, CycleStart: true},
-	}
+	logs := webhookReminderCycleLogs(t, "2026-03-01")
 	// 2026-03-14 02:00 UTC → 03-14 11:00 in Tokyo, 03-13 in Los Angeles.
 	nowInstant := time.Date(2026, time.March, 14, 2, 0, 0, 0, time.UTC)
 

@@ -55,7 +55,7 @@ func StatsCycleFactorContextWindowDays() int {
 }
 
 func buildStatsCycleFactorExplanation(user *models.User, logs []models.DailyLog, stats CycleStats, now time.Time, location *time.Location) (StatsCycleFactorExplanation, bool) {
-	completedCycles := buildCompletedCycleSpans(logs, location)
+	completedCycles := buildCompletedCycleSpans(logs, location, BoundaryContextFor(user, DateAtLocation(now, location)))
 	if !shouldBuildStatsCycleFactorExplanation(user, logs, completedCycles, stats) {
 		return StatsCycleFactorExplanation{}, false
 	}
@@ -80,7 +80,7 @@ func shouldBuildStatsCycleFactorExplanation(user *models.User, logs []models.Dai
 
 func collectStatsCycleFactorCounts(logs []models.DailyLog, now time.Time, location *time.Location) map[string]int {
 	today := DateAtLocation(now, location)
-	windowStart := today.AddDate(0, 0, -(statsCycleFactorContextWindowDays - 1))
+	windowStart := AddCalendarDays(today, -(statsCycleFactorContextWindowDays - 1), location)
 	counts := make(map[string]int, len(supportedDayCycleFactorKeys))
 	for _, logEntry := range logs {
 		logDay := CalendarDay(logEntry.Date, location)
@@ -103,7 +103,7 @@ func buildStatsCycleFactorSnapshots(logs []models.DailyLog, completedCycles []co
 		}
 		snapshots = append(snapshots, statsCycleFactorCycleSnapshot{
 			Start:          cycle.Start,
-			End:            cycle.NextStart.AddDate(0, 0, -1),
+			End:            AddCalendarDays(cycle.NextStart, -1, cycle.NextStart.Location()),
 			CycleLength:    cycle.CycleLength,
 			ComparisonKind: classifyStatsCycleFactorComparison(stats, cycle.CycleLength),
 			FactorKeys:     factorKeys,
@@ -194,15 +194,23 @@ func buildStatsCycleFactorRecentCycles(snapshots []statsCycleFactorCycleSnapshot
 		return nil
 	}
 
-	sort.Slice(snapshots, func(i, j int) bool {
-		return snapshots[i].Start.After(snapshots[j].Start)
+	// Sort a COPY. The caller hands the same slice to
+	// buildStatsCycleFactorPatternSummaries inside one composite literal, so
+	// sorting the argument in place would reorder what that builder sees and
+	// make the order of two struct fields load-bearing — an edit that reads as
+	// pure formatting. Regression:
+	// TestBuildStatsCycleFactorRecentCyclesLeavesItsArgumentUntouched.
+	ordered := make([]statsCycleFactorCycleSnapshot, len(snapshots))
+	copy(ordered, snapshots)
+	sort.Slice(ordered, func(i, j int) bool {
+		return ordered[i].Start.After(ordered[j].Start)
 	})
-	if len(snapshots) > statsCycleFactorRecentCycleLimit {
-		snapshots = snapshots[:statsCycleFactorRecentCycleLimit]
+	if len(ordered) > statsCycleFactorRecentCycleLimit {
+		ordered = ordered[:statsCycleFactorRecentCycleLimit]
 	}
 
-	summaries := make([]StatsCycleFactorRecentCycleSummary, 0, len(snapshots))
-	for _, snapshot := range snapshots {
+	summaries := make([]StatsCycleFactorRecentCycleSummary, 0, len(ordered))
+	for _, snapshot := range ordered {
 		summaries = append(summaries, StatsCycleFactorRecentCycleSummary{
 			Start:          snapshot.Start,
 			End:            snapshot.End,

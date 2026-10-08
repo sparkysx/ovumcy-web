@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -11,24 +12,36 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+// ErrResetTokenAlreadyConsumed is the shared value from internal/models, not a
+// second one with the same text. It is raised by the repository's CAS update
+// and reaches callers here unchanged, and this package cannot import
+// internal/db — a redeclaration would leave errors.Is false across the layer
+// boundary for the very error being tested for.
+var ErrResetTokenAlreadyConsumed = models.ErrResetTokenAlreadyConsumed
+
 var (
-	ErrRecoveryCodeNotFound      = errors.New("recovery code not found")
-	ErrInvalidResetToken         = errors.New("invalid reset token")
-	ErrResetTokenAlreadyConsumed = errors.New("reset token already consumed")
-	ErrAuthUserRequired          = errors.New("auth user is required")
-	ErrAuthUserNotFound          = errors.New("auth user not found")
-	ErrAuthUserLookupFailed      = errors.New("auth user lookup failed")
-	ErrRecoveryCodeGenerate      = errors.New("recovery code generation failed")
-	ErrRecoveryCodeUpdate        = errors.New("recovery code update failed")
-	ErrAuthRegisterInvalid       = errors.New("auth register invalid input")
-	ErrAuthEmailExists           = errors.New("auth email already exists")
-	ErrAuthRegisterFailed        = errors.New("auth register failed")
-	ErrAuthPasswordMismatch      = errors.New("auth register password mismatch")
-	ErrAuthWeakPassword          = errors.New("auth register weak password")
-	ErrAuthInvalidCreds          = errors.New("auth invalid credentials")
-	ErrAuthResetInvalid          = errors.New("auth reset invalid input")
-	ErrAuthPasswordHash          = errors.New("auth password hash failed")
-	ErrAuthPasswordUpdate        = errors.New("auth password update failed")
+	ErrRecoveryCodeNotFound = errors.New("recovery code not found")
+	ErrInvalidResetToken    = errors.New("invalid reset token")
+	ErrAuthUserRequired     = errors.New("auth user is required")
+	ErrAuthUserNotFound     = errors.New("auth user not found")
+	ErrAuthUserLookupFailed = errors.New("auth user lookup failed")
+	ErrRecoveryCodeGenerate = errors.New("recovery code generation failed")
+	ErrRecoveryCodeUpdate   = errors.New("recovery code update failed")
+	ErrAuthRegisterInvalid  = errors.New("auth register invalid input")
+	ErrAuthEmailExists      = errors.New("auth email already exists")
+	ErrAuthRegisterFailed   = errors.New("auth register failed")
+	ErrAuthPasswordMismatch = errors.New("auth register password mismatch")
+	ErrAuthWeakPassword     = errors.New("auth register weak password")
+	ErrAuthPasswordTooLong  = errors.New("auth register password too long")
+	ErrAuthInvalidCreds     = errors.New("auth invalid credentials")
+	ErrAuthResetInvalid     = errors.New("auth reset invalid input")
+	ErrAuthPasswordHash     = errors.New("auth password hash failed")
+	ErrAuthPasswordUpdate   = errors.New("auth password update failed")
+	// ErrAuthUserIDRequired mirrors ErrOperatorUserIDRequired: an id-addressed
+	// reset with no id is invalid input, the same way a blank email is, never a
+	// reason to fall through to a lookup that would compare a zero id against
+	// nothing and match nothing meaningful.
+	ErrAuthUserIDRequired = errors.New("auth user id is required")
 )
 
 // recoveryCodeTimingEqualizationHash and credentialsTimingEqualizationHash are
@@ -44,26 +57,34 @@ const credentialsTimingEqualizationHash = "$2a$12$pI5aDx1kby9ZEk9.2NzhBeq77y41xg
 
 type AuthUserRepository interface {
 	ExistsByNormalizedEmail(ctx context.Context, email string) (bool, error)
-	FindByNormalizedEmail(ctx context.Context, email string) (models.User, error)
-	FindByNormalizedEmailOptional(ctx context.Context, email string) (models.User, bool, error)
+	// FindAllByNormalizedEmail is read only through resolveUniqueUserByEmail.
+	FindAllByNormalizedEmail(ctx context.Context, email string) ([]models.User, error)
 	FindByID(ctx context.Context, userID uint) (models.User, error)
+	FindByIDOptional(ctx context.Context, userID uint) (models.User, bool, error)
 	Create(ctx context.Context, user *models.User) error
-	UpdateRecoveryCodeHashAndRevokeSessions(ctx context.Context, userID uint, recoveryHash string) error
-	UpdatePasswordAndRevokeSessions(ctx context.Context, userID uint, passwordHash string, mustChangePassword bool) error
+	UpdateRecoveryCodeHashAndRevokeSessions(ctx context.Context, userID uint, expectedSessionVersion int, recoveryHash string, beforeCommit func(sessionVersion int) error) error
+	UpdatePasswordAndRevokeSessions(ctx context.Context, userID uint, expectedSessionVersion int, passwordHash string, mustChangePassword bool) error
 	// ForceResetPasswordAndRevokeSessions is the operator-reset variant: it
 	// rewrites the password, forces change-on-next-login, bumps the session
 	// version, AND force-clears the calendar-feed token in one atomic update
 	// (feed-clear arm of the force-rotate-on-recovery rule). Distinct from the
 	// routine UpdatePasswordAndRevokeSessions, which must NOT touch the feed.
 	ForceResetPasswordAndRevokeSessions(ctx context.Context, userID uint, passwordHash string) error
-	UpdatePasswordRecoveryCodeAndRevokeSessions(ctx context.Context, userID uint, passwordHash string, recoveryHash string, mustChangePassword bool) error
-	UpdatePasswordRecoveryCodeAndRevokeSessionsCAS(ctx context.Context, userID uint, oldPasswordHash string, newPasswordHash string, recoveryHash string) error
-	// UpdatePasswordHashOnly rewrites password_hash WITHOUT bumping
+	UpdatePasswordRecoveryCodeAndRevokeSessions(ctx context.Context, userID uint, expectedSessionVersion int, passwordHash string, recoveryHash string, mustChangePassword bool, beforeCommit func(sessionVersion int) error) error
+	UpdatePasswordRecoveryCodeAndRevokeSessionsCAS(ctx context.Context, userID uint, oldPasswordHash string, oldSessionVersion int, newPasswordHash string, recoveryHash string, beforeCommit func(sessionVersion int) error) error
+	// UpgradePasswordHashCAS rewrites password_hash WITHOUT bumping
 	// auth_session_version — a transparent storage-format upgrade (bcrypt cost
-	// rise), not a credential change. Used only by the opportunistic rehash on
-	// successful login; the caller has already proven the password.
-	UpdatePasswordHashOnly(ctx context.Context, userID uint, passwordHash string) error
+	// rise), not a credential change — and only while password_hash still
+	// equals oldPasswordHash. Used only by the opportunistic rehash on
+	// successful login; the caller has already proven the password against
+	// oldPasswordHash. applied is false when a concurrent credential write won.
+	UpgradePasswordHashCAS(ctx context.Context, userID uint, oldPasswordHash string, newPasswordHash string) (applied bool, err error)
 	BumpAuthSessionVersion(ctx context.Context, userID uint) error
+	// ClaimRecoveryCodeReveal atomically consumes the account's one-time
+	// recovery-code reveal, returning true only for the call that consumed it.
+	// Every UPDATE that mints a recovery code re-arms it in the same statement
+	// (migration 036).
+	ClaimRecoveryCodeReveal(ctx context.Context, userID uint, revealedAt time.Time) (bool, error)
 }
 
 const (
@@ -96,15 +117,47 @@ func (service *AuthService) ConfigureLogoutAttemptLimits(attempts int, window ti
 	service.logoutAttemptPolicy.Configure(attempts, window)
 }
 
+// LogoutAttemptIdentity is the identity the logout budget is keyed by: the
+// owner of the session being ended. It deliberately does NOT name the session.
+// RevokeAuthSessions bumps AuthSessionVersion, so ResolveAuthSession refuses
+// that token on the very next request and no session can reach the logout
+// handler twice: a session-keyed budget would top out at one recorded attempt
+// against a limit of twenty and could never be spent, leaving the browser
+// logout route with no account-side cap at all. The session-independent harm a
+// per-owner key used to cause — one owner's sign-outs refusing another's —
+// belongs to the client bucket, and is fixed there (logoutClientBucket).
+func LogoutAttemptIdentity(userID uint) string {
+	return strconv.FormatUint(uint64(userID), 10)
+}
+
 // CheckAndRecordLogoutAttempt returns true if the per-account logout rate limit is
 // exceeded for this (clientKey, identity) pair. If not exceeded, it also records
-// the attempt so subsequent calls count it toward the window.
+// the attempt so subsequent calls count it toward the window; the check and the
+// booking are one reservation, so a burst cannot pass the cap together, and a
+// logout has no compare to succeed, so the reservation is never refunded. The budget lives
+// in its own limiter under its own scope: a logout is an attempt against this
+// budget only, never a failure against — and never a reset of — the login,
+// recovery or TOTP budgets.
 func (service *AuthService) CheckAndRecordLogoutAttempt(secretKey []byte, clientKey string, identity string, now time.Time) bool {
-	if service.logoutAttemptPolicy.TooManyRecent(secretKey, clientKey, identity, now) {
-		return true
+	clientBucket := logoutClientBucket(clientKey, identity)
+	_, admitted := service.logoutAttemptPolicy.Reserve(secretKey, clientBucket, identity, now)
+	return !admitted
+}
+
+// logoutClientBucket scopes the client-keyed bucket to the account as well, the
+// way ReauthAttempt.clientBucket does for re-authentication. Logout is reachable
+// only with a session in hand, so an address-wide bucket buys no protection an
+// attacker could not get around by signing in; it did cause harm: at the
+// account budget's size it ran a second, three-times-tighter per-address cap
+// under the documented per-IP row, and a household behind one address — or a
+// test run from one — was refused its twenty-first sign-out even though each
+// owner still had its own budget.
+func logoutClientBucket(clientKey string, identity string) string {
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		return clientKey
 	}
-	service.logoutAttemptPolicy.AddFailure(secretKey, clientKey, identity, now)
-	return false
+	return clientKey + "|" + identity
 }
 
 func (service *AuthService) RegistrationEmailExists(ctx context.Context, email string) (bool, error) {
@@ -115,12 +168,30 @@ func (service *AuthService) CreateUser(ctx context.Context, user *models.User) e
 	return service.users.Create(ctx, user)
 }
 
-func (service *AuthService) FindByNormalizedEmail(ctx context.Context, email string) (models.User, error) {
-	return service.users.FindByNormalizedEmail(ctx, email)
-}
-
 func (service *AuthService) FindByID(ctx context.Context, userID uint) (models.User, error) {
 	return service.users.FindByID(ctx, userID)
+}
+
+// FindByIDOptional separates an account that does not exist (found false, no
+// error) from a lookup that failed (an error), which FindByID leaves to the
+// caller to tell apart by a storage driver's sentinel.
+func (service *AuthService) FindByIDOptional(ctx context.Context, userID uint) (models.User, bool, error) {
+	return service.users.FindByIDOptional(ctx, userID)
+}
+
+// authPasswordPolicyError translates the shared password-policy verdict into
+// this layer's sentinels. The too-long refusal keeps its own sentinel the whole
+// way to the owner: collapsing it back into ErrAuthWeakPassword here would undo
+// the split at the first hop and hand the transport a single spec key again.
+func authPasswordPolicyError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, ErrPasswordTooLong):
+		return ErrAuthPasswordTooLong
+	default:
+		return ErrAuthWeakPassword
+	}
 }
 
 func (service *AuthService) ValidateRegistrationCredentials(password string, confirmPassword string) error {
@@ -133,8 +204,8 @@ func (service *AuthService) ValidateRegistrationCredentials(password string, con
 	if password != confirmPassword {
 		return ErrAuthPasswordMismatch
 	}
-	if err := ValidatePasswordStrength(password); err != nil {
-		return ErrAuthWeakPassword
+	if err := authPasswordPolicyError(ValidatePasswordStrength(password)); err != nil {
+		return err
 	}
 	return nil
 }
@@ -175,46 +246,80 @@ func (service *AuthService) ValidateResetPasswordInput(password string, confirmP
 	if password != confirmPassword {
 		return ErrAuthPasswordMismatch
 	}
-	if err := ValidatePasswordStrength(password); err != nil {
-		return ErrAuthWeakPassword
+	if err := authPasswordPolicyError(ValidatePasswordStrength(password)); err != nil {
+		return err
 	}
 	return nil
 }
 
-func (service *AuthService) ForceResetPasswordByEmail(ctx context.Context, email string, newPassword string) error {
-	normalizedEmail := NormalizeAuthEmail(email)
-	newPassword = strings.TrimSpace(newPassword)
-
-	if normalizedEmail == "" || newPassword == "" {
-		return ErrAuthResetInvalid
+// NormalizeForcedResetPassword is the operator-forced reset's whole password
+// rule — the trim AND the policy — in one exported call that returns the exact
+// string ForceResetPasswordByID will hash.
+//
+// It is exported because the `ovumcy reset-password` CLI has to apply the rule
+// BEFORE it spends the calendar-feed fence's one-shot confirmation, and a
+// second, hand-written copy of the rule there does not stay equal to this one:
+// a value the CLI trimmed differently is a value it checked and did not submit.
+// A trailing space is enough — " Passwd1 " passes a check on the raw bytes and
+// is refused by the policy once trimmed, and 71 characters plus two spaces are
+// refused as over the byte limit while the trimmed value is inside it. Callers
+// pass the returned string on to ForceResetPasswordByID, which applies this
+// same function again; it is idempotent, so the second pass changes nothing.
+func NormalizeForcedResetPassword(raw string) (string, error) {
+	newPassword := strings.TrimSpace(raw)
+	if newPassword == "" {
+		return "", ErrAuthResetInvalid
 	}
-	if err := ValidatePasswordStrength(newPassword); err != nil {
-		return ErrAuthWeakPassword
+	if err := authPasswordPolicyError(ValidatePasswordStrength(newPassword)); err != nil {
+		return "", err
+	}
+	return newPassword, nil
+}
+
+// ForceResetPasswordByID is the operator-forced reset: it applies the same
+// password policy the owner-facing paths do, then rewrites the hash, sets
+// must_change_password, re-enables local auth, clears the calendar-feed token
+// and bumps auth_session_version in one atomic update (forceResetPassword
+// below). It is addressed by id alone, because the id `users list` prints is
+// the only handle that reaches EVERY row: a legacy row the strict
+// NormalizeAuthEmail rule refuses, or one on a mailbox it shares with another
+// account, cannot be reached by any address-taking form at all. Its one
+// caller, the `ovumcy reset-password` CLI command, resolves the operator's
+// address to that id through OperatorUserService first, so an ambiguous
+// address is refused there rather than acted on here.
+func (service *AuthService) ForceResetPasswordByID(ctx context.Context, userID uint, newPassword string) error {
+	if userID == 0 {
+		return ErrAuthUserIDRequired
+	}
+	newPassword, err := NormalizeForcedResetPassword(newPassword)
+	if err != nil {
+		return err
 	}
 
-	exists, err := service.users.ExistsByNormalizedEmail(ctx, normalizedEmail)
+	user, found, err := service.users.FindByIDOptional(ctx, userID)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrAuthUserLookupFailed, err)
 	}
-	if !exists {
+	if !found {
 		return ErrAuthUserNotFound
 	}
 
-	user, err := service.users.FindByNormalizedEmail(ctx, normalizedEmail)
-	if err != nil {
-		return fmt.Errorf("%w: %v", ErrAuthUserLookupFailed, err)
-	}
+	return service.forceResetPassword(ctx, user.ID, newPassword)
+}
 
+// forceResetPassword is the write shared by both addressing forms: hash the
+// new password and apply the operator-reset update. Operator reset
+// (compromise/lockout recovery) rewrites the password, forces
+// change-on-next-login, revokes sessions, and force-clears the calendar-feed
+// token in one atomic update. A ROUTINE authenticated change uses
+// UpdatePasswordAndRevokeSessions and keeps the feed (manual rotate only).
+func (service *AuthService) forceResetPassword(ctx context.Context, userID uint, newPassword string) error {
 	passwordHash, err := bcrypt.GenerateFromPassword([]byte(newPassword), passwordHashCost)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrAuthPasswordHash, err)
 	}
 
-	// Operator reset (compromise/lockout recovery): rewrite the password, force
-	// change-on-next-login, revoke sessions, and force-clear the calendar-feed
-	// token in one atomic update. A ROUTINE authenticated change uses
-	// UpdatePasswordAndRevokeSessions and keeps the feed (manual rotate only).
-	if err := service.users.ForceResetPasswordAndRevokeSessions(ctx, user.ID, string(passwordHash)); err != nil {
+	if err := service.users.ForceResetPasswordAndRevokeSessions(ctx, userID, string(passwordHash)); err != nil {
 		return fmt.Errorf("%w: %v", ErrAuthPasswordUpdate, err)
 	}
 
@@ -243,7 +348,7 @@ func (service *AuthService) BuildOwnerUserWithRecovery(email string, rawPassword
 		Role:               models.RoleOwner,
 		CycleLength:        models.DefaultCycleLength,
 		PeriodLength:       models.DefaultPeriodLength,
-		AutoPeriodFill:     true,
+		AutoPeriodFill:     models.DefaultAutoPeriodFill,
 		CreatedAt:          createdAt,
 	}
 	return user, recoveryCode, nil
@@ -263,14 +368,17 @@ func (service *AuthService) BuildOIDCOwnerUser(email string, createdAt time.Time
 		Role:               models.RoleOwner,
 		CycleLength:        models.DefaultCycleLength,
 		PeriodLength:       models.DefaultPeriodLength,
-		AutoPeriodFill:     true,
+		AutoPeriodFill:     models.DefaultAutoPeriodFill,
 		CreatedAt:          createdAt,
 	}, nil
 }
 
 func (service *AuthService) AuthenticateCredentials(ctx context.Context, email string, password string) (models.User, error) {
-	user, err := service.users.FindByNormalizedEmail(ctx, email)
-	if err != nil {
+	// An address two accounts share is refused exactly as an unknown
+	// one — same sentinel, same bcrypt spend — so the duplicate stays
+	// invisible and neither account is picked for the caller.
+	user, found, err := resolveUniqueUserByEmail(ctx, service.users, email)
+	if err != nil || !found {
 		equalizeAuthCredentialsTiming(password)
 		return models.User{}, ErrAuthInvalidCreds
 	}
@@ -279,6 +387,12 @@ func (service *AuthService) AuthenticateCredentials(ctx context.Context, email s
 		return models.User{}, ErrAuthInvalidCreds
 	}
 	if bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)) != nil {
+		// The comparison above spends only the work the STORED hash carries.
+		// An account whose hash predates the current cost is therefore rejected
+		// measurably faster than an address with no account, which pays a full
+		// passwordHashCost comparison in the equalized branches above — the
+		// account-enumeration oracle in reverse. Buy the difference here.
+		topUpAuthCredentialsTiming(user.PasswordHash, password)
 		return models.User{}, ErrAuthInvalidCreds
 	}
 	if err := ValidateSupportedWebUser(&user); err != nil {
@@ -292,13 +406,20 @@ func (service *AuthService) AuthenticateCredentials(ctx context.Context, email s
 // stored bcrypt cost is below passwordHashCost, so the effective cost floor
 // rises for pre-existing accounts without forcing a reset. It runs only after
 // a successful CompareHashAndPassword (the plaintext is proven), rewrites the
-// hash in place via UpdatePasswordHashOnly (no auth_session_version bump — the
-// credential itself is unchanged), and mutates user.PasswordHash so a caller
-// that persists the struct sees the upgraded hash.
+// hash in place via UpgradePasswordHashCAS (no auth_session_version bump — the
+// credential itself is unchanged), and mutates user.PasswordHash only when the
+// write applied, so a caller that persists the struct sees what is stored.
 //
-// Best-effort by design: a costing/read error or a failed write is swallowed
-// so it can never turn a valid login into a failure. On the next login the
-// upgrade is simply retried.
+// The write is conditional on the hash this login compared against: a
+// password change or reset that lands between that compare and the write
+// wins, and the upgrade is dropped rather than restoring the old password over
+// the new one. The login itself still succeeds; the session minted from the
+// stale read dies anyway, because every other password_hash writer bumps
+// auth_session_version.
+//
+// Best-effort by design: a costing/read error, a failed write and a lost race
+// are all swallowed so none can turn a valid login into a failure. On the
+// next login the upgrade is simply retried.
 func (service *AuthService) rehashPasswordIfStale(ctx context.Context, user *models.User, password string) {
 	if user == nil || user.ID == 0 {
 		return
@@ -311,32 +432,70 @@ func (service *AuthService) rehashPasswordIfStale(ctx context.Context, user *mod
 	if err != nil {
 		return
 	}
-	if err := service.users.UpdatePasswordHashOnly(ctx, user.ID, string(upgraded)); err != nil {
+	applied, err := service.users.UpgradePasswordHashCAS(ctx, user.ID, user.PasswordHash, string(upgraded))
+	if err != nil || !applied {
 		return
 	}
 	user.PasswordHash = string(upgraded)
 }
 
-func (service *AuthService) FindUserByEmailAndRecoveryCode(ctx context.Context, email string, code string) (*models.User, error) {
+// FindUserByEmailRecoveryCodeAndPassword resolves the account behind a recovery
+// reset. It requires BOTH the account's current password and its recovery code:
+// the code is the substitute for the second factor, never for the first, so one
+// captured secret can no longer rewrite the password and mint a session.
+//
+// Every rejection returns the one ErrRecoveryCodeNotFound, and every rejection
+// spends the same bcrypt work as every OTHER rejection — two comparisons at
+// passwordHashCost. Where the row exists and its stored hashes were minted
+// below that cost, topUpRecoveryLookupTiming buys the shortfall back, so a
+// wrong code costs what an address with no account at all costs. A SUCCESS is
+// deliberately not held to that total: it runs no top-up, so an account still
+// carrying pre-raise hashes verifies more cheaply than it is rejected. Nothing
+// leaks by that — reaching the success path already requires both secrets.
+//
+// The operands are therefore never short-circuited against each other: when the row
+// exists, both comparisons run and only their combined result decides, and when
+// it does not, equalizeRecoveryCodeLookupTiming spends both against the fixed
+// placeholders. A password compare skipped after a failed code compare (or the
+// reverse) would be a timing oracle telling an attacker which of the two
+// secrets they got right — and, through the code operand, whether the account
+// exists at all.
+func (service *AuthService) FindUserByEmailRecoveryCodeAndPassword(ctx context.Context, email string, code string, password string) (*models.User, error) {
 	normalizedEmail := NormalizeAuthEmail(email)
 	if normalizedEmail == "" {
 		return nil, ErrRecoveryCodeNotFound
 	}
-	user, found, err := service.users.FindByNormalizedEmailOptional(ctx, normalizedEmail)
+	user, found, err := resolveUniqueUserByEmail(ctx, service.users, normalizedEmail)
+	var ambiguous *AmbiguousEmailError
+	if errors.As(err, &ambiguous) {
+		// Refused as an unknown address, for the reason AuthenticateCredentials
+		// gives; the error names the matching ids and must not travel further.
+		found, err = false, nil
+	}
 	if err != nil {
 		return nil, err
 	}
 	if !found {
-		equalizeRecoveryCodeLookupTiming(code)
+		equalizeRecoveryCodeLookupTiming(code, password)
 		return nil, ErrRecoveryCodeNotFound
 	}
 
 	hash := strings.TrimSpace(user.RecoveryCodeHash)
-	if !user.LocalAuthEnabled || hash == "" {
-		equalizeRecoveryCodeLookupTiming(code)
+	passwordHash := strings.TrimSpace(user.PasswordHash)
+	if !user.LocalAuthEnabled || hash == "" || passwordHash == "" {
+		equalizeRecoveryCodeLookupTiming(code, password)
 		return nil, ErrRecoveryCodeNotFound
 	}
-	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(NormalizeRecoveryCode(code))) != nil {
+	recoveryCodeMatches := bcrypt.CompareHashAndPassword([]byte(hash), []byte(NormalizeRecoveryCode(code))) == nil
+	passwordMatches := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(password)) == nil
+	if !recoveryCodeMatches || !passwordMatches {
+		// Both comparisons ran, but each spent only the work ITS stored hash
+		// carries, while equalizeRecoveryCodeLookupTiming above always spends
+		// two passwordHashCost comparisons. An account holding hashes minted
+		// before the current cost would answer faster than "no such address" —
+		// and unlike passwords, a recovery-code hash is never re-minted on a
+		// successful use, so a stale cost stays stale. Buy the difference.
+		topUpRecoveryLookupTiming(hash, code, passwordHash, password)
 		return nil, ErrRecoveryCodeNotFound
 	}
 	if err := ValidateSupportedWebUser(&user); err != nil {
@@ -345,12 +504,23 @@ func (service *AuthService) FindUserByEmailAndRecoveryCode(ctx context.Context, 
 	return &user, nil
 }
 
-func (service *AuthService) BuildPasswordResetToken(secretKey []byte, userID uint, passwordHash string, ttl time.Duration, now time.Time) (string, error) {
-	return BuildPasswordResetToken(secretKey, userID, passwordHash, ttl, now)
+// VerifyStoredRecoveryCode reports whether a presented recovery code matches a
+// stored bcrypt recovery-code hash. The code is compared exactly as presented:
+// the register-pickup flow feeds the server-minted value carried by its sealed
+// payload, so normalizing here would only widen what a payload can match.
+// User-typed recovery input goes through the normalizing email+code lookup
+// above instead. A malformed or empty hash fails closed.
+func (service *AuthService) VerifyStoredRecoveryCode(hash string, code string) bool {
+	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(code)) == nil
 }
 
-func (service *AuthService) BuildAuthSessionToken(secretKey []byte, userID uint, role string, sessionVersion int, ttl time.Duration, now time.Time) (string, error) {
-	return BuildAuthSessionTokenWithVersion(secretKey, userID, role, sessionVersion, ttl, now)
+// BuildPasswordResetToken forwards to the package-level builder. storedHash is
+// the account's bcrypt hash from the row — every caller passes user.PasswordHash
+// — and it is fingerprinted, not re-hashed. See PasswordStateFingerprint.
+// sessionVersion is the same row's auth_session_version, the epoch the grant
+// is bound to. purpose must be one of the PasswordResetTokenPurpose* constants.
+func (service *AuthService) BuildPasswordResetToken(secretKey []byte, userID uint, storedHash string, sessionVersion int, purpose string, ttl time.Duration, now time.Time) (string, error) {
+	return BuildPasswordResetToken(secretKey, userID, storedHash, sessionVersion, purpose, ttl, now)
 }
 
 func (service *AuthService) BuildAuthSessionTokenWithSessionID(secretKey []byte, userID uint, role string, sessionVersion int, ttl time.Duration, now time.Time) (string, string, error) {
@@ -375,7 +545,7 @@ func (service *AuthService) ResolveAuthSession(ctx context.Context, secretKey []
 	if user.MustChangePassword {
 		return nil, nil, ErrAuthSessionTokenRevoked
 	}
-	if NormalizeAuthSessionVersion(claims.SessionVersion) != NormalizeAuthSessionVersion(user.AuthSessionVersion) {
+	if !AuthSessionVersionsMatch(claims.SessionVersion, user.AuthSessionVersion) {
 		return nil, nil, ErrAuthSessionTokenRevoked
 	}
 	if err := ValidateSupportedWebUser(&user); err != nil {
@@ -400,21 +570,81 @@ func (service *AuthService) ResolveUserByResetToken(ctx context.Context, secretK
 	if !IsPasswordStateFingerprintMatch(claims.PasswordState, user.PasswordHash) {
 		return nil, ErrInvalidResetToken
 	}
+	// The grant dies with the epoch it was minted in: a recovery-code rotation,
+	// a session revocation or any other posture change bumps
+	// auth_session_version, and none of them touches the password hash the
+	// fingerprint above sees. A posture change landing between this read and
+	// the write is caught by the compare-and-swap in
+	// ResetPasswordAndRotateRecoveryCodeCAS, which keys on this row's version
+	// as well as its password hash.
+	if !AuthSessionVersionsMatch(claims.SessionVersion, user.AuthSessionVersion) {
+		return nil, ErrInvalidResetToken
+	}
 	if err := ValidateSupportedWebUser(&user); err != nil {
 		return nil, ErrInvalidResetToken
 	}
 	return &user, nil
 }
 
-func (service *AuthService) RegenerateRecoveryCode(ctx context.Context, userID uint) (string, error) {
+// RecoveryCodeDelivery seals everything that hands a freshly rotated recovery
+// code to its owner: the one-time reveal, and the re-issued session the reveal
+// is claimed under. The rotating write calls it after the write and before the
+// commit, with user already carrying the stored values (the session version
+// re-read from the row); an error rolls the rotation back, so the account keeps
+// its previous code rather than committing one nobody can be shown.
+type RecoveryCodeDelivery func(user *models.User, recoveryCode string) error
+
+// ErrRecoveryCodeDeliveryRequired refuses a rotation that names no delivery:
+// the code it would mint could never reach anyone.
+var ErrRecoveryCodeDeliveryRequired = errors.New("recovery code delivery is required")
+
+// RegenerateRecoveryCode rotates the account's recovery code and revokes its
+// sessions. On success user carries the rotated row; on any error, including
+// one from deliver, nothing was written and user is unchanged.
+func (service *AuthService) RegenerateRecoveryCode(ctx context.Context, user *models.User, deliver RecoveryCodeDelivery) (string, error) {
+	if user == nil {
+		return "", ErrAuthUserRequired
+	}
+	if deliver == nil {
+		return "", ErrRecoveryCodeDeliveryRequired
+	}
 	recoveryCode, recoveryHash, err := GenerateRecoveryCodeHash()
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", ErrRecoveryCodeGenerate, err)
 	}
-	if err := service.users.UpdateRecoveryCodeHashAndRevokeSessions(ctx, userID, recoveryHash); err != nil {
+	staged := *user
+	if err := service.users.UpdateRecoveryCodeHashAndRevokeSessions(ctx, user.ID, NormalizeAuthSessionVersion(user.AuthSessionVersion), recoveryHash, func(sessionVersion int) error {
+		staged.RecoveryCodeHash = recoveryHash
+		staged.AuthSessionVersion = sessionVersion
+		return deliver(&staged, recoveryCode)
+	}); err != nil {
+		if errors.Is(err, ErrAuthSessionVersionChanged) {
+			return "", ErrAuthSessionVersionChanged
+		}
 		return "", fmt.Errorf("%w: %v", ErrRecoveryCodeUpdate, err)
 	}
+	*user = staged
 	return recoveryCode, nil
+}
+
+// ClaimRecoveryCodeReveal consumes the account's one-time recovery-code reveal
+// and reports whether THIS call is the one that got it. False means the reveal
+// was already spent — a replayed sealed cookie, a second tab, a browser that
+// re-issued the request — and the caller must show nothing.
+//
+// The transport half (retracting the sealed cookie in the reveal response) asks
+// the browser to forget the value and cannot bind a client that kept it; this
+// mark is the half that holds.
+//
+// A zero userID is refused here, before the repository is reached: an absent
+// owner id is invalid input, not a claim that applies to whichever row comes
+// first. The compare-and-set below would match no row either — the guard makes
+// the refusal explicit rather than resting on that.
+func (service *AuthService) ClaimRecoveryCodeReveal(ctx context.Context, userID uint, revealedAt time.Time) (bool, error) {
+	if userID == 0 {
+		return false, ErrAuthUserRequired
+	}
+	return service.users.ClaimRecoveryCodeReveal(ctx, userID, revealedAt)
 }
 
 func (service *AuthService) RevokeAuthSessions(ctx context.Context, userID uint) error {
@@ -424,8 +654,15 @@ func (service *AuthService) RevokeAuthSessions(ctx context.Context, userID uint)
 	return service.users.BumpAuthSessionVersion(ctx, userID)
 }
 
-func equalizeRecoveryCodeLookupTiming(code string) {
-	_ = bcrypt.CompareHashAndPassword([]byte(recoveryCodeTimingEqualizationHash), []byte(NormalizeRecoveryCode(code)))
+// equalizeRecoveryCodeLookupTiming spends, on the early-return paths of the
+// recovery lookup, the bcrypt compute of BOTH operands the reset route now
+// verifies — the recovery code and the account password. Equalizing only the
+// code would make "this address has no account" measurably cheaper than a wrong
+// password on a real account by one whole cost-12 comparison, which is the
+// account-enumeration oracle this route must not have.
+func equalizeRecoveryCodeLookupTiming(code string, password string) {
+	_ = authTimingEqualizerCompare([]byte(recoveryCodeTimingEqualizationHash), []byte(NormalizeRecoveryCode(code)))
+	_ = authTimingEqualizerCompare([]byte(credentialsTimingEqualizationHash), []byte(password))
 }
 
 // equalizeAuthCredentialsTiming runs a bcrypt comparison against a fixed
@@ -438,8 +675,19 @@ func equalizeRecoveryCodeLookupTiming(code string) {
 // asserting "bcrypt was called" without measuring wall-clock time (which is
 // flake-prone on shared CI runners). Production code never reassigns this.
 var equalizeAuthCredentialsTiming = func(password string) {
-	_ = bcrypt.CompareHashAndPassword([]byte(credentialsTimingEqualizationHash), []byte(password))
+	_ = authTimingEqualizerCompare([]byte(credentialsTimingEqualizationHash), []byte(password))
 }
+
+// authTimingEqualizerCompare is the single seam through which the local-auth
+// equalizers — login, registration, recovery lookup and settings re-auth —
+// spend their bcrypt work. It exists because swapping an equalizer var proves
+// nothing about its BODY, and reading a func-declared one's cost off the
+// placeholder CONSTANT proves nothing about the comparisons it makes: both
+// once left an emptied body with the suite green. Swapping this instead drives
+// the shipped body and accounts the comparisons it actually makes, the way
+// timingTopUpCompare does for the top-up half. Production code never
+// reassigns this; TestTimingEqualizerVarsSpendThroughASeam fails if it does.
+var authTimingEqualizerCompare = bcrypt.CompareHashAndPassword
 
 // equalizeRegistrationTiming mirrors the bcrypt work BuildOwnerUserWithRecovery
 // performs on a fresh registration (password hash + recovery-code hash) so the
@@ -448,8 +696,129 @@ var equalizeAuthCredentialsTiming = func(password string) {
 // response latency. Declared as a var for the same test-substitution reason as
 // equalizeAuthCredentialsTiming.
 var equalizeRegistrationTiming = func(password string) {
-	_ = bcrypt.CompareHashAndPassword([]byte(credentialsTimingEqualizationHash), []byte(password))
-	_ = bcrypt.CompareHashAndPassword([]byte(recoveryCodeTimingEqualizationHash), []byte(password))
+	_ = authTimingEqualizerCompare([]byte(credentialsTimingEqualizationHash), []byte(password))
+	_ = authTimingEqualizerCompare([]byte(recoveryCodeTimingEqualizationHash), []byte(password))
+}
+
+// timingTopUpPlaceholderInput is the value the top-up placeholder hashes below
+// are minted from. It is not a credential and cannot become one: the hashes it
+// produces are only ever compared with the result discarded, and every real
+// verification in this package compares against a hash read from the row.
+const timingTopUpPlaceholderInput = "ovumcy timing equalization placeholder"
+
+// timingTopUpHashesByCost holds one placeholder bcrypt hash per cost below
+// passwordHashCost. A comparison against a hash at cost k spends ~2^k units of
+// bcrypt work, so this table is what lets a rejection buy exactly the work a
+// legacy stored hash did not spend (see bcryptCostTopUpSchedule).
+//
+// The hashes are MINTED, never pasted in as constants: hand-written literals
+// would stay pinned to today's passwordHashCost, so raising the constant would
+// silently leave the new top cost unpaid and reopen the gap this table closes.
+// The one-time price is the sum of 2^k for k = bcrypt.MinCost ..
+// passwordHashCost-1, which is just under a single passwordHashCost hash —
+// roughly one login's work, paid once at startup and never per request.
+var timingTopUpHashesByCost = mintTimingTopUpHashes()
+
+func mintTimingTopUpHashes() map[int][]byte {
+	minted := make(map[int][]byte, passwordHashCost-bcrypt.MinCost)
+	for cost := bcrypt.MinCost; cost < passwordHashCost; cost++ {
+		hash, err := bcrypt.GenerateFromPassword([]byte(timingTopUpPlaceholderInput), cost)
+		if err != nil {
+			continue // codecov:ignore -- bcrypt only errors on an out-of-range cost; spendBcryptCostTopUp overpays a missing entry rather than under-paying it
+		}
+		minted[cost] = hash
+	}
+	return minted
+}
+
+// bcryptCostTopUpSchedule names the costs at which dummy bcrypt work has to be
+// spent so that a comparison already made against a hash at storedCost adds up
+// to the work of a comparison at passwordHashCost.
+//
+// bcrypt work is exponential in the cost — a comparison at cost c spends ~2^c
+// units — and the deficit 2^passwordHashCost - 2^c is exactly the sum of 2^k
+// for k = c .. passwordHashCost-1. One dummy comparison at each of those costs
+// therefore pays the deficit precisely. The schedule is derived from
+// passwordHashCost and the observed stored cost, never from a fixed pair, so
+// raising the constant widens it without a second edit.
+//
+// A stored cost at or above passwordHashCost owes nothing. A cost below
+// bcrypt.MinCost cannot come out of bcrypt.Cost (it rejects such a hash
+// outright); it is clamped so the schedule stays finite either way.
+func bcryptCostTopUpSchedule(storedCost int) []int {
+	if storedCost < bcrypt.MinCost {
+		storedCost = bcrypt.MinCost
+	}
+	if storedCost >= passwordHashCost {
+		return nil
+	}
+
+	schedule := make([]int, 0, passwordHashCost-storedCost)
+	for cost := storedCost; cost < passwordHashCost; cost++ {
+		schedule = append(schedule, cost)
+	}
+	return schedule
+}
+
+// timingTopUpCompare is the single point at which the top-up spends bcrypt
+// work. Declared as a var for the same test-substitution reason as the
+// equalize* helpers, but used differently: a guard WRAPS it to account the work
+// spendBcryptCostTopUp actually spends, rather than recomputing that work from
+// bcryptCostTopUpSchedule. Recomputing it would only prove the schedule is
+// consistent with itself, and would stay green if the loop below stopped
+// comparing altogether. Production code never reassigns it.
+var timingTopUpCompare = func(hash []byte, operand []byte) {
+	_ = bcrypt.CompareHashAndPassword(hash, operand)
+}
+
+// spendBcryptCostTopUp pays, against placeholder hashes, the bcrypt work a real
+// comparison against storedHash left unspent relative to passwordHashCost. Like
+// the equalize* helpers it never authenticates anyone: every result is
+// discarded, and the placeholders are minted from a fixed non-credential input.
+//
+// fullCostPlaceholder is the caller's own passwordHashCost placeholder, spent
+// whole when the stored hash is unparseable — there bcrypt.CompareHashAndPassword
+// rejected the hash without running the KDF at all, so the entire cost is owed
+// rather than a deficit, and a zero-work rejection would be the loudest signal
+// of the three.
+func spendBcryptCostTopUp(storedHash string, operand string, fullCostPlaceholder string) {
+	storedCost, err := bcrypt.Cost([]byte(storedHash))
+	if err != nil {
+		timingTopUpCompare([]byte(fullCostPlaceholder), []byte(operand))
+		return
+	}
+
+	for _, topUpCost := range bcryptCostTopUpSchedule(storedCost) {
+		placeholder, ok := timingTopUpHashesByCost[topUpCost]
+		if !ok {
+			// Unreachable: the table covers every cost a schedule can name.
+			// If it ever does not, overpay by a full comparison instead of
+			// silently skipping the work.
+			timingTopUpCompare([]byte(fullCostPlaceholder), []byte(operand)) // codecov:ignore -- unreachable while the table covers bcrypt.MinCost..passwordHashCost-1
+			return
+		}
+		timingTopUpCompare(placeholder, []byte(operand))
+	}
+}
+
+// topUpAuthCredentialsTiming closes the login half of the same gap the
+// equalize* helpers close: the early-return branches of AuthenticateCredentials
+// always spend a passwordHashCost comparison, while the real comparison spends
+// only what the stored hash carries. Declared as a var for the same
+// test-substitution reason as equalizeAuthCredentialsTiming — production code
+// never reassigns it.
+var topUpAuthCredentialsTiming = func(storedHash string, password string) {
+	spendBcryptCostTopUp(storedHash, password, credentialsTimingEqualizationHash)
+}
+
+// topUpRecoveryLookupTiming is the recovery-lookup counterpart: it tops up both
+// operands equalizeRecoveryCodeLookupTiming spends at full cost, each against
+// its own placeholder, so a rejection costs the same whether the address has no
+// account or the account's stored hashes predate the current cost. The code is
+// normalized exactly as the real comparison normalizes it.
+var topUpRecoveryLookupTiming = func(recoveryHash string, code string, passwordHash string, password string) {
+	spendBcryptCostTopUp(recoveryHash, NormalizeRecoveryCode(code), recoveryCodeTimingEqualizationHash)
+	spendBcryptCostTopUp(passwordHash, password, credentialsTimingEqualizationHash)
 }
 
 // ResetPasswordAndRotateRecoveryCodeCAS is the single-use variant of
@@ -458,12 +827,21 @@ var equalizeRegistrationTiming = func(password string) {
 // issued (sourced from the resolved user before any write).
 //
 // The UPDATE carries the predicate
-// `WHERE id = ? AND password_hash = oldPasswordHash`. Concurrent or replayed
-// redeems both reach the UPDATE, but only one sees RowsAffected == 1; the
-// loser receives ErrResetTokenAlreadyConsumed.
-func (service *AuthService) ResetPasswordAndRotateRecoveryCodeCAS(ctx context.Context, user *models.User, oldPasswordHash string, newPassword string) (string, error) {
+// `WHERE id = ? AND password_hash = oldPasswordHash AND auth_session_version =
+// <the version on user>`. Concurrent or replayed redeems both reach the
+// UPDATE, but only one sees RowsAffected == 1; the loser receives
+// ErrResetTokenAlreadyConsumed. The version term closes the window between
+// resolving the token (which checks the version) and this write: a revocation
+// or posture change landing in between makes the reset lose too.
+//
+// deliver runs inside the write's transaction, before its commit (see
+// RecoveryCodeDelivery); an error from it leaves the row, and user, unchanged.
+func (service *AuthService) ResetPasswordAndRotateRecoveryCodeCAS(ctx context.Context, user *models.User, oldPasswordHash string, newPassword string, deliver RecoveryCodeDelivery) (string, error) {
 	if user == nil {
 		return "", ErrAuthUserRequired // codecov:ignore -- defensive; callers always pass a resolved user
+	}
+	if deliver == nil {
+		return "", ErrRecoveryCodeDeliveryRequired
 	}
 
 	passwordHash, err := bcrypt.GenerateFromPassword([]byte(newPassword), passwordHashCost)
@@ -476,14 +854,18 @@ func (service *AuthService) ResetPasswordAndRotateRecoveryCodeCAS(ctx context.Co
 	}
 
 	// CAS predicate prevents concurrent / replayed redeems.
-	if err := service.users.UpdatePasswordRecoveryCodeAndRevokeSessionsCAS(ctx, user.ID, oldPasswordHash, string(passwordHash), recoveryHash); err != nil {
+	staged := *user
+	if err := service.users.UpdatePasswordRecoveryCodeAndRevokeSessionsCAS(ctx, user.ID, oldPasswordHash, NormalizeAuthSessionVersion(user.AuthSessionVersion), string(passwordHash), recoveryHash, func(sessionVersion int) error {
+		staged.PasswordHash = string(passwordHash)
+		staged.RecoveryCodeHash = recoveryHash
+		staged.LocalAuthEnabled = true
+		staged.AuthSessionVersion = sessionVersion
+		staged.MustChangePassword = false
+		return deliver(&staged, recoveryCode)
+	}); err != nil {
 		return "", err
 	}
-	user.PasswordHash = string(passwordHash)
-	user.RecoveryCodeHash = recoveryHash
-	user.LocalAuthEnabled = true
-	user.AuthSessionVersion = NormalizeAuthSessionVersion(user.AuthSessionVersion) + 1
-	user.MustChangePassword = false
+	*user = staged
 
 	return recoveryCode, nil
 }

@@ -6,8 +6,49 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
 )
+
+// invalidTOTPCodeForSkewWindow returns a 6-digit code proven NOT to validate
+// against secret across the whole ±1-step skew window totp.Validate checks
+// at the instant it is called (the enrollment check, VerifyEnrollmentCode,
+// reads time.Now() itself and has no injectable clock, so this stays
+// deterministic without one). It computes
+// the codes for a wider window (±3 steps, i.e. ±90s around "now") than
+// Validate's own ±1-step skew (±30s) so a step boundary crossed between this
+// computation and the call under test cannot land the excluded set short,
+// then the caller re-asserts the precondition with totp.Validate immediately
+// before exercising the code path under test.
+func invalidTOTPCodeForSkewWindow(t *testing.T, secret string) string {
+	t.Helper()
+	opts := totp.ValidateOpts{
+		Period:    30,
+		Skew:      1,
+		Digits:    otp.DigitsSix,
+		Algorithm: otp.AlgorithmSHA1,
+	}
+	now := time.Now()
+	excluded := make(map[string]bool, 7)
+	for i := -3; i <= 3; i++ {
+		at := now.Add(time.Duration(i) * 30 * time.Second)
+		code, err := totp.GenerateCodeCustom(secret, at, opts)
+		if err != nil {
+			t.Fatalf("GenerateCodeCustom: %v", err)
+		}
+		excluded[code] = true
+	}
+	for _, candidate := range []string{
+		"000000", "111111", "222222", "333333", "444444",
+		"555555", "666666", "777777", "888888", "999999",
+	} {
+		if !excluded[candidate] {
+			return candidate
+		}
+	}
+	t.Fatal("invalidTOTPCodeForSkewWindow: every candidate collided with the skew window — widen the candidate set")
+	return ""
+}
 
 // stubTOTPUserRepo is a minimal stub for TOTPUserRepository used in unit tests.
 // claimedSteps emulates the persisted totp_last_used_step column per userID;
@@ -21,8 +62,10 @@ type stubTOTPUserRepo struct {
 	updateTOTPCalled bool
 
 	reencryptErr          error
+	reencryptLost         bool
 	reencryptCalled       bool
 	reencryptedUserID     uint
+	reencryptedOld        string
 	reencryptedCiphertext string
 
 	claimErr      error
@@ -31,22 +74,26 @@ type stubTOTPUserRepo struct {
 	lastClaimStep int64
 }
 
-func (stub *stubTOTPUserRepo) UpdateTOTPFieldsAndRevokeSessions(ctx context.Context, userID uint, encryptedSecret string, enabled bool) error {
+func (stub *stubTOTPUserRepo) UpdateTOTPFieldsAndRevokeSessions(ctx context.Context, userID uint, _ int, encryptedSecret string, enabled bool, lastUsedStep int64) error {
 	stub.updateTOTPCalled = true
 	stub.updatedUserID = userID
 	stub.updatedSecret = encryptedSecret
 	stub.updatedEnabled = enabled
 	if stub.claimedSteps != nil {
-		stub.claimedSteps[userID] = 0
+		stub.claimedSteps[userID] = lastUsedStep
 	}
 	return stub.updateErr
 }
 
-func (stub *stubTOTPUserRepo) UpdateTOTPSecretCiphertext(ctx context.Context, userID uint, encryptedSecret string) error {
+func (stub *stubTOTPUserRepo) UpgradeTOTPSecretCiphertextCAS(ctx context.Context, userID uint, oldCiphertext string, newCiphertext string) (bool, error) {
 	stub.reencryptCalled = true
 	stub.reencryptedUserID = userID
-	stub.reencryptedCiphertext = encryptedSecret
-	return stub.reencryptErr
+	stub.reencryptedOld = oldCiphertext
+	stub.reencryptedCiphertext = newCiphertext
+	if stub.reencryptErr != nil {
+		return false, stub.reencryptErr
+	}
+	return !stub.reencryptLost, nil
 }
 
 func (stub *stubTOTPUserRepo) ClaimTOTPStep(ctx context.Context, userID uint, step int64) (bool, error) {
@@ -87,7 +134,10 @@ func TestTOTPService_GenerateSetupKey(t *testing.T) {
 	}
 }
 
-func TestTOTPService_ValidateCodeRaw_Valid(t *testing.T) {
+// The enrollment check finds its step with findValidatedTOTPStep against the
+// raw, not yet persisted, secret; these two pin that it accepts a current code
+// and refuses one outside the whole skew window.
+func TestFindValidatedTOTPStep_RawSecret_Valid(t *testing.T) {
 	repo := &stubTOTPUserRepo{}
 	svc := NewTOTPService(repo, []byte("test-secret-key-32-bytes-padding!"), nil)
 
@@ -96,17 +146,22 @@ func TestTOTPService_ValidateCodeRaw_Valid(t *testing.T) {
 		t.Fatalf("GenerateSetupKey() error: %v", err)
 	}
 
-	code, err := totp.GenerateCode(key.Secret(), time.Now())
+	now := time.Now()
+	code, err := totp.GenerateCode(key.Secret(), now)
 	if err != nil {
 		t.Fatalf("GenerateCode() error: %v", err)
 	}
 
-	if !svc.ValidateCodeRaw(key.Secret(), code) {
-		t.Error("ValidateCodeRaw() returned false for a valid code")
+	step, found := findValidatedTOTPStep(key.Secret(), code, now)
+	if !found {
+		t.Fatal("findValidatedTOTPStep() found no step for a valid code")
+	}
+	if want := now.Unix() / totpStepSeconds; step != want {
+		t.Errorf("findValidatedTOTPStep() step = %d, want %d", step, want)
 	}
 }
 
-func TestTOTPService_ValidateCodeRaw_Invalid(t *testing.T) {
+func TestFindValidatedTOTPStep_RawSecret_Invalid(t *testing.T) {
 	repo := &stubTOTPUserRepo{}
 	svc := NewTOTPService(repo, []byte("test-secret-key-32-bytes-padding!"), nil)
 
@@ -115,8 +170,13 @@ func TestTOTPService_ValidateCodeRaw_Invalid(t *testing.T) {
 		t.Fatalf("GenerateSetupKey() error: %v", err)
 	}
 
-	if svc.ValidateCodeRaw(key.Secret(), "000000") {
-		t.Error("ValidateCodeRaw() returned true for '000000' — possible but extremely unlikely; rerun to confirm")
+	code := invalidTOTPCodeForSkewWindow(t, key.Secret())
+	if totp.Validate(code, key.Secret()) {
+		t.Fatalf("test setup produced code %q which validates against the secret right now — precondition failed, cannot prove the negative", code)
+	}
+
+	if _, found := findValidatedTOTPStep(key.Secret(), code, time.Now()); found {
+		t.Errorf("findValidatedTOTPStep() found a step for %q, proven invalid across the whole skew window", code)
 	}
 }
 
@@ -125,7 +185,7 @@ func TestTOTPService_EnableTOTP_StoresEncryptedSecret(t *testing.T) {
 	svc := NewTOTPService(repo, []byte("test-secret-key-32-bytes-padding!"), nil)
 
 	rawSecret := "JBSWY3DPEHPK3PXP"
-	if err := svc.EnableTOTP(context.Background(), 42, rawSecret); err != nil {
+	if err := svc.EnableTOTP(context.Background(), 42, 1, rawSecret, pastEnrollmentStep()); err != nil {
 		t.Fatalf("EnableTOTP() error: %v", err)
 	}
 
@@ -156,7 +216,7 @@ func TestTOTPService_ValidateCode_EncryptDecryptRoundTrip(t *testing.T) {
 		t.Fatalf("GenerateSetupKey() error: %v", err)
 	}
 
-	if err := svc.EnableTOTP(context.Background(), 1, key.Secret()); err != nil {
+	if err := svc.EnableTOTP(context.Background(), 1, 1, key.Secret(), pastEnrollmentStep()); err != nil {
 		t.Fatalf("EnableTOTP() error: %v", err)
 	}
 	encryptedSecret := repo.updatedSecret
@@ -185,7 +245,7 @@ func TestTOTPService_ValidateCode_ReplayRejected(t *testing.T) {
 		t.Fatalf("GenerateSetupKey() error: %v", err)
 	}
 
-	if err := svc.EnableTOTP(context.Background(), 1, key.Secret()); err != nil {
+	if err := svc.EnableTOTP(context.Background(), 1, 1, key.Secret(), pastEnrollmentStep()); err != nil {
 		t.Fatalf("EnableTOTP() error: %v", err)
 	}
 	encryptedSecret := repo.updatedSecret
@@ -230,7 +290,7 @@ func TestTOTPService_ValidateCode_ReplaySurvivesServiceRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateSetupKey() error: %v", err)
 	}
-	if err := svc.EnableTOTP(context.Background(), 1, key.Secret()); err != nil {
+	if err := svc.EnableTOTP(context.Background(), 1, 1, key.Secret(), pastEnrollmentStep()); err != nil {
 		t.Fatalf("EnableTOTP() error: %v", err)
 	}
 	encryptedSecret := repo.updatedSecret
@@ -265,12 +325,12 @@ func TestTOTPService_ValidateCode_SameCodeDifferentUser_Allowed(t *testing.T) {
 		t.Fatalf("GenerateSetupKey() error: %v", err)
 	}
 
-	if err := svc.EnableTOTP(context.Background(), 1, key.Secret()); err != nil {
+	if err := svc.EnableTOTP(context.Background(), 1, 1, key.Secret(), pastEnrollmentStep()); err != nil {
 		t.Fatalf("EnableTOTP() user 1 error: %v", err)
 	}
 	encrypted1 := repo.updatedSecret
 
-	if err := svc.EnableTOTP(context.Background(), 2, key.Secret()); err != nil {
+	if err := svc.EnableTOTP(context.Background(), 2, 1, key.Secret(), pastEnrollmentStep()); err != nil {
 		t.Fatalf("EnableTOTP() user 2 error: %v", err)
 	}
 	encrypted2 := repo.updatedSecret
@@ -299,7 +359,7 @@ func TestTOTPService_DisableTOTP_ClearsFields(t *testing.T) {
 	repo := &stubTOTPUserRepo{}
 	svc := NewTOTPService(repo, []byte("test-secret-key-32-bytes-padding!"), nil)
 
-	if err := svc.DisableTOTP(context.Background(), 99); err != nil {
+	if err := svc.DisableTOTP(context.Background(), 99, 1); err != nil {
 		t.Fatalf("DisableTOTP() error: %v", err)
 	}
 
@@ -321,10 +381,32 @@ func TestTOTPService_EnableTOTP_RepoError(t *testing.T) {
 	repo := &stubTOTPUserRepo{updateErr: ErrTOTPUpdateFailed}
 	svc := NewTOTPService(repo, []byte("test-secret-key-32-bytes-padding!"), nil)
 
-	err := svc.EnableTOTP(context.Background(), 1, "JBSWY3DPEHPK3PXP")
-	if err == nil {
-		t.Fatal("EnableTOTP() should propagate repo error")
+	err := svc.EnableTOTP(context.Background(), 1, 1, "JBSWY3DPEHPK3PXP", pastEnrollmentStep())
+	if !errors.Is(err, ErrTOTPUpdateFailed) {
+		t.Fatalf("EnableTOTP() error = %v, want the repo error as ErrTOTPUpdateFailed", err)
 	}
+}
+
+func TestTOTPService_EnableTOTP_RefusesAZeroEnrollmentStep(t *testing.T) {
+	for _, enrollment := range []TOTPEnrollmentStep{{}, {step: -1}} {
+		repo := &stubTOTPUserRepo{}
+		svc := NewTOTPService(repo, []byte("test-secret-key-32-bytes-padding!"), nil)
+
+		err := svc.EnableTOTP(context.Background(), 42, 1, "JBSWY3DPEHPK3PXP", enrollment)
+		if !errors.Is(err, ErrTOTPEnrollmentStepMissing) {
+			t.Fatalf("EnableTOTP(step %d) error = %v, want ErrTOTPEnrollmentStepMissing", enrollment.step, err)
+		}
+		if repo.updateTOTPCalled {
+			t.Fatalf("EnableTOTP(step %d) wrote the TOTP columns", enrollment.step)
+		}
+	}
+}
+
+// pastEnrollmentStep is the step an enrollment confirmed an hour ago would have
+// recorded: nonzero, as EnableTOTP requires, and below the step of any code a
+// test sends now.
+func pastEnrollmentStep() TOTPEnrollmentStep {
+	return TOTPEnrollmentStep{step: time.Now().Add(-time.Hour).Unix() / totpStepSeconds}
 }
 
 // --- rate-limit: verification (CheckRateLimit / RecordFailure / ResetAttempts) ---
@@ -375,8 +457,13 @@ func TestTOTPService_ResetAttempts_ClearsLimit(t *testing.T) {
 
 	svc.ResetAttempts(secretKey, "1.2.3.4", 1)
 
-	if err := svc.CheckRateLimit(secretKey, "1.2.3.4", 1, now); err != nil {
-		t.Errorf("CheckRateLimit() after ResetAttempts = %v, want nil", err)
+	// The client bucket is forgiven: the same client is open for another account.
+	if err := svc.CheckRateLimit(secretKey, "1.2.3.4", 2, now); err != nil {
+		t.Errorf("CheckRateLimit() for another account after ResetAttempts = %v, want nil", err)
+	}
+	// The identity bucket pools every client's failures and is not reset.
+	if err := svc.CheckRateLimit(secretKey, "5.6.7.8", 1, now); !errors.Is(err, ErrTOTPRateLimited) {
+		t.Errorf("CheckRateLimit() for the same account from another client = %v, want ErrTOTPRateLimited", err)
 	}
 }
 
@@ -423,72 +510,74 @@ func TestTOTPService_CheckRateLimit_ClientIPIsolation(t *testing.T) {
 	}
 }
 
-// --- rate-limit: disable (CheckDisableRateLimit / RecordDisableFailure / ResetDisableAttempts) ---
+// --- rate-limit: disable (the account's password re-auth ReauthBudget) ---
 
 func TestTOTPService_CheckDisableRateLimit_BelowLimit_ReturnsNil(t *testing.T) {
-	repo := &stubTOTPUserRepo{}
-	secretKey := []byte("test-secret-key-32-bytes-padding!")
-	svc := NewTOTPService(repo, secretKey, nil)
+	settings := newDisableBudgetSettings([]byte("test-secret-key-32-bytes-padding!"), nil)
 	now := time.Now()
 
-	for range DefaultTOTPDisableAttemptsLimit - 1 {
-		svc.RecordDisableFailure(secretKey, "1.2.3.4", 1, now)
+	for range DefaultSettingsReauthAttemptsLimit - 1 {
+		recordDisableFailure(settings, "1.2.3.4", 1, now)
 	}
 
-	if err := svc.CheckDisableRateLimit(secretKey, "1.2.3.4", 1, now); err != nil {
-		t.Errorf("CheckDisableRateLimit() after %d failures = %v, want nil", DefaultTOTPDisableAttemptsLimit-1, err)
+	if err := checkDisableBudget(settings, "1.2.3.4", 1, now); err != nil {
+		t.Errorf("disable budget after %d failures = %v, want nil", DefaultSettingsReauthAttemptsLimit-1, err)
 	}
 }
 
-func TestTOTPService_CheckDisableRateLimit_AtLimit_ReturnsErrTOTPDisableRateLimited(t *testing.T) {
-	repo := &stubTOTPUserRepo{}
-	secretKey := []byte("test-secret-key-32-bytes-padding!")
-	svc := NewTOTPService(repo, secretKey, nil)
+func TestTOTPService_CheckDisableRateLimit_AtLimit_ReturnsErrSettingsReauthRateLimited(t *testing.T) {
+	settings := newDisableBudgetSettings([]byte("test-secret-key-32-bytes-padding!"), nil)
 	now := time.Now()
 
-	for range DefaultTOTPDisableAttemptsLimit {
-		svc.RecordDisableFailure(secretKey, "1.2.3.4", 1, now)
+	for range DefaultSettingsReauthAttemptsLimit {
+		recordDisableFailure(settings, "1.2.3.4", 1, now)
 	}
 
-	err := svc.CheckDisableRateLimit(secretKey, "1.2.3.4", 1, now)
-	if !errors.Is(err, ErrTOTPDisableRateLimited) {
-		t.Errorf("CheckDisableRateLimit() after %d failures = %v, want ErrTOTPDisableRateLimited", DefaultTOTPDisableAttemptsLimit, err)
+	err := checkDisableBudget(settings, "1.2.3.4", 1, now)
+	if !errors.Is(err, ErrSettingsReauthRateLimited) {
+		t.Errorf("disable budget after %d failures = %v, want ErrSettingsReauthRateLimited", DefaultSettingsReauthAttemptsLimit, err)
 	}
 }
 
 func TestTOTPService_ResetDisableAttempts_ClearsLimit(t *testing.T) {
-	repo := &stubTOTPUserRepo{}
-	secretKey := []byte("test-secret-key-32-bytes-padding!")
-	svc := NewTOTPService(repo, secretKey, nil)
+	settings := newDisableBudgetSettings([]byte("test-secret-key-32-bytes-padding!"), nil)
 	now := time.Now()
 
-	for range DefaultTOTPDisableAttemptsLimit {
-		svc.RecordDisableFailure(secretKey, "1.2.3.4", 1, now)
+	for range DefaultSettingsReauthAttemptsLimit {
+		recordDisableFailure(settings, "1.2.3.4", 1, now)
 	}
-	if err := svc.CheckDisableRateLimit(secretKey, "1.2.3.4", 1, now); !errors.Is(err, ErrTOTPDisableRateLimited) {
-		t.Fatalf("precondition: disable limiter not tripped after %d failures, err=%v", DefaultTOTPDisableAttemptsLimit, err)
+	if err := checkDisableBudget(settings, "1.2.3.4", 1, now); !errors.Is(err, ErrSettingsReauthRateLimited) {
+		t.Fatalf("precondition: disable limiter not tripped after %d failures, err=%v", DefaultSettingsReauthAttemptsLimit, err)
 	}
 
-	svc.ResetDisableAttempts(secretKey, "1.2.3.4", 1)
+	resetDisableBudget(settings, "1.2.3.4", 1)
 
-	if err := svc.CheckDisableRateLimit(secretKey, "1.2.3.4", 1, now); err != nil {
-		t.Errorf("CheckDisableRateLimit() after ResetDisableAttempts = %v, want nil", err)
+	if err := checkDisableBudget(settings, "1.2.3.4", 1, now); err != nil {
+		t.Errorf("disable budget after Reset = %v, want nil", err)
+	}
+	// Disabling TOTP is session-bound: the account's counter is cleared too,
+	// so the same account is open from any client.
+	if err := checkDisableBudget(settings, "5.6.7.8", 1, now); err != nil {
+		t.Errorf("disable budget for the same account from another client = %v, want nil", err)
 	}
 }
 
 // TestTOTPService_DisableAndVerifyLimitsAreIndependent verifies that the
-// "totp" and "totp.disable" scopes use separate buckets — exhausting the
-// disable limit must not trip the verification limit and vice versa.
+// sign-in "totp" scope and the disable confirmation's re-auth budget use
+// separate buckets on one shared limiter — exhausting the disable limit must
+// not trip the verification limit.
 func TestTOTPService_DisableAndVerifyLimitsAreIndependent(t *testing.T) {
 	repo := &stubTOTPUserRepo{}
 	secretKey := []byte("test-secret-key-32-bytes-padding!")
-	svc := NewTOTPService(repo, secretKey, nil)
+	limiter := NewAttemptLimiter()
+	svc := NewTOTPService(repo, secretKey, limiter)
+	settings := newDisableBudgetSettings(secretKey, limiter)
 	now := time.Now()
 
-	for range DefaultTOTPDisableAttemptsLimit {
-		svc.RecordDisableFailure(secretKey, "1.2.3.4", 1, now)
+	for range DefaultSettingsReauthAttemptsLimit {
+		recordDisableFailure(settings, "1.2.3.4", 1, now)
 	}
-	if err := svc.CheckDisableRateLimit(secretKey, "1.2.3.4", 1, now); !errors.Is(err, ErrTOTPDisableRateLimited) {
+	if err := checkDisableBudget(settings, "1.2.3.4", 1, now); !errors.Is(err, ErrSettingsReauthRateLimited) {
 		t.Fatalf("precondition: disable limiter not tripped, err=%v", err)
 	}
 	if err := svc.CheckRateLimit(secretKey, "1.2.3.4", 1, now); err != nil {

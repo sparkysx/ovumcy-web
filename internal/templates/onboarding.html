@@ -9,19 +9,16 @@
   data-cycle-length="{{.CycleLength}}"
   data-period-length="{{.PeriodLength}}"
   data-auto-period-fill="{{if .AutoPeriodFill}}true{{else}}false{{end}}"
-  data-age-group="{{.AgeGroup}}"
   data-usage-goal="{{.UsageGoal}}"
   data-period-exceeds-cycle-message="{{t .Messages "onboarding.step2.error_incompatible"}}"
-  data-today-label="{{t .Messages "onboarding.step1.today"}}"
-  data-yesterday-label="{{t .Messages "onboarding.step1.yesterday"}}"
-  data-two-days-ago-label="{{t .Messages "onboarding.step1.two_days_ago"}}"
+  data-week-start="{{.WeekStart}}"
   data-lang="{{.Lang}}">
-  <div class="journal-card journal-hero overflow-hidden p-6 sm:p-8">
+  <div class="card card-hero overflow-hidden p-6 sm:p-8">
     <div class="space-y-3" data-onboarding-progress>
       <p class="journal-kicker" data-onboarding-progress-kicker="1" {{if ne .OnboardingStep 1}}hidden{{end}}>{{t .Messages "onboarding.progress.step1"}}</p>
       <p class="journal-kicker" data-onboarding-progress-kicker="2" {{if ne .OnboardingStep 2}}hidden{{end}}>{{t .Messages "onboarding.progress.step2"}}</p>
 
-      <div class="journal-panel space-y-2">
+      <div class="card-quiet space-y-2">
         <div class="h-2 overflow-hidden rounded-full bg-[rgba(232,196,168,0.35)]">
           <div class="onboarding-progress-fill" data-onboarding-progress-bar data-step="{{.OnboardingStep}}"></div>
         </div>
@@ -29,12 +26,14 @@
     </div>
 
     <div data-onboarding-panel="1" class="mt-6 space-y-4" {{if ne .OnboardingStep 1}}hidden{{end}}>
-      <h1 class="journal-title">{{t .Messages "onboarding.step1.title"}}</h1>
+      <h1 class="journal-title" data-title-key="onboarding.step1.title">{{t .Messages "onboarding.step1.title"}}</h1>
       <p class="journal-muted">{{t .Messages "onboarding.step1.subtitle"}}</p>
       <p class="journal-muted text-sm">{{t .Messages "onboarding.step1.day1_tip"}}</p>
       <p class="journal-muted text-sm">{{t .Messages "onboarding.step1.privacy"}}</p>
 
       <form
+        action="/api/v1/onboarding/steps/1"
+        method="post"
         hx-post="/api/v1/onboarding/steps/1"
         hx-target="#onboarding-step1-status"
         hx-swap="innerHTML"
@@ -44,21 +43,53 @@
       <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
       <input type="hidden" name="client_timezone" value="" data-onboarding-timezone-field>
 
-        <label class="field-label" id="last-period-start-label" for="last-period-start">{{t .Messages "onboarding.step1.field"}}</label>
-        <div data-onboarding-start-date-field>
-          {{template "localized_date_field" (dict
-            "Messages" .Messages
-            "FieldID" "last-period-start"
-            "FieldName" "last_period_start"
-            "Value" .LastPeriodStart
-            "Lang" .Lang
-            "LabelID" "last-period-start-label"
-            "Min" .MinDate
-            "Max" .MaxDate
-            "Required" true)}}
-        </div>
+        <p class="field-label" id="last-period-start-label">{{t .Messages "onboarding.step1.field"}}</p>
+        <div
+          class="card-quiet onboarding-picker space-y-3"
+          role="group"
+          aria-labelledby="last-period-start-label"
+          data-onboarding-picker
+          data-onboarding-visible-month=""
+          data-selected-label="{{t .Messages "onboarding.step1.selected"}}"
+          data-required-message="{{t .Messages "onboarding.error.date_required"}}"
+          data-out-of-range-message="{{t .Messages "onboarding.error.last_period_range"}}">
+          <input
+            type="hidden"
+            id="last-period-start"
+            name="last_period_start"
+            value="{{.LastPeriodStart}}"
+            min="{{.MinDate}}"
+            max="{{.MaxDate}}"
+            data-onboarding-start-date>
+          {{/* The picker needs JavaScript; without it this field is the date.
+               Scripts drop it. It follows the hidden input above because the
+               step binds the last value of a repeated field. */}}
+          <input
+            type="date"
+            class="input-field w-auto"
+            name="last_period_start"
+            value="{{.LastPeriodStart}}"
+            min="{{.MinDate}}"
+            max="{{.MaxDate}}"
+            required
+            aria-labelledby="last-period-start-label"
+            data-nojs-only>
 
-        <div class="grid max-h-72 grid-cols-3 gap-2 overflow-y-auto pr-1 sm:grid-cols-4 lg:grid-cols-6 onboarding-day-grid" data-onboarding-day-options role="group" aria-label="{{t .Messages "onboarding.step1.field"}}"></div>
+          <div class="flex flex-wrap gap-2">
+            <button type="button" class="btn-soft text-sm onboarding-shortcut" data-onboarding-shortcut="today">{{t .Messages "onboarding.step1.today"}}</button>
+            <button type="button" class="btn-soft text-sm onboarding-shortcut" data-onboarding-shortcut="yesterday">{{t .Messages "onboarding.step1.yesterday"}}</button>
+          </div>
+
+          <div class="flex items-center justify-between gap-2">
+            <button type="button" class="btn-secondary onboarding-month-nav" data-onboarding-month-prev aria-label="{{t .Messages "onboarding.step1.previous_month"}}"><span aria-hidden="true">←</span></button>
+            <span class="field-label text-center" data-onboarding-month-title></span>
+            <button type="button" class="btn-secondary onboarding-month-nav" data-onboarding-month-next aria-label="{{t .Messages "onboarding.step1.next_month"}}"><span aria-hidden="true">→</span></button>
+          </div>
+
+          <div class="grid grid-cols-7 gap-1 text-center text-xs journal-muted" data-onboarding-weekdays aria-hidden="true"></div>
+          <div class="grid grid-cols-7 gap-1 onboarding-day-grid" data-onboarding-day-options></div>
+          <p class="journal-muted text-sm" data-onboarding-selected-date aria-live="polite"></p>
+        </div>
 
         <button type="submit" class="btn-primary">{{t .Messages "onboarding.button.next"}}</button>
         <div id="onboarding-step1-status" class="save-status text-sm" aria-live="polite"></div>
@@ -66,9 +97,11 @@
     </div>
 
     <div data-onboarding-panel="2" class="mt-6 space-y-4" {{if ne .OnboardingStep 2}}hidden{{end}}>
-      <h1 class="journal-title">{{t .Messages "onboarding.step2.title"}}</h1>
+      <h1 class="journal-title" data-title-key="onboarding.step2.title">{{t .Messages "onboarding.step2.title"}}</h1>
 
       <form
+        action="/api/v1/onboarding/steps/2"
+        method="post"
         hx-post="/api/v1/onboarding/steps/2"
         hx-target="#onboarding-step2-status"
         hx-swap="innerHTML"
@@ -124,7 +157,7 @@
           <label class="period-toggle" data-binary-toggle data-active="{{if .AutoPeriodFill}}true{{else}}false{{end}}">
             <input type="checkbox" name="auto_period_fill" value="true" data-onboarding-auto-period-fill data-binary-toggle-input {{if .AutoPeriodFill}}checked{{end}}>
             <span class="period-toggle-copy">
-              <span class="period-toggle-main">🩸 {{t .Messages "onboarding.step2.auto_period_fill"}}</span>
+              <span class="period-toggle-main"><span aria-hidden="true">{{template "icon" "drop"}}</span> {{t .Messages "onboarding.step2.auto_period_fill"}}</span>
             </span>
           </label>
           <p class="journal-muted text-sm">{{t .Messages "onboarding.step2.auto_period_fill_hint"}}</p>
@@ -134,56 +167,30 @@
           <label class="period-toggle" data-binary-toggle data-active="{{if .IrregularCycle}}true{{else}}false{{end}}">
             <input type="checkbox" name="irregular_cycle" value="true" autocomplete="off" data-binary-toggle-input {{if .IrregularCycle}}checked{{end}}>
             <span class="period-toggle-copy">
-              <span class="period-toggle-main">〰️ {{t .Messages "onboarding.step2.irregular_cycle"}}</span>
+              <span class="period-toggle-main"><span aria-hidden="true">{{template "icon" "wave"}}</span> {{t .Messages "onboarding.step2.irregular_cycle"}}</span>
             </span>
           </label>
           <p class="journal-muted text-sm">{{t .Messages "onboarding.step2.irregular_cycle_hint"}}</p>
         </div>
 
-        <div class="space-y-3">
-          <div>
-            <p class="field-label">{{t .Messages "onboarding.step2.age_group"}}</p>
-            <p class="journal-muted text-sm">{{t .Messages "onboarding.step2.age_group_hint"}}</p>
-          </div>
-          <div class="grid gap-2 sm:grid-cols-2">
-            <label class="choice-option">
-              <input type="radio" name="age_group" value="" class="choice-input" {{if eq .AgeGroup ""}}checked{{end}}>
-              <span class="radio-tile radio-tile-inline"><span>{{t .Messages "settings.age_group.unspecified"}}</span></span>
-            </label>
-            <label class="choice-option">
-              <input type="radio" name="age_group" value="under_40" class="choice-input" {{if eq .AgeGroup "under_40"}}checked{{end}}>
-              <span class="radio-tile radio-tile-inline"><span>{{t .Messages "settings.age_group.under_40"}}</span></span>
-            </label>
-            <label class="choice-option">
-              <input type="radio" name="age_group" value="age_40_45" class="choice-input" {{if eq .AgeGroup "age_40_45"}}checked{{end}}>
-              <span class="radio-tile radio-tile-inline"><span>{{t .Messages "settings.age_group.40_to_45"}}</span></span>
-            </label>
-            <label class="choice-option">
-              <input type="radio" name="age_group" value="age_45_plus" class="choice-input" {{if eq .AgeGroup "age_45_plus"}}checked{{end}}>
-              <span class="radio-tile radio-tile-inline"><span>{{t .Messages "settings.age_group.45_plus"}}</span></span>
-            </label>
-          </div>
-        </div>
-
-        <div class="space-y-3">
-          <div>
-            <p class="field-label">{{t .Messages "onboarding.step2.usage_goal"}}</p>
-            <p class="journal-muted text-sm">{{t .Messages "onboarding.step2.usage_goal_hint"}}</p>
-          </div>
+        <div class="space-y-3" data-onboarding-usage-goal data-usage-goal-warning-scope>
+          <p class="field-label">{{t .Messages "onboarding.step2.usage_goal"}}</p>
           <div class="grid gap-2">
             <label class="choice-option">
-              <input type="radio" name="usage_goal" value="avoid_pregnancy" class="choice-input" {{if eq .UsageGoal "avoid_pregnancy"}}checked{{end}}>
-              <span class="radio-tile"><span>{{t .Messages "settings.goal.avoid"}}</span></span>
+              <input type="radio" name="usage_goal" value="health" class="choice-input" {{if or (eq .UsageGoal "health") (eq .UsageGoal "")}}checked{{end}}>
+              <span class="chip chip-stack"><span>{{t .Messages "settings.goal.health"}}</span></span>
+            </label>
+            <label class="choice-option">
+              <input type="radio" name="usage_goal" value="avoid_pregnancy" class="choice-input" aria-describedby="onboarding-usage-goal-avoid-warning" {{if eq .UsageGoal "avoid_pregnancy"}}checked{{end}}>
+              <span class="chip chip-stack"><span>{{t .Messages "settings.goal.avoid"}}</span></span>
             </label>
             <label class="choice-option">
               <input type="radio" name="usage_goal" value="trying_to_conceive" class="choice-input" {{if eq .UsageGoal "trying_to_conceive"}}checked{{end}}>
-              <span class="radio-tile"><span>{{t .Messages "settings.goal.trying"}}</span></span>
-            </label>
-            <label class="choice-option">
-              <input type="radio" name="usage_goal" value="health" class="choice-input" {{if or (eq .UsageGoal "health") (eq .UsageGoal "")}}checked{{end}}>
-              <span class="radio-tile"><span>{{t .Messages "settings.goal.health"}}</span></span>
+              <span class="chip chip-stack"><span>{{t .Messages "settings.goal.trying"}}</span></span>
             </label>
           </div>
+          <p id="onboarding-usage-goal-avoid-warning" class="warning-amber text-sm" role="note" data-usage-goal-avoid-warning{{if ne .UsageGoal "avoid_pregnancy"}} hidden{{end}}>{{t .Messages "usage_goal.avoid_warning"}}</p>
+          <button type="submit" class="btn-secondary" data-onboarding-usage-goal-skip>{{t .Messages "onboarding.step2.usage_goal_skip"}}</button>
         </div>
 
         <div class="flex flex-wrap items-center gap-3">

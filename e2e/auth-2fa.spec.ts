@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from './support/fixtures';
 import { generateSync } from 'otplib';
 import {
   completeOnboardingIfPresent,
@@ -10,9 +10,16 @@ import {
   registerOwnerViaUI,
 } from './support/auth-helpers';
 
+// The management view's own control, addressed by the endpoint its form posts
+// to. `{ hasText: /disable/i }` used the localized caption as the sole
+// discriminator between the enroll and disable submits, so the whole 2FA suite
+// hinged on the English word "disable" surviving translation.
+const DISABLE_2FA_SUBMIT =
+  'form[hx-delete="/api/v1/users/current/2fa"] button[type="submit"]';
+
 // Reads the raw TOTP secret from the visible manual-entry element on the
 // enrollment page (the same string the user copies into their authenticator).
-async function readTOTPSecret(page: import('@playwright/test').Page): Promise<string> {
+async function readTOTPSecret(page: Page): Promise<string> {
   const el = page.locator('[data-totp-manual-secret]');
   await expect(el).toBeVisible();
   const secret = (await el.textContent())?.trim() ?? '';
@@ -58,22 +65,14 @@ test.describe('Auth: TOTP two-factor authentication', () => {
     await page.goto('/settings/2fa');
 
     // After successful enrollment the management view shows the disable button.
-    await expect(page.locator('button[type="submit"]', { hasText: /disable/i })).toBeVisible({
-      timeout: 5_000,
-    });
+    await expect(page.locator(DISABLE_2FA_SUBMIT)).toBeVisible({ timeout: 5_000 });
 
     // The ovumcy_totp_setup cookie should be cleared.
     const setupCookie = await cookieByName(context, 'ovumcy_totp_setup');
     expect(setupCookie).toBeFalsy();
   });
 
-  test('login after enrollment redirects to 2FA challenge page', async ({
-    page,
-    context,
-    browserName,
-  }) => {
-    test.skip(browserName === 'webkit', 'flaky redirect timing on webkit; covered in chromium');
-
+  test('login after enrollment redirects to 2FA challenge page', async ({ page, context }) => {
     const creds = createCredentials('2fa-login-redirect');
     await registerOwnerViaUI(page, creds);
     await continueFromRecoveryCode(page);
@@ -89,18 +88,33 @@ test.describe('Auth: TOTP two-factor authentication', () => {
     // Form submit is HTMX-intercepted; wait for inline success then reload.
     await expect(page.locator('#settings-2fa-verify-status .status-ok')).toBeVisible({ timeout: 5_000 });
     await page.goto('/settings/2fa');
-    await expect(page.locator('button[type="submit"]', { hasText: /disable/i })).toBeVisible({
-      timeout: 5_000,
-    });
+    await expect(page.locator(DISABLE_2FA_SUBMIT)).toBeVisible({ timeout: 5_000 });
 
     // Log out (must be DELETE+CSRF; GET to /api/v1/sessions/current is rejected).
     await logoutViaAPI(page);
 
-    // Log back in — should hit challenge page
+    // Log back in — should hit challenge page. The wait binds to this click's own
+    // POST /api/v1/sessions and reads its answer: the 303 to /auth/2fa is what
+    // "the challenge was demanded" actually means, and it is settled on the server
+    // before any navigation starts. Polling only the landed URL made the assertion
+    // race the redirect, which is what kept this test permanently skipped on webkit.
     await page.goto('/login');
     await page.locator('input[name="email"]').fill(creds.email);
     await page.locator('input[name="password"]').fill(creds.password);
-    await page.locator('form[action="/api/v1/sessions"] button[type="submit"]').click();
+    const [loginRequest] = await Promise.all([
+      page.waitForRequest(
+        (candidate) =>
+          candidate.method() === 'POST' && new URL(candidate.url()).pathname === '/api/v1/sessions'
+      ),
+      page.locator('form[action="/api/v1/sessions"] button[type="submit"]').click(),
+    ]);
+    const loginResponse = await loginRequest.response();
+    expect(loginResponse, 'expected a response for POST /api/v1/sessions').not.toBeNull();
+    expect(
+      loginResponse!.status(),
+      `POST /api/v1/sessions answered ${loginResponse!.status()}, want a 303 redirect`
+    ).toBe(303);
+    expect(loginResponse!.headers()['location']).toBe('/auth/2fa');
 
     await expect(page).toHaveURL('/auth/2fa', { timeout: 5_000 });
 
@@ -131,9 +145,7 @@ test.describe('Auth: TOTP two-factor authentication', () => {
     // reload to render the management view (DB now has TOTPEnabled=true).
     await expect(page.locator('#settings-2fa-verify-status .status-ok')).toBeVisible({ timeout: 5_000 });
     await page.goto('/settings/2fa');
-    await expect(page.locator('button[type="submit"]', { hasText: /disable/i })).toBeVisible({
-      timeout: 5_000,
-    });
+    await expect(page.locator(DISABLE_2FA_SUBMIT)).toBeVisible({ timeout: 5_000 });
 
     // Log out (must be DELETE+CSRF; GET to /api/v1/sessions/current is rejected).
     await logoutViaAPI(page);
@@ -145,8 +157,10 @@ test.describe('Auth: TOTP two-factor authentication', () => {
     await page.locator('form[action="/api/v1/sessions"] button[type="submit"]').click();
     await expect(page).toHaveURL('/auth/2fa', { timeout: 5_000 });
 
-    // Provide valid code on the challenge page
-    const challengeCode = generateSync({ secret, strategy: 'totp' });
+    // Provide valid code on the challenge page. Enrollment consumed the step its
+    // code matched, so the challenge takes the next step's code (inside the
+    // server's ±1-step window).
+    const challengeCode = generateSync({ secret, strategy: 'totp', epoch: Math.floor(Date.now() / 1000) + 30 });
     await page.locator('input[name="code"]').fill(challengeCode);
     await page.locator('form[action="/api/v1/sessions/2fa-challenge"] button[type="submit"]').click();
 
@@ -176,9 +190,7 @@ test.describe('Auth: TOTP two-factor authentication', () => {
     // reload to render the management view (DB now has TOTPEnabled=true).
     await expect(page.locator('#settings-2fa-verify-status .status-ok')).toBeVisible({ timeout: 5_000 });
     await page.goto('/settings/2fa');
-    await expect(page.locator('button[type="submit"]', { hasText: /disable/i })).toBeVisible({
-      timeout: 5_000,
-    });
+    await expect(page.locator(DISABLE_2FA_SUBMIT)).toBeVisible({ timeout: 5_000 });
 
     // Log out (must be DELETE+CSRF; GET to /api/v1/sessions/current is rejected).
     await logoutViaAPI(page);
@@ -196,6 +208,12 @@ test.describe('Auth: TOTP two-factor authentication', () => {
 
     // Should stay on challenge page
     await expect(page).toHaveURL('/auth/2fa', { timeout: 5_000 });
+    // Positive anchor: the challenge endpoint ran and rejected this exact code.
+    // Without it, a handler that unconditionally bounces back to /auth/2fa
+    // passes both negative assertions around it.
+    await expect(
+      page.locator('[data-auth-server-error][data-error-key="error.totp_invalid_code"]')
+    ).toBeVisible();
     const authCookie = await cookieByName(context, 'ovumcy_auth');
     expect(authCookie).toBeFalsy();
   });
@@ -220,13 +238,11 @@ test.describe('Auth: TOTP two-factor authentication', () => {
     // reload to render the management view (DB now has TOTPEnabled=true).
     await expect(page.locator('#settings-2fa-verify-status .status-ok')).toBeVisible({ timeout: 5_000 });
     await page.goto('/settings/2fa');
-    await expect(page.locator('button[type="submit"]', { hasText: /disable/i })).toBeVisible({
-      timeout: 5_000,
-    });
+    await expect(page.locator(DISABLE_2FA_SUBMIT)).toBeVisible({ timeout: 5_000 });
 
     // Disable
     await page.locator('input[name="password"]').fill(creds.password);
-    await page.locator('button[type="submit"]', { hasText: /disable/i }).click();
+    await page.locator(DISABLE_2FA_SUBMIT).click();
     // HTMX-intercepted; wait for inline success status, then reload to render
     // the setup view (DB now has TOTPEnabled=false).
     await expect(page.locator('#settings-2fa-status .status-ok')).toBeVisible({ timeout: 5_000 });

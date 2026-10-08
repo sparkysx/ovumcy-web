@@ -16,9 +16,9 @@ import (
 // tests full control over write capture and error injection.
 //
 // Entries are keyed by the canonical UTC-midnight calendar date of the stored
-// Date value. Writes emulate models.DailyLog.BeforeSave (re-anchor the value's
-// own y/m/d to UTC-midnight), which is the on-disk convention DayRange queries
-// against. This keeps the stub coherent under non-UTC request locations.
+// Date value, and writes canonicalize it through canonicalStoredDayDate
+// (day_service_workflow_test.go), the package's single mirror of
+// models.DailyLog.BeforeSave.
 type mr3dayLogStub struct {
 	entries map[string]models.DailyLog
 	nextID  uint
@@ -39,18 +39,8 @@ func newMr3dayLogStub() *mr3dayLogStub {
 	}
 }
 
-// mr3canonicalDate mirrors models.DailyLog.BeforeSave: take the calendar
-// components of value in its own location and re-anchor them to UTC-midnight.
-func mr3canonicalDate(value time.Time) time.Time {
-	if value.IsZero() {
-		return value
-	}
-	y, m, d := value.Date()
-	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
-}
-
 func mr3dayKey(value time.Time) string {
-	return mr3canonicalDate(value).Format("2006-01-02")
+	return canonicalStoredDayDate(value).Format("2006-01-02")
 }
 
 func (s *mr3dayLogStub) ListByUser(ctx context.Context, userID uint) ([]models.DailyLog, error) {
@@ -100,6 +90,10 @@ func (s *mr3dayLogStub) ListByUserDayRange(ctx context.Context, userID uint, day
 	return logs, nil
 }
 
+func (s *mr3dayLogStub) FindByUserAndDayRangeForUpdate(ctx context.Context, userID uint, dayStart time.Time, dayEnd time.Time) (models.DailyLog, bool, error) {
+	return s.FindByUserAndDayRange(ctx, userID, dayStart, dayEnd)
+}
+
 func (s *mr3dayLogStub) FindByUserAndDayRange(ctx context.Context, userID uint, dayStart time.Time, dayEnd time.Time) (models.DailyLog, bool, error) {
 	key := mr3dayKey(dayStart)
 	entry, ok := s.entries[key]
@@ -114,7 +108,7 @@ func (s *mr3dayLogStub) Create(ctx context.Context, entry *models.DailyLog) erro
 		entry.ID = s.nextID
 		s.nextID++
 	}
-	entry.Date = mr3canonicalDate(entry.Date)
+	entry.Date = canonicalStoredDayDate(entry.Date)
 	s.entries[mr3dayKey(entry.Date)] = *entry
 	return nil
 }
@@ -132,7 +126,7 @@ func (s *mr3dayLogStub) Save(ctx context.Context, entry *models.DailyLog) error 
 	if s.failSaveWhenCycleStart != nil && entry.CycleStart {
 		return s.failSaveWhenCycleStart
 	}
-	entry.Date = mr3canonicalDate(entry.Date)
+	entry.Date = canonicalStoredDayDate(entry.Date)
 	key := mr3dayKey(entry.Date)
 	prev, existed := s.entries[key]
 	if existed && prev.IsPeriod && !entry.IsPeriod {
@@ -161,16 +155,37 @@ type mr3dayUserStub struct {
 	settings    models.User
 	loadErr     error
 	lastUpdates map[string]any
+	// userIDs records the owner id of every user-repository call, so a mutant
+	// that swaps the acting owner for another account is observable here rather
+	// than only in the written map (docs/SECURITY_INVARIANTS.md, privacy
+	// boundary).
+	userIDs []uint
 }
 
-func (s *mr3dayUserStub) LoadSettingsByID(context.Context, uint) (models.User, error) {
+// assertUserRepositoryCallsTargetOwner mirrors the workflow stub's guard: at
+// least one call, and every recorded id is the acting owner.
+func (s *mr3dayUserStub) assertUserRepositoryCallsTargetOwner(t *testing.T, want uint) {
+	t.Helper()
+	if len(s.userIDs) == 0 {
+		t.Fatalf("expected at least one user-repository call for owner %d, saw none", want)
+	}
+	for index, got := range s.userIDs {
+		if got != want {
+			t.Fatalf("user-repository call %d targeted owner %d, want the acting owner %d", index+1, got, want)
+		}
+	}
+}
+
+func (s *mr3dayUserStub) LoadSettingsByID(_ context.Context, userID uint) (models.User, error) {
+	s.userIDs = append(s.userIDs, userID)
 	if s.loadErr != nil {
 		return models.User{}, s.loadErr
 	}
 	return s.settings, nil
 }
 
-func (s *mr3dayUserStub) UpdateByID(ctx context.Context, _ uint, updates map[string]any) error {
+func (s *mr3dayUserStub) UpdateByID(ctx context.Context, userID uint, updates map[string]any) error {
+	s.userIDs = append(s.userIDs, userID)
 	s.lastUpdates = updates
 	return nil
 }
@@ -213,7 +228,7 @@ func TestMR3Day_ClearAutoFilledPeriodNeighbors_NonUTCCoverage(t *testing.T) {
 
 	startDay := CalendarDay(seed.In(zone), zone) // local 2026-02-11
 	logs.clearedKeys = nil
-	if err := service.ClearAutoFilledPeriodNeighbors(context.Background(), 10, startDay, 3, zone); err != nil {
+	if err := service.ClearAutoFilledPeriodNeighbors(context.Background(), 10, startDay, 3, models.FlowLight, zone); err != nil {
 		t.Fatalf("ClearAutoFilledPeriodNeighbors: %v", err)
 	}
 
@@ -228,6 +243,7 @@ func TestMR3Day_ClearAutoFilledPeriodNeighbors_NonUTCCoverage(t *testing.T) {
 	if !logs.entries["2026-02-11"].IsPeriod {
 		t.Fatal("the anchor day 2026-02-11 must not be cleared")
 	}
+	users.assertUserRepositoryCallsTargetOwner(t, 10)
 }
 
 // NOTE: day_feedback_policy.go:62 NEGATION (`if location != nil { cycleStart =
@@ -264,6 +280,7 @@ func TestMR3Day_UpsertDayEntryWithAutoFillAt_ReturnsPopulatedEntry(t *testing.T)
 	if entry.Flow != models.FlowMedium {
 		t.Fatalf("returned entry Flow = %q, want %q", entry.Flow, models.FlowMedium)
 	}
+	users.assertUserRepositoryCallsTargetOwner(t, 10)
 }
 
 // --- day_service.go:448 NEGATION — MarkCycleStartManually tx-close propagates error ---
@@ -288,6 +305,7 @@ func TestMR3Day_MarkCycleStartManually_PropagatesTxError(t *testing.T) {
 	if !errors.Is(err, ErrManualCycleStartFailed) {
 		t.Fatalf("expected ErrManualCycleStartFailed wrap, got %v", err)
 	}
+	users.assertUserRepositoryCallsTargetOwner(t, 10)
 }
 
 func mr3dayKeys(stub *mr3dayLogStub) []string {

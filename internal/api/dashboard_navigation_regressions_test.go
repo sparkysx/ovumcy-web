@@ -5,11 +5,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/ovumcy/ovumcy-web/internal/models"
+	"golang.org/x/net/html"
 )
 
 func TestDashboardLogoutFormsRequireConfirmation(t *testing.T) {
@@ -186,6 +188,340 @@ func TestCalendarSelectedDayLoadsEditModeWhenRequested(t *testing.T) {
 	}
 	if got := htmlAttr(loader, "hx-get"); got != "/calendar/day/2026-03-12?mode=edit" {
 		t.Fatalf("expected the #day-editor lazy-loader to fetch edit mode from /calendar/day/2026-03-12?mode=edit, got hx-get=%q", got)
+	}
+}
+
+// navSectionHooks lists the section destinations a navigation landmark offers,
+// in document order, by their stable data-nav-link hooks.
+func navSectionHooks(root *html.Node) []string {
+	links := htmlFindElements(root, func(node *html.Node) bool {
+		return node.Type == html.ElementNode && htmlHasAttr(node, "data-nav-link")
+	})
+	hooks := make([]string, 0, len(links))
+	for _, link := range links {
+		hooks = append(hooks, htmlAttr(link, "data-nav-link"))
+	}
+	return hooks
+}
+
+// desktopPrimaryNavigation returns the header's desktop navigation landmark —
+// the only <nav> that holds the account actions block.
+func desktopPrimaryNavigation(root *html.Node) *html.Node {
+	return htmlFindElement(root, func(node *html.Node) bool {
+		if node.Type != html.ElementNode || node.Data != "nav" {
+			return false
+		}
+		return htmlFindElement(node, func(candidate *html.Node) bool {
+			return candidate.Type == html.ElementNode && htmlHasAttr(candidate, "data-nav-account-actions")
+		}) != nil
+	})
+}
+
+// settingsHrefTargets lists, in document order, the href values under root that
+// lead to the settings page. A bare path, a query and a section fragment are
+// the same destination as far as a reader of the navigation is concerned.
+func settingsHrefTargets(root *html.Node) []string {
+	links := htmlFindElements(root, func(node *html.Node) bool {
+		if node.Type != html.ElementNode || !htmlHasAttr(node, "href") {
+			return false
+		}
+		path, _, _ := strings.Cut(htmlAttr(node, "href"), "#")
+		path, _, _ = strings.Cut(path, "?")
+		return path == "/settings" || strings.HasPrefix(path, "/settings/")
+	})
+	targets := make([]string, 0, len(links))
+	for _, link := range links {
+		targets = append(targets, htmlAttr(link, "href"))
+	}
+	return targets
+}
+
+// TestDesktopHeaderOffersASingleSettingsEntry pins the one-entry contract for
+// the desktop header. It used to carry a gear icon link and the account
+// identity chip side by side — two controls in the same navigation landmark
+// leading to the same page, with the gear adding nothing the chip does not
+// already offer. The chip is the survivor: it reaches settings and names the
+// account, so it must keep an accessible name of its own (its avatar glyph is
+// decorative and stays out of the accessibility tree).
+func TestDesktopHeaderOffersASingleSettingsEntry(t *testing.T) {
+	app, database := newOnboardingTestApp(t)
+	user := createOnboardingTestUser(t, database, "single-settings-entry@example.com", "StrongPass1", true)
+	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
+
+	for _, path := range []string{"/dashboard", "/calendar", "/stats", "/settings"} {
+		document := mustParseHTMLDocument(t, fetchPageBody(t, app, path, authCookie))
+
+		desktop := desktopPrimaryNavigation(document)
+		if desktop == nil {
+			t.Fatalf("%s: expected the desktop primary navigation to render", path)
+		}
+
+		targets := settingsHrefTargets(desktop)
+		if len(targets) != 1 {
+			t.Errorf(
+				"%s: the desktop header offers %d controls leading to settings (%v); exactly one must",
+				path, len(targets), targets,
+			)
+		}
+
+		entry := htmlElementByID(desktop, "nav-user-chip-desktop")
+		if entry == nil {
+			t.Fatalf("%s: the surviving desktop settings entry must be the account identity chip", path)
+		}
+		if got := strings.TrimSpace(htmlAttr(entry, "aria-label")); got == "" {
+			t.Errorf("%s: the account identity chip must carry an accessible name", path)
+		}
+	}
+}
+
+// navLinkIsActive reports whether a navigation element carries the active
+// treatment: the nav-link-active / nav-user-chip-active class family plus the
+// aria-current="page" semantics that make the marking readable to assistive
+// technology.
+func navLinkIsActive(node *html.Node, activeClass string) bool {
+	styled, current := navActiveMarking(node, activeClass)
+	return styled && current
+}
+
+// navActiveMarking splits an active-state marking into its two halves: the fill
+// a sighted reader sees and the aria-current="page" a screen reader hears. Both
+// are asserted separately because either one alone is the defect — a class with
+// no attribute marks the current section for eyes only, an attribute with no
+// class announces a page that does not look current.
+func navActiveMarking(node *html.Node, activeClass string) (styled, current bool) {
+	return slices.Contains(strings.Fields(htmlAttr(node, "class")), activeClass),
+		htmlAttr(node, "aria-current") == "page"
+}
+
+// navCurrentEntries lists, in document order, the elements under root that
+// declare themselves the current page.
+func navCurrentEntries(root *html.Node) []*html.Node {
+	return htmlFindElements(root, func(node *html.Node) bool {
+		return node.Type == html.ElementNode && htmlAttr(node, "aria-current") == "page"
+	})
+}
+
+// TestDesktopSettingsEntryMarksSettingsAsTheCurrentSection covers a loss that
+// came with the single-settings-entry change: the removed gear link had been the
+// desktop element carrying /settings's active state, and the surviving identity
+// chip did not take it over, so on /settings the desktop navigation marked no
+// current section at all while Today / Calendar / Insights each marked theirs.
+// The chip now computes its state through the same isActiveRoute call the
+// section links use, and the mobile menu chip stays unmarked because the bottom
+// tab bar is what marks the current section on a phone.
+func TestDesktopSettingsEntryMarksSettingsAsTheCurrentSection(t *testing.T) {
+	app, database := newOnboardingTestApp(t)
+	user := createOnboardingTestUser(t, database, "settings-active-state@example.com", "StrongPass1", true)
+	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
+
+	for _, path := range []string{"/dashboard", "/calendar", "/stats", "/settings"} {
+		document := mustParseHTMLDocument(t, fetchPageBody(t, app, path, authCookie))
+
+		desktop := desktopPrimaryNavigation(document)
+		if desktop == nil {
+			t.Fatalf("%s: expected the desktop primary navigation to render", path)
+		}
+		chip := htmlElementByID(desktop, "nav-user-chip-desktop")
+		if chip == nil {
+			t.Fatalf("%s: expected the desktop settings entry to render", path)
+		}
+
+		onSettings := path == "/settings"
+		if got := navLinkIsActive(chip, "nav-user-chip-active"); got != onSettings {
+			t.Errorf(
+				"%s: the desktop settings entry reports active=%t, expected %t (class=%q aria-current=%q)",
+				path, got, onSettings, htmlAttr(chip, "class"), htmlAttr(chip, "aria-current"),
+			)
+		}
+
+		// The mechanism is shared, so the section links must keep marking their
+		// own page: an active chip that came at their cost is not the fix.
+		insights := htmlElementByAttr(desktop, "data-nav-link", "insights")
+		if insights == nil {
+			t.Fatalf("%s: expected the insights section link to render", path)
+		}
+		if got, want := slices.Contains(strings.Fields(htmlAttr(insights, "class")), "nav-link-active"), path == "/stats"; got != want {
+			t.Errorf("%s: the insights section link reports active=%t, expected %t", path, got, want)
+		}
+
+		mobileMenuChip := htmlElementByID(document, "nav-user-chip-mobile")
+		if mobileMenuChip == nil {
+			t.Fatalf("%s: expected the mobile menu account chip to render", path)
+		}
+		if slices.Contains(strings.Fields(htmlAttr(mobileMenuChip, "class")), "nav-user-chip-active") ||
+			htmlAttr(mobileMenuChip, "aria-current") != "" {
+			t.Errorf(
+				"%s: the mobile menu account chip must stay unmarked — the bottom tab bar marks the current section on a phone, and two markings read as two current pages",
+				path,
+			)
+		}
+	}
+}
+
+// navEntrySection names the section a navigation entry leads to. Section links
+// carry the stable data-nav-link hook; the desktop account chip is the header's
+// only route to settings and is identified by its element id instead.
+func navEntrySection(node *html.Node) string {
+	if hook := htmlAttr(node, "data-nav-link"); hook != "" {
+		return hook
+	}
+	if htmlAttr(node, "id") == "nav-user-chip-desktop" {
+		return "settings"
+	}
+	return ""
+}
+
+// assertNavMarking pins both halves of one navigation entry's active state
+// against what the requested page expects of it.
+func assertNavMarking(t *testing.T, path, entry string, node *html.Node, activeClass string, want bool) {
+	t.Helper()
+
+	styled, current := navActiveMarking(node, activeClass)
+	if styled != want || current != want {
+		t.Errorf(
+			"%s: the %s reports styled=%t aria-current=%t, expected %t for both (class=%q aria-current=%q)",
+			path, entry, styled, current, want, htmlAttr(node, "class"), htmlAttr(node, "aria-current"),
+		)
+	}
+}
+
+// TestNavigationMarksTheCurrentSectionForAssistiveTechnology extends to the rest
+// of the navigation the marking the desktop account chip already carried. Today,
+// Calendar and Insights announced their own page through nav-link-active in the
+// header and mobile-tabbar-link-active in the bottom bar, and the tab bar's
+// settings icon through the latter alone — a fill and a weight, with nothing
+// behind them, so a screen reader reading the four entries out had no way to say
+// which page it was already on. Each landmark now marks exactly one entry, marks
+// it both ways, and leaves the other three unmarked in both ways: an attribute
+// left on an inactive link announces a second current page.
+func TestNavigationMarksTheCurrentSectionForAssistiveTechnology(t *testing.T) {
+	app, database := newOnboardingTestApp(t)
+	user := createOnboardingTestUser(t, database, "nav-aria-current@example.com", "StrongPass1", true)
+	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
+
+	for _, current := range []struct{ path, section string }{
+		{"/dashboard", "today"},
+		{"/calendar", "calendar"},
+		{"/stats", "insights"},
+		{"/settings", "settings"},
+	} {
+		document := mustParseHTMLDocument(t, fetchPageBody(t, app, current.path, authCookie))
+
+		desktop := desktopPrimaryNavigation(document)
+		if desktop == nil {
+			t.Fatalf("%s: expected the desktop primary navigation to render", current.path)
+		}
+		tabbar := htmlElementByTagAndClass(document, "nav", "mobile-tabbar")
+		if tabbar == nil {
+			t.Fatalf("%s: expected the bottom tab bar to render", current.path)
+		}
+
+		for _, landmark := range []struct {
+			name string
+			root *html.Node
+		}{
+			{"desktop navigation", desktop},
+			{"bottom tab bar", tabbar},
+		} {
+			marked := navCurrentEntries(landmark.root)
+			if len(marked) != 1 {
+				t.Errorf(
+					"%s: the %s marks %d entries with aria-current=\"page\", expected exactly one",
+					current.path, landmark.name, len(marked),
+				)
+				continue
+			}
+			if got := navEntrySection(marked[0]); got != current.section {
+				t.Errorf(
+					"%s: the %s marks the %q entry as the current page, expected %q",
+					current.path, landmark.name, got, current.section,
+				)
+			}
+		}
+
+		// Desktop reaches settings through the account chip, which
+		// TestDesktopSettingsEntryMarksSettingsAsTheCurrentSection pins; its
+		// section links are the three page destinations.
+		for _, section := range []string{"today", "calendar", "insights"} {
+			link := htmlElementByAttr(desktop, "data-nav-link", section)
+			if link == nil {
+				t.Fatalf("%s: expected the desktop %s section link to render", current.path, section)
+			}
+			assertNavMarking(t, current.path, "desktop "+section+" link", link, "nav-link-active", section == current.section)
+		}
+
+		for _, section := range []string{"today", "calendar", "insights", "settings"} {
+			link := htmlElementByAttr(tabbar, "data-nav-link", section)
+			if link == nil {
+				t.Fatalf("%s: expected the tab bar %s link to render", current.path, section)
+			}
+			assertNavMarking(t, current.path, "tab bar "+section+" link", link, "mobile-tabbar-link-active", section == current.section)
+		}
+	}
+}
+
+// TestMobileHeaderMenuCarriesOnlyAccountEntries pins the single-navigation
+// contract for mobile: the header menu used to repeat Today / Calendar /
+// Insights / Settings, so a phone carried two navigations to the same four
+// destinations — the menu pushed the page down when opened and left the bottom
+// tab bar visible underneath it. The four section destinations now live in the
+// tab bar alone; the header menu is the account menu (profile chip + logout)
+// and declares that reduced scope through data-mobile-menu="account". Desktop
+// keeps its own primary navigation, unaffected by that reduction.
+func TestMobileHeaderMenuCarriesOnlyAccountEntries(t *testing.T) {
+	app, database := newOnboardingTestApp(t)
+	user := createOnboardingTestUser(t, database, "mobile-single-nav@example.com", "StrongPass1", true)
+	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
+
+	sections := []string{"today", "calendar", "insights", "settings"}
+	// Desktop reaches settings through the account chip (an account control, not
+	// a section link), so its section hooks stop at the three page destinations —
+	// TestDesktopHeaderOffersASingleSettingsEntry pins the settings route itself.
+	desktopSections := []string{"today", "calendar", "insights"}
+
+	for _, path := range []string{"/dashboard", "/calendar", "/stats", "/settings"} {
+		document := mustParseHTMLDocument(t, fetchPageBody(t, app, path, authCookie))
+
+		menu := htmlFindElement(document, func(node *html.Node) bool {
+			return node.Type == html.ElementNode && node.Data == "nav" && htmlHasAttr(node, "data-mobile-menu")
+		})
+		if menu == nil {
+			t.Fatalf("%s: expected the header to render the mobile menu landmark", path)
+		}
+		if got := htmlAttr(menu, "data-mobile-menu"); got != "account" {
+			t.Errorf("%s: mobile menu declares data-mobile-menu=%q, expected \"account\"", path, got)
+		}
+		if hooks := navSectionHooks(menu); len(hooks) != 0 {
+			t.Errorf(
+				"%s: the mobile header menu still lists section destinations %v; the bottom tab bar already covers them, so a phone gets two navigations to the same places",
+				path, hooks,
+			)
+		}
+		if htmlElementByID(menu, "nav-user-chip-mobile") == nil {
+			t.Errorf("%s: the mobile menu must keep the profile entry", path)
+		}
+		if htmlElementByAttr(menu, "action", "/logout") == nil {
+			t.Errorf("%s: the mobile menu must keep the logout form", path)
+		}
+
+		tabbar := htmlElementByTagAndClass(document, "nav", "mobile-tabbar")
+		if tabbar == nil {
+			t.Fatalf("%s: expected the bottom tab bar to stay in place", path)
+		}
+		if got := navSectionHooks(tabbar); !slices.Equal(got, sections) {
+			t.Errorf("%s: the bottom tab bar must remain the mobile route to every section, got %v", path, got)
+		}
+
+		desktop := desktopPrimaryNavigation(document)
+		if desktop == nil {
+			t.Fatalf("%s: expected the desktop primary navigation to render", path)
+		}
+		if got := navSectionHooks(desktop); !slices.Equal(got, desktopSections) {
+			t.Errorf("%s: desktop navigation must keep every section link, got %v", path, got)
+		}
+		if htmlElementByID(desktop, "nav-user-chip-desktop") == nil {
+			t.Errorf("%s: the desktop navigation must keep the account chip, its only route to settings", path)
+		}
 	}
 }
 

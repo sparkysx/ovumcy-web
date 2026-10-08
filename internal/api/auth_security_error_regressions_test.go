@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -18,6 +19,8 @@ type stubLoginWorkflowService struct {
 	result services.LoginResult
 	err    error
 }
+
+func (stub *stubLoginWorkflowService) ResetAttempts(string) {}
 
 func (stub *stubLoginWorkflowService) Authenticate(context.Context, []byte, string, string, string, time.Duration, time.Time) (services.LoginResult, error) {
 	if stub.err != nil {
@@ -162,18 +165,43 @@ func TestLoginForcedResetCookieWriteFailureReturns500(t *testing.T) {
 	}
 }
 
-func TestRenderRecoveryCodeResponseCookieWriteFailureReturns500(t *testing.T) {
-	handler := &Handler{
-		location: time.UTC,
+// TestRecoveryCodeDeliveryFailuresMapToTheirOwnRefusal pins
+// mapRecoveryCodeDeliveryError over the two ways a delivery can fail to seal:
+// a handler whose cookie codec cannot be built fails on the session, and a
+// reveal the sealer refuses (an empty code) fails on the reveal after the
+// session sealed. Either way the hook reports the failure and fills nothing.
+func TestRecoveryCodeDeliveryFailuresMapToTheirOwnRefusal(t *testing.T) {
+	user := &models.User{ID: 1, Role: models.RoleOwner, OnboardingCompleted: true}
+
+	// The key is valid, so the session token signs; only the codec fails. A
+	// handler with no key at all would fail earlier, on the signature, and never
+	// reach the seal this case is about.
+	codecRefused := errors.New("cookie codec unavailable")
+	noCodec := &Handler{location: time.UTC, secretKey: []byte(testHandlerSecretKey), authService: &services.AuthService{}}
+	noCodec.cookieCodecOnce.Do(func() { noCodec.cookieCodecErr = codecRefused })
+	deliver, delivery := noCodec.newRecoveryCodeDelivery(false, services.PostLoginRedirectPath, recoveryCodeSurfaceDedicated)
+	if err := deliver(user, "ABCD-1234"); !errors.Is(err, codecRefused) || !errors.Is(delivery.failure, codecRefused) {
+		t.Fatalf("a handler with no cookie codec must fail to seal the session, got %v", err)
+	}
+	if got := mapRecoveryCodeDeliveryError(delivery.failure).Key; got != authSessionCreateErrorSpec().Key {
+		t.Fatalf("a session that cannot be sealed must map to %q, got %q", authSessionCreateErrorSpec().Key, got)
+	}
+	if delivery.session.sessionID != "" || delivery.nextPath != "" {
+		t.Fatal("a failed delivery must fill nothing a handler could write")
+	}
+
+	sealing := &Handler{location: time.UTC, secretKey: []byte(testHandlerSecretKey), authService: &services.AuthService{}}
+	deliver, delivery = sealing.newRecoveryCodeDelivery(false, services.PostLoginRedirectPath, recoveryCodeSurfaceDedicated)
+	if err := deliver(user, "  "); err == nil || !errors.Is(delivery.failure, errRecoveryCodeRevealSeal) {
+		t.Fatalf("a reveal the sealer refuses must fail as a reveal failure, got %v", delivery.failure)
+	}
+	if delivery.session.sessionID != "" || delivery.nextPath != "" {
+		t.Fatal("a delivery whose reveal failed must not hand back the session it sealed first")
 	}
 
 	app := fiber.New()
 	app.Get("/api/auth/recovery-response-test", func(c fiber.Ctx) error {
-		user := &models.User{
-			ID:   1,
-			Role: models.RoleOwner,
-		}
-		return handler.renderRecoveryCodeResponse(c, user, "ABCD-1234", fiber.StatusCreated)
+		return sealing.respondMappedError(c, mapRecoveryCodeDeliveryError(delivery.failure))
 	})
 
 	request := httptest.NewRequest(http.MethodGet, "/api/auth/recovery-response-test", nil)

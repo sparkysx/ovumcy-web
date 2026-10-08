@@ -1,6 +1,16 @@
 # syntax=docker/dockerfile:1
 
-FROM golang:1.26.5-alpine3.24@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS builder
+# The builder tag must stay equal to the toolchain go.mod asks for — its
+# `toolchain` directive where there is one, otherwise the `go` line, which is
+# the order actions/setup-go reads them in. Every CI Go job resolves its
+# toolchain with `go-version-file: go.mod`, so a builder ahead of that directive
+# ships a binary compiled by a toolchain no unit, race or e2e run ever
+# exercised — GOTOOLCHAIN only ever upgrades, never downgrades, so the newer
+# image simply wins. A release candidate reached this line that way. CI
+# now asserts the equality (`Builder toolchain matches go.mod` in
+# .github/workflows/ci.yml), and Dependabot is told to leave pre-release tags of
+# this image alone.
+FROM golang:1.27.1-alpine3.24@sha256:8a5910f31396cd4d89662f56c68b3ae31d374308270a1c3bd96672ee5ed43414 AS builder
 WORKDIR /src
 
 COPY go.mod go.sum ./
@@ -20,13 +30,23 @@ ARG BUILD_REVISION=""
 ENV CGO_ENABLED=0 GOOS=linux
 RUN go build -trimpath -ldflags="-s -w -X main.buildVersion=${BUILD_REVISION}" -o /out/ovumcy ./cmd/ovumcy
 
-FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS runtime-assets
+FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS runtime-assets
 WORKDIR /app
 
-RUN apk add --no-cache tzdata ca-certificates \
+# The two packages are pinned to the revision the v3.24 main repository carried
+# when this line was last bumped, so a rebuild of one commit installs the same
+# files. Alpine keeps only the CURRENT revision of a package in a branch, so a
+# pin goes stale as soon as the branch publishes a newer one and the build then
+# fails with "no such package" until the pin is bumped: read the new revisions
+# from the v3.24 main APKINDEX (the `V:` line under `P:tzdata` and
+# `P:ca-certificates`) or from `apk policy` inside the pinned alpine image, and
+# bump both together with the base image digest above. The runtime stage is
+# `scratch` and carries no package database, so the image scan cannot report
+# these two packages' versions; the pin is the only record of them.
+RUN apk add --no-cache tzdata=2026d-r0 ca-certificates=20260909-r0 \
     && addgroup -S -g 10001 ovumcy \
     && adduser -S -D -H -u 10001 -G ovumcy -h /app ovumcy \
-    && mkdir -p /app/data
+    && mkdir -p /app/data /app/fence
 
 FROM scratch AS runtime
 WORKDIR /app
@@ -35,12 +55,20 @@ COPY --from=runtime-assets /etc/passwd /etc/group /etc/
 COPY --from=runtime-assets /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=runtime-assets /usr/share/zoneinfo /usr/share/zoneinfo
 COPY --from=runtime-assets --chown=10001:10001 /app/data /app/data
+# /app/fence is the mountpoint for the calendar-feed restore fence. It is a
+# SECOND persistent location on purpose: the fence proves the database in
+# front of the app is the one this instance last wrote, so it only works
+# while it stays out of every database backup. Left unmounted the directory
+# is on the read-only layer, the fence cannot be written, and the app
+# disarms every armed calendar feed on each start and says so.
+COPY --from=runtime-assets --chown=10001:10001 /app/fence /app/fence
 COPY --from=builder --chown=10001:10001 /out/ovumcy /app/ovumcy
 
 USER 10001:10001
 
 EXPOSE 8080
 ENV DB_PATH=/app/data/ovumcy.db
+ENV CALENDAR_FEED_FENCE_PATH=/app/fence/calendar-feed.fence
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD ["/app/ovumcy", "healthcheck"]
 CMD ["/app/ovumcy"]

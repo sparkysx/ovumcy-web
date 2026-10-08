@@ -53,8 +53,11 @@ type StatsPageViewData struct {
 	SymptomPatterns                   []StatsSymptomPatternViewData
 	SymptomCounts                     []StatsSymptomCountViewData
 	CurrentCycleBBTChart              StatsBBTChartViewData
+	CycleRibbon                       StatsCycleRibbon
 	PhaseMoodInsights                 []StatsPhaseMoodInsight
 	PhaseSymptomInsights              []StatsPhaseSymptomInsight
+	Statements                        []StatsStatement
+	HasStatements                     bool
 	HasLastCycleSymptoms              bool
 	HasSymptomPatterns                bool
 	HasRecentCycleFactors             bool
@@ -78,8 +81,14 @@ type StatsPageViewData struct {
 	ShowLongCycleNotice   bool
 	ShowPerimenopauseHint bool
 	PredictionDisabled    bool
-	IsIrregularMode       bool
-	IsOwner               bool
+	// ShowPredictionModeCard is false while the pregnancy pause holds: the
+	// phase-or-facts-only card has nothing true to say then (the "facts only /
+	// this mode" wording is the unpredictable-cycle setting's), and the pause
+	// explainer above the grid already names the state. It is resolved from the
+	// cycle context's pause verdict so the template reads one answer.
+	ShowPredictionModeCard bool
+	IsIrregularMode        bool
+	IsOwner                bool
 }
 
 type statsPageBaseData struct {
@@ -95,7 +104,9 @@ type statsOwnerInsightsViewData struct {
 	lastCycleSymptoms       []StatsSymptomCountViewData
 	symptomPatterns         []StatsSymptomPatternViewData
 	currentCycleBBTChart    StatsBBTChartViewData
+	cycleRibbon             StatsCycleRibbon
 	phaseSymptomInsights    []StatsPhaseSymptomInsight
+	statements              []StatsStatement
 	hasPhaseSymptomInsights bool
 }
 
@@ -110,28 +121,51 @@ func (service *StatsService) BuildStatsPageViewData(ctx context.Context, user *m
 		return StatsPageViewData{}, fmt.Errorf("%w: %v", ErrStatsPageViewLoadSymptoms, err)
 	}
 	symptomCounts := buildStatsSymptomCountViewData(language, frequencies)
-	phaseMoodInsights, hasPhaseMoodInsights := service.BuildPhaseMoodInsights(user, baseData.logs, location)
-	ownerInsights, err := service.buildOwnerStatsInsights(ctx, user, language, baseData.stats, baseData.logs, now, location)
+	boundaryCtx := BoundaryContextFor(user, DateAtLocation(now, location))
+	phaseMoodInsights, hasPhaseMoodInsights := service.BuildPhaseMoodInsights(user, baseData.logs, location, boundaryCtx)
+	// The one traversal that yields the completed-cycle lengths feeds every
+	// consumer below, including the statements section, so the tiers there are
+	// read off StatsFlags.CompletedCycleCount's own source rather than a
+	// second count of the same thing.
+	completedCycleLengths := CompletedCycleTrendLengths(baseData.logs, now, location, boundaryCtx)
+	ownerInsights, err := service.buildOwnerStatsInsights(ctx, user, language, baseData.stats, baseData.logs, completedCycleLengths, now, location)
 	if err != nil {
 		return StatsPageViewData{}, err
 	}
 
 	showIrregularityNotice := shouldShowStatsIrregularityNotice(user, baseData.flags, baseData.stats)
 	showIrregularInsufficientDataNotice := shouldShowStatsIrregularInsufficientDataNotice(user, baseData.flags)
-	completedCycleLengths := CompletedCycleTrendLengths(baseData.logs, now, location)
 	showShortCycleNotice := shouldShowStatsShortCycleNotice(user, completedCycleLengths)
 	showLongCycleNotice := shouldShowStatsLongCycleNotice(user, completedCycleLengths)
 	showPerimenopauseHint := shouldShowStatsPerimenopauseHint(user)
-	predictionDisabled := DashboardPredictionDisabled(user)
+	cycleContext := BuildDashboardCycleContext(user, baseData.logs, baseData.stats, DateAtLocation(now, location), location)
+	// The stats phase card reads the suppression the cycle context already
+	// resolved, not DashboardPredictionDisabled(user) on its own: the
+	// unpredictable-cycle setting is one signal among several, and a pregnancy
+	// pause left this surface — the last prediction surface without the gate the
+	// calendar grid, the .ics feed and the webhook pass all carry — still
+	// claiming a fertile window whose only source is the onboarding
+	// cycle-length slider. Reading the resolved decision rather than
+	// recombining the signals here keeps /stats moving with the dashboard on
+	// every later reliability change. Regression:
+	// TestStatsFertileWindowCardIsSuppressedByAPregnancyPause.
+	predictionDisabled := cycleContext.PredictionDisabled
 	isIrregularMode := isStatsIrregularMode(user)
 	isOwner := IsOwnerUser(user)
 	predictionSampleCount, predictionSampleUsesRecentWindow, predictionReliabilityLabelKey, predictionReliabilityHintKey, showPredictionReliability := buildStatsPredictionReliability(user, baseData.flags, baseData.stats)
 	cycleFactorExplanation, hasCycleFactorExplanation := buildStatsCycleFactorExplanation(user, baseData.logs, baseData.stats, now, location)
-	cycleContext := BuildDashboardCycleContext(user, baseData.stats, DateAtLocation(now, location), location)
 	predictionExplanation := BuildOwnerPredictionExplanation(user, cycleContext, hasCycleFactorExplanation && len(cycleFactorExplanation.HintFactorKeys) > 0)
+	// The one adapter every projection surface publishes through, so /stats and
+	// the JSON API cannot drift apart on what a suppressed tier may carry — and,
+	// ahead of it, the one resolver that moves the ovulation day, the fertile
+	// window and the fertility status onto a shift the owner's temperatures
+	// confirm, so this page's fertile-window card cannot name the projection
+	// while the grid and the chart name the confirmed day.
+	today := DateAtLocation(now, location)
+	_, publishedStats, _ := ConfirmedAndPublishedStats(user, baseData.logs, baseData.stats, today, location)
 
 	return StatsPageViewData{
-		Stats:                               baseData.stats,
+		Stats:                               publishedStats,
 		ChartData:                           baseData.chartData,
 		ChartBaseline:                       baseData.chartBaseline,
 		TrendPointCount:                     baseData.trendPointCount,
@@ -153,8 +187,11 @@ func (service *StatsService) BuildStatsPageViewData(ctx context.Context, user *m
 		SymptomPatterns:                     ownerInsights.symptomPatterns,
 		SymptomCounts:                       symptomCounts,
 		CurrentCycleBBTChart:                ownerInsights.currentCycleBBTChart,
+		CycleRibbon:                         ownerInsights.cycleRibbon,
 		PhaseMoodInsights:                   phaseMoodInsights,
 		PhaseSymptomInsights:                ownerInsights.phaseSymptomInsights,
+		Statements:                          ownerInsights.statements,
+		HasStatements:                       len(ownerInsights.statements) > 0,
 		HasLastCycleSymptoms:                len(ownerInsights.lastCycleSymptoms) > 0,
 		HasSymptomPatterns:                  len(ownerInsights.symptomPatterns) > 0,
 		HasRecentCycleFactors:               hasCycleFactorExplanation && len(cycleFactorExplanation.RecentFactors) > 0,
@@ -170,13 +207,15 @@ func (service *StatsService) BuildStatsPageViewData(ctx context.Context, user *m
 		ShowLongCycleNotice:                 showLongCycleNotice,
 		ShowPerimenopauseHint:               showPerimenopauseHint,
 		PredictionDisabled:                  predictionDisabled,
+		ShowPredictionModeCard:              !cycleContext.PregnancyPaused,
 		IsIrregularMode:                     isIrregularMode,
 		IsOwner:                             isOwner,
 	}, nil
 }
 
 func (service *StatsService) buildStatsPageBaseData(ctx context.Context, user *models.User, cycleLabelPattern string, now time.Time, location *time.Location, maxTrendPoints int) (statsPageBaseData, error) {
-	stats, logs, err := service.BuildCycleStatsForRange(ctx, user, now.AddDate(-2, 0, 0), now, now, location)
+	statsFrom, statsTo := StatsOverviewRange(now)
+	stats, logs, err := service.BuildCycleStatsForRange(ctx, user, statsFrom, statsTo, now, location)
 	if err != nil {
 		return statsPageBaseData{}, fmt.Errorf("%w: %v", ErrStatsPageViewLoadStats, err)
 	}
@@ -221,13 +260,19 @@ func buildStatsSymptomCountViewData(language string, frequencies []SymptomFreque
 	return symptomCounts
 }
 
-func (service *StatsService) buildOwnerStatsInsights(ctx context.Context, user *models.User, language string, stats CycleStats, logs []models.DailyLog, now time.Time, location *time.Location) (statsOwnerInsightsViewData, error) {
+func (service *StatsService) buildOwnerStatsInsights(ctx context.Context, user *models.User, language string, stats CycleStats, logs []models.DailyLog, completedCycleLengths []int, now time.Time, location *time.Location) (statsOwnerInsightsViewData, error) {
 	insights := statsOwnerInsightsViewData{}
 	if !IsOwnerUser(user) {
 		return insights, nil
 	}
 
-	insights.currentCycleBBTChart = buildCurrentCycleBBTChart(stats, logs, now, location)
+	insights.currentCycleBBTChart = buildOwnerCurrentCycleBBTChart(user, language, stats, logs, now, location).inTemperatureUnit(user.TemperatureUnit)
+	// The cycle-length trend needs no symptom catalogue, so it is built before
+	// the reader check below: an owner with no symptom repository still gets
+	// the statement about their own cycle lengths.
+	if trend, ok := buildCycleLengthTrendStatement(completedCycleLengths); ok {
+		insights.statements = append(insights.statements, trend)
+	}
 	if service.symptoms == nil {
 		return insights, nil
 	}
@@ -236,10 +281,13 @@ func (service *StatsService) buildOwnerStatsInsights(ctx context.Context, user *
 	if err != nil {
 		return statsOwnerInsightsViewData{}, fmt.Errorf("%w: %v", ErrStatsPageViewLoadSymptoms, err)
 	}
-	completedCycles := buildCompletedCycleSpans(logs, location)
+	boundaryCtx := BoundaryContextFor(user, DateAtLocation(now, location))
+	completedCycles := buildCompletedCycleSpans(logs, location, boundaryCtx)
+	insights.cycleRibbon = buildStatsCycleRibbon(user, stats, logs, completedCycles)
 	insights.lastCycleSymptoms = buildLastCycleSymptomCounts(language, logs, completedCycles, symptomByID, location)
 	insights.symptomPatterns = buildSymptomPatternInsights(logs, completedCycles, symptomByID, location)
-	insights.phaseSymptomInsights, insights.hasPhaseSymptomInsights = buildPhaseSymptomInsightsWithMap(logs, location, symptomByID)
+	insights.phaseSymptomInsights, insights.hasPhaseSymptomInsights = buildPhaseSymptomInsightsWithMap(logs, location, symptomByID, boundaryCtx)
+	insights.statements = append(insights.statements, buildSymptomPhaseRecurrenceStatements(logs, symptomByID, location, boundaryCtx)...)
 	return insights, nil
 }
 
@@ -255,11 +303,16 @@ func shouldShowStatsIrregularInsufficientDataNotice(user *models.User, flags Sta
 // boundary (the settings/onboarding info_cycle_short advisory fires below
 // the same value), so the logged-cycle note and the cycle-length setting
 // stay consistent.
+//
+// The 24-day value is clinical, not an engineering choice: FIGO AUB System 1
+// classifies a cycle shorter than 24 days as frequent and one longer than 38
+// days as infrequent (Munro MG et al., Int J Gynecol Obstet 2018;143:393–408).
 const shortCycleNoticeThresholdDays = 24
 
 // shortCycleNoticeMinimumOccurrences requires a repeated pattern before the
 // note shows, so a one-off short cycle (or a missed-log artifact) never
-// surfaces medical wording.
+// surfaces medical wording. The count of three is an engineering heuristic,
+// not a clinical threshold.
 const shortCycleNoticeMinimumOccurrences = 3
 
 // shouldShowStatsShortCycleNotice surfaces a soft "several recent cycles are
@@ -304,12 +357,24 @@ func shouldShowStatsLongCycleNotice(user *models.User, completedCycleLengths []i
 	return long >= shortCycleNoticeMinimumOccurrences
 }
 
-// shouldShowStatsPerimenopauseHint surfaces a STRAW+10-aligned educational
-// note for users aged 45+, where within-individual cycle variability rises
-// sharply (Gibson et al., npj Digital Medicine 2023, Apple Women's Health
-// Study, n=12,608) and persistent ≥7-day differences between consecutive
-// cycles mark entry into the menopausal transition (Harlow et al., the
-// ReSTAGE collaboration, median entry age 45.5 years).
+// shouldShowStatsPerimenopauseHint surfaces a STRAW+10-aligned educational note
+// for users aged 45+, where cycle variability is ~45% higher at 45–49 and ~200%
+// higher at 50+ than at 35–39 (Li H. et al., senior author Gibson EA, npj
+// Digital Medicine 2023, PMID 37248288, Apple Women's Health Study, n=12,608).
+//
+// THE AGE BRACKET IS THE WHOLE RULE — no cycle data is consulted, and that is
+// deliberate, not an omission. The copy is an invitation to look, not a verdict:
+// it tells the owner that a persistent difference of ≥7 days in consecutive
+// cycle length, recurring within 10 cycles, is what marks entry into the early
+// menopausal transition (STRAW+10: Harlow SD et al., Menopause 2012;19:387–395,
+// PMID 22343510; the ReSTAGE cohorts put its median onset between 41.0
+// (TREMIN) and 49.5 (MWMHP) years, Fertil Steril 2008) and asks them to notice
+// it. Gating the hint on that criterion would turn the invitation into a claim
+// the app makes about the account, and would withhold it from exactly the owners
+// with too little history to measure variability at all. It is why this function
+// is unlike the two siblings above it, which DO make pattern statements and are
+// therefore gated at 3 occurrences. Regression:
+// TestStatsPerimenopauseHintFollowsTheAgeBracketAlone.
 func shouldShowStatsPerimenopauseHint(user *models.User) bool {
 	return user != nil && NormalizeAgeGroup(user.AgeGroup) == models.AgeGroup45Plus
 }
@@ -318,8 +383,13 @@ func isStatsIrregularMode(user *models.User) bool {
 	return user != nil && user.IrregularCycle
 }
 
+// buildStatsPredictionReliability resolves the "how far can the predictions be
+// trusted" card. While the pregnancy pause holds there are no predictions to
+// grade, so the card is withheld: it would still read "building pattern" off the
+// completed cycles behind a surface that has stopped predicting. Regression:
+// TestStatsPageWithholdsTheReliabilityAndModeTilesDuringAPregnancyPause.
 func buildStatsPredictionReliability(user *models.User, flags StatsFlags, stats CycleStats) (int, bool, string, string, bool) {
-	if flags.CompletedCycleCount < statsMinimumInsightsCycles || DashboardPredictionDisabled(user) {
+	if stats.PregnancyPaused || !HasPersonalCycleRange(user, flags.CompletedCycleCount) {
 		return 0, false, "", "", false
 	}
 
@@ -331,21 +401,47 @@ func buildStatsPredictionReliability(user *models.User, flags StatsFlags, stats 
 	}
 
 	variablePattern := user != nil && (user.IrregularCycle || (flags.CompletedCycleCount >= minimumPhaseInsightCycles && IsIrregularCycleSpread(stats)))
-	labelKey := "stats.reliability.early"
+	tier := resolveStatsReliabilityTier(variablePattern, sampleCount)
 
+	return sampleCount, usesRecentWindow, tier.labelKey, tier.hintKey, true
+}
+
+// statsReliabilityTier is the single reliability verdict the card renders. The
+// heading and the hint are two sentences about ONE state of the account, so
+// they are read off one tier rather than derived from two independent
+// expressions: the label was gated at minimumPhaseInsightCycles and the hint was
+// not, which paired "the pattern is still early" with the hint written for a
+// variable pattern for an irregular-cycle owner at exactly two completed cycles
+// — the case HasPersonalCycleRange admits and both statements describe
+// differently.
+type statsReliabilityTier struct {
+	labelKey string
+	hintKey  string
+}
+
+var (
+	// statsReliabilityEarly is the floor: enough cycles for basic insights, not
+	// enough to characterize a pattern. It says nothing about variability in
+	// either sentence, which is what "conservative with sparse data" means here.
+	statsReliabilityEarly    = statsReliabilityTier{labelKey: "stats.reliability.early", hintKey: "stats.reliability.hint"}
+	statsReliabilityBuilding = statsReliabilityTier{labelKey: "stats.reliability.building", hintKey: "stats.reliability.hint"}
+	statsReliabilityStable   = statsReliabilityTier{labelKey: "stats.reliability.stable", hintKey: "stats.reliability.hint"}
+	statsReliabilityVariable = statsReliabilityTier{labelKey: "stats.reliability.variable", hintKey: "stats.reliability.hint_variable"}
+)
+
+// resolveStatsReliabilityTier picks the tier from the sample the card is about.
+// A variable pattern needs minimumPhaseInsightCycles behind it exactly as every
+// other pattern claim on this page does; below that the account is early,
+// whichever mode it is in.
+func resolveStatsReliabilityTier(variablePattern bool, sampleCount int) statsReliabilityTier {
 	switch {
 	case variablePattern && sampleCount >= minimumPhaseInsightCycles:
-		labelKey = "stats.reliability.variable"
+		return statsReliabilityVariable
 	case sampleCount >= cyclePredictionWindow:
-		labelKey = "stats.reliability.stable"
+		return statsReliabilityStable
 	case sampleCount >= minimumPhaseInsightCycles:
-		labelKey = "stats.reliability.building"
+		return statsReliabilityBuilding
+	default:
+		return statsReliabilityEarly
 	}
-
-	hintKey := "stats.reliability.hint"
-	if variablePattern {
-		hintKey = "stats.reliability.hint_variable"
-	}
-
-	return sampleCount, usesRecentWindow, labelKey, hintKey, true
 }

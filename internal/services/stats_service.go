@@ -25,8 +25,18 @@ type StatsService struct {
 const statsOverviewWindowYears = 2
 
 const (
+	// statsMinimumInsightsCycles is the basic-insights tier: the number of
+	// COMPLETED cycles below which the stats page has nothing to compare.
 	statsMinimumInsightsCycles = 2
-	statsReliableTrendCycles   = 3
+	// statsReliableTrendCycles is how many TREND POINTS the cycle-length chart
+	// needs before HasReliableTrend calls its shape reliable. It is not the
+	// pattern minimum: trend points are the trimmed series BuildTrend returns
+	// (TrimTrailingCycleTrendLengths caps them at the caller's maximum), while
+	// minimumPhaseInsightCycles counts completed cycles. The two are both 3
+	// today and answer different questions, so neither is expressed in terms of
+	// the other — TestStatsThresholdsAreNamedPerSurface fails if a change makes
+	// one of them silently move the other's surface.
+	statsReliableTrendCycles = 3
 )
 
 type StatsFlags struct {
@@ -55,28 +65,85 @@ func (service *StatsService) BuildCycleStatsForRange(ctx context.Context, user *
 }
 
 // BuildCycleStatsFromLogs computes cycle stats from already-fetched logs, for
-// callers that have the relevant range in memory and want to avoid a
-// redundant daily_logs query.
-func (service *StatsService) BuildCycleStatsFromLogs(user *models.User, logs []models.DailyLog, now time.Time, location *time.Location) CycleStats {
-	stats := BuildCycleStats(logs, now)
+// callers that have the relevant range in memory and want to avoid a redundant
+// daily_logs query.
+//
+// It is package-level because it consults NO repositories: the whole derivation
+// is BuildCycleStats + ApplyUserCycleBaseline + ResolvePregnancyPause over the
+// logs it is handed. The repository-free callers — the webhook decision pass and
+// the .ics feed — used to say that in a comment and reach it through
+// NewStatsService(nil, nil), a service whose two fields exist only to be not
+// dereferenced. Here the property is structural: there is no receiver to hold a
+// nil store, so a future line that needs one cannot compile into this function
+// unnoticed.
+//
+// The three passes run over ONE timeline, bounded at the owner's today. Only
+// BuildCycleStats bounded its own input (cycles.go, filterLogsNotAfter); the
+// baseline and the pregnancy pause were handed the raw set, so a day logged
+// ahead of today reached two of the three. ResolvePregnancyPause is where that
+// cost something: it lifts a pause on ANY cycle boundary later than the
+// positive test, and an explicit mark opens one whatever its date, while
+// manualCycleStartFutureDays lets an
+// owner record a start two days ahead. The surfaces that looked safe were safe
+// by accident — the dashboard and the .ics feed pre-bound the set they pass
+// (FilterLogsByDateRange, the fetched range), and the webhook notify pass, the
+// one surface that speaks to a destination outside the instance, passed the
+// whole stored history. So a positive test today plus a permitted start
+// tomorrow left the owner paused everywhere they could look and unpaused in the
+// payload leaving the instance. Bounding here rather than at each caller is what
+// makes "one timeline" a property of the derivation instead of a habit of three
+// call sites: suppression is the floor, and a floor one surface stands a day in
+// front of is not one.
+func BuildCycleStatsFromLogs(user *models.User, logs []models.DailyLog, now time.Time, location *time.Location) CycleStats {
+	logs = filterLogsNotAfter(logs, DateAtLocation(now, location))
+	boundaryCtx := BoundaryContextFor(user, DateAtLocation(now, location))
+	stats := BuildCycleStats(logs, now, boundaryCtx)
 	stats = ApplyUserCycleBaseline(user, logs, stats, now, location)
-	if _, paused := ResolvePregnancyPause(logs); paused {
+	if _, paused := ResolvePregnancyPause(logs, boundaryCtx); paused {
 		stats.PregnancyPaused = true
 	}
 	return stats
 }
 
+// BuildCycleStatsFromLogs is the method form, kept because the dashboard view
+// service depends on this derivation through an interface seam
+// (DashboardStatsProvider) that its tests substitute. It adds nothing: the
+// method IS the package function, so the two can never disagree about what the
+// dashboard's stats are. Regression:
+// TestStatsServiceBuildCycleStatsFromLogsIsThePackageFunction.
+func (service *StatsService) BuildCycleStatsFromLogs(user *models.User, logs []models.DailyLog, now time.Time, location *time.Location) CycleStats {
+	return BuildCycleStatsFromLogs(user, logs, now, location)
+}
+
+// StatsOverviewRange is the one history window every surface derives its cycle
+// statistics from: the dashboard, the calendar, the stats page, the JSON API, the
+// .ics feed and the webhook reminder pass. A surface that read a different span
+// would hold different cycle lengths, and with them a different overdue verdict,
+// so one of two surfaces could publish a projection the other had withheld.
 func StatsOverviewRange(now time.Time) (time.Time, time.Time) {
 	return now.AddDate(-statsOverviewWindowYears, 0, 0), now
 }
 
-func (service *StatsService) BuildOverviewStats(ctx context.Context, user *models.User, now time.Time, location *time.Location) (CycleStats, error) {
+// FilterLogsToStatsHistory narrows an unbounded log slice to StatsOverviewRange
+// around the owner-local today, for a caller that already holds the whole stored
+// history in memory and so cannot ask the repository for the range. Bounds and
+// inclusion are FilterLogsByDateRange's, which is the shape the ranged query uses.
+func FilterLogsToStatsHistory(logs []models.DailyLog, now time.Time, location *time.Location) []models.DailyLog {
+	from, to := StatsOverviewRange(DateAtLocation(now, location))
+	return FilterLogsByDateRange(logs, from, to, location)
+}
+
+// BuildOverviewStats also returns the logs it fetched, alongside the derived
+// stats: PublishedOverviewStats needs them to resolve a confirmed ovulation
+// day through the shared BBT detector, and a second fetch here would be a
+// second read of the same range this call already bounded.
+func (service *StatsService) BuildOverviewStats(ctx context.Context, user *models.User, now time.Time, location *time.Location) (CycleStats, []models.DailyLog, error) {
 	from, to := StatsOverviewRange(now)
-	stats, _, err := service.BuildCycleStatsForRange(ctx, user, from, to, now, location)
+	stats, logs, err := service.BuildCycleStatsForRange(ctx, user, from, to, now, location)
 	if err != nil {
-		return CycleStats{}, err
+		return CycleStats{}, nil, err
 	}
-	return stats, nil
+	return stats, logs, nil
 }
 
 func TrimTrailingCycleTrendLengths(lengths []int, maxPoints int) []int {
@@ -87,7 +154,7 @@ func TrimTrailingCycleTrendLengths(lengths []int, maxPoints int) []int {
 }
 
 func (service *StatsService) BuildTrend(user *models.User, logs []models.DailyLog, now time.Time, location *time.Location, maxTrendPoints int) ([]int, int) {
-	lengths := CompletedCycleTrendLengths(logs, now, location)
+	lengths := CompletedCycleTrendLengths(logs, now, location, BoundaryContextFor(user, DateAtLocation(now, location)))
 	lengths = TrimTrailingCycleTrendLengths(lengths, maxTrendPoints)
 	if len(lengths) == 0 {
 		return lengths, 0
@@ -96,18 +163,17 @@ func (service *StatsService) BuildTrend(user *models.User, logs []models.DailyLo
 }
 
 func (service *StatsService) BuildFlags(user *models.User, logs []models.DailyLog, stats CycleStats, now time.Time, location *time.Location, trendPointCount int) StatsFlags {
-	observedCycleCount := len(CycleLengths(logs))
-	completedCycleCount := len(CompletedCycleTrendLengths(logs, now, location))
 	today := DateAtLocation(now, location)
-	cycleDayReference := DashboardCycleReferenceLength(user, stats)
-	cycleStaleAnchor := DashboardCycleStaleAnchor(user, stats, location)
+	boundaryCtx := BoundaryContextFor(user, today)
+	observedCycleCount := len(CycleLengths(logs, boundaryCtx))
+	completedCycleCount := len(CompletedCycleTrendLengths(logs, now, location, boundaryCtx))
 
 	return StatsFlags{
 		HasObservedCycleData: observedCycleCount > 0,
 		HasTrendData:         trendPointCount > 0,
 		HasInsights:          completedCycleCount >= statsMinimumInsightsCycles,
 		HasReliableTrend:     trendPointCount >= statsReliableTrendCycles,
-		CycleDataStale:       DashboardCycleDataLooksStale(cycleStaleAnchor, today, cycleDayReference),
+		CycleDataStale:       dashboardCycleDataStale(user, stats, today, location),
 		CompletedCycleCount:  completedCycleCount,
 		InsightProgress:      statsInsightProgress(completedCycleCount),
 	}

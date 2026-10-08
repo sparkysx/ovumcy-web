@@ -14,10 +14,10 @@ func PhaseTranslationKey(phase string) string {
 		return "phases.follicular"
 	case "ovulation":
 		return "phases.ovulation"
-	case "fertile":
-		return "phases.fertile"
 	case "luteal":
 		return "phases.luteal"
+	case "withheld":
+		return "phases.withheld"
 	default:
 		return "phases.unknown"
 	}
@@ -75,28 +75,49 @@ func PregnancyTestTranslationKey(value string) string {
 	}
 }
 
-func RoleTranslationKey(role string) string {
-	switch NormalizeUserRole(role) {
-	case models.RoleOwner:
-		return "role.owner"
+// MoodTranslationKey names a step of the mood scale. The faces alone leave the
+// scale to be guessed — two people picking the third one were recording
+// different things — so every step carries a name, and the name is a catalogue
+// key rather than a glyph or a fraction. A value outside the scale has no name;
+// callers render their own no-data label for it.
+func MoodTranslationKey(value int) string {
+	switch value {
+	case 1:
+		return "dashboard.mood.very_low"
+	case 2:
+		return "dashboard.mood.low"
+	case 3:
+		return "dashboard.mood.neutral"
+	case 4:
+		return "dashboard.mood.good"
+	case 5:
+		return "dashboard.mood.very_good"
 	default:
-		return role
+		return ""
 	}
 }
 
+// PhaseIcon names the icon a phase is drawn with. The value is a key into the
+// first-party icon set the templates render, not a glyph: emoji rendered as
+// text were read out as page content ("cherry blossom", "maple leaf") and drew
+// differently on every platform.
 func PhaseIcon(phase string) string {
 	switch strings.ToLower(strings.TrimSpace(phase)) {
 	case "menstrual":
-		return "\U0001FA78"
+		return "drop"
 	case "follicular":
-		return "\U0001F338"
+		return "sprout"
 	case "ovulation":
-		return "\u2600\uFE0F"
-	case "fertile":
-		return "\U0001F33F"
+		return "sun"
 	case "luteal":
-		return "\U0001F342"
+		return "leaf"
+	// "withheld" is not a phase the app failed to work out, so it must not wear
+	// the icon that says so. Falling through to the default put the label
+	// "fertile details held back" beside the unknown glyph, which is the same
+	// collapse of held-back into unknown the ribbon's own colours refuse.
+	case "withheld":
+		return "eye-off"
 	default:
-		return "\u2728"
+		return "sparkle"
 	}
 }

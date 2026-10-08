@@ -20,25 +20,32 @@ var ErrWebhookOwnerNotFound = errors.New("webhook owner not found")
 // WebhookSettingsRepository (the slice-1 write surface) so the save path's
 // interface stays minimal; *db.UserRepository satisfies both.
 type WebhookOwnerReader interface {
-	FindByNormalizedEmailOptional(ctx context.Context, email string) (models.User, bool, error)
+	// FindAllByNormalizedEmail is read only through resolveUniqueUserByEmail.
+	FindAllByNormalizedEmail(ctx context.Context, email string) ([]models.User, error)
 }
 
 // WebhookSettingsView is the SAFE, transport-free projection of an owner's
 // webhook settings for operator surfaces (the CLI show/set output). It carries
 // the toggle state, the lead window, and — for the endpoint — only the HOST,
 // never the full URL, path, query, or userinfo (which can embed an ntfy/Gotify
-// token). Configured reports whether any endpoint ciphertext is stored.
+// token). Readability reports what this instance can say about the stored ciphertext.
 type WebhookSettingsView struct {
-	// Configured is true when an endpoint ciphertext is stored (independent of
-	// whether delivery is currently enabled).
-	Configured bool
-	Enabled    bool
+	// Readability is the same three-valued answer the web surface renders --
+	// absent, unreadable, readable -- and for the same reason: an endpoint this
+	// instance can no longer open is not the same fact as one it can, and the
+	// operator is the person who has to act on the difference.
+	Readability WebhookURLReadability
+	Enabled     bool
 	// Host is the destination hostname only (e.g. "ntfy.example.io"), or "" when
 	// no endpoint is configured. It is the single form of a webhook URL that may
 	// appear in operator output — never the scheme/path/query/token.
-	Host             string
-	NotifyPeriod     bool
-	NotifyOvulation  bool
+	Host            string
+	NotifyPeriod    bool
+	NotifyOvulation bool
+	// ReminderLeadDays is the lead window IN FORCE — always clamped through
+	// NormalizeReminderLeadDays, the same value DecideDueReminders applies —
+	// never the raw stored column. Both builders of this struct clamp, so `show`
+	// and `set` cannot report two different readings of one window.
 	ReminderLeadDays int
 }
 
@@ -147,11 +154,21 @@ func (service *WebhookSettingsCLIService) ApplyWebhookSettings(ctx context.Conte
 	case webhookURLClear:
 		update.URL = ""
 	case webhookURLKeep:
-		update.URL = currentURL
+		// Named so the switch still reads as the three actions it has, and
+		// falling through so it cannot acquire a second body: see below.
+		fallthrough
 	default:
-		// codecov:ignore -- unreachable: URLAction is only ever one of the three
-		// named actions (set via SetURL/ClearURL or the zero-value keep). Kept so a
-		// future action added without a case fails safe by preserving the URL.
+		// Keep — and any action added later without a case of its own, which
+		// lands here for the same reason: preserving the endpoint is the safe
+		// default. The two arms share one body deliberately. A keep-merge is the
+		// one action that needs the plaintext, and on a row this instance cannot
+		// open there is nothing to keep: re-persisting the empty string would
+		// silently delete the endpoint the operator asked to leave alone. Guarding
+		// only the named case would have left the fallback doing exactly that,
+		// while its comment claimed it failed safe.
+		if current.Readability == WebhookURLUnreadable {
+			return WebhookSettingsView{}, ErrWebhookURLUnreadable
+		}
 		update.URL = currentURL
 	}
 
@@ -182,35 +199,53 @@ func (service *WebhookSettingsCLIService) resolveOwner(ctx context.Context, emai
 		return models.User{}, WebhookSettingsView{}, "", err
 	}
 
-	owner, found, err := service.reader.FindByNormalizedEmailOptional(ctx, normalizedEmail)
+	owner, found, err := resolveUniqueUserByEmail(ctx, service.reader, normalizedEmail)
 	if err != nil {
+		var ambiguous *AmbiguousEmailError
+		if errors.As(err, &ambiguous) {
+			return models.User{}, WebhookSettingsView{}, "", err
+		}
 		return models.User{}, WebhookSettingsView{}, "", fmt.Errorf("%w: %v", ErrOperatorUserLookupFailed, err)
 	}
 	if !found {
 		return models.User{}, WebhookSettingsView{}, "", ErrWebhookOwnerNotFound
 	}
 
+	// One projection rule for both surfaces. This path used to fail outright on a
+	// ciphertext it could not open, which left the operator unable to SEE the
+	// broken row and unable to clear it -- the one situation the CLI exists for.
+	// It now reports the same three-valued readability the settings page renders;
+	// only the merge that genuinely needs the plaintext refuses, below.
+	display := service.settings.BuildWebhookURLDisplay(owner.ID, owner.WebhookURL)
 	plaintextURL := ""
-	host := ""
-	configured := strings.TrimSpace(owner.WebhookURL) != ""
-	if configured {
-		// Decrypt once; the plaintext is returned to the caller for a URL-keeping
-		// merge and used here only to derive the host.
+	if display.Readability == WebhookURLReadable {
+		// Decrypt once more only where the plaintext is actually needed: a
+		// URL-keeping merge re-persists the existing endpoint unchanged. The
+		// display above deliberately discards it.
 		plaintext, decryptErr := service.settings.DecryptWebhookURL(owner.ID, owner.WebhookURL)
+		// codecov:ignore:start -- unreachable: this arm runs only when the
+		// projection above already opened the same ciphertext under the same key
+		// and owner id. Kept because the alternative is discarding an error, and
+		// the day the two stop sharing one decrypt this fails closed.
 		if decryptErr != nil {
-			return models.User{}, WebhookSettingsView{}, "", fmt.Errorf("decrypt current webhook url: %w", decryptErr)
+			return models.User{}, WebhookSettingsView{}, "", ErrWebhookURLUnreadable
 		}
+		// codecov:ignore:end
 		plaintextURL = plaintext
-		host = hostOnly(plaintext)
 	}
 
 	view := WebhookSettingsView{
-		Configured:       configured,
-		Enabled:          owner.WebhookEnabled,
-		Host:             host,
-		NotifyPeriod:     owner.WebhookNotifyPeriod,
-		NotifyOvulation:  owner.WebhookNotifyOvulation,
-		ReminderLeadDays: owner.ReminderLeadDays,
+		Readability:     display.Readability,
+		Enabled:         owner.WebhookEnabled,
+		Host:            display.Host,
+		NotifyPeriod:    owner.WebhookNotifyPeriod,
+		NotifyOvulation: owner.WebhookNotifyOvulation,
+		// Clamped, exactly as viewFromUpdate and DecideDueReminders clamp it: the
+		// view reports the window IN FORCE, never the raw stored column. A row
+		// outside the bound — hand-edited, restored from a backup, or written
+		// before the bound existed — otherwise made `show` print a window no
+		// reminder can fire on, and a no-op `set` look like a change.
+		ReminderLeadDays: NormalizeReminderLeadDays(owner.ReminderLeadDays),
 	}
 	return owner, view, plaintextURL, nil
 }
@@ -234,8 +269,12 @@ func validateWebhookUpdateForDryRun(update WebhookSettingsUpdate) error {
 // view mirrors what a subsequent ResolveWebhookSettings would report.
 func viewFromUpdate(update WebhookSettingsUpdate) WebhookSettingsView {
 	trimmedURL := strings.TrimSpace(update.URL)
+	readability := WebhookURLAbsent
+	if trimmedURL != "" {
+		readability = WebhookURLReadable
+	}
 	return WebhookSettingsView{
-		Configured:       trimmedURL != "",
+		Readability:      readability,
 		Enabled:          update.Enabled,
 		Host:             hostOnly(trimmedURL),
 		NotifyPeriod:     update.NotifyPeriod,

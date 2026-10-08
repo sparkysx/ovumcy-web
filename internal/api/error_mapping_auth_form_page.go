@@ -1,0 +1,76 @@
+package api
+
+import (
+	"github.com/gofiber/fiber/v3"
+	"github.com/ovumcy/ovumcy-web/internal/httpx"
+)
+
+// plainAuthFormPagePaths enumerates the plain (no HTMX, no JavaScript
+// interception assumed) browser-form auth routes whose CSRF refusal (an idle
+// or rotated token) or transport-level rejection (raised before any handler
+// runs, so before a domain spec exists to route through respondAuthError) must
+// answer as the page-form refusal page (the shared layout around the localized
+// status, sendPageFormRefusalPage) rather than the JSON envelope — the same
+// answer POST /lang gives (WEB-84, WEB-264). A plain <form> action is the route
+// key, not the page it renders on.
+//
+// No OIDC route is a member: /auth/oidc/start, /auth/oidc/callback and the
+// logout bridge are none of them a page a browser submits (start and the
+// bridge are GET-only; the callback is CSRF-exempt, protected instead by the
+// sealed one-time state cookie), and /auth/oidc/link-confirm carries no entry
+// either — that route is unreachable today and a sibling issue removes it.
+//
+// Deliberately absent: POST /logout and DELETE /api/v1/sessions/current. Both
+// answer the mapped envelope today for a plain browser Accept, and WEB-84
+// leaves that unchanged — logout's own answer (it is not a page a refusal can
+// re-render: DELETE has no <form>, and POST /logout replaces the page the
+// owner was already looking at) is a decision for its own issue.
+var plainAuthFormPagePaths = map[string]struct{}{
+	"/api/v1/users":                  {},
+	"/api/v1/sessions":               {},
+	"/api/v1/sessions/2fa-challenge": {},
+	"/api/v1/password-resets":        {},
+	"/api/v1/password-resets/redeem": {},
+}
+
+// plainAuthFormPageBackPaths maps each plain auth-form route to the page that
+// renders the form it received the POST from. Fixed and server-side, keyed by
+// route — never derived from the request — because unlike POST /lang, none of
+// these forms carry a `next` field for a refusal's back link to read: without
+// a fixed mapping every refusal here would link to "/" instead of back to the
+// form the owner was on. Every key here is also a key of plainAuthFormPagePaths;
+// TestPlainAuthFormPagePathsAllHaveAFixedBackLink pins that they stay in step.
+var plainAuthFormPageBackPaths = map[string]string{
+	"/api/v1/users":                  "/register",
+	"/api/v1/sessions":               "/login",
+	"/api/v1/sessions/2fa-challenge": "/auth/2fa",
+	"/api/v1/password-resets":        "/forgot-password",
+	"/api/v1/password-resets/redeem": "/reset-password",
+}
+
+// plainAuthFormPageBackPath resolves the fixed back link for a plain-auth-form
+// route (already httpx.RoutingNormalizedPath-normalized). "/" is a defensive
+// fallback only — every path isPlainAuthFormPageNavigation admits is a key
+// above, by construction of plainAuthFormPagePaths.
+func plainAuthFormPageBackPath(path string) string {
+	if back, ok := plainAuthFormPageBackPaths[path]; ok {
+		return back
+	}
+	return "/"
+}
+
+// isPlainAuthFormPageNavigation reports whether c is a plain HTML POST to one
+// of the routes above: the app's public sign-in surface, submitted by neither
+// HTMX nor a JSON client. Scoped to POST because every one of these routes is
+// POST-only; a CSRF refusal on any other method there is unrouted and answers
+// like one everywhere else.
+func isPlainAuthFormPageNavigation(c fiber.Ctx) bool {
+	if c.Method() != fiber.MethodPost {
+		return false
+	}
+	if responseFormat(c) != httpx.ResponseFormatHTML {
+		return false
+	}
+	_, ok := plainAuthFormPagePaths[httpx.RoutingNormalizedPath(c.Path())]
+	return ok
+}

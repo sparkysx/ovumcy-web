@@ -1,5 +1,6 @@
-import { expect, test } from '@playwright/test';
+import { expect, test } from './support/fixtures';
 import {
+  apiOriginHeader,
   completeOnboardingIfPresent,
   continueFromRecoveryCode,
   cookieByName,
@@ -146,6 +147,12 @@ test.describe('Auth: register, login, logout', () => {
     // the bcrypt 72-byte input cap as a stable validation error. The form
     // intentionally has no maxlength attribute — server validation owns the
     // upper bound.
+    //
+    // The key asserted here is the LENGTH one. While a single error covered
+    // both rules, this case pinned auth.error.weak_password — so the only
+    // server-side password refusal reachable through this form was carrying the
+    // composition rule's name, and the message it rendered recited character
+    // classes the password already satisfied.
     const longPassword = `Aa1${'x'.repeat(70)}`;
     const creds = createCredentials('auth-long-pass', longPassword);
 
@@ -154,8 +161,61 @@ test.describe('Auth: register, login, logout', () => {
     await expect(page).toHaveURL(/\/register$/);
     expectNoSensitiveAuthParams(page.url());
     await expect(
+      page.locator('[data-auth-server-error][data-error-key="auth.error.password_too_long"]')
+    ).toBeVisible();
+    await expect(
+      page.locator('[data-auth-server-error][data-error-key="auth.error.weak_password"]')
+    ).toHaveCount(0);
+  });
+
+  test('register password failing only the character classes keeps the weak-password error', async ({
+    page,
+  }) => {
+    // The sibling of the case above, so each rule is pinned on its own rather
+    // than one message standing in for both.
+    //
+    // This one cannot be driven through the form: the client-side checklist
+    // enforces the character classes, so a composition failure never reaches
+    // the server from the UI. Driving POST /api/v1/users directly is the
+    // sanctioned way round that — with an explicit Origin, since the harness
+    // serves over TLS whenever COOKIE_SECURE is on and the CSRF middleware
+    // validates it. The redirect is pinned rather than followed, then the
+    // flash-backed render is read on the next load.
+    await page.goto('/register');
+    await expect(page.locator('#register-form')).toBeVisible();
+
+    const csrfToken =
+      (await page.locator('meta[name="csrf-token"]').getAttribute('content')) ?? '';
+    expect(csrfToken).not.toBe('');
+
+    // 13 characters, well inside the byte limit, but no uppercase letter.
+    const weakPassword = 'alllowercase1';
+    expect(weakPassword.length).toBeGreaterThanOrEqual(8);
+    expect(new TextEncoder().encode(weakPassword).length).toBeLessThanOrEqual(72);
+
+    const response = await page.request.post('/api/v1/users', {
+      headers: apiOriginHeader(page),
+      form: {
+        csrf_token: csrfToken,
+        email: createCredentials('auth-weak-classes').email,
+        password: weakPassword,
+        confirm_password: weakPassword,
+        consent: 'true',
+      },
+      maxRedirects: 0,
+    });
+    expect(response.status()).toBe(303);
+    expectNoSensitiveAuthParams(
+      new URL(String(response.headers()['location'] ?? '/register'), page.url()).toString()
+    );
+
+    await page.goto('/register');
+    await expect(
       page.locator('[data-auth-server-error][data-error-key="auth.error.weak_password"]')
     ).toBeVisible();
+    await expect(
+      page.locator('[data-auth-server-error][data-error-key="auth.error.password_too_long"]')
+    ).toHaveCount(0);
   });
 
   test('register form rejects invalid email via browser validation', async ({ page }) => {
@@ -179,13 +239,10 @@ test.describe('Auth: register, login, logout', () => {
   });
 
   test('register form rejects emoji email via client validation', async ({ page }) => {
-    const consoleErrors: string[] = [];
-    page.on('console', (message) => {
-      if (message.type() === 'error') {
-        consoleErrors.push(message.text());
-      }
-    });
-
+    // The `page.on('console')` collector that used to live here — the suite's
+    // only error handler — is now the shared fixture's job, and it is
+    // stricter: it fails this test on ANY unallowlisted console error, not
+    // just on the invalid-pattern one below. One mechanism, every spec.
     await page.goto('/register');
     await expect(page).toHaveURL(/\/register(?:\?.*)?$/);
 
@@ -199,14 +256,24 @@ test.describe('Auth: register, login, logout', () => {
     );
     expect(isValidBeforeSubmit).toBe(false);
 
+    // The client validator copies the message the form declared in
+    // data-email-message; compare against that declaration rather than a
+    // three-of-six-languages regex whose alternation matched whichever branch
+    // happened to be rendered. Asserting the declaration is non-empty first
+    // stops an empty attribute from passing against an empty status.
+    const declaredEmailMessage = (
+      (await page.locator('#register-form').getAttribute('data-email-message')) ?? ''
+    ).trim();
+    expect(declaredEmailMessage, 'the register form must declare data-email-message').not.toBe('');
+
     await page.locator('form[action="/api/v1/users"] button[type="submit"]').click();
     await expect(page).toHaveURL(/\/register(?:\?.*)?$/);
     await expect(page.locator('#register-client-status .status-error')).toContainText(
-      /valid email address|корректный адрес|correo válido/i
+      declaredEmailMessage
     );
-    expect(
-      consoleErrors.some((text) => /Pattern attribute value .* is not a valid regular expression/i.test(text))
-    ).toBe(false);
+    // The "Pattern attribute value ... is not a valid regular expression"
+    // console error this test used to look for is covered by the fixture,
+    // which is why the local collector is gone.
   });
 
   test('register empty submit validates in top-down order and places the error next to the active field', async ({

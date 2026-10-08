@@ -3,7 +3,10 @@
 This document describes, in full, how ovumcy estimates ovulation, the fertile
 window, and the next period. It exists so that anyone — users, contributors,
 auditors — can read exactly what the app computes and verify it against the
-code. The worked examples below are mirrored 1:1 by automated reference tests
+code. It covers what is computed; whether a given estimate is *shown* is a
+separate gate, and the one that withholds the whole fertility half until the
+account completes three cycles is described under "Early cycles" below.
+The worked examples below are mirrored 1:1 by automated reference tests
 (`internal/services/cycles_reference_test.go`), so the documentation and the
 implementation cannot silently drift apart.
 
@@ -19,24 +22,85 @@ implementation cannot silently drift apart.
 
 | Input | Meaning | Source |
 |-------|---------|--------|
-| `periodStart` | First day of the current menstrual period (cycle day 1) | Detected from logged period days |
+| `periodStart` | First day of the current menstrual period (cycle day 1) | Where a cycle starts, by the rule below |
 | `cycleLength` | Length of the cycle in days | Median of observed cycles, or the user's configured value |
-| `lutealPhase` | Days from ovulation to the next period | **14-day** default, refined toward the owner's own value from logged BBT / cervical-mucus signals when enough cycles carry them |
+| `lutealPhase` | Days that **follow** ovulation, up to and including the day before the next period | **14-day** default, refined toward the owner's own value from logged BBT / cervical-mucus signals when enough cycles carry them |
+
+## Where a cycle starts
+
+One rule decides it, and every surface reads the same answer: the count of
+completed cycles, their lengths, the last period start, the dashboard's cycle
+day, the calendar's "recorded" day, the stats insights and the luteal-phase
+inference. Two screens cannot disagree about the same history.
+
+Period days that sit fewer than five clear days apart form one bleeding
+episode. An episode opens a cycle when it has any of:
+
+- two or more consecutive non-spotting period days;
+- a non-spotting day the owner marked as a cycle start (and did not mark as
+  uncertain);
+- a lone non-spotting period day dated today or yesterday — the period may still
+  be running. It stops counting once a later day passes without a second period
+  day.
+
+The cycle starts on the earliest qualifying day of the episode, and an explicit
+mark wins over the run. Spotting never opens a cycle, even when marked: a day
+whose flow is spotting, or whose only bleeding signal is the Spotting symptom
+with no flow chosen. A lone bleeding day that qualifies under none of the above
+starts no cycle and does not split the cycle around it. An episode whose only
+mark is "uncertain" is held back the same way. A history that records each
+period as a single unmarked day older than yesterday therefore holds no cycles
+for those periods; marking each such day as a cycle start restores them.
+
+The start date stored at onboarding (the last period start) is a boundary of its
+own. It joins the grouping as a marked, non-spotting day, so a logged episode it
+falls inside or adjoins yields one start, not two. A start dated in the future is
+ignored. Un-ticking the period on the start date, or deleting that day, clears
+the stored start. A start day with no entry shows its period ticked in the day
+editor and in the dashboard's Today form, and each form posts a hidden field
+saying the tick came from the stored start; saving either form unticked clears
+the start too. Saving it with the box still ticked, adding a mood or a symptom
+to a non-period entry there, or a JSON write of that date without the period
+(which never showed the tick) leaves it in place. Moving the start in Settings
+writes the new start's days as onboarding would, through the period's last day
+or the owner's local today, whichever comes first. When auto-fill is on in the
+stored settings and the move corrects the old date — the old start still opens
+the newest cycle and the new one is earlier, or less than a shortest cycle (15
+days) later — it also removes the days the old start's fill wrote: the run from
+the old start that one fill write produced, stopping at the first day that is
+missing, carries anything the owner entered, or was written by another save.
+Only a fill written as one cohort of at least two days is removed: unless the
+old start and the day after it share one write, nothing goes. So a period day
+ticked by hand is never removed, a period length of 1 is never cleared, an
+onboarding completed on its own start day wrote that one day only and keeps it, and an
+install onboarded before this release (whose fill carries a stamp per day)
+keeps its old days on a move, as it did before. Otherwise the old fill would
+remain a boundary of its own and leave a phantom short cycle. A later move keeps
+the old days as history.
+An export over a requested range omits the stored start when
+it lies outside that range.
+
+The pregnancy pause reads the same rule without the today-or-yesterday
+allowance: a positive test pauses predictions until a boundary falls on a later
+calendar day, so a marked start or an unmarked two-day bleed lifts it, while a
+single bleeding day (even one dated today), a spotting day or an uncertain mark
+does not.
 
 ## The model
 
-The model rests on one physiological assumption: **the luteal phase (ovulation →
-next period) is relatively stable per person** — modelled at ~14 days by default,
-and refined toward the owner's own value when logged signals allow — while the
-follicular phase (period → ovulation) absorbs the variation in cycle length. So
-ovulation is counted *backwards* from the next expected period.
+The model rests on one physiological assumption: **the luteal phase (the days
+after ovulation, up to the next period) is relatively stable per person** —
+modelled at ~14 days by default, and refined toward the owner's own value when
+logged signals allow — while the follicular phase (period → ovulation) absorbs
+the variation in cycle length. So ovulation is counted *backwards* from the next
+expected period.
 
 ### Constants
 
 | Constant | Value | Role |
 |----------|-------|------|
 | `defaultLutealPhaseDays` | 14 | Default luteal phase, used when it is not refined from logged signals |
-| `minLutealPhaseDays` | 10 | Lower clamp for the luteal phase |
+| `minLutealPhaseDays` | 10 | Lower clamp for the luteal phase (engineering heuristic, not a clinical boundary) |
 | `minOvulationCycleDay` | 5 | Ovulation may not fall before cycle day 5 |
 | (min cycle for a prediction) | 15 | `minLutealPhaseDays + minOvulationCycleDay` |
 
@@ -61,6 +125,55 @@ if ovulationDay < 5:                      no prediction
 `periodStart` is cycle day 1, so the ovulation **date** is
 `periodStart + (ovulationDay − 1)` days.
 
+### Step 2a — the same arithmetic, run backwards
+
+Personalization travels this arithmetic in the other direction: an ovulation
+*observed* from logged signals is turned back into the `lutealPhase` the step
+above consumes. That is Step 2 solved for the luteal phase, and nothing more:
+
+```
+observedLuteal = cycleLength − observedOvulationDay
+```
+
+Both directions have to use one indexing, or an observation trains a value that
+predicts a different day than the one observed. What using one buys:
+
+> An ovulation observed on cycle day **N** predicts cycle day **N** again on a
+> next cycle of the same length — unless the luteal phase that observation
+> implies no longer fits the cycle, in which case Step 2's clamp applies and the
+> prediction is marked non-exact.
+
+The exception is not hypothetical, so the table below carries a row for it: on a
+15-day cycle an ovulation observed on day 4 implies an 11-day luteal phase, which
+is physiologically ordinary and still more than that cycle can hold, and the
+reserve clamp is what stops the estimate from landing before cycle day 5. The
+table is asserted row for row by
+`TestLutealPhaseRoundTrip_ReferenceVectors`. The invariant itself is a claim
+about the *observation* path, so it is pinned where that path runs, by
+`TestInferredLutealPhaseRoundTripsThroughPrediction` and
+`TestInferredLutealPhaseReachesTheOwnerSurfacesThroughTheBaseline`: those read an
+ovulation out of logged temperature or mucus entries and follow it all the way to
+a rendered date. A test of the two formulas alone could never have caught the
+drift, and not by oversight: they are exact inverses by construction, so the pair
+always agrees. What drifted was a third thing — the step that read an ovulation
+out of the logs and worked out which argument to hand them.
+
+| cycleLength | observed ovulation | → lutealPhase | → predicted ovulation |
+|-------------|--------------------|---------------|-----------------------|
+| 28 | day 14 | 14 (the model default) | day 14 |
+| 28 | day 15 | 13 | day 15 |
+| 21 | day 8  | 13 | day 8  |
+| 35 | day 21 | 14 | day 21 |
+| 40 | day 26 | 14 | day 26 |
+| 30 | day 20 | 10 (equal to the floor, not clamped to it) | day 20 |
+| 15 | day 4  | 11, clamped to 10 by Step 2 | day 5 (non-exact) |
+
+The parameter counts the days that *follow* ovulation, so it is one day shorter
+than the calendar span from the ovulation date to the next period start — that
+span counts the ovulation day itself. Measuring that span and feeding it back in
+as the parameter moved every personalized prediction one day early, the
+ovulation date and both fertile-window edges alike.
+
 ### Step 3 — fertile window
 
 The fertile window is the **6-day range ending on ovulation day**, reflecting
@@ -74,6 +187,27 @@ if fertilityStart < periodStart:  fertilityStart = periodStart   (short-cycle cl
 
 On short cycles the window may overlap menstruation; it is never allowed to
 start before the period.
+
+**Irregular range mode — the current cycle only.** An account with
+irregular-cycle mode on and at least three completed cycles is shown a range of
+possible ovulation days, so its current cycle's window is widened to cover that
+range: it runs from the shortest recent cycle's window start to the longest
+recent cycle's ovulation day, each placed by the same arithmetic as above.
+
+```
+fertilityStart = window(minCycleLength).fertilityStart   (clamp included; periodStart
+                                                          when no ovulation fits)
+fertilityEnd   = window(maxCycleLength).ovulationDate
+```
+
+The published ovulation date stays the median one, so it can sit in the middle
+of this window. On the days after it, up to the window's last day, no phase is
+named (the phase is `unknown`): the ovulation may still be ahead, and "luteal"
+would say it is behind. A day with bleeding logged on it stays `menstrual` —
+a recorded fact outranks the rule. The window can run past the projected next period;
+it is not cut there, and the calendar marks those days as both. The projected
+cycles chained after the current one keep the median window — a projection of a
+projection is not widened.
 
 ### Step 4 — next period
 
@@ -94,6 +228,8 @@ These are the exact cases asserted by the reference tests.
 | 2026-06-01 | 30 | 0 (→14) | 2026-06-16 | 2026-06-11 … 2026-06-16 | 2026-07-01 | yes |
 | 2026-01-01 | 21 | 14 | 2026-01-07 | 2026-01-02 … 2026-01-07 | 2026-01-22 | yes |
 | 2026-02-01 | 15 | 14 (→10) | 2026-02-05 | 2026-02-01 … 2026-02-05 | 2026-02-16 | no (luteal clamped, window clamped to period start) |
+| 2026-02-20 | 25 | 11 (personalised) | 2026-03-05 | 2026-02-28 … 2026-03-05 | 2026-03-17 | yes |
+| 2026-07-15 | 32 | 16 (personalised) | 2026-07-30 | 2026-07-25 … 2026-07-30 | 2026-08-16 | yes |
 | any | 14 | any | — | — | — | no prediction (cycle too short) |
 
 ## How cycle length and luteal phase are chosen
@@ -102,32 +238,65 @@ These are the exact cases asserted by the reference tests.
   being the gap between two detected period starts). The median is used rather
   than the mean, so a single missed-log gap that merges two cycles cannot skew
   the estimate. When there is not enough history, the owner's configured value
-  is used.
+  is used — for the next-period estimate only; see "Early cycles" below.
 - **Luteal phase** defaults to the fixed 14-day model value, but is refined for
   the owner when their logs carry enough signal: when basal body temperature or
-  cervical-mucus entries let the app infer the ovulation-to-next-period length
-  across several cycles, that observed luteal length (clamped to a physiological
-  10–20 day range) replaces the default. The cervical-mucus signal estimates
-  ovulation as the day after the last egg-white (peak-quality) mucus day of the
-  cycle; self-observed peak days can differ from reference ovulation by a day
-  or more, which is another reason the inferred luteal length stays an
-  estimate. With little or no such data the fixed
-  14-day default stands. Individual luteal phases vary (commonly 11–17 days),
-  which is one reason predictions remain estimates.
+  cervical-mucus entries place the ovulation inside past cycles, each of those
+  observations becomes a luteal length by Step 2a and the average of them
+  replaces the default. A cycle whose inferred luteal length falls outside a
+  10–20 day window is **discarded** from that average rather than pulled to the
+  nearest edge of it, and the refinement needs at least two surviving cycles, so
+  a single odd reading cannot move the estimate on its own. That window is an
+  engineering outlier filter over *inferred* lengths, not a clinical boundary:
+  luteal phases at or below its floor occur and are ordinary — a TTC cohort
+  anchored on ovulation tests put 18 % of cycles at 11 days or fewer counting
+  the ovulation day itself, which is 10 or fewer on the count this document
+  uses, which excludes it — so a discarded sample is one this inference declines
+  to average, never a measurement shown to be wrong and never a statement about
+  the owner's body. The cervical-mucus signal estimates ovulation as the day
+  after the last egg-white (peak-quality) mucus day of the cycle; self-observed
+  peak days can differ from reference ovulation by a day or more, which is
+  another reason the inferred luteal length stays an estimate. With little or no
+  such data, or with fewer than two surviving samples, the fixed 14-day default
+  stands — it is the model's constant, not a value observed from this owner, and
+  no surface may present it as evidence of a personalised luteal phase.
+  Individual luteal phases vary (commonly 11–17 days), which is one reason
+  predictions remain estimates.
 - For irregular cycles the app widens the prediction into a range rather than a
   single date. The range and variability statistics (shortest/longest cycle and
   the sample standard deviation) are computed over the same recent-cycle window
   as the median, so an old outlier cycle stops affecting them once it ages out
-  of the window.
+  of the window. The ovulation range runs from the ovulation date the model
+  places in the shortest of those cycles to the one it places in the longest —
+  the same arithmetic as a single projected date, applied once per end — so it
+  agrees with the calendar, the feed and the reminders for the same cycle
+  length. When the shortest observed cycle is under 15 days — too short for the
+  model to place an ovulation — the range starts at the earliest ovulation the
+  model ever names (cycle day 5). Earlier versions derived the range by shifting
+  the next-period range back by the luteal phase, which put that start before
+  cycle day 1 for such a history.
 
 ### How a BBT temperature shift is detected (the "3-over-6" coverline rule)
 
 Basal body temperature rises ~0.2–0.5 °C after ovulation (progesterone from the
 corpus luteum is thermogenic), so a sustained rise *confirms ovulation
-retrospectively*. One shared detector drives the luteal-phase inference, the
-calendar's tentative-ovulation signal, and the coverline + probable-ovulation
-marker on the stats BBT chart, so those surfaces can never disagree. It applies
-the classical symptothermal ("3-over-6") rule:
+retrospectively*. One shared detector drives every surface that names an
+ovulation day: the luteal-phase inference, the calendar's ovulation markers
+(dashed only while BBT tracking is on and no confirmed shift is shown yet; the
+solid dot marks a confirmed day, but is also drawn for projected future cycles,
+for phases derived from logged period starts, and for the whole current cycle
+when temperature tracking is off — so a solid dot alone is not a confirmation),
+the dashboard's
+ovulation line, the JSON overview's `ovulation_date` / `ovulation_confirmed`,
+and the coverline + probable-ovulation marker on the stats BBT chart. For the
+current cycle the calendar, the dashboard and the JSON overview read one
+resolver and the chart shares its detection window, so a shift names one day
+wherever it is shown; the chart is the one surface that keeps its marker while
+the others withhold every date (an overdue cycle, unpredictable mode, a
+pregnancy pause, the first cycle). That window runs through the owner's today
+rather than to the projected next-period start — a shift that arrives after the
+projected date has passed is still this cycle's. The rule applied is the
+classical symptothermal ("3-over-6") one:
 
 - **Coverline** — the maximum of the **6 immediately preceding** recorded,
   undisturbed temperatures. The maximum (not the mean) is used so ordinary
@@ -147,11 +316,147 @@ the classical symptothermal ("3-over-6") rule:
   no marker, and the luteal inference falls back to the cervical-mucus signal
   or the 14-day default.
 
-The stats chart draws the coverline only once a shift is confirmed — until
-then there is nothing physiologically meaningful to draw. Even a confirmed
-shift remains an estimate (±1–2 days), never a fact: prospective studies find
-BBT alone identifies the ovulation day imperfectly, so treat the marker as
+**What this detector is not.** The rule above is the *temperature* half of a
+symptothermal method, applied to recorded, undisturbed readings. It is not the
+full fertility-awareness protocol those methods define, and the differences are
+deliberate rather than gaps:
+
+- **No double-check against a second indicator.** Symptothermal protocols
+  confirm a thermal shift against cervical mucus or the cervix before treating
+  it as a change of phase. Here the temperature rule stands alone; the
+  cervical-mucus signal is a separate fallback estimate used when no shift is
+  found, never a cross-check on one that was.
+- **No slow-rise exception — the detector is stricter.** Reference methods
+  carry exception rules that rescue a rise whose third day misses the 0.2 °C
+  margin, by waiting for a fourth day that only has to stay above the coverline.
+  This detector has none. What decides a candidate is how far its third day
+  stands above the coverline, not how large a single step was: three days
+  climbing 0.1 °C each do confirm over a flat window, because the third of them
+  is 0.3 °C above it. What is never rescued is a rise that falls short on its
+  third day and keeps climbing afterwards — the coverline is recomputed for each
+  candidate from the six recordings before it, so those first elevated readings
+  join the window the later days are measured against and lift the bar to their
+  own level.
+- **A disturbed day is dropped whole.** An `illness` or `sleep_disruption` tag
+  removes the reading from the detection series without asking whether its value
+  actually stands out from its neighbours — broader than the reference method's
+  bracketing of a single outlying value, and the reason a tagged day does not
+  occupy a slot in the six either.
+- **The six are recordings, not calendar days.** A morning left unrecorded
+  lengthens the window backwards instead of shrinking it, and any number of gaps
+  is tolerated; a published implementation that scores the window over calendar
+  days (Zhu et al., 2021) allows one missing day of six and no more.
+
+The reference method in the first three points is Sensiplan (Arbeitsgruppe
+NFP), and its rules are taken from secondary accounts: the handbook *Natürlich
+und sicher* was not consulted, so those differences are stated against the
+accounts, not quoted from the method's text. The method's effectiveness study is
+Frank-Herrmann et al., *Hum Reprod* 2007;22(5):1310–1319,
+doi:10.1093/humrep/dem003. The last point compares against Zhu et al. (2021)
+directly.
+
+The date it produces is an inference from a signal, not an observation of
+ovulation: the day before the first elevated reading. Prospective work comparing
+home temperature records against an LH-anchored reference finds that first
+elevated reading follows the anchor by days on average (Zhu et al., *JMIR
+mHealth and uHealth*, 2021: 2.7 ± 1.9 days after LH+1 in that cohort). A
+confirmed shift therefore says an ovulation has already happened — it is not a
+forecast, and not a method of contraception.
+
+The stats chart draws the coverline only once a shift is confirmed — until then
+there is nothing physiologically meaningful to draw. Even a confirmed shift
+remains an estimate, never a fact, and no individual accuracy interval is
+promised: the day is inferred from the signal, and, as above, the first elevated
+reading lags the LH-anchored day by days on average. Treat the marker as
 indicative, not diagnostic.
+
+## Early cycles — what is computed but not shown
+
+The math above runs from the first day logged, but a projection whose only source
+is the onboarding cycle-length slider is a configuration default wearing the
+clothes of a measurement, and one built from one or two observed lengths is a
+single data point or the midpoint of two. Until the account completes **three**
+cycles (`CompletedCycleCount >= 3` — the same count the stats page reports as
+"based on N completed cycles"; regular and irregular mode share the number), the
+whole fertility half of the projection is withheld. With no completed cycle the
+wire reason is `awaiting_first_cycle`; with one or two in regular mode it is
+`awaiting_more_cycles` (irregular mode keeps `irregular_needs_more_cycles`, which
+also withholds the next period). What is withheld:
+
+- the ovulation date, the fertile window and the peak-fertility band on the
+  calendar grid;
+- the ovulation events in the `.ics` feed;
+- the ovulation reminder in the webhook pass;
+- the ovulation banner on the dashboard.
+
+The ribbon's phase labels after menstruation withhold the same way. The floor
+withholds projections only: past completed cycles keep their inferred shading under
+the "show historical phases" setting.
+The next-period estimate survives this floor, with its own estimate qualifier —
+its anchor is a date the owner actually recorded.
+
+Three further signals withhold **every** projected date, the next period included,
+on every one of those surfaces: unpredictable-cycle mode (the settings toggle
+"My cycle is unpredictable"), a pregnancy pause, and a cycle overdue past its own
+cycle length — more than a week past it, a margin that is an explicitly named
+engineering safety rule rather than a clinical cutoff: no guideline says a
+prediction becomes invalid on a particular cycle day, and past that point the
+projected period is more than a week behind today and the model has nothing
+later to offer but a whole-cycle roll, so what it would yield is manufactured
+rather than estimated.
+
+That comparison uses the **shorter** of the two cycle lengths: the median-first
+projection length every published date is projected from, and the
+average-first reference length. The average alone cannot carry the decision. A
+period that was never logged merges two cycles into one 300-day gap, which leaves
+the median at 28 and pulls the average of three ordinary cycles to 96, and a rule
+measured against 96 withheld nothing on cycle day 61 while every date it published
+came from the 28. The median alone cannot carry it either: where the median sits
+above the average (28/60/60 — median 60, average 49) it would keep dates published
+to cycle day 67 while the out-of-date-data notice, which reads the average with no
+week of grace, has stood since day 50. Taking the shorter length withholds no later
+than either statistic would, keeps the days on which that notice stands beside a
+published date to seven at most, and settles the merged span without ruling on
+which spans still count as a cycle. The late-cycle notice follows the same length;
+the dashboard's cycle ribbon is not drawn at all past the gate, because its axis
+length, its start window and its "today" marker are all projection output. The
+out-of-date-data notice keeps the displayed reference length. Nothing recorded is
+discarded: the merged span stays in the history, and logging the missing period
+corrects it.
+
+The same gate covers the two places a projected window is read outside those
+surfaces: the day-save message no longer calls a day fertile from a withheld window,
+and logging a new cycle start no longer offers the implantation-bleeding hint counted
+from a withheld ovulation. Both read the fertility gate, so unpredictable-cycle mode,
+a pregnancy pause and the three-cycle floor withhold them too — the hint states a
+number of days since ovulation, and below three completed cycles that ovulation is
+the configured cycle length, or one or two observed lengths, rolled forward, which
+is an inference no reader could tell from a measurement. One value outlives
+it: an ovulation day the owner's own temperatures confirmed. It was never rolled
+forward from the length that ran out,
+so the dashboard line, the calendar's solid marker and the JSON overview keep
+naming it — still worded as an estimate, beside the disclaimer — while the fertile
+window and fertility status derived from it stay withheld. Unpredictable-cycle mode,
+a pregnancy pause and the zero-completed-cycle floor still withhold that day too;
+the one-or-two-cycle tier of a regular account does not, as the thin-history tier
+of irregular mode does not — it exists because a projection has too few observed
+lengths, and a day read off the owner's own temperatures is not a projection.
+
+The day-save message adds one more condition of its own: the fertile line is spoken only
+when the saved day is today (in the owner's timezone). A day the owner records after the
+fact, or a day still ahead, answers the plain "Saved." message even when it sits inside
+the window the current cycle projects.
+
+The floor is the fourth signal and the only partial one. Predicates:
+`FertilityProjectionSuppressed` over `PredictionsSuppressed`
+(`internal/services/dashboard_cycle.go`) — one predicate rather than a copy per
+surface, precisely because the floor had once been missed at one of four sites.
+All five surfaces — the calendar grid, the `.ics` feed, the webhook reminder, the
+dashboard reminder banner and the implantation hint — are pinned by
+`TestFirstCycleFloorSuppressesFertilityOnEverySurface`.
+
+Everything below and above describes the numbers themselves — the floor decides
+whether they reach a surface, never what they are.
 
 ## Assumptions and limitations
 
@@ -166,13 +471,47 @@ indicative, not diagnostic.
 - Accuracy degrades sharply for irregular or very short/long cycles.
 - The model is **not** a fertility-awareness contraceptive method (which require
   trained tracking of multiple biomarkers).
+- **A newly logged period can move the predicted next-period date slightly
+  earlier.** The projection is `last period start + predicted cycle length`, and
+  logging a new start advances *both* terms: the anchor moves forward, and the new
+  observed cycle re-estimates the length. When the fresh cycle is much shorter
+  than the running estimate, the shrinking estimate outweighs the advancing
+  anchor. Two starts on 1990-01-01 and 1990-02-17 give a single observed cycle of
+  47 days, so the prediction is 1990-04-05. Logging a third start on 1990-03-04
+  adds a 15-day cycle; the median of `[15, 47]` is 31, so the prediction becomes
+  1990-03-04 + 31 = 1990-04-04 — one day earlier than before. This is the
+  intended behaviour of an estimator revising on new evidence, not a regression:
+  the model deliberately re-estimates cycle length instead of holding it fixed.
+
+- **Which thresholds are clinical and which are engineering heuristics.** Only
+  one threshold is taken from a clinical classification: the 24-day boundary
+  behind the short-cycle note on the stats page (FIGO AUB System 1: a cycle
+  shorter than 24 days is *frequent*, one longer than 38 days *infrequent*; see
+  below). The onboarding hint's "about 24-38 days" quotes the same range. The
+  following are engineering heuristics, chosen for display safety and not
+  clinical boundaries: the 10–20 day window the luteal inference filters its
+  samples through, the seven days past the reference length after which a
+  cycle counts as overdue and projections pause, the seven-day spread between
+  cycle lengths past which predictions are treated as irregular, and the
+  minimum of three cycles before a pattern note (short, long or irregular)
+  appears.
 
 ## Physiological basis
 
 The ~14-day luteal phase and the "6-day fertile window ending at ovulation" are
 standard reproductive-physiology concepts (e.g. the fertile-window work of
 Wilcox et al., *NEJM* 1995). ovumcy applies them as a transparent calendar
-estimate, nothing more.
+estimate, nothing more. An estimated window often misses the real fertile
+days, regular cycles included: in a prospective study only about 30% of women
+had their fertile window entirely within the days clinical guidelines name
+(Wilcox AJ, Dunson D, Baird DD, *BMJ* 2000, PMID 11082086). That is why a day
+outside the window is reported as `outside_estimated_window`, never as a day on
+which conception is not possible, and why the irregular range mode widens the
+current cycle's window rather than narrowing the doubt to one median estimate.
+
+The 24-day short-cycle boundary follows the FIGO AUB System 1 normal range for
+cycle frequency, 24–38 days (Munro MG et al., *Int J Gynecol Obstet*
+2018;143:393–408).
 
 ## Verifying this document
 
@@ -181,21 +520,23 @@ and related tests in `internal/services/cycles_reference_test.go`. Property-base
 tests (`cycles_property_test.go`) additionally assert the invariants for
 thousands of generated inputs.
 
-### Shared golden-vector fixture (lockstep with ovumcy-app)
+### Golden-vector fixture (shared with ovumcy-app in origin, not yet in lockstep)
 
-The worked examples above are pinned to the code by a **shared golden-vector
+The worked examples above are pinned to the code by a **golden-vector
 fixture**, [`internal/services/testdata/cycle-prediction-golden-vectors.json`](../internal/services/testdata/cycle-prediction-golden-vectors.json),
-consumed by `TestCyclePrediction_GoldenVectors`. That file is kept
-**byte-identical** with ovumcy-app's
-`src/services/__fixtures__/cycle-prediction-golden-vectors.json` (ovumcy-app
-PR #75), where it is consumed by `src/services/cycle-prediction-reference.test.ts`.
+consumed by `TestCyclePrediction_GoldenVectors`. The fixture originated with
+ovumcy-app's `src/services/__fixtures__/cycle-prediction-golden-vectors.json`
+(ovumcy-app PR #75), where it is consumed by
+`src/services/cycle-prediction-reference.test.ts`. The two copies are **not**
+currently byte-identical and nothing enforces that they match, so lockstep with
+the app is not established.
 
 The Go source of truth here (`internal/services/cycles.go`) and ovumcy-app's
 TypeScript port (`src/services/cycle-prediction-policy.ts`) are hand-parallel
-implementations; consuming one shared fixture makes any divergence between them
-fail CI on **both** sides instead of drifting silently. If you change the
-prediction math, update the fixture, **both** docs (this file and ovumcy-app's
-`docs/cycle-prediction.md`), and **both** reference tests in the same change.
+implementations; only once the two fixture copies are brought back in sync
+would a divergence between them fail CI on both sides. If you change the
+prediction math, update the fixture, both docs (this file and ovumcy-app's
+`docs/cycle-prediction.md`), and both reference tests in the same change.
 
 #### Projection / anchor section
 
@@ -216,8 +557,11 @@ stages:
 2. **Projected cycle start + cycle day** — `ProjectCycleStart` advances the last
    period start by whole cycles up to `today` and reports the 1-based day within
    the current cycle.
-3. **Displayed next-period date** — the projected (un-shifted) start plus the
-   selected length, re-anchored in the request timezone.
+3. **Displayed next-period date** — the last recorded period start plus the
+   selected length, re-anchored in the request timezone: the period that closes
+   the running cycle. It is never rolled a cycle forward with the stage-2 start —
+   from cycle day m+1 that period is late and due now, not a cycle away, and the
+   overdue gate withholds it once it is more than a week behind.
 4. **Ovulation date** — the window for the projected cycle, rolled forward once
    by `ShiftCycleStartToFutureOvulation` when its ovulation already fell before
    `today`, so a displayed ovulation is never in the past.

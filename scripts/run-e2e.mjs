@@ -140,7 +140,7 @@ function parsePortValue(value, label) {
   return port;
 }
 
-function reservePort(port = 0) {
+function reservePort(port = 0, host = "127.0.0.1") {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
 
@@ -163,7 +163,7 @@ function reservePort(port = 0) {
       });
     });
 
-    server.listen(port, "127.0.0.1");
+    server.listen(port, host);
   });
 }
 
@@ -356,13 +356,25 @@ async function runDockerCapture(args) {
   });
 }
 
-async function generateLocalTLSFixture(tmpDir, runID) {
+async function generateLocalTLSFixture(tmpDir, runID, extraHosts = []) {
   const certPath = path.join(tmpDir, `localhost-${runID}.cert.pem`);
   const keyPath = path.join(tmpDir, `localhost-${runID}.key.pem`);
+  // One fixture serves both the app-facing proxy and the mock IdP, so the
+  // cross-site lane's IdP host has to be a SAN of the same certificate.
+  const hosts = ["127.0.0.1", "localhost", ...extraHosts.filter(Boolean)];
 
   await spawnAndCapture(
     goBinary(),
-    ["run", "./scripts/e2e-tls-cert", "--cert", certPath, "--key", keyPath],
+    [
+      "run",
+      "./scripts/e2e-tls-cert",
+      "--cert",
+      certPath,
+      "--key",
+      keyPath,
+      "--hosts",
+      [...new Set(hosts)].join(","),
+    ],
     {
       cwd: repoRoot,
       stdio: ["ignore", "pipe", "pipe"],
@@ -414,11 +426,42 @@ async function waitForHostPort(host, port) {
   throw new Error(`Postgres host port ${host}:${port} did not become reachable in time`);
 }
 
+// pullDockerImage fetches an image with a bounded retry, so a single registry
+// blip does not fail the run. Docker Hub is reached over the public internet from
+// CI runners, and one `i/o timeout` pulling postgres has already turned main red
+// while the same tree was green on the pull request minutes earlier.
+//
+// Only the PULL is retried. `docker run -d` is not idempotent — an attempt that
+// died after the daemon started a container would leave it orphaned, and `--rm`
+// does not cover a container we never learned the id of.
+async function pullDockerImage(image) {
+  const attempts = 3;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      await runDockerCapture(["pull", image]);
+      return;
+    } catch (error) {
+      if (attempt === attempts) {
+        throw new Error(`docker pull ${image} failed after ${attempts} attempts: ${error.message}`, {
+          cause: error,
+        });
+      }
+      const backoffMs = attempt * 10000;
+      console.log(
+        `[e2e] docker pull ${image} attempt ${attempt}/${attempts} failed, retrying in ${backoffMs}ms`,
+      );
+      await delay(backoffMs);
+    }
+  }
+}
+
 async function startPostgresRuntime(runID) {
   const databaseName = createPostgresDatabaseName(runID);
   const user = process.env.E2E_POSTGRES_USER ?? "ovumcy";
   const password = process.env.E2E_POSTGRES_PASSWORD ?? "ovumcy";
   const image = process.env.E2E_POSTGRES_IMAGE ?? "postgres:17-alpine";
+
+  await pullDockerImage(image);
 
   const result = await runDockerCapture([
     "run",
@@ -474,14 +517,24 @@ async function main() {
     String(process.env.E2E_USE_HTTPS_PROXY ?? "").trim().toLowerCase() === "true" ||
     cookieSecureEnabled ||
     localOIDCProviderEnabled;
-  const tlsFixture = useHTTPSProxy || localOIDCProviderEnabled ? await generateLocalTLSFixture(tmpDir, runID) : null;
+  // The app always answers on 127.0.0.1. E2E_OIDC_HOST moves ONLY the mock
+  // IdP: any other loopback host (127.0.0.2 by default in the cross-site lane)
+  // is a different site to the browser, so the form_post callback POST arrives
+  // cross-site and the SameSite attributes of the OIDC transit cookies are
+  // actually exercised. Same host = the old same-site lane, unchanged.
+  const localOIDCHost = (process.env.E2E_OIDC_HOST ?? "").trim() || "127.0.0.1";
+  const oidcIsCrossSite = localOIDCProviderEnabled && localOIDCHost !== "127.0.0.1";
+  const tlsFixture =
+    useHTTPSProxy || localOIDCProviderEnabled
+      ? await generateLocalTLSFixture(tmpDir, runID, [localOIDCHost])
+      : null;
   const publicPort = useHTTPSProxy ? await reservePort(0) : appPort;
   const appURL = `http://127.0.0.1:${appPort}`;
   const baseURL =
     process.env.PLAYWRIGHT_BASE_URL ??
     (useHTTPSProxy ? `https://127.0.0.1:${publicPort}` : appURL);
-  const localOIDCPort = localOIDCProviderEnabled ? await reservePort(0) : null;
-  const localOIDCIssuer = localOIDCPort ? `https://127.0.0.1:${localOIDCPort}` : "";
+  const localOIDCPort = localOIDCProviderEnabled ? await reservePort(0, localOIDCHost) : null;
+  const localOIDCIssuer = localOIDCPort ? `https://${localOIDCHost}:${localOIDCPort}` : "";
 
   const dbPath = path.join(tmpDir, `run-${runID}.db`);
   const appLogPath = path.join(tmpDir, `app-${runID}.log`);
@@ -539,6 +592,7 @@ async function main() {
           certPath: tlsFixture.certPath,
           keyPath: tlsFixture.keyPath,
           listenPort: localOIDCPort,
+          listenHost: localOIDCHost,
           clientID: process.env.OIDC_CLIENT_ID ?? "ovumcy-e2e",
           clientSecret: process.env.OIDC_CLIENT_SECRET ?? "ovumcy-e2e-secret",
           redirectURL: process.env.OIDC_REDIRECT_URL ?? `${baseURL}/auth/oidc/callback`,
@@ -571,10 +625,29 @@ async function main() {
     // (TRUST_PROXY_ENABLED=true in docs/examples/reverse-proxy/*).
     TRUST_PROXY_ENABLED: process.env.TRUST_PROXY_ENABLED ?? (useHTTPSProxy ? "true" : "false"),
     TRUSTED_PROXIES: process.env.TRUSTED_PROXIES ?? (useHTTPSProxy ? "127.0.0.1,::1" : ""),
-    RATE_LIMIT_LOGIN_MAX: process.env.RATE_LIMIT_LOGIN_MAX ?? "500",
-    RATE_LIMIT_FORGOT_PASSWORD_MAX: process.env.RATE_LIMIT_FORGOT_PASSWORD_MAX ?? "500",
-    RATE_LIMIT_REGISTER_MAX: process.env.RATE_LIMIT_REGISTER_MAX ?? "500",
-    RATE_LIMIT_API_MAX: process.env.RATE_LIMIT_API_MAX ?? "5000",
+    // Every RATE_LIMIT_*_MAX has a ceiling (cmd/ovumcy/config.go) above which
+    // the app falls back to its tight default, and the five credential pairs
+    // are also held to 30 requests per minute (MAX over WINDOW), so a shorter
+    // window no longer widens them: 100 per 200 s is the widest pair the app
+    // accepts, and the same one a real operator may set. A pair above the rate
+    // falls back to 8 per 15 minutes, which a serial run would exhaust.
+    RATE_LIMIT_LOGIN_MAX: process.env.RATE_LIMIT_LOGIN_MAX ?? "100",
+    RATE_LIMIT_LOGIN_WINDOW: process.env.RATE_LIMIT_LOGIN_WINDOW ?? "200s",
+    RATE_LIMIT_FORGOT_PASSWORD_MAX: process.env.RATE_LIMIT_FORGOT_PASSWORD_MAX ?? "100",
+    RATE_LIMIT_FORGOT_PASSWORD_WINDOW: process.env.RATE_LIMIT_FORGOT_PASSWORD_WINDOW ?? "200s",
+    RATE_LIMIT_REGISTER_MAX: process.env.RATE_LIMIT_REGISTER_MAX ?? "100",
+    RATE_LIMIT_REGISTER_WINDOW: process.env.RATE_LIMIT_REGISTER_WINDOW ?? "200s",
+    RATE_LIMIT_TOTP_CHALLENGE_MAX: process.env.RATE_LIMIT_TOTP_CHALLENGE_MAX ?? "100",
+    RATE_LIMIT_TOTP_CHALLENGE_WINDOW: process.env.RATE_LIMIT_TOTP_CHALLENGE_WINDOW ?? "200s",
+    RATE_LIMIT_PASSWORD_RESET_REDEEM_MAX: process.env.RATE_LIMIT_PASSWORD_RESET_REDEEM_MAX ?? "100",
+    RATE_LIMIT_PASSWORD_RESET_REDEEM_WINDOW:
+      process.env.RATE_LIMIT_PASSWORD_RESET_REDEEM_WINDOW ?? "200s",
+    RATE_LIMIT_API_MAX: process.env.RATE_LIMIT_API_MAX ?? "3000",
+    // The per-account logout budget is keyed on the owner, and a serial suite
+    // signs the same owner in and out far more than twenty times: widen it the
+    // same way, by the window rather than past the ceiling.
+    RATE_LIMIT_LOGOUT_ACCOUNT_MAX: process.env.RATE_LIMIT_LOGOUT_ACCOUNT_MAX ?? "200",
+    RATE_LIMIT_LOGOUT_ACCOUNT_WINDOW: process.env.RATE_LIMIT_LOGOUT_ACCOUNT_WINDOW ?? "10s",
     OIDC_ENABLED: process.env.OIDC_ENABLED ?? (localOIDCProviderEnabled ? "true" : "false"),
     OIDC_ISSUER_URL: process.env.OIDC_ISSUER_URL ?? localOIDCIssuer,
     OIDC_CLIENT_ID: process.env.OIDC_CLIENT_ID ?? (localOIDCProviderEnabled ? "ovumcy-e2e" : ""),
@@ -602,6 +675,7 @@ async function main() {
     OIDC_CA_FILE: appEnv.OIDC_CA_FILE,
     OIDC_LOGIN_MODE: process.env.OIDC_LOGIN_MODE ?? "hybrid",
     OIDC_RESPONSE_MODE: oidcResponseMode,
+    E2E_OIDC_CROSS_SITE: oidcIsCrossSite ? "true" : "false",
     OIDC_AUTO_PROVISION: process.env.OIDC_AUTO_PROVISION ?? "false",
     OIDC_POST_LOGOUT_REDIRECT_URL: appEnv.OIDC_POST_LOGOUT_REDIRECT_URL,
   };

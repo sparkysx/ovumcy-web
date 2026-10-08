@@ -3,18 +3,17 @@ package reminders
 import (
 	"testing"
 	"time"
+
+	"github.com/ovumcy/ovumcy-web/internal/testenv"
 )
 
-// mustLoadLocation loads an IANA zone or skips the test when the platform lacks
-// the tz database (some minimal Windows dev boxes). The Linux runtime that ships
-// always has it, and CI validates there.
+// mustLoadLocation loads an IANA zone, skipping only on a genuine absence of
+// the tz database (some minimal Windows dev boxes) — and failing instead on a
+// lane that set OVUMCY_REQUIRE_TZDATA, since the Linux runtime that ships
+// always has it and CI is meant to validate there.
 func mustLoadLocation(t *testing.T, name string) *time.Location {
 	t.Helper()
-	loc, err := time.LoadLocation(name)
-	if err != nil {
-		t.Skipf("timezone %q unavailable on this platform: %v", name, err)
-	}
-	return loc
+	return testenv.RequireTimeZone(t, name)
 }
 
 // TestNextRunBasicSameDayAndRollover covers the non-DST core: when the target
@@ -73,6 +72,83 @@ func TestNextRunHourZeroAccepted(t *testing.T) {
 	}
 }
 
+// TestNextRunHourZeroAcrossMissingMidnight is the regression for the hot loop a
+// single-day advance produced. In a zone whose spring-forward transition lands on
+// MIDNIGHT, tomorrow's 00:00 does not exist and time.Date normalizes it BACKWARD
+// — to 23:00 of the current day, i.e. before now. A single advance returned that
+// past instant, untilNextRun went negative, the timer fired immediately and the
+// loop recomputed the same negative delay: a full notify pass over every owner,
+// repeated from local 23:00 until the transition.
+//
+// Advancing past such a day is not the answer either: that skips the day's pass
+// for every owner, and a reminder due only on that day is then never delivered
+// (nothing ran, so no watermark can compensate). The day resolves to its FIRST
+// EXISTING INSTANT — the transition — which is the convention the rest of the
+// tree already follows through services.StartOfCalendarDay.
+//
+// The zones are west of UTC on purpose: only there does Go normalize a missing
+// midnight backward. East-of-UTC zones normalize forward and would prove nothing.
+// Verified against this host's tzdata:
+// time.Date(2025,9,7,0,0,0,0,Santiago) -> 2025-09-06T23:00:00-04:00, whose day
+// really begins at 2025-09-07T01:00:00-03:00; time.Date(2026,3,8,0,0,0,0,Havana)
+// -> 2026-03-07T23:00:00-05:00, day begins 2026-03-08T01:00:00-04:00.
+func TestNextRunHourZeroAcrossMissingMidnight(t *testing.T) {
+	cases := []struct {
+		name string
+		zone string
+		// now is expressed as local wall-clock fields on the day BEFORE the
+		// transition, shortly before the midnight that does not exist.
+		year  int
+		month time.Month
+		day   int
+		hour  int
+		min   int
+		// want is the first instant the transition day really has, in RFC3339.
+		want string
+	}{
+		{name: "America/Santiago 2025-09-07", zone: "America/Santiago", year: 2025, month: 9, day: 6, hour: 23, min: 30, want: "2025-09-07T01:00:00-03:00"},
+		{name: "America/Havana 2026-03-08", zone: "America/Havana", year: 2026, month: 3, day: 7, hour: 23, min: 30, want: "2026-03-08T01:00:00-04:00"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			loc := mustLoadLocation(t, tc.zone)
+			now := time.Date(tc.year, tc.month, tc.day, tc.hour, tc.min, 0, 0, loc)
+
+			// Guard the premise: the next calendar day's midnight really is missing
+			// in this zone, and time.Date resolves it to an instant at or before now.
+			missing := time.Date(tc.year, tc.month, tc.day+1, 0, 0, 0, 0, loc)
+			if missing.After(now) {
+				t.Fatalf("premise broken: local midnight of the transition day resolved to %s, which is after now %s (tzdata may have changed)", missing.Format(time.RFC3339), now.Format(time.RFC3339))
+			}
+
+			got := nextRun(now, 0, loc)
+			if !got.After(now) {
+				t.Fatalf("nextRun must return an instant strictly after now: got %s, now %s", got.Format(time.RFC3339), now.Format(time.RFC3339))
+			}
+			// The pass must still happen ON the transition day: skipping it drops a
+			// day of reminders for every owner.
+			if y, m, d := got.In(loc).Date(); y != tc.year || m != tc.month || d != tc.day+1 {
+				t.Fatalf("expected the fire to land on the transition day %d-%02d-%02d, got %s", tc.year, tc.month, tc.day+1, got.In(loc).Format(time.RFC3339))
+			}
+			want, err := time.Parse(time.RFC3339, tc.want)
+			if err != nil {
+				t.Fatalf("bad want literal %q: %v", tc.want, err)
+			}
+			if !got.Equal(want) {
+				t.Fatalf("expected the transition day's first existing instant %s, got %s", want.Format(time.RFC3339), got.In(loc).Format(time.RFC3339))
+			}
+
+			// Scheduler seam, no real clock involved: the armed delay must be
+			// positive, which is what stops the timer from firing in a tight loop.
+			scheduler := New(nil, nil, Config{Hour: 0, Location: loc})
+			if delay := scheduler.untilNextRun(now); delay <= 0 {
+				t.Fatalf("untilNextRun must arm a positive delay, got %s (next %s, now %s)", delay, got.Format(time.RFC3339), now.Format(time.RFC3339))
+			}
+		})
+	}
+}
+
 // TestNextRunNilLocationDefaultsUTC covers the defensive nil-location branch.
 func TestNextRunNilLocationDefaultsUTC(t *testing.T) {
 	now := time.Date(2026, 3, 10, 6, 0, 0, 0, time.UTC)
@@ -117,9 +193,12 @@ func TestNextRunDSTSpringForward(t *testing.T) {
 
 // TestNextRunDSTFallBack pins the fall-back edge in America/New_York: on
 // 2026-11-01 local clocks fall 02:00 -> 01:00, so local 01:00 occurs twice.
-// nextRun must resolve the target to ONE concrete future instant (the once-per-
-// local-day marker, tested elsewhere, prevents the repeated hour from firing a
-// second pass).
+// nextRun must resolve the target to ONE concrete future instant, and — the
+// second half below — must roll to the next calendar day once that instant has
+// passed, which is what keeps the repeated hour from firing a second pass. This
+// case tests nextRun alone; the same property driven through the scheduler loop
+// is TestSchedulerLoopFiresOnceAcrossTheRepeatedFallBackHour. The once-per-local-
+// day marker is not involved in either: the timer loop never reads it.
 func TestNextRunDSTFallBack(t *testing.T) {
 	ny := mustLoadLocation(t, "America/New_York")
 

@@ -1,0 +1,238 @@
+package cli
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/ovumcy/ovumcy-web/internal/db"
+	"github.com/ovumcy/ovumcy-web/internal/security"
+	"github.com/ovumcy/ovumcy-web/internal/services"
+)
+
+// link-oidc-identity is the no-session recovery path for issue #701: linking
+// an OIDC identity is a permanent, password-change-weight binding, so the two
+// sanctioned ways to create one are an authenticated Settings step-up
+// (internal/api's /api/v1/users/current/oidc/link/step-up) or this operator
+// command. The public /auth/oidc/link-confirm route that used to authorise the
+// same binding with a password alone, on a page reachable without a session,
+// was removed for good (WEB-77) — this command exists so closing that path
+// does not strand an account with no working sign-in path at all.
+//
+// Addressing mirrors reset-password exactly (see PR #699): a bare email or
+// `--id <id>`, mutually exclusive, exactly one required. The id form reaches a
+// legacy row the strict NormalizeAuthEmail rule refuses, or one sharing a
+// mailbox with another account, neither of which any email-taking command can
+// address at all.
+//
+// A new link changes how the account can be entered, so ConfirmAndLinkIdentity
+// bumps its AuthSessionVersion in the same write: every session the account
+// had open is signed out, exactly as a link from Settings does. Re-running the
+// command for a pair already linked to that account changes nothing and signs
+// nobody out.
+const linkOIDCIdentityUsage = "usage: ovumcy link-oidc-identity <email>|--id <id> --issuer <issuer> --subject <subject>"
+
+type linkOIDCIdentityOptions struct {
+	email   string
+	userID  uint
+	issuer  string
+	subject string
+}
+
+// parseLinkOIDCIdentityArgs mirrors parseResetPasswordArgs's addressing (same
+// flag spelling, same precedence, same ambiguity wording) and adds the two
+// required identity flags this command carries instead of a password.
+func parseLinkOIDCIdentityArgs(args []string) (linkOIDCIdentityOptions, error) {
+	opts := linkOIDCIdentityOptions{}
+	for index := 0; index < len(args); index++ {
+		value := strings.TrimSpace(args[index])
+		switch {
+		case value == "":
+			continue
+		case isUsersIDFlag(value):
+			userID, consumed, err := parseUsersIDFlag(args, index, linkOIDCIdentityUsage)
+			if err != nil {
+				return linkOIDCIdentityOptions{}, err
+			}
+			if opts.userID != 0 {
+				return linkOIDCIdentityOptions{}, errors.New(linkOIDCIdentityUsage)
+			}
+			opts.userID = userID
+			index += consumed
+		case value == "--issuer" || strings.HasPrefix(value, "--issuer="):
+			issuer, consumed, err := parseLinkOIDCIdentityStringFlag(args, index, "--issuer", linkOIDCIdentityUsage)
+			if err != nil {
+				return linkOIDCIdentityOptions{}, err
+			}
+			if opts.issuer != "" {
+				return linkOIDCIdentityOptions{}, errors.New(linkOIDCIdentityUsage)
+			}
+			opts.issuer = issuer
+			index += consumed
+		case value == "--subject" || strings.HasPrefix(value, "--subject="):
+			subject, consumed, err := parseLinkOIDCIdentityStringFlag(args, index, "--subject", linkOIDCIdentityUsage)
+			if err != nil {
+				return linkOIDCIdentityOptions{}, err
+			}
+			if opts.subject != "" {
+				return linkOIDCIdentityOptions{}, errors.New(linkOIDCIdentityUsage)
+			}
+			opts.subject = subject
+			index += consumed
+		case strings.HasPrefix(value, "--"):
+			return linkOIDCIdentityOptions{}, errors.New(linkOIDCIdentityUsage)
+		default:
+			if opts.email != "" {
+				return linkOIDCIdentityOptions{}, errors.New(linkOIDCIdentityUsage)
+			}
+			opts.email = value
+		}
+	}
+
+	if (opts.email == "") == (opts.userID == 0) {
+		return linkOIDCIdentityOptions{}, errors.New(linkOIDCIdentityUsage)
+	}
+	if strings.TrimSpace(opts.issuer) == "" || strings.TrimSpace(opts.subject) == "" {
+		return linkOIDCIdentityOptions{}, errors.New(linkOIDCIdentityUsage)
+	}
+	return opts, nil
+}
+
+// parseLinkOIDCIdentityStringFlag accepts both `--name value` and
+// `--name=value` and reports how many FOLLOWING arguments it consumed, the
+// same shape parseUsersIDFlag uses for --id.
+func parseLinkOIDCIdentityStringFlag(args []string, index int, name string, usage string) (string, int, error) {
+	if after, found := strings.CutPrefix(strings.TrimSpace(args[index]), name+"="); found {
+		value := strings.TrimSpace(after)
+		if value == "" {
+			return "", 0, errors.New(usage)
+		}
+		return value, 0, nil
+	}
+	if index+1 >= len(args) {
+		return "", 0, errors.New(usage)
+	}
+	value := strings.TrimSpace(args[index+1])
+	if value == "" {
+		return "", 0, errors.New(usage)
+	}
+	return value, 1, nil
+}
+
+func RunLinkOIDCIdentityCommand(databaseConfig db.Config, oidcConfig security.OIDCConfig, args []string) error {
+	return runLinkOIDCIdentityCommand(databaseConfig, oidcConfig, args, os.Stdout)
+}
+
+func runLinkOIDCIdentityCommand(databaseConfig db.Config, oidcConfig security.OIDCConfig, args []string, output io.Writer) error {
+	opts, err := parseLinkOIDCIdentityArgs(args)
+	if err != nil {
+		return err
+	}
+
+	normalizedEmail := ""
+	if opts.userID == 0 {
+		normalizedEmail, err = normalizeOperatorEmailArgument(opts.email)
+		if err != nil {
+			return err
+		}
+	}
+
+	oidcClient := security.NewOIDCClient(oidcConfig)
+	if !oidcClient.Enabled() {
+		return errors.New("OIDC is not enabled on this instance (set OIDC_ENABLED=true)")
+	}
+	issuer := strings.TrimSpace(opts.issuer)
+	if configuredIssuer := strings.TrimSpace(oidcConfig.IssuerURL); configuredIssuer != "" && issuer != configuredIssuer {
+		// Not a security check (nothing here is reachable without operator
+		// access) — a guard against the operator's likeliest mistake. A
+		// mismatched issuer creates a row no future sign-in can ever match: the
+		// login path resolves identities by the EXACT issuer string the ID
+		// token carries, which is this instance's configured issuer.
+		return fmt.Errorf("issuer %q does not match the configured OIDC_ISSUER_URL %q", issuer, configuredIssuer)
+	}
+
+	repositories, _, closeDatabase, err := openOperatorRepositories(databaseConfig, calendarFeedFencePath())
+	if err != nil {
+		return err
+	}
+	defer closeDatabase()
+	return linkOIDCIdentity(
+		linkOIDCRepositories{Users: repositories.Users, OIDCIdentities: repositories.OIDCIdentities},
+		oidcClient, opts, normalizedEmail, issuer, output,
+	)
+}
+
+// linkOIDCUserRepository is the user storage the link needs: the account
+// lookups plus the session-version bump the link performs.
+type linkOIDCUserRepository interface {
+	services.AuthUserRepository
+	services.OperatorUserRepository
+	services.OIDCUserStore
+}
+
+// linkOIDCRepositories is the storage linkOIDCIdentity runs against. It is
+// narrower than db.Repositories so a test can hand it a user repository that
+// fails, which the concrete db.UserRepository cannot be made to do on demand.
+type linkOIDCRepositories struct {
+	Users          linkOIDCUserRepository
+	OIDCIdentities services.OIDCIdentityStore
+}
+
+func linkOIDCIdentity(repositories linkOIDCRepositories, oidcClient *security.OIDCClient, opts linkOIDCIdentityOptions, normalizedEmail string, issuer string, output io.Writer) error {
+	authService := services.NewAuthService(repositories.Users)
+	userService := services.NewOperatorUserService(repositories.Users, authService)
+
+	target, err := resolveOperatorUser(userService, opts.userID, normalizedEmail)
+	if err != nil {
+		return mapOperatorUserLookupError(err, opts.userID, normalizedEmail)
+	}
+
+	// The link revokes sessions only from the version it is handed. This command
+	// mints no session, so a revocation landing after this read only fails the
+	// command for a rerun.
+	account, err := authService.FindByID(context.Background(), target.ID)
+	if err != nil {
+		// codecov:ignore:start -- the account was resolved a line above; only a
+		// storage fault or a concurrent deletion between the two reads lands here.
+		return mapOperatorUserLookupError(err, opts.userID, normalizedEmail)
+		// codecov:ignore:end
+	}
+
+	oidcLoginService := services.NewOIDCLoginService(oidcClient, repositories.OIDCIdentities, repositories.Users, nil)
+	claims := security.OIDCClaims{
+		Issuer:  issuer,
+		Subject: strings.TrimSpace(opts.subject),
+	}
+	if _, err := oidcLoginService.ConfirmAndLinkIdentity(context.Background(), target.ID, account.AuthSessionVersion, claims, time.Now()); err != nil {
+		return mapLinkOIDCIdentityLinkError(err)
+	}
+
+	if output == nil {
+		output = os.Stdout
+	}
+	_, _ = fmt.Fprintf(output, "✅ Linked OIDC identity (issuer=%s, subject=%s) to account %q (id=%d)\n", claims.Issuer, claims.Subject, target.Email, target.ID)
+	_, _ = fmt.Fprintln(output, "   A new link signs out every session the account had open; its owner signs in again.")
+	return nil
+}
+
+// mapLinkOIDCIdentityLinkError translates OIDCLoginService.ConfirmAndLinkIdentity's
+// sentinels into operator-facing wording. ErrOIDCIdentityResolveFailed (a
+// storage failure resolving the identity lookup) shares the default arm
+// deliberately: both wrap the same way, and giving it its own case would be
+// two branches a test has to prove behave identically rather than one.
+func mapLinkOIDCIdentityLinkError(err error) error {
+	switch {
+	case errors.Is(err, services.ErrOIDCDisabled):
+		return errors.New("OIDC is not enabled on this instance (set OIDC_ENABLED=true)")
+	case errors.Is(err, services.ErrOIDCLinkFailed):
+		return errors.New("that (issuer, subject) pair is already linked to a different account")
+	case errors.Is(err, services.ErrAuthSessionVersionChanged):
+		return errors.New("the account's sessions changed while linking; nothing was linked, run the command again")
+	default:
+		return fmt.Errorf("link oidc identity: %w", err)
+	}
+}

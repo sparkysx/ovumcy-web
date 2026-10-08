@@ -1,5 +1,6 @@
 import { expect, type BrowserContext, type Locator, type Page } from '@playwright/test';
-import { dateFieldRoot, fillDateField } from './date-field-helpers';
+import { isoToday, shiftISODate } from './iso-date-helpers';
+import { selectOnboardingStartDate } from './onboarding-helpers';
 
 export type Credentials = {
   email: string;
@@ -45,17 +46,6 @@ export function expectNoSensitiveAuthParams(urlString: string): void {
   expect(combined).not.toContain('recovery=');
 }
 
-function isoDateDaysAgo(days: number): string {
-  const date = new Date();
-  date.setHours(0, 0, 0, 0);
-  date.setDate(date.getDate() - days);
-
-  const yyyy = date.getFullYear();
-  const mm = String(date.getMonth() + 1).padStart(2, '0');
-  const dd = String(date.getDate()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd}`;
-}
-
 export async function registerOwnerViaUI(
   page: Page,
   credentials: Credentials,
@@ -71,9 +61,20 @@ export async function registerOwnerViaUI(
   await requestSubmitForm(page.locator('form[action="/api/v1/users"]'));
 }
 
+// registrationSettleTimeout covers the one step in the suite whose server cost
+// is a deliberate expense rather than a query: POST /api/v1/users hashes a
+// password and a recovery code with bcrypt before it can answer. Measured at
+// 5.8-7.3s under parallel runs, which puts it past Playwright's 5s default and
+// made this the suite's most frequent flake. The wait itself stays bound to a
+// concrete signal — the landed URL and the rendered recovery block — so only
+// the budget is widened, never the condition.
+const registrationSettleTimeout = 20_000;
+
 export async function expectInlineRegisterRecoveryStep(page: Page): Promise<void> {
-  await expect(page).toHaveURL(/\/register(?:\?.*)?$/);
-  await expect(page.locator('[data-auth-inline-recovery]')).toBeVisible();
+  await expect(page).toHaveURL(/\/register(?:\?.*)?$/, { timeout: registrationSettleTimeout });
+  await expect(page.locator('[data-auth-inline-recovery]')).toBeVisible({
+    timeout: registrationSettleTimeout,
+  });
 }
 
 export async function expectDedicatedRecoveryPage(page: Page): Promise<void> {
@@ -120,30 +121,36 @@ export async function continueFromRecoveryCode(page: Page): Promise<void> {
   await expect(page).toHaveURL(/\/(onboarding|dashboard)(?:\?.*)?$/);
 }
 
+const POST_REGISTRATION_PATHS = ['/onboarding', '/dashboard', '/login'];
+
 export async function completeOnboardingIfPresent(page: Page): Promise<void> {
   const currentPath = pathOf(page.url());
-  if (currentPath !== '/onboarding' && currentPath !== '/dashboard') {
+  if (!POST_REGISTRATION_PATHS.includes(currentPath)) {
+    // Tolerant of the redirect having already landed, never of it never landing:
+    // the bare `.catch` used to swallow a hung redirect and let it resurface as
+    // an unrelated failure further down whichever spec called this helper, so the
+    // settled path is asserted here instead.
     await page
-      .waitForURL((url) => {
-        const path = new URL(url).pathname;
-        return path === '/onboarding' || path === '/dashboard' || path === '/login';
-      })
+      .waitForURL((url) => POST_REGISTRATION_PATHS.includes(new URL(url).pathname), { timeout: 15000 })
       .catch(() => {});
+
+    expect(
+      POST_REGISTRATION_PATHS,
+      `post-registration redirect never landed, still at ${page.url()}`
+    ).toContain(pathOf(page.url()));
   }
 
   if (pathOf(page.url()) !== '/onboarding') {
     return;
   }
 
-  const startDateInput = page.locator('#last-period-start');
   const stepOneForm = page.locator('form[hx-post="/api/v1/onboarding/steps/1"]');
   const stepTwoForm = page.locator('form[hx-post="/api/v1/onboarding/steps/2"]');
   const isStepOneVisible = await stepOneForm.isVisible().catch(() => false);
   const isStepTwoVisible = await stepTwoForm.isVisible().catch(() => false);
 
   if (isStepOneVisible) {
-    await expect(dateFieldRoot(startDateInput)).toBeVisible();
-    await fillDateField(startDateInput, isoDateDaysAgo(3));
+    await selectOnboardingStartDate(page, shiftISODate(isoToday(), -3));
     await stepOneForm.locator('button[type="submit"]').click();
   }
 
@@ -152,17 +159,56 @@ export async function completeOnboardingIfPresent(page: Page): Promise<void> {
   }
 
   await expect(stepTwoForm).toBeVisible();
+
+  // Automatic period fill ships OFF for a new account, so the days around the
+  // start date above exist only if this helper asks for them. Nearly every
+  // caller reaches the dashboard expecting the current period window to be
+  // populated, so the shared path arms the toggle deliberately instead of
+  // inheriting whatever the product default happens to be; a spec whose subject
+  // IS the default drives onboarding itself (bugs.spec.ts's
+  // onboardOwnerWithAutoPeriodFill, onboarding.spec.ts). `check()` is
+  // idempotent, and the assertion after it keeps the helper failing loudly if
+  // the control is renamed or removed rather than silently onboarding without it.
+  const autoPeriodFill = stepTwoForm.locator('input[name="auto_period_fill"]');
+  await autoPeriodFill.check();
+  await expect(autoPeriodFill).toBeChecked();
+
   await Promise.all([
     page.waitForURL(/\/dashboard(?:\?.*)?$/, { timeout: 15000 }),
-    stepTwoForm.locator('button[type="submit"]').click(),
+    // Step 2 carries two submit buttons — "Finish" and the skip action for the
+    // mode question — so the finish control is addressed by its own hook.
+    stepTwoForm.locator('[data-onboarding-step2-submit]').click(),
   ]);
+}
+
+/**
+ * The one header a direct API call needs before the CSRF middleware will accept
+ * it. Spread it into whatever headers the call already sends — the caller keeps
+ * its own `X-CSRF-Token`, `Content-Type`, `HX-Request` and so on.
+ *
+ * Why it is needed at every `page.request.*` site: the middleware validates
+ * `Origin` against the app-observed scheme+host on every mutating request, and an
+ * API call sends none of its own — it is not a browser navigation. Plain HTTP has
+ * nothing to compare and lets it through; HTTPS answers **403**. The harness
+ * serves over TLS whenever `COOKIE_SECURE=true`, `E2E_USE_HTTPS_PROXY=true`, or
+ * `E2E_OIDC_PROVIDER=local`, so a missing Origin turns into a pile of failures in
+ * specs whose subject is something else entirely.
+ */
+export function apiOriginHeader(page: Page): Record<string, string> {
+  return { Origin: new URL(page.url()).origin };
 }
 
 export async function logoutViaAPI(page: Page): Promise<void> {
   const csrfToken = await page.locator('meta[name="csrf-token"]').getAttribute('content');
   expect(csrfToken).toBeTruthy();
 
+  // Origin is required over HTTPS — see apiOriginHeader above. This helper is the
+  // one that made the gap visible: every spec that logs out through it failed the
+  // moment the harness switched to TLS, which is why the suite had never run
+  // against the HTTPS posture the public deployment profile recommends, and why
+  // enabling the OIDC lane appeared to break thirty-odd unrelated tests.
   const response = await page.request.delete('/api/v1/sessions/current', {
+    headers: apiOriginHeader(page),
     form: { csrf_token: csrfToken ?? '' },
     maxRedirects: 0,
   });

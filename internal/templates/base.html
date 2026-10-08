@@ -16,7 +16,12 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <meta name="apple-mobile-web-app-title" content="Ovumcy">
   <script src="/static/js/theme-bootstrap.js?v={{.AssetVersion}}"></script>
-  <script src="/static/js/timezone-bootstrap.js?v={{.AssetVersion}}"></script>
+  {{/* The timezone bootstrap runs only for a rendered session. It writes the
+       ovumcy_tz cookie synchronously on every page it loads on, so serving it
+       to an anonymous page would put the cookie straight back after a sign-out
+       retracted it — the login page this very redirect lands on. There is also
+       nothing for it to do there: no anonymous surface renders a date. */}}
+  {{if .CurrentUser}}<script src="/static/js/timezone-bootstrap.js?v={{.AssetVersion}}"></script>{{end}}
   <link rel="stylesheet" href="/static/css/tailwind.css?v={{.AssetVersion}}">
   <script defer src="/static/js/htmx.min.js?v={{.AssetVersion}}"></script>
   <script defer src="/static/js/chart-lite.js?v={{.AssetVersion}}"></script>
@@ -29,11 +34,8 @@
   data-request-failed="{{t .Messages "common.error.request_failed"}}"
   data-period-tip-message="{{t .Messages "dashboard.period_tip_once"}}"
   data-period-tip-pending="{{if and .CurrentUser (not .CurrentUser.ShownPeriodTip)}}true{{else}}false{{end}}"
-  {{if .CurrentUser}}data-persisted-timezone="{{.CurrentUser.Timezone}}"{{end}}
-  data-theme-label-dark="{{t .Messages "theme.switch_to_dark"}}"
-  data-theme-label-light="{{t .Messages "theme.switch_to_light"}}"
-  data-theme-name-dark="{{t .Messages "theme.name.dark"}}"
-  data-theme-name-light="{{t .Messages "theme.name.light"}}">
+  {{if .CurrentUser}}data-persisted-timezone="{{.CurrentUser.Timezone}}"{{end}}>
+  {{template "icon_sprite" .}}
   <a href="#main-content" class="skip-link">{{t .Messages "a11y.skip_to_content"}}</a>
   <div class="app-shell">
     <header class="paper-header">
@@ -76,17 +78,24 @@
       </div>
 
       {{if and .CurrentUser (not .HideNavigation)}}
+      <!-- One condition per section, bound to a variable, so the active fill and the
+           aria-current="page" that makes it readable to assistive technology can never
+           drift apart: a class alone marks the current section for sighted eyes only. -->
+      {{- $todayActive := or (isActiveRoute .CurrentPath "/dashboard") (isActiveRoute .CurrentPath "/")}}
+      {{- $calendarActive := isActiveRoute .CurrentPath "/calendar"}}
+      {{- $insightsActive := isActiveRoute .CurrentPath "/stats"}}
+      {{- $settingsActive := isActiveRoute .CurrentPath "/settings"}}
       <div class="container-main pb-4">
-        <nav class="hidden items-center gap-2 sm:flex">
-          <a href="/dashboard" class="nav-link {{if isActiveRoute .CurrentPath "/dashboard"}}nav-link-active{{else if isActiveRoute .CurrentPath "/"}}nav-link-active{{end}}">{{t .Messages "nav.today"}}</a>
-          <a href="/calendar" class="nav-link {{if isActiveRoute .CurrentPath "/calendar"}}nav-link-active{{end}}">{{t .Messages "nav.calendar"}}</a>
-          <a href="/stats" class="nav-link {{if isActiveRoute .CurrentPath "/stats"}}nav-link-active{{end}}">{{t .Messages "nav.insights"}}</a>
-          <a href="/settings" class="nav-link nav-link-icon {{if isActiveRoute .CurrentPath "/settings"}}nav-link-active{{end}}" aria-label="{{t .Messages "nav.settings"}}" title="{{t .Messages "nav.settings"}}">
-            <span aria-hidden="true">⚙️</span>
-          </a>
+        <nav class="hidden items-center gap-2 sm:flex" aria-label="{{t .Messages "a11y.nav.primary"}}">
+          <a href="/dashboard" class="nav-link {{if $todayActive}}nav-link-active{{end}}" data-nav-link="today" data-nav-link-key="nav.today" {{if $todayActive}}aria-current="page"{{end}}>{{t .Messages "nav.today"}}</a>
+          <a href="/calendar" class="nav-link {{if $calendarActive}}nav-link-active{{end}}" data-nav-link="calendar" data-nav-link-key="nav.calendar" {{if $calendarActive}}aria-current="page"{{end}}>{{t .Messages "nav.calendar"}}</a>
+          <a href="/stats" class="nav-link {{if $insightsActive}}nav-link-active{{end}}" data-nav-link="insights" data-nav-link-key="nav.insights" {{if $insightsActive}}aria-current="page"{{end}}>{{t .Messages "nav.insights"}}</a>
 
+          <!-- Settings is reached through the account chip alone: a gear beside it led to the same page.
+               Being the only desktop route to settings, the chip also carries the section's active
+               state, computed with the same isActiveRoute call the three section links use. -->
           <div class="nav-account-actions" data-nav-account-actions>
-            {{template "nav_user_identity_chip" (dict "CurrentUser" .CurrentUser "Messages" .Messages "ElementID" "nav-user-chip-desktop" "Block" false "SwapOOB" false)}}
+            {{template "nav_user_identity_chip" (dict "CurrentUser" .CurrentUser "Messages" .Messages "ElementID" "nav-user-chip-desktop" "Block" false "SwapOOB" false "Active" $settingsActive)}}
             <form action="/logout" method="post" class="nav-logout-form" data-confirm="{{t .Messages "auth.confirm_logout"}}" data-confirm-accept="{{t .Messages "nav.logout"}}">
               <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
               <button type="submit" class="nav-link nav-link-logout">{{t .Messages "nav.logout"}}</button>
@@ -94,12 +103,10 @@
           </div>
         </nav>
 
-        <nav id="mobile-menu" data-mobile-menu hidden class="mt-2 space-y-2 sm:hidden">
-          <a href="/dashboard" class="nav-link block {{if isActiveRoute .CurrentPath "/dashboard"}}nav-link-active{{else if isActiveRoute .CurrentPath "/"}}nav-link-active{{end}}">{{t .Messages "nav.today"}}</a>
-          <a href="/calendar" class="nav-link block {{if isActiveRoute .CurrentPath "/calendar"}}nav-link-active{{end}}">{{t .Messages "nav.calendar"}}</a>
-          <a href="/stats" class="nav-link block {{if isActiveRoute .CurrentPath "/stats"}}nav-link-active{{end}}">{{t .Messages "nav.insights"}}</a>
-          <a href="/settings" class="nav-link nav-link-icon block {{if isActiveRoute .CurrentPath "/settings"}}nav-link-active{{end}}" aria-label="{{t .Messages "nav.settings"}}" title="{{t .Messages "nav.settings"}}"><span aria-hidden="true">⚙️</span></a>
-          {{template "nav_user_identity_chip" (dict "CurrentUser" .CurrentUser "Messages" .Messages "ElementID" "nav-user-chip-mobile" "Block" true "SwapOOB" false)}}
+        <!-- Account menu only: the four section destinations are the bottom tab bar's job on mobile,
+             and so is their active state — this chip stays unmarked so a phone shows one. -->
+        <nav id="mobile-menu" data-mobile-menu="account" hidden class="mt-2 space-y-2 sm:hidden" aria-label="{{t .Messages "a11y.nav.mobile_menu"}}">
+          {{template "nav_user_identity_chip" (dict "CurrentUser" .CurrentUser "Messages" .Messages "ElementID" "nav-user-chip-mobile" "Block" true "SwapOOB" false "Active" false)}}
           <form action="/logout" method="post" data-confirm="{{t .Messages "auth.confirm_logout"}}" data-confirm-accept="{{t .Messages "nav.logout"}}">
             <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
             <button type="submit" class="nav-link nav-link-logout w-full text-left">{{t .Messages "nav.logout"}}</button>
@@ -109,29 +116,26 @@
       {{end}}
     </header>
 
+    <!-- One compact row, shown only while a native install prompt is pending: the
+         multi-line pitch moved to the settings interface section, which keeps the
+         offer reachable after this row is dismissed. -->
     <section
-      data-pwa-install-banner
+      data-pwa-install-offer
       hidden
-      class="container-main mobile-install-banner sm:hidden"
+      class="container-main mobile-install-offer sm:hidden"
       aria-live="polite">
-      <div class="mobile-install-shell reveal">
-        <div class="mobile-install-copy">
-          <span class="mobile-install-kicker">{{t .Messages "pwa.install.kicker"}}</span>
-          <div class="mobile-install-heading">
-            <img src="/static/brand/ovumcy-icon.svg" width="40" height="40" alt="" class="mobile-install-icon" aria-hidden="true">
-            <div class="space-y-1">
-              <h2 class="mobile-install-title">{{t .Messages "pwa.install.title"}}</h2>
-              <p class="mobile-install-text" data-pwa-install-copy="prompt" hidden>{{t .Messages "pwa.install.prompt_text"}}</p>
-              <p class="mobile-install-text" data-pwa-install-copy="ios" hidden>{{t .Messages "pwa.install.ios_text"}}</p>
-              <p class="mobile-install-text" data-pwa-install-copy="menu" hidden>{{t .Messages "pwa.install.menu_text"}}</p>
-            </div>
-          </div>
-        </div>
-
-        <div class="mobile-install-actions">
-          <button type="button" class="btn-primary" data-pwa-install-action="install" hidden>{{t .Messages "pwa.install.action.install"}}</button>
-          <button type="button" class="btn-secondary" data-pwa-install-action="dismiss">{{t .Messages "pwa.install.action.later"}}</button>
-        </div>
+      <div class="mobile-install-row">
+        <button
+          type="button"
+          class="btn-primary mobile-install-cta"
+          data-pwa-install-action="install"
+          data-pwa-install-title
+          data-pwa-install-title-key="pwa.install.title">{{t .Messages "pwa.install.title"}}</button>
+        <button
+          type="button"
+          class="mobile-install-dismiss"
+          data-pwa-install-action="dismiss"
+          aria-label="{{t .Messages "pwa.install.action.later"}}"><span aria-hidden="true">×</span></button>
       </div>
     </section>
 
@@ -140,17 +144,21 @@
     </main>
 
     {{if and .CurrentUser (not .HideNavigation)}}
-    <nav class="mobile-tabbar sm:hidden" aria-label="{{t .Messages "nav.menu"}}">
-      <a href="/dashboard" class="mobile-tabbar-link {{if isActiveRoute .CurrentPath "/dashboard"}}mobile-tabbar-link-active{{else if isActiveRoute .CurrentPath "/"}}mobile-tabbar-link-active{{end}}">{{t .Messages "nav.today"}}</a>
-      <a href="/calendar" class="mobile-tabbar-link {{if isActiveRoute .CurrentPath "/calendar"}}mobile-tabbar-link-active{{end}}">{{t .Messages "nav.calendar"}}</a>
-      <a href="/stats" class="mobile-tabbar-link {{if isActiveRoute .CurrentPath "/stats"}}mobile-tabbar-link-active{{end}}">{{t .Messages "nav.insights"}}</a>
-      <a href="/settings" class="mobile-tabbar-link mobile-tabbar-icon {{if isActiveRoute .CurrentPath "/settings"}}mobile-tabbar-link-active{{end}}" aria-label="{{t .Messages "nav.settings"}}" title="{{t .Messages "nav.settings"}}"><span class="mobile-tabbar-icon-glyph" aria-hidden="true">⚙️</span></a>
+    {{- $todayActive := or (isActiveRoute .CurrentPath "/dashboard") (isActiveRoute .CurrentPath "/")}}
+    {{- $calendarActive := isActiveRoute .CurrentPath "/calendar"}}
+    {{- $insightsActive := isActiveRoute .CurrentPath "/stats"}}
+    {{- $settingsActive := isActiveRoute .CurrentPath "/settings"}}
+    <nav class="mobile-tabbar sm:hidden" aria-label="{{t .Messages "a11y.nav.tabbar"}}">
+      <a href="/dashboard" class="mobile-tabbar-link {{if $todayActive}}mobile-tabbar-link-active{{end}}" data-nav-link="today" data-nav-link-key="nav.today" {{if $todayActive}}aria-current="page"{{end}}>{{t .Messages "nav.today"}}</a>
+      <a href="/calendar" class="mobile-tabbar-link {{if $calendarActive}}mobile-tabbar-link-active{{end}}" data-nav-link="calendar" data-nav-link-key="nav.calendar" {{if $calendarActive}}aria-current="page"{{end}}>{{t .Messages "nav.calendar"}}</a>
+      <a href="/stats" class="mobile-tabbar-link {{if $insightsActive}}mobile-tabbar-link-active{{end}}" data-nav-link="insights" data-nav-link-key="nav.insights" {{if $insightsActive}}aria-current="page"{{end}}>{{t .Messages "nav.insights"}}</a>
+      <a href="/settings" class="mobile-tabbar-link mobile-tabbar-icon {{if $settingsActive}}mobile-tabbar-link-active{{end}}" data-nav-link="settings" data-nav-link-key="nav.settings" aria-label="{{t .Messages "nav.settings"}}" title="{{t .Messages "nav.settings"}}" {{if $settingsActive}}aria-current="page"{{end}}><span class="mobile-tabbar-icon-glyph" aria-hidden="true">{{template "icon" "settings"}}</span></a>
     </nav>
     {{end}}
 
     {{if not (isActiveRoute .CurrentPath "/privacy")}}
     <footer class="container-main pb-8 pt-2{{if and .CurrentUser (not .HideNavigation)}} footer-with-mobile-nav{{end}}">
-      <nav class="flex items-center justify-center">
+      <nav class="flex items-center justify-center" aria-label="{{t .Messages "a11y.nav.footer"}}">
         <a href="/privacy?back={{urlquery .CurrentPath}}" class="nav-link text-sm">{{t .Messages "nav.privacy"}}</a>
       </nav>
     </footer>
@@ -165,8 +173,8 @@
     aria-hidden="true"
     aria-labelledby="confirm-modal-message">
     <div class="confirm-modal-center">
-      <section class="journal-card confirm-modal-card">
-        <p id="confirm-modal-message" class="journal-subtitle text-sm"></p>
+      <section class="card card-modal">
+        <p id="confirm-modal-message" class="confirm-modal-message"></p>
         <div class="confirm-modal-actions">
           <button id="confirm-modal-cancel" type="button" class="btn-secondary"></button>
           <button id="confirm-modal-accept" type="button" class="btn-danger"></button>

@@ -22,6 +22,42 @@
   <p id="{{.FieldID}}-hint" class="journal-muted text-xs">{{.TemperatureRangeHint}}</p>
 </fieldset>
 {{end}}
+{{/* cycle_start_question asks, beside the period toggle, whether a new cycle
+     begins on this day. It rides the day form: the answer is saved with the
+     entry, nothing is written or recomputed before that save, and leaving both
+     options untouched writes nothing at all. It carries data-period-fields so
+     the existing period-toggle sync reveals it the moment the toggle goes on
+     and disables its controls again when the toggle goes off. */}}
+{{define "cycle_start_question"}}
+<fieldset class="space-y-2" data-cycle-start-question data-period-fields {{if not .CurrentIsPeriod}}hidden{{end}}>
+  <legend class="field-label">{{t .Messages "dashboard.cycle_start_question"}}</legend>
+  <div class="cervical-mucus-row{{if .Compact}} cervical-mucus-row-compact{{end}}">
+    <label class="choice-option">
+      <input
+        type="radio"
+        name="cycle_start"
+        value="true"
+        class="choice-input"
+        data-cycle-start-answer="yes"
+        data-disable-without-period="true"
+        {{if not .CurrentIsPeriod}}disabled{{end}}>
+      <span class="chip chip-stack{{if .Compact}} chip-sm{{end}}"><span>{{t .Messages "common.yes"}}</span></span>
+    </label>
+    <label class="choice-option">
+      <input
+        type="radio"
+        name="cycle_start"
+        value="false"
+        class="choice-input"
+        data-cycle-start-answer="no"
+        data-disable-without-period="true"
+        {{if not .CurrentIsPeriod}}disabled{{end}}>
+      <span class="chip chip-stack{{if .Compact}} chip-sm{{end}}"><span>{{t .Messages "common.no"}}</span></span>
+    </label>
+  </div>
+  <p class="journal-muted text-xs">{{t .Messages "dashboard.cycle_start_question_hint"}}</p>
+</fieldset>
+{{end}}
 {{define "period_flow_option"}}
 <label class="choice-option">
   <input
@@ -31,8 +67,8 @@
     class="choice-input"
     {{if .DisableWhenNotPeriod}}data-disable-without-period="true"{{if not .CurrentIsPeriod}} disabled{{end}}{{end}}
     {{if eq .SelectedFlow .Value}}checked{{end}}>
-  <span class="{{if .Compact}}radio-tile radio-tile-sm radio-tile-inline{{else}}radio-tile radio-tile-inline{{end}}">
-    <span class="radio-icon radio-icon-inline">{{if eq .Value "none"}}○{{else if eq .Value "spotting"}}◌{{else if eq .Value "light"}}◔{{else if eq .Value "medium"}}◑{{else}}◕{{end}}</span>
+  <span class="chip chip-stack chip-inline{{if .Compact}} chip-sm{{end}}">
+    <span class="chip-icon" aria-hidden="true">{{if eq .Value "none"}}○{{else if eq .Value "spotting"}}◌{{else if eq .Value "light"}}◔{{else if eq .Value "medium"}}◑{{else}}◕{{end}}</span>
     <span>{{flowLabel .Messages .Value}}</span>
   </span>
 </label>
@@ -47,25 +83,44 @@
 </div>
 {{end}}
 {{define "mood_option"}}
-<label class="choice-option">
+<label class="choice-option" data-mood-option="{{.Value}}">
   <input
     type="radio"
     name="mood"
     value="{{.Value}}"
     class="choice-input"
+    {{/* The chip's only content is a decorative emoji, so the control names
+         itself — with the step's name, not with its position on the scale,
+         which said nothing about what was being recorded. The enclosing
+         fieldset legend supplies the "Mood" context. */}}
+    aria-label="{{moodLabel .Messages .Value}}"
     {{if eq .SelectedMood .Value}}checked{{end}}>
-  <span class="{{if .Compact}}mood-chip mood-chip-sm{{else}}mood-chip{{end}}" title="{{.Value}}/5">
-    <span class="mood-chip-emoji">{{moodEmoji .Value}}</span>
+  <span class="chip chip-round{{if .Compact}} chip-sm{{end}}" title="{{moodLabel .Messages .Value}}">
+    <span class="chip-emoji" aria-hidden="true">{{moodEmoji .Value}}</span>
   </span>
+  {{/* The visible half of the same name. It is laid over the caption band under
+       the whole row rather than under its own face: five names under five faces
+       do not survive 390px in six languages without shrinking either the type
+       or the tap targets. Only the chosen one shows. */}}
+  <span
+    class="journal-muted text-xs mood-caption mood-step-name"
+    data-mood-name="{{.Value}}"
+    data-mood-name-key="{{moodLabelKey .Value}}">{{moodLabel .Messages .Value}}</span>
 </label>
 {{end}}
 {{define "mood_picker"}}
-<div class="{{if .Compact}}mood-row mood-row-compact{{else}}mood-row{{end}}">
-  {{template "mood_option" (dict "SelectedMood" .SelectedMood "Value" 1 "Compact" .Compact)}}
-  {{template "mood_option" (dict "SelectedMood" .SelectedMood "Value" 2 "Compact" .Compact)}}
-  {{template "mood_option" (dict "SelectedMood" .SelectedMood "Value" 3 "Compact" .Compact)}}
-  {{template "mood_option" (dict "SelectedMood" .SelectedMood "Value" 4 "Compact" .Compact)}}
-  {{template "mood_option" (dict "SelectedMood" .SelectedMood "Value" 5 "Compact" .Compact)}}
+{{$scale := moodScale}}
+<div class="mood-picker" data-mood-picker>
+  <div class="{{if .Compact}}mood-row mood-row-compact{{else}}mood-row{{end}}">
+    {{range $step := $scale.Steps}}
+    {{template "mood_option" (dict "Messages" $.Messages "SelectedMood" $.SelectedMood "Value" $step "Compact" $.Compact)}}
+    {{end}}
+  </div>
+  {{/* Nothing chosen yet: name the two ends so the direction of the row is
+       readable before the first tap. Both ends come from the scale itself. */}}
+  <p
+    class="journal-muted text-xs mood-caption mood-scale-ends"
+    data-mood-scale-ends>{{moodLabel .Messages $scale.Lowest}} – {{moodLabel .Messages $scale.Highest}}</p>
 </div>
 {{end}}
 {{define "sex_activity_option"}}
@@ -76,7 +131,7 @@
     value="{{.Value}}"
     class="choice-input"
     {{if eq .SelectedSexActivity .Value}}checked{{end}}>
-  <span class="{{if .Compact}}radio-tile radio-tile-sm{{else}}radio-tile{{end}}">
+  <span class="chip chip-stack{{if .Compact}} chip-sm{{end}}">
     <span>{{sexActivityLabel .Messages .Value}}</span>
   </span>
 </label>
@@ -84,8 +139,8 @@
 {{define "sex_activity_field"}}
 <details class="sex-activity-details" data-sex-activity-details {{if ne .SelectedSexActivity "none"}}open{{end}}>
   <summary class="sex-chip-summary">
-    <span class="{{if .Compact}}check-chip check-chip-sm check-chip-static{{else}}check-chip check-chip-static{{end}} sex-chip-summary-pill{{if ne .SelectedSexActivity "none"}} choice-chip-active{{end}}">
-      <span class="symptom-icon sex-heart-icon">♥</span>
+    <span class="chip chip-lead chip-static{{if .Compact}} chip-sm{{end}} sex-chip-summary-pill{{if ne .SelectedSexActivity "none"}} chip-selected{{end}}">
+      <span class="symptom-icon sex-heart-icon" aria-hidden="true">{{template "icon" "heart"}}</span>
       <span class="symptom-label">{{t .Messages "dashboard.sex"}}</span>
       <span class="sex-chip-chevron" aria-hidden="true">▼</span>
     </span>
@@ -105,7 +160,7 @@
     value="{{.Value}}"
     class="choice-input"
     {{if eq .SelectedCervicalMucus .Value}}checked{{end}}>
-  <span class="{{if .Compact}}radio-tile radio-tile-sm{{else}}radio-tile{{end}}">
+  <span class="chip chip-stack{{if .Compact}} chip-sm{{end}}">
     <span>{{cervicalMucusLabel .Messages .Value}}</span>
   </span>
 </label>
@@ -119,23 +174,54 @@
   {{template "cervical_mucus_option" (dict "Messages" .Messages "SelectedCervicalMucus" .SelectedCervicalMucus "Value" "eggwhite" "Compact" .Compact)}}
 </div>
 {{end}}
+{{/* A pregnancy test has two results and an absence. Only the two results are
+     offered as options, at equal weight and in the same neutral tokens the
+     other day pickers use — neither is styled as good or bad news. The absence
+     is not a third choice: an untested day carries the "none" value on a hidden
+     radio, so the control renders with nothing filled and says so in words.
+     Once a result is saved the same hidden value is offered back as an explicit
+     secondary action, because otherwise the unset state would exist in the
+     model and be unreachable from the interface. That action is a button after
+     the group, not a third radio: inside the group it announced as "radio 3 of
+     3", which reads as a third result. The button clears the two results, moves
+     the hidden carrier onto "none" and lets the change it fires reach whichever
+     save model the surrounding form uses — the dashboard's autosave, or the
+     calendar editor's explicit Save. */}}
 {{define "pregnancy_test_option"}}
-<label class="choice-option">
+<label class="choice-option" data-pregnancy-test-option="{{.Value}}">
   <input
     type="radio"
     name="pregnancy_test"
     value="{{.Value}}"
     class="choice-input"
     {{if eq .SelectedPregnancyTest .Value}}checked{{end}}>
-  <span class="{{if .Compact}}radio-tile radio-tile-sm{{else}}radio-tile{{end}}">
+  <span class="chip chip-stack{{if .Compact}} chip-sm{{end}}">
+    <span class="pregnancy-test-mark-off" aria-hidden="true">○</span>
+    <span class="pregnancy-test-mark-on" aria-hidden="true">●</span>
     <span>{{pregnancyTestLabel .Messages .Value}}</span>
   </span>
 </label>
 {{end}}
 {{define "pregnancy_test_options"}}
-<div class="cervical-mucus-row{{if .Compact}} cervical-mucus-row-compact{{end}}">
-  {{template "pregnancy_test_option" (dict "Messages" .Messages "SelectedPregnancyTest" .SelectedPregnancyTest "Value" "none" "Compact" .Compact)}}
-  {{template "pregnancy_test_option" (dict "Messages" .Messages "SelectedPregnancyTest" .SelectedPregnancyTest "Value" "negative" "Compact" .Compact)}}
-  {{template "pregnancy_test_option" (dict "Messages" .Messages "SelectedPregnancyTest" .SelectedPregnancyTest "Value" "positive" "Compact" .Compact)}}
+{{$recorded := or (eq .SelectedPregnancyTest "negative") (eq .SelectedPregnancyTest "positive")}}
+<div
+  class="pregnancy-test-field"
+  data-pregnancy-test
+  data-pregnancy-test-state="{{if $recorded}}recorded{{else}}absent{{end}}">
+  <div class="pregnancy-test-row{{if .Compact}} pregnancy-test-row-compact{{end}}">
+    {{template "pregnancy_test_option" (dict "Messages" .Messages "SelectedPregnancyTest" .SelectedPregnancyTest "Value" "negative" "Compact" .Compact)}}
+    {{template "pregnancy_test_option" (dict "Messages" .Messages "SelectedPregnancyTest" .SelectedPregnancyTest "Value" "positive" "Compact" .Compact)}}
+  </div>
+  <input type="radio" name="pregnancy_test" value="none" data-pregnancy-test-unset {{if not $recorded}}checked {{end}}hidden>
+  {{/* Both are always rendered and one is hidden: the field flips between
+       "recorded" and "absent" in the browser after an autosave, and a branch the
+       server rendered away would leave nothing to show. */}}
+  <button
+    type="button"
+    class="btn-secondary btn-compact"
+    data-pregnancy-test-remove
+    data-action-weight="secondary"
+    {{if not $recorded}}hidden{{end}}>{{t .Messages "dashboard.pregnancy_test.remove"}}</button>
+  <p class="journal-muted text-sm" data-pregnancy-test-empty{{if $recorded}} hidden{{end}}>{{t .Messages "dashboard.pregnancy_test.absent"}}</p>
 </div>
 {{end}}

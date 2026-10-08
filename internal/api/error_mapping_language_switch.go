@@ -1,0 +1,59 @@
+package api
+
+import (
+	"fmt"
+	"html/template"
+
+	"github.com/gofiber/fiber/v3"
+	"github.com/ovumcy/ovumcy-web/internal/httpx"
+	"github.com/ovumcy/ovumcy-web/internal/services"
+)
+
+// languageSwitchBackLabelKey labels the way back out of a refused language
+// switch.
+const languageSwitchBackLabelKey = "common.back"
+
+// isLanguageSwitchPageNavigation reports whether c is a plain HTML navigation
+// submitting the language-switch form — the app's one public form with no HTMX
+// and no JavaScript behind it. Its refusal replaces the whole page, so whichever
+// layer raises it (the handler, CSRF, a recovered panic, the request deadline)
+// a JSON envelope would be painted into the browser window as text.
+//
+// Scoped to POST because the route and its limiter are POST-only: any other
+// method on the path is an unrouted request and answers like one everywhere else.
+func isLanguageSwitchPageNavigation(c fiber.Ctx) bool {
+	return c.Method() == fiber.MethodPost &&
+		httpx.RoutingNormalizedPath(c.Path()) == LanguageSwitchPath &&
+		responseFormat(c) == httpx.ResponseFormatHTML
+}
+
+// languageSwitchBackPath is the link a refused language switch offers back: the
+// form's sanitized `next` path, "/" when it has none. The refusal replaces the
+// whole page the browser shows, and without the link a refused switch — most
+// often an idle CSRF token — is a dead end. /lang is the one plain form that
+// carries a `next` field to read the back link from; the plain auth-form pages
+// (WEB-84) have no such field and use a fixed, route-mapped back path instead.
+func languageSwitchBackPath(c fiber.Ctx) string {
+	return services.SanitizeRedirectPath(c.FormValue("next"), "/")
+}
+
+// sendStatusFragmentWithBackLink answers one mapped spec as the shared status
+// fragment followed by a link to `back`: the floor sendPageFormRefusalPage falls
+// back to when the page cannot render. The fragment then replaces the whole page
+// the browser was looking at, so without the link a refusal is a dead end.
+// Status and stable key still come from the spec; `back` is the only thing
+// that varies between callers, and each caller is responsible for it being
+// safe (a fixed, server-owned path, or a value already run through
+// services.SanitizeRedirectPath) — this helper does not sanitize it again.
+func sendStatusFragmentWithBackLink(c fiber.Ctx, spec APIErrorSpec, back string) error {
+	label := languageSwitchBackLabelKey
+	if localized, translated := lookupMessage(currentMessages(c), languageSwitchBackLabelKey); translated {
+		label = localized
+	}
+	markup := localizedStatusErrorMarkup(c, spec) + fmt.Sprintf(
+		"<p><a href=\"%s\">%s</a></p>",
+		template.HTMLEscapeString(back),
+		template.HTMLEscapeString(label),
+	)
+	return sendHTMLFragment(c.Status(spec.Status), markup)
+}

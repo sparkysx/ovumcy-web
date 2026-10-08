@@ -30,6 +30,14 @@ func TestMapAuthRegisterError(t *testing.T) {
 			want: authFormErrorSpec(fiber.StatusBadRequest, APIErrorCategoryValidation, "weak password"),
 		},
 		{
+			// Its own spec key, not the weak-password one: the length refusal
+			// carries the only fact that helps here, and a collapse back into
+			// "weak password" is invisible at the service layer.
+			name: "password too long",
+			err:  services.ErrAuthPasswordTooLong,
+			want: authFormErrorSpec(fiber.StatusBadRequest, APIErrorCategoryValidation, "password too long"),
+		},
+		{
 			name: "email exists",
 			err:  services.ErrAuthEmailExists,
 			want: authFormErrorSpec(fiber.StatusBadRequest, APIErrorCategoryValidation, "invalid input"),
@@ -159,6 +167,11 @@ func TestMapPasswordResetCompleteError(t *testing.T) {
 			want: authFormErrorSpec(fiber.StatusBadRequest, APIErrorCategoryValidation, "weak password"),
 		},
 		{
+			name: "password too long",
+			err:  services.ErrAuthPasswordTooLong,
+			want: authFormErrorSpec(fiber.StatusBadRequest, APIErrorCategoryValidation, "password too long"),
+		},
+		{
 			name: "invalid input",
 			err:  services.ErrAuthResetInvalid,
 			want: authFormErrorSpec(fiber.StatusBadRequest, APIErrorCategoryValidation, "invalid input"),
@@ -166,6 +179,11 @@ func TestMapPasswordResetCompleteError(t *testing.T) {
 		{
 			name: "invalid token",
 			err:  services.ErrInvalidResetToken,
+			want: authFormErrorSpec(fiber.StatusBadRequest, APIErrorCategoryValidation, "invalid reset token"),
+		},
+		{
+			name: "lost concurrent redeem",
+			err:  services.ErrResetTokenAlreadyConsumed,
 			want: authFormErrorSpec(fiber.StatusBadRequest, APIErrorCategoryValidation, "invalid reset token"),
 		},
 		{

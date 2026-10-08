@@ -53,12 +53,38 @@ type stubOIDCIdentityStore struct {
 	findErr        error
 	createErr      error
 	touchedID      uint
+	touchedUserID  uint
 	touchedAt      time.Time
 	created        models.OIDCIdentity
 	createCallSeen bool
+	// lastIssuer / lastSubject record the lookup key the service handed over.
+	// Without them the stub answers every (issuer, subject) with the same
+	// identity, so a swapped or constant key at the resolution seam changes
+	// nothing observable and a mis-scoped link would go unnoticed.
+	lastIssuer  string
+	lastSubject string
+
+	revokedFromVersion int
+	revokeErr          error
+
+	revokedOnCreate bool
+	listed          []models.OIDCIdentity
+	listErr         error
+	lastListUserID  uint
+	deleteErr       error
+	deleteCalls     int
+	deletedID       uint
+	// deleteNotFound simulates a delete that loses a race: the owner-scoped read
+	// above found the identity, but by the time the delete runs it is already
+	// gone — (false, nil), not an error.
+	deleteNotFound bool
+
+	deleteLocalSignInOpen bool
 }
 
-func (stub *stubOIDCIdentityStore) FindByIssuerSubject(context.Context, string, string) (models.OIDCIdentity, bool, error) {
+func (stub *stubOIDCIdentityStore) FindByIssuerSubject(_ context.Context, issuer string, subject string) (models.OIDCIdentity, bool, error) {
+	stub.lastIssuer = issuer
+	stub.lastSubject = subject
 	if stub.findErr != nil {
 		return models.OIDCIdentity{}, false, stub.findErr
 	}
@@ -76,17 +102,69 @@ func (stub *stubOIDCIdentityStore) Create(ctx context.Context, identity *models.
 	return stub.createErr
 }
 
-func (stub *stubOIDCIdentityStore) TouchLastUsed(ctx context.Context, identityID uint, usedAt time.Time) error {
+// CreateAndRevokeSessions records into the same fields as Create — a link is a
+// link to the assertions that read them — and additionally marks that the
+// write carried the session-version bump.
+func (stub *stubOIDCIdentityStore) CreateAndRevokeSessions(ctx context.Context, identity *models.OIDCIdentity, expectedSessionVersion int) error {
+	stub.revokedOnCreate = true
+	stub.revokedFromVersion = expectedSessionVersion
+	if stub.revokeErr != nil {
+		return stub.revokeErr
+	}
+	return stub.Create(ctx, identity)
+}
+
+func (stub *stubOIDCIdentityStore) ListByUser(_ context.Context, userID uint) ([]models.OIDCIdentity, error) {
+	stub.lastListUserID = userID
+	if stub.listErr != nil {
+		return nil, stub.listErr
+	}
+	owned := make([]models.OIDCIdentity, 0, len(stub.listed))
+	for _, identity := range stub.listed {
+		if identity.UserID == userID {
+			owned = append(owned, identity)
+		}
+	}
+	return owned, nil
+}
+
+func (stub *stubOIDCIdentityStore) DeleteForUserAndRevokeSessions(_ context.Context, userID uint, identityID uint, _ int, localSignInOpen bool) (bool, error) {
+	stub.deleteCalls++
+	stub.deleteLocalSignInOpen = localSignInOpen
+	if stub.deleteErr != nil {
+		return false, stub.deleteErr
+	}
+	if stub.deleteNotFound {
+		return false, nil
+	}
+	for index, identity := range stub.listed {
+		if identity.ID == identityID && identity.UserID == userID {
+			stub.listed = append(stub.listed[:index], stub.listed[index+1:]...)
+			stub.deletedID = identityID
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (stub *stubOIDCIdentityStore) TouchLastUsed(ctx context.Context, identityID uint, userID uint, usedAt time.Time) error {
 	stub.touchedID = identityID
+	stub.touchedUserID = userID
 	stub.touchedAt = usedAt
 	return nil
 }
 
 type stubOIDCUserStore struct {
-	byID            models.User
-	byIDErr         error
+	byID    models.User
+	byIDErr error
+	// lastLookupID records the id the service resolved the account with. The
+	// stub answers any id with the same user, so this is the only way a test
+	// can see the account lookup being scoped to the linked identity's owner
+	// rather than to a constant.
+	lastLookupID    uint
 	byEmail         models.User
 	byEmailFound    bool
+	byEmailAll      []models.User
 	byEmailErr      error
 	lastLookupEmail string
 }
@@ -107,22 +185,25 @@ func (stub *stubOIDCAutoProvisioner) AutoProvisionOwnerAccount(ctx context.Conte
 	return stub.user, nil
 }
 
-func (stub *stubOIDCUserStore) FindByID(context.Context, uint) (models.User, error) {
+func (stub *stubOIDCUserStore) FindByID(_ context.Context, userID uint) (models.User, error) {
+	stub.lastLookupID = userID
 	if stub.byIDErr != nil {
 		return models.User{}, stub.byIDErr
 	}
 	return stub.byID, nil
 }
 
-func (stub *stubOIDCUserStore) FindByNormalizedEmailOptional(ctx context.Context, email string) (models.User, bool, error) {
+func (stub *stubOIDCUserStore) FindAllByNormalizedEmail(ctx context.Context, email string) ([]models.User, error) {
 	stub.lastLookupEmail = email
-	if stub.byEmailErr != nil {
-		return models.User{}, false, stub.byEmailErr
+	switch {
+	case stub.byEmailErr != nil:
+		return nil, stub.byEmailErr
+	case stub.byEmailAll != nil:
+		return stub.byEmailAll, nil
+	case !stub.byEmailFound:
+		return nil, nil
 	}
-	if !stub.byEmailFound {
-		return models.User{}, false, nil
-	}
-	return stub.byEmail, true, nil
+	return []models.User{stub.byEmail}, nil
 }
 
 func TestOIDCLoginServiceResponseMode(t *testing.T) {
@@ -193,6 +274,19 @@ func TestOIDCLoginServiceAuthenticateUsesExistingIdentityLink(t *testing.T) {
 	}
 	if result.User.ID != 7 {
 		t.Fatalf("expected linked user id 7, got %d", result.User.ID)
+	}
+	// The stubs answer any argument with the same record, so the returned user
+	// alone proves nothing about scoping. Pin the lookup keys themselves: the
+	// identity must be resolved by the asserted (issuer, subject) pair, and the
+	// account by that identity's owner id — not by a constant.
+	if identities.lastIssuer != "https://id.example.com" {
+		t.Fatalf("expected identity lookup by issuer %q, got %q", "https://id.example.com", identities.lastIssuer)
+	}
+	if identities.lastSubject != "owner-subject" {
+		t.Fatalf("expected identity lookup by subject %q, got %q", "owner-subject", identities.lastSubject)
+	}
+	if users.lastLookupID != 7 {
+		t.Fatalf("expected the account to be resolved by the linked identity's owner id 7, got %d", users.lastLookupID)
 	}
 	if identities.touchedID != 44 {
 		t.Fatalf("expected last-used touch for identity 44, got %d", identities.touchedID)
@@ -276,7 +370,7 @@ func TestOIDCLoginServiceConfirmAndLinkIdentityPersistsLink(t *testing.T) {
 		Subject: "first-login-sub",
 		Email:   "owner@example.com",
 	}
-	if err := service.ConfirmAndLinkIdentity(context.Background(), 9, claims, now); err != nil {
+	if _, err := service.ConfirmAndLinkIdentity(context.Background(), 9, 1, claims, now); err != nil {
 		t.Fatalf("ConfirmAndLinkIdentity() unexpected error: %v", err)
 	}
 	if !identities.createCallSeen {
@@ -287,6 +381,42 @@ func TestOIDCLoginServiceConfirmAndLinkIdentityPersistsLink(t *testing.T) {
 	}
 	if identities.created.LastUsedAt == nil || !identities.created.LastUsedAt.Equal(now) {
 		t.Fatalf("expected LastUsedAt=%s, got %+v", now, identities.created.LastUsedAt)
+	}
+}
+
+// The link revokes only from the version the caller verified and reports the
+// version it left: the next one after a write, the verified one when the pair
+// was already linked and nothing was written. A store that found the version
+// moved surfaces as ErrAuthSessionVersionChanged, never as a plain link
+// failure the Settings mapper would word as "claimed by another account".
+func TestOIDCLoginServiceConfirmAndLinkIdentityCarriesTheVerifiedSessionVersion(t *testing.T) {
+	t.Parallel()
+
+	claims := security.OIDCClaims{Issuer: "https://id.example.com", Subject: "versioned-sub"}
+	link := func(identities *stubOIDCIdentityStore, expected int) (int, error) {
+		service := NewOIDCLoginService(&stubOIDCProviderClient{enabled: true}, identities, &stubOIDCUserStore{}, nil)
+		return service.ConfirmAndLinkIdentity(context.Background(), 9, expected, claims, time.Now())
+	}
+
+	written := &stubOIDCIdentityStore{}
+	if version, err := link(written, 4); err != nil || version != 5 || written.revokedFromVersion != 4 {
+		t.Fatalf("expected a write from version 4 leaving 5, got version=%d from=%d err=%v", version, written.revokedFromVersion, err)
+	}
+	legacy := &stubOIDCIdentityStore{}
+	if version, err := link(legacy, 0); err != nil || version != 2 || legacy.revokedFromVersion != 1 {
+		t.Fatalf("expected a legacy zero to revoke from 1 leaving 2, got version=%d from=%d err=%v", version, legacy.revokedFromVersion, err)
+	}
+	existing := &stubOIDCIdentityStore{found: true, identity: models.OIDCIdentity{ID: 3, UserID: 9, Issuer: claims.Issuer, Subject: claims.Subject}}
+	if version, err := link(existing, 4); err != nil || version != 4 || existing.revokedOnCreate {
+		t.Fatalf("expected an existing link to write nothing and report version 4, got version=%d revoked=%v err=%v", version, existing.revokedOnCreate, err)
+	}
+	moved := &stubOIDCIdentityStore{revokeErr: models.ErrAuthSessionVersionChanged}
+	if version, err := link(moved, 4); !errors.Is(err, ErrAuthSessionVersionChanged) || errors.Is(err, ErrOIDCLinkFailed) || version != 0 {
+		t.Fatalf("expected ErrAuthSessionVersionChanged and no version, got version=%d err=%v", version, err)
+	}
+	failed := &stubOIDCIdentityStore{revokeErr: errors.New("disk full")}
+	if _, err := link(failed, 4); !errors.Is(err, ErrOIDCLinkFailed) {
+		t.Fatalf("expected any other store error to read as ErrOIDCLinkFailed, got %v", err)
 	}
 }
 
@@ -310,7 +440,7 @@ func TestOIDCLoginServiceConfirmAndLinkIdentityRefusesCrossUserClaim(t *testing.
 	service := NewOIDCLoginService(&stubOIDCProviderClient{enabled: true}, identities, &stubOIDCUserStore{}, nil)
 
 	claims := security.OIDCClaims{Issuer: "https://id.example.com", Subject: "first-login-sub"}
-	if err := service.ConfirmAndLinkIdentity(context.Background(), 9, claims, now); !errors.Is(err, ErrOIDCLinkFailed) {
+	if _, err := service.ConfirmAndLinkIdentity(context.Background(), 9, 1, claims, now); !errors.Is(err, ErrOIDCLinkFailed) {
 		t.Fatalf("expected ErrOIDCLinkFailed for cross-user claim, got %v", err)
 	}
 	if identities.createCallSeen {
@@ -343,6 +473,208 @@ func TestOIDCLoginServiceAuthenticateRejectsUnverifiedEmail(t *testing.T) {
 // that still calls linkIdentity inline — the existing-email path now requires
 // confirmation and links through ConfirmAndLinkIdentity instead, covered
 // separately).
+// TestOIDCLoginServiceAuthenticateSetsRequiresTOTPForLinkedTOTPAccount pins
+// session issuance parity (docs/security/oidc-and-sessions.md) at the service
+// layer: an OIDC callback resolving to an already-linked identity whose
+// account has TOTP enabled must come back with RequiresTOTP set, the same
+// signal LoginResult.RequiresTOTP carries for the local login path
+// (login_service.go). The handler gates on this field rather than on the raw
+// User.TOTPEnabled value; this test is what proves the service actually
+// derives it.
+func TestOIDCLoginServiceAuthenticateSetsRequiresTOTPForLinkedTOTPAccount(t *testing.T) {
+	t.Parallel()
+
+	identities := &stubOIDCIdentityStore{
+		found: true,
+		identity: models.OIDCIdentity{
+			ID:      9,
+			UserID:  7,
+			Issuer:  "https://id.example.com",
+			Subject: "owner-subject",
+		},
+	}
+	users := &stubOIDCUserStore{
+		byID: models.User{
+			ID:          7,
+			Role:        models.RoleOwner,
+			TOTPEnabled: true,
+		},
+	}
+	service := NewOIDCLoginService(&stubOIDCProviderClient{
+		enabled: true,
+		exchange: security.OIDCExchangeResult{
+			Claims: security.OIDCClaims{
+				Issuer:        "https://id.example.com",
+				Subject:       "owner-subject",
+				Email:         "owner@example.com",
+				EmailVerified: true,
+			},
+		},
+	}, identities, users, nil)
+
+	result, err := service.Authenticate(context.Background(), "code", "verifier", "nonce", time.Time{})
+	if err != nil {
+		t.Fatalf("Authenticate() unexpected error: %v", err)
+	}
+	if !result.RequiresTOTP {
+		t.Fatal("expected RequiresTOTP for a linked identity whose account has TOTP enabled")
+	}
+}
+
+// TestOIDCLoginServiceAuthenticateMustChangePasswordOutranksRequiresTOTP pins
+// the same ordering decision the local login path pins
+// (TestLoginServiceForcedResetOutranksTOTPForAnAccountWithBothFlags): an
+// account carrying BOTH MustChangePassword and TOTPEnabled must not raise
+// RequiresTOTP. The handler routes MustChangePassword to the forced-reset
+// flow first, and that flow is the sanctioned skip of the second factor
+// (docs/security/known-disclosures.md); a RequiresTOTP that won here would
+// contradict the routing the handler actually performs.
+func TestOIDCLoginServiceAuthenticateMustChangePasswordOutranksRequiresTOTP(t *testing.T) {
+	t.Parallel()
+
+	identities := &stubOIDCIdentityStore{
+		found: true,
+		identity: models.OIDCIdentity{
+			ID:      9,
+			UserID:  7,
+			Issuer:  "https://id.example.com",
+			Subject: "owner-subject",
+		},
+	}
+	users := &stubOIDCUserStore{
+		byID: models.User{
+			ID:                 7,
+			Role:               models.RoleOwner,
+			TOTPEnabled:        true,
+			MustChangePassword: true,
+		},
+	}
+	service := NewOIDCLoginService(&stubOIDCProviderClient{
+		enabled: true,
+		exchange: security.OIDCExchangeResult{
+			Claims: security.OIDCClaims{
+				Issuer:        "https://id.example.com",
+				Subject:       "owner-subject",
+				Email:         "owner@example.com",
+				EmailVerified: true,
+			},
+		},
+	}, identities, users, nil)
+
+	result, err := service.Authenticate(context.Background(), "code", "verifier", "nonce", time.Time{})
+	if err != nil {
+		t.Fatalf("Authenticate() unexpected error: %v", err)
+	}
+	if result.RequiresTOTP {
+		t.Fatal("expected MustChangePassword to outrank RequiresTOTP, mirroring the local login path's ordering")
+	}
+	if !result.User.MustChangePassword {
+		t.Fatal("expected the returned user to still carry MustChangePassword for the handler's own reset routing")
+	}
+	if !result.RequiresPasswordReset {
+		t.Fatal("expected RequiresPasswordReset for a MustChangePassword account, mirroring LoginService.Authenticate")
+	}
+}
+
+// TestOIDCLoginServiceAuthenticateRoutesUnverifiableTOTPToForcedReset pins the
+// THIRD TOTP state on the OIDC login path, mirroring
+// TestLoginServiceRoutesUnverifiableTOTPToForcedResetWithoutMustChangePassword
+// at the local-login service: an account enrolled in TOTP whose secret is
+// unverifiable (SECRET_KEY rotation) but carrying NO MustChangePassword flag
+// must still come back with RequiresPasswordReset=true and RequiresTOTP=false
+// once a TOTPFactorVerifier is wired — the escape hatch chosen because the
+// factor cannot be checked, not only when the routing flag happens to be set.
+func TestOIDCLoginServiceAuthenticateRoutesUnverifiableTOTPToForcedReset(t *testing.T) {
+	t.Parallel()
+
+	identities := &stubOIDCIdentityStore{
+		found: true,
+		identity: models.OIDCIdentity{
+			ID:      9,
+			UserID:  8,
+			Issuer:  "https://id.example.com",
+			Subject: "owner-subject-unverifiable",
+		},
+	}
+	users := &stubOIDCUserStore{
+		byID: models.User{
+			ID:          8,
+			Role:        models.RoleOwner,
+			TOTPEnabled: true,
+		},
+	}
+	service := NewOIDCLoginService(&stubOIDCProviderClient{
+		enabled: true,
+		exchange: security.OIDCExchangeResult{
+			Claims: security.OIDCClaims{
+				Issuer:        "https://id.example.com",
+				Subject:       "owner-subject-unverifiable",
+				Email:         "owner-unverifiable@example.com",
+				EmailVerified: true,
+			},
+		},
+	}, identities, users, nil)
+	service.SetTOTPVerifier(&stubTOTPFactorVerifier{unverifiable: map[uint]bool{8: true}})
+
+	result, err := service.Authenticate(context.Background(), "code", "verifier", "nonce", time.Time{})
+	if err != nil {
+		t.Fatalf("Authenticate() unexpected error: %v", err)
+	}
+	if !result.RequiresPasswordReset {
+		t.Fatal("expected an account with an unverifiable TOTP secret to route to the forced-reset escape hatch even without MustChangePassword")
+	}
+	if result.RequiresTOTP {
+		t.Fatal("expected no TOTP challenge for an account whose secret cannot be decrypted — no code could ever satisfy it")
+	}
+}
+
+// TestOIDCLoginServiceAuthenticateRequiresTOTPWhenVerifiable is the companion
+// case: with a TOTPFactorVerifier wired, a normal enrolled-and-verifiable
+// account must still be routed to the TOTP challenge.
+func TestOIDCLoginServiceAuthenticateRequiresTOTPWhenVerifiable(t *testing.T) {
+	t.Parallel()
+
+	identities := &stubOIDCIdentityStore{
+		found: true,
+		identity: models.OIDCIdentity{
+			ID:      10,
+			UserID:  11,
+			Issuer:  "https://id.example.com",
+			Subject: "owner-subject-verifiable",
+		},
+	}
+	users := &stubOIDCUserStore{
+		byID: models.User{
+			ID:          11,
+			Role:        models.RoleOwner,
+			TOTPEnabled: true,
+		},
+	}
+	service := NewOIDCLoginService(&stubOIDCProviderClient{
+		enabled: true,
+		exchange: security.OIDCExchangeResult{
+			Claims: security.OIDCClaims{
+				Issuer:        "https://id.example.com",
+				Subject:       "owner-subject-verifiable",
+				Email:         "owner-verifiable@example.com",
+				EmailVerified: true,
+			},
+		},
+	}, identities, users, nil)
+	service.SetTOTPVerifier(&stubTOTPFactorVerifier{unverifiable: map[uint]bool{}})
+
+	result, err := service.Authenticate(context.Background(), "code", "verifier", "nonce", time.Time{})
+	if err != nil {
+		t.Fatalf("Authenticate() unexpected error: %v", err)
+	}
+	if !result.RequiresTOTP {
+		t.Fatal("expected a verifiable TOTP account to still require the TOTP challenge")
+	}
+	if result.RequiresPasswordReset {
+		t.Fatal("did not expect the forced-reset branch for a verifiable account")
+	}
+}
+
 func TestOIDCLoginServiceAuthenticateMapsLinkPersistenceFailure(t *testing.T) {
 	t.Parallel()
 

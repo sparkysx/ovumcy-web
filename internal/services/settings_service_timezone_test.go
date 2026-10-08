@@ -29,15 +29,22 @@ func (repo *recordingTimezoneRepo) UpdateUserTimezone(_ context.Context, userID 
 	return repo.updateErr
 }
 
+func (repo *recordingTimezoneRepo) UpdateInterfaceLanguage(context.Context, uint, string) (bool, error) {
+	return true, nil
+}
+
 func (repo *recordingTimezoneRepo) UpdateReminderLeadDays(context.Context, uint, int) error {
 	return nil
 }
 
-func (repo *recordingTimezoneRepo) UpdatePasswordAndRevokeSessions(context.Context, uint, string, bool) error {
+func (repo *recordingTimezoneRepo) UpdatePasswordAndRevokeSessions(context.Context, uint, int, string, bool) error {
 	return nil
 }
 
-func (repo *recordingTimezoneRepo) UpdatePasswordRecoveryCodeAndRevokeSessions(context.Context, uint, string, string, bool) error {
+func (repo *recordingTimezoneRepo) UpdatePasswordRecoveryCodeAndRevokeSessions(_ context.Context, _ uint, _ int, _ string, _ string, _ bool, beforeCommit func(sessionVersion int) error) error {
+	if beforeCommit != nil {
+		return beforeCommit(1)
+	}
 	return nil
 }
 
@@ -49,7 +56,7 @@ func (repo *recordingTimezoneRepo) LoadSettingsByID(context.Context, uint) (mode
 	return models.User{}, nil
 }
 
-func (repo *recordingTimezoneRepo) ClearAllDataAndResetSettings(context.Context, uint) error {
+func (repo *recordingTimezoneRepo) ClearAllDataAndResetSettings(context.Context, uint, int) error {
 	return nil
 }
 

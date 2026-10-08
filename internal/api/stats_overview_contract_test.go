@@ -1,0 +1,898 @@
+package api
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gofiber/fiber/v3"
+	"github.com/ovumcy/ovumcy-web/internal/i18n"
+	"github.com/ovumcy/ovumcy-web/internal/models"
+	"github.com/ovumcy/ovumcy-web/internal/services"
+	"golang.org/x/net/html"
+	"gorm.io/gorm"
+)
+
+// The contract matrix for GET /api/v1/stats/overview.
+//
+// The endpoint used to end in `return c.JSON(stats)` — a direct serialization of
+// the domain CycleStats, forward-looking fields and all — so every ovulation
+// date, fertile window and next-period estimate that /stats and the dashboard
+// withhold left the instance as JSON. Suppression is the floor, and a floor one
+// surface stands in front of is not one (docs/SECURITY_INVARIANTS.md -> medical
+// safety).
+//
+// Each state below turns on one suppression signal through the real request
+// path — an owner in the database, an authenticated GET, the rendered response —
+// rather than through a constructed CycleStats, because the defect was in what
+// the TRANSPORT published, not in what the derivation computed.
+
+type statsOverviewState struct {
+	name string
+	// seed puts the owner into the state and returns nothing: the endpoint reads
+	// the same database the page does.
+	seed func(t *testing.T, database *gorm.DB, user models.User, today time.Time)
+	// history is the cycle starts to record, in days back from today. A state
+	// with none is the zero-completed-cycle tier; every other state carries real
+	// history, because the stats page renders its empty state instead of its stat
+	// cards without one — and a parity check against a page that rendered nothing
+	// is a comparison that never happened.
+	history []int
+	// wantReasons are the reasons the payload must NAME. Several signals can hold
+	// at once (a paused owner with no completed cycle names two), so this is a
+	// containment check, never an equality one.
+	wantReasons       []string
+	wantPredictions   bool
+	wantFertility     bool
+	wantNextPeriodSet bool
+	// wantsFertilityHook says the stats page renders data-fertility-status in
+	// this tier, so the parity subtest knows whether an absent hook is the page
+	// answering on another branch or the comparison silently not happening. It is
+	// asserted per state rather than counted across them: a counter read after
+	// t.Run would be both unsynchronised and read too early the day a subtest
+	// takes t.Parallel.
+	wantsFertilityHook bool
+	// wantCycleDataStale is the pages' out-of-date verdict for this state. It
+	// withholds the phase and the status and no date, so a state carrying it
+	// alone publishes its projection while answering "unknown" for both.
+	wantCycleDataStale bool
+	// wantCurrentFertility is the status the state publishes; empty means
+	// "unknown", the answer of every withholding state.
+	wantCurrentFertility string
+	// wantCurrentPhase, when set, is the phase the state must publish.
+	wantCurrentPhase string
+	// wantsDashboardPhase says the parity subtest also reads the dashboard
+	// header, which prints the hero's own phase label while the hero is drawn
+	// — a second phase producer the stats page never consults.
+	wantsDashboardPhase bool
+}
+
+func statsOverviewStates() []statsOverviewState {
+	return []statsOverviewState{
+		{
+			// The projected next period survives this tier: its anchor is a start
+			// the owner recorded and only the length falls back to the setting.
+			name:              "zero completed cycles",
+			seed:              func(*testing.T, *gorm.DB, models.User, time.Time) {},
+			wantReasons:       []string{"awaiting_first_cycle"},
+			wantPredictions:   false,
+			wantFertility:     true,
+			wantNextPeriodSet: true,
+			// No history, so the page renders its empty state instead of the cards.
+			wantsFertilityHook: false,
+		},
+		{
+			name:    "active pregnancy pause",
+			history: []int{62, 34, 6},
+			seed: func(t *testing.T, database *gorm.DB, user models.User, today time.Time) {
+				seedStatsOverviewLog(t, database, models.DailyLog{
+					UserID:        user.ID,
+					Date:          services.AddCalendarDays(today, -2, time.UTC),
+					PregnancyTest: models.PregnancyTestPositive,
+				})
+			},
+			wantReasons:     []string{"pregnancy_pause"},
+			wantPredictions: true,
+			wantFertility:   true,
+			// A pause reports PredictionDisabled through the cycle context, so the
+			// page takes the same facts-only branch unpredictable mode does.
+			wantsFertilityHook: false,
+		},
+		{
+			// Two completed cycles in regular mode: the fertility half is withheld
+			// under its own reason and the next period stays published — not the
+			// irregular tier's reason, and not the zero-cycle one.
+			name:               "regular mode with fewer than three completed cycles",
+			history:            []int{62, 34, 6},
+			seed:               func(*testing.T, *gorm.DB, models.User, time.Time) {},
+			wantReasons:        []string{"awaiting_more_cycles"},
+			wantPredictions:    false,
+			wantFertility:      true,
+			wantNextPeriodSet:  true,
+			wantsFertilityHook: true,
+		},
+		{
+			// Two completed cycles in irregular mode: the dashboard says "needs more
+			// cycles" for both dates, so the payload publishes neither.
+			name:    "irregular mode with fewer than three completed cycles",
+			history: []int{62, 34, 6},
+			seed: func(t *testing.T, database *gorm.DB, user models.User, today time.Time) {
+				updateStatsOverviewUser(t, database, user, map[string]any{"irregular_cycle": true})
+			},
+			wantReasons:     []string{"irregular_needs_more_cycles"},
+			wantPredictions: true,
+			wantFertility:   true,
+			// Not a facts-only tier: the page renders its status and answers
+			// "unknown", like the overdue tier.
+			wantsFertilityHook: true,
+		},
+		{
+			name:    "unpredictable cycle mode",
+			history: []int{62, 34, 6},
+			seed: func(t *testing.T, database *gorm.DB, user models.User, today time.Time) {
+				updateStatsOverviewUser(t, database, user, map[string]any{"unpredictable_cycle": true})
+			},
+			wantReasons:     []string{"unpredictable_cycle"},
+			wantPredictions: true,
+			wantFertility:   true,
+			// Unpredictable mode is the page's facts-only tier: it publishes no
+			// fertility status at all, which is the stricter answer.
+			wantsFertilityHook: false,
+		},
+		{
+			// The history is itself overdue: the anchor is the latest recorded
+			// start, so a recent one would end the state this case is about.
+			name:    "cycle overdue past its own reference length",
+			history: []int{90, 62, 45},
+			seed: func(t *testing.T, database *gorm.DB, user models.User, today time.Time) {
+				updateStatsOverviewUser(t, database, user, map[string]any{
+					"last_period_start": services.AddCalendarDays(today, -45, time.UTC),
+				})
+			},
+			wantReasons:     []string{"cycle_overdue"},
+			wantPredictions: true,
+			wantFertility:   true,
+			// The overdue tier is the one that suppresses the projection and still
+			// renders a status, so it is where the two surfaces must agree on the
+			// value rather than both on silence.
+			wantsFertilityHook: true,
+			// Cycle day 46 against a 23-day reference (17 and 28): out of date too.
+			wantCycleDataStale: true,
+		},
+		{
+			// The same overdue tier reached through the history that used to walk
+			// past it: three 28-day cycles, then one 300-day gap where a period
+			// log is missing. The mean of the recent window is 96 and the median
+			// is 28, so a gate resolved against the mean asked whether cycle day
+			// 61 was past 103 — and this endpoint published dates rolled forward
+			// from the 28 the projection actually uses. The service-level guard is
+			// TestLongCycleGateSuppressesEverySurfaceWhenAMergedCycleInflatesTheAverage;
+			// this case is here because the endpoint is a separate consumer, and a
+			// helper's verdict is not a payload.
+			name:    "cycle overdue behind a mean inflated by a merged cycle",
+			history: []int{444, 416, 388, 360, 60},
+			seed: func(t *testing.T, database *gorm.DB, user models.User, today time.Time) {
+				// The onboarding anchor the fixture account carries is newer than
+				// the logged starts and would stay active, so
+				// the running cycle has to be anchored on the start this history
+				// is about — otherwise the case is about cycle day 6.
+				updateStatsOverviewUser(t, database, user, map[string]any{
+					"last_period_start": services.AddCalendarDays(today, -60, time.UTC),
+				})
+			},
+			// cycle_overdue, not a new reason: the gate is the same one, resolved
+			// against a length an outlier cannot lift.
+			wantReasons:        []string{"cycle_overdue"},
+			wantPredictions:    true,
+			wantFertility:      true,
+			wantNextPeriodSet:  false,
+			wantsFertilityHook: true,
+			// Cycle day 61 is inside the 96-day mean the stale check measures.
+			wantCycleDataStale: false,
+		},
+		{
+			// Out of date, not yet overdue: three 28-day cycles and cycle day 31.
+			// The overdue gate needs a day past 35, so nothing is suppressed and
+			// every projected date is published — the next period and the window
+			// already behind today — while both pages print phase and fertility
+			// as unknown. The API published "luteal" and a categorical status
+			// read against a window the cycle had already outrun.
+			name:    "data out of date before the cycle is overdue",
+			history: []int{114, 86, 58, 30},
+			seed: func(t *testing.T, database *gorm.DB, user models.User, today time.Time) {
+				// The fixture's onboarding anchor (six days back) would stay
+				// active and put the account on cycle day 7.
+				updateStatsOverviewUser(t, database, user, map[string]any{
+					"last_period_start": services.AddCalendarDays(today, -30, time.UTC),
+				})
+			},
+			wantReasons:        nil,
+			wantPredictions:    false,
+			wantFertility:      false,
+			wantNextPeriodSet:  true,
+			wantsFertilityHook: true,
+			wantCycleDataStale: true,
+		},
+		{
+			// Irregular range mode, nothing withheld: cycles of 25, 45 and 28
+			// days and cycle day 20. The window runs from the shortest cycle's
+			// window start (day 6) to the longest cycle's ovulation (day 31),
+			// while the published ovulation stays the median day 14 — so today
+			// is fertile, and "luteal" would claim the ovulation is behind the
+			// owner on a day the window says it may be ahead. No phase is named,
+			// on the API and on both pages, the dashboard hero's label included.
+			name:    "irregular range mode past the median ovulation",
+			history: []int{117, 92, 47, 19},
+			seed: func(t *testing.T, database *gorm.DB, user models.User, today time.Time) {
+				updateStatsOverviewUser(t, database, user, map[string]any{
+					"irregular_cycle":   true,
+					"last_period_start": services.AddCalendarDays(today, -19, time.UTC),
+				})
+			},
+			wantReasons:          nil,
+			wantPredictions:      false,
+			wantFertility:        false,
+			wantNextPeriodSet:    true,
+			wantsFertilityHook:   true,
+			wantCycleDataStale:   false,
+			wantCurrentFertility: services.FertilityStatusFertile,
+			wantCurrentPhase:     "unknown",
+			wantsDashboardPhase:  true,
+		},
+		{
+			// The same day with bleeding logged on it and no cycle start marked:
+			// the anchor stays on the recorded start, so the window still calls
+			// today fertile, and the logged day outranks the band — "menstrual"
+			// on the API and on both pages, the dashboard hero's label included.
+			name:    "irregular range mode with bleeding logged past the median ovulation",
+			history: []int{117, 92, 47, 19},
+			seed: func(t *testing.T, database *gorm.DB, user models.User, today time.Time) {
+				updateStatsOverviewUser(t, database, user, map[string]any{
+					"irregular_cycle":   true,
+					"last_period_start": services.AddCalendarDays(today, -19, time.UTC),
+				})
+				seedStatsOverviewLog(t, database, models.DailyLog{
+					UserID:   user.ID,
+					Date:     today,
+					IsPeriod: true,
+					Flow:     models.FlowLight,
+				})
+			},
+			wantReasons:          nil,
+			wantPredictions:      false,
+			wantFertility:        false,
+			wantNextPeriodSet:    true,
+			wantsFertilityHook:   true,
+			wantCycleDataStale:   false,
+			wantCurrentFertility: services.FertilityStatusFertile,
+			wantCurrentPhase:     "menstrual",
+			wantsDashboardPhase:  true,
+		},
+	}
+}
+
+func TestStatsOverviewWithholdsEveryProjectionItsGatesRefuse(t *testing.T) {
+	for _, state := range statsOverviewStates() {
+		t.Run(state.name, func(t *testing.T) {
+			app, database, _ := newOnboardingTestAppWithLocation(t, time.UTC)
+			user, authCookie, today := newStatsOverviewOwner(t, app, database, "overview-"+strings.ReplaceAll(state.name, " ", "-")+"@example.com")
+			seedStatsOverviewCycleHistory(t, database, user, today, state.history...)
+			state.seed(t, database, user, today)
+
+			body, payload := fetchStatsOverview(t, app, authCookie)
+
+			if payload.Suppression.Predictions != state.wantPredictions {
+				t.Fatalf("suppression.predictions = %v, want %v (reasons %v)", payload.Suppression.Predictions, state.wantPredictions, payload.Suppression.Reasons)
+			}
+			if payload.Suppression.Fertility != state.wantFertility {
+				t.Fatalf("suppression.fertility = %v, want %v (reasons %v)", payload.Suppression.Fertility, state.wantFertility, payload.Suppression.Reasons)
+			}
+			for _, reason := range state.wantReasons {
+				if !containsString(payload.Suppression.Reasons, reason) {
+					t.Fatalf("suppression.reasons = %v, want it to name %q — a withheld date with no machine-readable cause is a client's guess", payload.Suppression.Reasons, reason)
+				}
+			}
+
+			// The fertility half, refused in every suppressed state here.
+			if state.wantFertility {
+				for field, value := range map[string]*string{
+					"ovulation_date":         payload.OvulationDate,
+					"fertility_window_start": payload.FertilityWindowStart,
+					"fertility_window_end":   payload.FertilityWindowEnd,
+				} {
+					if value != nil {
+						t.Fatalf("%s published as %q while suppression.fertility is true", field, *value)
+					}
+				}
+				if payload.OvulationExact {
+					t.Fatal("ovulation_exact is true beside a null ovulation_date")
+				}
+				if payload.OvulationConfirmed {
+					t.Fatal("ovulation_confirmed is true beside a null ovulation_date")
+				}
+			}
+			// The status is withheld by the fertility gate or by out-of-date
+			// data; the one state that withholds neither names its own.
+			wantStatus := state.wantCurrentFertility
+			if wantStatus == "" {
+				wantStatus = services.FertilityStatusUnknown
+			}
+			if payload.CurrentFertility != wantStatus {
+				t.Fatalf("current_fertility = %q, want %q (suppression.fertility %v, cycle_data_stale %v)", payload.CurrentFertility, wantStatus, payload.Suppression.Fertility, payload.CycleDataStale)
+			}
+			// fertility_basis is null exactly when the status is unknown, and
+			// none of these owners has a confirmed shift to read against.
+			if (payload.FertilityBasis == nil) != (payload.CurrentFertility == services.FertilityStatusUnknown) {
+				t.Fatalf("fertility_basis = %v beside current_fertility %q — null exactly when the status is unknown", payload.FertilityBasis, payload.CurrentFertility)
+			}
+			if payload.FertilityBasis != nil && *payload.FertilityBasis != services.FertilityBasisProjection {
+				t.Fatalf("fertility_basis = %q, want %q", *payload.FertilityBasis, services.FertilityBasisProjection)
+			}
+			if state.wantCurrentPhase != "" && payload.CurrentPhase != state.wantCurrentPhase {
+				t.Fatalf("current_phase = %q, want %q", payload.CurrentPhase, state.wantCurrentPhase)
+			}
+			if payload.CycleDataStale != state.wantCycleDataStale {
+				t.Fatalf("cycle_data_stale = %v, want %v", payload.CycleDataStale, state.wantCycleDataStale)
+			}
+			if payload.CycleDataStale && payload.CurrentPhase != "unknown" {
+				t.Fatalf("current_phase = %q beside cycle_data_stale, want unknown — the pages print unknown here", payload.CurrentPhase)
+			}
+			if (payload.NextPeriodStart != nil) != state.wantNextPeriodSet {
+				t.Fatalf("next_period_start present = %v, want %v", payload.NextPeriodStart != nil, state.wantNextPeriodSet)
+			}
+
+			// Recorded history is fact, not projection: it survives every tier, or
+			// the endpoint has answered "suppressed" by publishing nothing at all.
+			if payload.LastPeriodStart == nil {
+				t.Fatal("last_period_start is null — a recorded anchor is not a projection and no gate withholds it")
+			}
+
+			// current_phase is the axis orthogonal to fertility (#416), so it is
+			// published in every tier and is NOT withheld with the dates — it is
+			// pinned here against the spec's enum so a suppressed payload cannot
+			// answer with something no client is told to expect.
+			if !containsString([]string{"menstrual", "follicular", "ovulation", "luteal", "unknown"}, payload.CurrentPhase) {
+				t.Fatalf("current_phase = %q, which the published enum does not name", payload.CurrentPhase)
+			}
+
+			assertStatsOverviewFraming(t, payload)
+			assertNoInstantTimestamps(t, body)
+		})
+	}
+}
+
+// TestStatsOverviewPublishesAWholeProjectionWhenNothingSuppressesIt is the other
+// end of the matrix. Without it a handler that answered `null` to everything
+// would satisfy every assertion above.
+func TestStatsOverviewPublishesAWholeProjectionWhenNothingSuppressesIt(t *testing.T) {
+	app, database, _ := newOnboardingTestAppWithLocation(t, time.UTC)
+	user, authCookie, today := newStatsOverviewOwner(t, app, database, "overview-unsuppressed@example.com")
+	seedStatsOverviewCycleHistory(t, database, user, today, 90, 62, 34, 6)
+
+	_, payload := fetchStatsOverview(t, app, authCookie)
+
+	if payload.Suppression.Predictions || payload.Suppression.Fertility {
+		t.Fatalf("an owner with observed cycles got suppression %+v", payload.Suppression)
+	}
+	if len(payload.Suppression.Reasons) != 0 {
+		t.Fatalf("reasons = %v, want none", payload.Suppression.Reasons)
+	}
+	if payload.OvulationDate == nil || payload.FertilityWindowStart == nil || payload.FertilityWindowEnd == nil || payload.NextPeriodStart == nil {
+		t.Fatalf("an unsuppressed owner is missing projected dates: %+v", payload)
+	}
+	if payload.CompletedCycleCount < 1 {
+		t.Fatalf("completed_cycle_count = %d — the fixture did not build the state it claims", payload.CompletedCycleCount)
+	}
+	assertStatsOverviewFraming(t, payload)
+}
+
+// TestStatsOverviewAgreesWithTheStatsPageOnFertility is the parity half: the two
+// owner surfaces publish through one adapter, so they cannot differ on what a
+// suppressed tier may carry. The page is read at its rendered hook rather than
+// at a view flag — a context field is not a rendered value, and a page can
+// answer on a sibling branch first.
+//
+// The page renders that hook only in the tiers that have a fertility status —
+// unpredictable-cycle mode takes the facts-only branch instead — so a missing
+// hook cannot be a failure everywhere. It also cannot be allowed to read as
+// agreement: each state DECLARES whether the page publishes one, so a renamed
+// attribute or a widened facts-only branch reds the states that must render it
+// rather than turning every subtest into a green report about nothing.
+func TestStatsOverviewAgreesWithTheStatsPageOnFertility(t *testing.T) {
+	for _, state := range statsOverviewStates() {
+		t.Run(state.name, func(t *testing.T) {
+			app, database, _ := newOnboardingTestAppWithLocation(t, time.UTC)
+			user, authCookie, today := newStatsOverviewOwner(t, app, database, "parity-"+strings.ReplaceAll(state.name, " ", "-")+"@example.com")
+			seedStatsOverviewCycleHistory(t, database, user, today, state.history...)
+			state.seed(t, database, user, today)
+
+			_, payload := fetchStatsOverview(t, app, authCookie)
+			document := fetchStatsPageDocument(t, app, authCookie)
+
+			node := findHTMLNodeWithAttr(document, "data-fertility-status")
+			if (node != nil) != state.wantsFertilityHook {
+				t.Fatalf("the page rendered data-fertility-status = %v, want %v — with no hook this test compares nothing and would pass the same way if the two surfaces disagreed", node != nil, state.wantsFertilityHook)
+			}
+			if node != nil {
+				if rendered := htmlAttr(node, "data-fertility-status"); rendered != payload.CurrentFertility {
+					t.Fatalf("the page renders fertility %q while the API publishes %q", rendered, payload.CurrentFertility)
+				}
+				if rendered := htmlAttr(node, "data-stats-current-phase"); rendered != payload.CurrentPhase {
+					t.Fatalf("the page renders phase %q while the API publishes %q", rendered, payload.CurrentPhase)
+				}
+				if rendered := findHTMLNodeWithAttr(document, "data-stats-phase-estimated") != nil; rendered != payload.CycleDataStale {
+					t.Fatalf("the page renders its out-of-date notice = %v while the API publishes cycle_data_stale %v", rendered, payload.CycleDataStale)
+				}
+			}
+			if payload.Suppression.Fertility && findHTMLNodeWithAttr(document, "data-fertile-window") != nil {
+				t.Fatal("the page names a fertile window while the API suppresses the fertility half")
+			}
+			if state.wantsDashboardPhase {
+				dashboard := fetchStatsOverviewDashboardDocument(t, app, authCookie)
+				// The header prints the hero's label in place of the published
+				// phase only while the ribbon is drawn; without it this compares
+				// the published phase with itself.
+				if ribbon := findHTMLNodeWithAttr(dashboard, "data-cycle-ribbon-visible"); ribbon == nil || htmlAttr(ribbon, "data-cycle-ribbon-visible") != "true" {
+					t.Fatal("the dashboard drew no cycle ribbon, so its header did not read the hero's phase")
+				}
+				header := findHTMLNodeWithAttr(dashboard, "data-dashboard-status-header")
+				if header == nil {
+					t.Fatal("the dashboard rendered no status header")
+				}
+				if rendered := htmlAttr(header, "data-dashboard-phase"); rendered != payload.CurrentPhase {
+					t.Fatalf("the dashboard header renders phase %q while the API publishes %q", rendered, payload.CurrentPhase)
+				}
+				if rendered := htmlAttr(header, "data-fertility-status"); rendered != payload.CurrentFertility {
+					t.Fatalf("the dashboard header renders fertility %q while the API publishes %q", rendered, payload.CurrentFertility)
+				}
+			}
+		})
+	}
+}
+
+func fetchStatsOverviewDashboardDocument(t *testing.T, app *fiber.App, authCookie string) *html.Node {
+	t.Helper()
+
+	request := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
+	request.Header.Set("Accept-Language", "en")
+	request.Header.Set("Cookie", joinCookieHeader(authCookie, timezoneCookieName+"=UTC"))
+	request.Header.Set(timezoneHeaderName, "UTC")
+
+	response := mustAppResponse(t, app, request)
+	assertStatusCode(t, response, http.StatusOK)
+	return mustParseHTMLDocument(t, mustReadBodyString(t, response.Body))
+}
+
+// TestStatsOverviewAgreesWithTheStatsPageOnAPublishedProjection is the parity
+// case with something to publish: both surfaces name a fertility status, and the
+// page carries the fertile-window line the API's own status implies. The
+// suppressed states above can be satisfied by two surfaces that publish nothing;
+// this one cannot.
+func TestStatsOverviewAgreesWithTheStatsPageOnAPublishedProjection(t *testing.T) {
+	app, database, _ := newOnboardingTestAppWithLocation(t, time.UTC)
+	user, authCookie, today := newStatsOverviewOwner(t, app, database, "parity-unsuppressed@example.com")
+	seedStatsOverviewCycleHistory(t, database, user, today, 90, 62, 34, 6)
+
+	_, payload := fetchStatsOverview(t, app, authCookie)
+	document := fetchStatsPageDocument(t, app, authCookie)
+
+	node := findHTMLNodeWithAttr(document, "data-fertility-status")
+	if node == nil {
+		t.Fatal("the page rendered no fertility status for an owner whose projection is published")
+	}
+	if rendered := htmlAttr(node, "data-fertility-status"); rendered != payload.CurrentFertility {
+		t.Fatalf("the page renders fertility %q while the API publishes %q", rendered, payload.CurrentFertility)
+	}
+	if payload.Suppression.Fertility {
+		t.Fatalf("an owner with observed cycles got the fertility gate: %v", payload.Suppression.Reasons)
+	}
+	if payload.CycleDataStale {
+		t.Fatal("cycle_data_stale on cycle day 7 of a 28-day history")
+	}
+	if payload.FertilityBasis == nil || *payload.FertilityBasis != services.FertilityBasisProjection {
+		t.Fatalf("fertility_basis = %v, want %q beside a published projected status", payload.FertilityBasis, services.FertilityBasisProjection)
+	}
+
+	// The window line is the page's own consequence of that status, so the two
+	// must not disagree about whether today is inside the fertile window.
+	renderedWindow := findHTMLNodeWithAttr(document, "data-fertile-window") != nil
+	if renderedWindow != (payload.CurrentFertility == services.FertilityStatusFertile) {
+		t.Fatalf("the page renders the fertile-window line = %v while the API publishes fertility %q", renderedWindow, payload.CurrentFertility)
+	}
+}
+
+// TestStatsOverviewPublishesTheConfirmedOvulationDayNotTheModelsProjection is
+// the JSON-API half of the confirmed-ovulation substitution the calendar's
+// solid marker, the dashboard's ovulation line and four other surfaces
+// already apply (services.ConfirmedCurrentCycleOvulation,
+// dashboard_confirmed_ovulation_test.go). The model and the confirmed day are
+// made to differ deliberately, the way MED-2's trace does: a median-cycle
+// projection lands on cycle day 14, while a recorded BBT shift confirms cycle
+// day 17. Before this fix the endpoint answered the model's superseded day;
+// it must now answer the confirmed one, with ovulation_confirmed reporting
+// true for it — the same "confirmed, not modeled" bit the dashboard carries
+// as DisplayOvulationConfirmed beside its own DisplayOvulationExact
+// (dashboard_cycle.go). This fixture's luteal phase is not clamped, so
+// ovulation_exact is true here too; the case that pulls the two apart is
+// TestStatsOverviewConfirmedOvulationIsIndependentOfOvulationExact below.
+func TestStatsOverviewPublishesTheConfirmedOvulationDayNotTheModelsProjection(t *testing.T) {
+	app, database, _ := newOnboardingTestAppWithLocation(t, time.UTC)
+	user := createOnboardingTestUser(t, database, "overview-confirmed-ovulation@example.com", "StrongPass1", true)
+	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
+	today := services.DateAtLocation(time.Now().In(time.UTC), time.UTC)
+	updateStatsOverviewUser(t, database, user, map[string]any{"track_bbt": true})
+
+	// Three prior 28-day cycles fix the median at 28 and lift the
+	// zero-completed-cycle floor; the fourth start opens the CURRENT cycle at
+	// today-20 (cycle day 21 today). The median projects ovulation on cycle
+	// day 14 (cycleLen 28 - luteal 14), i.e. today-7.
+	seedStatsOverviewCycleHistory(t, database, user, today, 104, 76, 48, 20)
+
+	// Undisturbed temperatures fill the shared 3-over-6 detector's 6-day
+	// coverline window (cycle days 12-17 = today-9..today-4); three elevated
+	// days follow (cycle days 18-20 = today-3..today-1). The detector confirms
+	// ovulation the day BEFORE the shift: cycle day 17 = today-4 — three days
+	// off the model's today-7, so the two dates cannot pass by coincidence.
+	for _, offset := range []int{9, 8, 7, 6, 5, 4} {
+		seedStatsOverviewLog(t, database, models.DailyLog{UserID: user.ID, Date: services.AddCalendarDays(today, -offset, time.UTC), BBT: new(dashboardConfirmedOvulationLowBBT)})
+	}
+	for _, offset := range []int{3, 2, 1} {
+		seedStatsOverviewLog(t, database, models.DailyLog{UserID: user.ID, Date: services.AddCalendarDays(today, -offset, time.UTC), BBT: new(dashboardConfirmedOvulationHighBBT)})
+	}
+
+	_, payload := fetchStatsOverview(t, app, authCookie)
+
+	wantConfirmed := services.AddCalendarDays(today, -4, time.UTC).Format(statsOverviewDateLayout)
+	wantModel := services.AddCalendarDays(today, -7, time.UTC).Format(statsOverviewDateLayout)
+
+	if payload.OvulationDate == nil {
+		t.Fatal("ovulation_date is null for an owner with a published projection")
+	}
+	if *payload.OvulationDate == wantModel {
+		t.Fatalf("ovulation_date = %s — the model's projection the owner's own temperatures already superseded; want the confirmed %s", *payload.OvulationDate, wantConfirmed)
+	}
+	if *payload.OvulationDate != wantConfirmed {
+		t.Fatalf("ovulation_date = %s, want the BBT-confirmed %s", *payload.OvulationDate, wantConfirmed)
+	}
+	if !payload.OvulationConfirmed {
+		t.Fatal("ovulation_confirmed = false beside a BBT-confirmed ovulation_date — the JSON view must name the substitution the calendar and dashboard already applied")
+	}
+	if !payload.OvulationExact {
+		t.Fatal("ovulation_exact = false: this fixture's luteal phase (14, cycle length 28) is not clamped, so the model's own fit is exact independent of the confirmation")
+	}
+	if payload.Suppression.Fertility {
+		t.Fatalf("suppression.fertility = true for an owner with observed cycles and a confirmed shift: %v", payload.Suppression.Reasons)
+	}
+}
+
+// TestStatsOverviewConfirmedOvulationIsIndependentOfOvulationExact pins the
+// boundary TestStatsOverviewPublishesTheConfirmedOvulationDayNotTheModelsProjection
+// cannot: ovulation_confirmed and ovulation_exact are two different signals,
+// mirroring the dashboard's own DisplayOvulationConfirmed vs
+// DisplayOvulationExact (dashboard_cycle.go), and a single collapsed boolean
+// would hide whichever one it discarded. The fixture forces the fallback
+// 14-day luteal phase to be CLAMPED (a short 18-day median cycle: the shared
+// CalcOvulationDay caps a 14-day luteal phase at cycleLen-5=13), so
+// ovulation_exact must read false, while the current cycle's own BBT shift
+// still confirms an ovulation — a fact ovulation_confirmed must still report
+// regardless of the model's own fit.
+func TestStatsOverviewConfirmedOvulationIsIndependentOfOvulationExact(t *testing.T) {
+	app, database, _ := newOnboardingTestAppWithLocation(t, time.UTC)
+	user := createOnboardingTestUser(t, database, "overview-confirmed-not-exact@example.com", "StrongPass1", true)
+	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
+	today := services.DateAtLocation(time.Now().In(time.UTC), time.UTC)
+	updateStatsOverviewUser(t, database, user, map[string]any{"track_bbt": true})
+
+	// Three prior 18-day cycles fix the median at 18 (no BBT data recorded in
+	// them, so InferUserLutealPhase finds nothing to personalize and the
+	// 14-day fallback stays in force); the fourth start opens the CURRENT
+	// cycle at today-11 (cycle day 12 today). CalcOvulationDay(18, 14) clamps
+	// the fallback to 13 (18-5), landing the model's projection on cycle day
+	// 5 = today-7, with ovulation_exact = false.
+	seedStatsOverviewCycleHistory(t, database, user, today, 72, 54, 36, 11)
+
+	// Undisturbed temperatures fill the coverline window (cycle days 3-8 =
+	// today-9..today-4); three elevated days follow (cycle days 9-11 =
+	// today-3..today-1). The detector confirms ovulation the day BEFORE the
+	// shift: cycle day 8 = today-4.
+	for _, offset := range []int{9, 8, 7, 6, 5, 4} {
+		seedStatsOverviewLog(t, database, models.DailyLog{UserID: user.ID, Date: services.AddCalendarDays(today, -offset, time.UTC), BBT: new(dashboardConfirmedOvulationLowBBT)})
+	}
+	for _, offset := range []int{3, 2, 1} {
+		seedStatsOverviewLog(t, database, models.DailyLog{UserID: user.ID, Date: services.AddCalendarDays(today, -offset, time.UTC), BBT: new(dashboardConfirmedOvulationHighBBT)})
+	}
+
+	_, payload := fetchStatsOverview(t, app, authCookie)
+
+	wantConfirmed := services.AddCalendarDays(today, -4, time.UTC).Format(statsOverviewDateLayout)
+
+	if payload.OvulationDate == nil {
+		t.Fatalf("ovulation_date is absent, want the BBT-confirmed %s", wantConfirmed)
+	}
+	if *payload.OvulationDate != wantConfirmed {
+		t.Fatalf("ovulation_date = %s, want the BBT-confirmed %s", *payload.OvulationDate, wantConfirmed)
+	}
+	if !payload.OvulationConfirmed {
+		t.Fatal("ovulation_confirmed = false beside a BBT-confirmed ovulation_date")
+	}
+	if payload.OvulationExact {
+		t.Fatal("ovulation_exact = true, want false: the fixture's 18-day median clamps the 14-day fallback luteal phase, and a confirmed observation must not silently launder that into an exact model fit")
+	}
+}
+
+// TestStatsOverviewConfirmsALateShiftOnOrAfterTheProjectedNextPeriodStart is
+// the JSON-API half of the current-cycle detection window fix
+// (services.ConfirmedCurrentCycleOvulation): a thermal shift whose coverline
+// window straddles the model's own projected next period start is still an
+// event of the CURRENT cycle, and GET /api/v1/stats/overview must confirm it
+// like the calendar and the dashboard do. The cohort is seedLateThermalShiftCycle
+// (dashboard_confirmed_ovulation_test.go), shared with the rendered half, and it
+// is read on both sides of the projected start: a shift confirmed ON it and one
+// confirmed a day AFTER it, the latter being the case where the confirmed day
+// outruns NextPeriodStart rather than landing on it.
+//
+// next_period_start carries the cohort's one real anchor. Every other date in
+// either half is derived from the same today the seed used, so this is the
+// single point where the seed's arithmetic is checked against the model's.
+func TestStatsOverviewConfirmsALateShiftOnOrAfterTheProjectedNextPeriodStart(t *testing.T) {
+	for _, testCase := range []struct {
+		name               string
+		daysPastProjection int
+	}{
+		{name: "on the projected start", daysPastProjection: 0},
+		{name: "after the projected start", daysPastProjection: 1},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			app, database, _ := newOnboardingTestAppWithLocation(t, time.UTC)
+			email := fmt.Sprintf("overview-late-shift-%d@example.com", testCase.daysPastProjection)
+			user := createOnboardingTestUser(t, database, email, "StrongPass1", true)
+			authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
+			today := services.DateAtLocation(time.Now().In(time.UTC), time.UTC)
+			updateStatsOverviewUser(t, database, user, map[string]any{"track_bbt": true})
+			confirmedDay, projectedStart := seedLateThermalShiftCycle(t, database, user, today, testCase.daysPastProjection)
+
+			_, payload := fetchStatsOverview(t, app, authCookie)
+
+			wantProjected := projectedStart.Format(statsOverviewDateLayout)
+			if payload.NextPeriodStart == nil {
+				t.Fatalf("fixture anchor: next_period_start is absent, want the projected %s", wantProjected)
+			}
+			if *payload.NextPeriodStart != wantProjected {
+				t.Fatalf("fixture anchor: next_period_start = %s, want %s — the seed's projection and the model's must be one date before the confirmed day is read against it", *payload.NextPeriodStart, wantProjected)
+			}
+
+			wantConfirmed := confirmedDay.Format(statsOverviewDateLayout)
+			if payload.OvulationDate == nil {
+				t.Fatalf("ovulation_date is absent, want the BBT-confirmed %s (a shift recorded on or after the projected next period start is still this cycle's)", wantConfirmed)
+			}
+			if *payload.OvulationDate != wantConfirmed {
+				t.Fatalf("ovulation_date = %s, want the BBT-confirmed %s (a shift recorded on or after the projected next period start is still this cycle's)", *payload.OvulationDate, wantConfirmed)
+			}
+			if !payload.OvulationConfirmed {
+				t.Fatal("ovulation_confirmed = false beside a BBT-confirmed ovulation_date recorded on or after the projected next period start")
+			}
+		})
+	}
+}
+
+// TestStatsOverviewSuppressedOvulationIsNeverReportedConfirmed pins the floor
+// PublishedOverviewStats' own doc comment names: ovulation_confirmed is
+// derived off the CLEARED stats, never off the ConfirmedCurrentCycleOvulation
+// call alone, so a suppressed projection cannot assert a confirmed day even if a
+// real BBT shift exists in the account's history. The fixture is
+// TestStatsOverviewPublishesTheConfirmedOvulationDayNotTheModelsProjection's,
+// with unpredictable-cycle mode layered on top — the same temperatures that
+// confirm a day there must confirm nothing here, matching the suppression
+// gate ConfirmedCurrentCycleOvulation already reads for itself
+// (FertilityProjectionSuppressed, cycle_signals.go).
+func TestStatsOverviewSuppressedOvulationIsNeverReportedConfirmed(t *testing.T) {
+	app, database, _ := newOnboardingTestAppWithLocation(t, time.UTC)
+	user := createOnboardingTestUser(t, database, "overview-confirmed-suppressed@example.com", "StrongPass1", true)
+	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
+	today := services.DateAtLocation(time.Now().In(time.UTC), time.UTC)
+	updateStatsOverviewUser(t, database, user, map[string]any{"track_bbt": true, "unpredictable_cycle": true})
+
+	seedStatsOverviewCycleHistory(t, database, user, today, 104, 76, 48, 20)
+	for _, offset := range []int{9, 8, 7, 6, 5, 4} {
+		seedStatsOverviewLog(t, database, models.DailyLog{UserID: user.ID, Date: services.AddCalendarDays(today, -offset, time.UTC), BBT: new(dashboardConfirmedOvulationLowBBT)})
+	}
+	for _, offset := range []int{3, 2, 1} {
+		seedStatsOverviewLog(t, database, models.DailyLog{UserID: user.ID, Date: services.AddCalendarDays(today, -offset, time.UTC), BBT: new(dashboardConfirmedOvulationHighBBT)})
+	}
+
+	_, payload := fetchStatsOverview(t, app, authCookie)
+
+	if !payload.Suppression.Fertility {
+		t.Fatal("suppression.fertility = false for an unpredictable-cycle account — fixture did not build the state it claims")
+	}
+	if payload.OvulationDate != nil {
+		t.Fatalf("ovulation_date = %s while suppression.fertility is true", *payload.OvulationDate)
+	}
+	if payload.OvulationConfirmed {
+		t.Fatal("ovulation_confirmed = true beside a null ovulation_date — a suppressed projection must never assert a confirmed day, even with a real BBT shift on record")
+	}
+}
+
+// TestStatsOverviewCarriesTheDisclaimerWithoutTheLanguageMiddleware pins the
+// framing against its own wiring.
+//
+// The disclaimer is resolved from the per-request catalogue, which
+// LanguageMiddleware fills. Every other test here mounts that middleware, so
+// none of them can see what happens without it — and the fallback in
+// translateMessage renders a miss as the KEY, which would publish the literal
+// "medical.disclaimer" as the owner-visible safety text with the whole suite
+// green. Here the resolver runs against a request that carries no catalogue at
+// all, which is what a route reached ahead of that middleware would hand it.
+func TestStatsOverviewCarriesTheDisclaimerWithoutTheLanguageMiddleware(t *testing.T) {
+	manager, err := i18n.NewManager("en")
+	if err != nil {
+		t.Fatalf("init i18n: %v", err)
+	}
+	probe := func(t *testing.T, handler *Handler) string {
+		t.Helper()
+
+		app := fiber.New()
+		app.Get("/probe", func(c fiber.Ctx) error {
+			return c.SendString(handler.medicalDisclaimer(c))
+		})
+
+		response := mustAppResponse(t, app, httptest.NewRequest(http.MethodGet, "/probe", nil))
+		assertStatusCode(t, response, http.StatusOK)
+		return mustReadBodyString(t, response.Body)
+	}
+
+	t.Run("falls back to the server's default language", func(t *testing.T) {
+		disclaimer := probe(t, &Handler{i18n: manager})
+
+		if disclaimer == medicalDisclaimerMessageKey || strings.TrimSpace(disclaimer) == "" {
+			t.Fatalf("disclaimer = %q with no request catalogue — the payload must fall back to the server's default language, not to the key", disclaimer)
+		}
+	})
+
+	// A handler with no catalogue at all is never production — NewHandler takes a
+	// manager — only a partially wired test one. It answers empty rather than
+	// panicking, matching what the egress adapter does with a nil manager, and
+	// never the key: an empty string is visibly missing framing, while the key
+	// would read as framing that happens to be untranslated.
+	t.Run("a handler with no catalogue answers empty, never the key", func(t *testing.T) {
+		if disclaimer := probe(t, &Handler{}); disclaimer != "" {
+			t.Fatalf("disclaimer = %q with no i18n manager, want empty", disclaimer)
+		}
+	})
+}
+
+func newStatsOverviewOwner(t *testing.T, app *fiber.App, database *gorm.DB, email string) (models.User, string, time.Time) {
+	t.Helper()
+
+	user := createOnboardingTestUser(t, database, email, "StrongPass1", true)
+	authCookie := loginAndExtractAuthCookie(t, app, user.Email, "StrongPass1")
+	today := services.DateAtLocation(time.Now().In(time.UTC), time.UTC)
+	updateStatsOverviewUser(t, database, user, map[string]any{
+		"cycle_length":      28,
+		"period_length":     5,
+		"last_period_start": services.AddCalendarDays(today, -6, time.UTC),
+	})
+	return user, authCookie, today
+}
+
+// seedStatsOverviewCycleHistory records three explicit cycle starts, which is
+// what lifts the zero-completed-cycle floor: the projection then rests on
+// observed lengths rather than on the onboarding setting.
+func seedStatsOverviewCycleHistory(t *testing.T, database *gorm.DB, user models.User, today time.Time, daysBackList ...int) {
+	t.Helper()
+
+	if len(daysBackList) == 0 {
+		return
+	}
+	for _, daysBack := range daysBackList {
+		seedStatsOverviewLog(t, database, models.DailyLog{
+			UserID:     user.ID,
+			Date:       services.AddCalendarDays(today, -daysBack, time.UTC),
+			IsPeriod:   true,
+			Flow:       models.FlowMedium,
+			CycleStart: true,
+		})
+	}
+}
+
+func seedStatsOverviewLog(t *testing.T, database *gorm.DB, log models.DailyLog) {
+	t.Helper()
+
+	if err := database.Create(&log).Error; err != nil {
+		t.Fatalf("seed daily log: %v", err)
+	}
+}
+
+// updateStatsOverviewUser writes stored preferences onto a test account. It is
+// named after the file it started in but is shared across the package, so its
+// failure message names the account rather than any one surface.
+func updateStatsOverviewUser(t *testing.T, database *gorm.DB, user models.User, updates map[string]any) {
+	t.Helper()
+
+	if err := database.Model(&models.User{}).Where("id = ?", user.ID).Updates(updates).Error; err != nil {
+		t.Fatalf("update test owner: %v", err)
+	}
+}
+
+func fetchStatsOverview(t *testing.T, app *fiber.App, authCookie string) (string, StatsOverviewResponse) {
+	t.Helper()
+
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/stats/overview", nil)
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Accept-Language", "en")
+	request.Header.Set("Cookie", joinCookieHeader(authCookie, timezoneCookieName+"=UTC"))
+	request.Header.Set(timezoneHeaderName, "UTC")
+
+	response := mustAppResponse(t, app, request)
+	assertStatusCode(t, response, http.StatusOK)
+	body := mustReadBodyString(t, response.Body)
+
+	payload := StatsOverviewResponse{}
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		t.Fatalf("decode stats overview payload: %v\n%s", err, body)
+	}
+	return body, payload
+}
+
+func fetchStatsPageDocument(t *testing.T, app *fiber.App, authCookie string) *html.Node {
+	t.Helper()
+
+	request := httptest.NewRequest(http.MethodGet, "/stats", nil)
+	request.Header.Set("Accept-Language", "en")
+	request.Header.Set("Cookie", joinCookieHeader(authCookie, timezoneCookieName+"=UTC"))
+	request.Header.Set(timezoneHeaderName, "UTC")
+
+	response := mustAppResponse(t, app, request)
+	assertStatusCode(t, response, http.StatusOK)
+	return mustParseHTMLDocument(t, mustReadBodyString(t, response.Body))
+}
+
+// assertStatsOverviewFraming pins the safety framing every state carries: the
+// localized disclaimer AND the stable key beside it, so a client branches on the
+// key and a test cannot go quiet when the wording changes.
+func assertStatsOverviewFraming(t *testing.T, payload StatsOverviewResponse) {
+	t.Helper()
+
+	if payload.DisclaimerKey != medicalDisclaimerMessageKey {
+		t.Fatalf("disclaimer_key = %q, want %q", payload.DisclaimerKey, medicalDisclaimerMessageKey)
+	}
+	if strings.TrimSpace(payload.Disclaimer) == "" || payload.Disclaimer == medicalDisclaimerMessageKey {
+		t.Fatalf("disclaimer = %q — the payload carries no resolved safety framing", payload.Disclaimer)
+	}
+	if payload.Suppression.Reasons == nil {
+		t.Fatal("suppression.reasons is null — an absent list and an empty one must not mean the same thing to a client")
+	}
+}
+
+// assertNoInstantTimestamps refuses the shape the endpoint used to publish: the
+// domain struct's time.Time fields serialize as RFC 3339 instants, which name a
+// timezone the owner never chose and carry a zero date as a real one.
+func assertNoInstantTimestamps(t *testing.T, body string) {
+	t.Helper()
+
+	if strings.Contains(body, "T00:00:00") {
+		t.Fatalf("the payload carries an instant, not a calendar day:\n%s", body)
+	}
+	if strings.Contains(body, "0001-01-01") {
+		t.Fatalf("the payload publishes a zero date instead of null:\n%s", body)
+	}
+}
+
+func findHTMLNodeWithAttr(document *html.Node, attribute string) *html.Node {
+	return htmlFindElement(document, func(node *html.Node) bool {
+		return node.Type == html.ElementNode && htmlHasAttr(node, attribute)
+	})
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}

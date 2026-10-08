@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -24,6 +25,7 @@ func (handler *Handler) buildDashboardViewData(ctx context.Context, user *models
 		"CycleHero":                             viewData.CycleHero,
 		"CycleDayReference":                     viewData.CycleContext.CycleDayReference,
 		"CycleDayWarning":                       viewData.CycleContext.CycleDayWarning,
+		"LateCycle":                             viewData.CycleContext.LateCycle,
 		"CycleDataStale":                        viewData.CycleContext.CycleDataStale,
 		"PredictionDisabled":                    viewData.CycleContext.PredictionDisabled,
 		"DisplayNextPeriodStart":                viewData.CycleContext.DisplayNextPeriodStart,
@@ -38,8 +40,10 @@ func (handler *Handler) buildDashboardViewData(ctx context.Context, user *models
 		"DisplayOvulationRangeEnd":              viewData.CycleContext.DisplayOvulationRangeEnd,
 		"DisplayOvulationUseRange":              viewData.CycleContext.DisplayOvulationUseRange,
 		"DisplayOvulationNeedsData":             viewData.CycleContext.DisplayOvulationNeedsData,
+		"DisplayOvulationConfirmed":             viewData.CycleContext.DisplayOvulationConfirmed,
 		"DisplayOvulationExact":                 viewData.CycleContext.DisplayOvulationExact,
 		"DisplayOvulationImpossible":            viewData.CycleContext.DisplayOvulationImpossible,
+		"NextPeriodEstimatePaused":              viewData.CycleContext.NextPeriodEstimatePaused,
 		"NextPeriodInPast":                      viewData.CycleContext.NextPeriodInPast,
 		"OvulationInPast":                       viewData.CycleContext.OvulationInPast,
 		"ShowReminderBanner":                    viewData.ReminderBanner.Show,
@@ -52,7 +56,8 @@ func (handler *Handler) buildDashboardViewData(ctx context.Context, user *models
 		"Yesterday":                             viewData.Yesterday.Format("2006-01-02"),
 		"YesterdayMonth":                        viewData.YesterdayMonth,
 		"FormattedDate":                         viewData.FormattedDate,
-		"TodayEntry":                            viewData.TodayLog,
+		"TodayEntry":                            viewData.TodayEntry,
+		"TodayPeriodFromStoredStart":            viewData.TodayPeriodFromStoredStart,
 		"TodayLog":                              viewData.TodayLog,
 		"TodayHasData":                          viewData.TodayHasData,
 		"TodayEntryExists":                      viewData.TodayEntryExists,
@@ -68,6 +73,12 @@ func (handler *Handler) buildDashboardViewData(ctx context.Context, user *models
 		"ShowBBTField":                          viewData.ShowBBTField,
 		"ShowCycleFactors":                      viewData.ShowCycleFactors,
 		"ShowNotesField":                        viewData.ShowNotesField,
+		"MoreFieldsOpen":                        viewData.MoreFieldsOpen,
+		"ShowOvulationEstimate":                 viewData.ShowOvulationEstimate,
+		"ShowFirstCycleBridge":                  viewData.ShowFirstCycleBridge,
+		"ShowMoreCyclesBridge":                  viewData.ShowMoreCyclesBridge,
+		"ShowFertilityStatus":                   viewData.ShowFertilityStatus,
+		"ShowBBTInVisibleTier":                  viewData.ShowBBTInVisibleTier,
 		"TemperatureUnit":                       bbtView.Unit,
 		"TemperatureUnitSymbol":                 bbtView.Symbol,
 		"TemperatureInputMin":                   bbtView.Min,
@@ -88,6 +99,7 @@ func (handler *Handler) buildDashboardViewData(ctx context.Context, user *models
 		"MissedDay":                             viewData.MissedDay.Format("2006-01-02"),
 		"MissedDayMonth":                        viewData.MissedDay.Format("2006-01"),
 		"ShowCycleStartSuggestion":              viewData.ShowCycleStartSuggestion,
+		"ShowCycleStartQuestion":                viewData.ShowCycleStartQuestion,
 		"ShowSpottingCycleWarning":              viewData.ShowSpottingCycleWarning,
 		"PredictionExplanationPrimaryKey":       viewData.PredictionExplanationPrimaryKey,
 		"PredictionExplanationSecondaryKey":     viewData.PredictionExplanationSecondaryKey,
@@ -97,6 +109,7 @@ func (handler *Handler) buildDashboardViewData(ctx context.Context, user *models
 		"HasPredictionFactorHint":               viewData.HasPredictionFactorHint,
 		"UsageGoalLabelKey":                     services.UsageGoalTranslationKey(user.UsageGoal),
 		"UsageGoalSummaryKey":                   services.UsageGoalSummaryTranslationKey(user.UsageGoal),
+		"UsageGoalAlternatives":                 services.AlternativeUsageGoals(user.UsageGoal),
 		"IsOwner":                               viewData.IsOwner,
 	}
 	return data, nil
@@ -116,6 +129,7 @@ func (handler *Handler) buildDayEditorPartialData(ctx context.Context, user *mod
 		"IsFutureDate":                          viewData.IsFutureDate,
 		"NoDataLabel":                           translateMessage(messages, "common.not_available"),
 		"Log":                                   viewData.Log,
+		"PeriodFromStoredStart":                 viewData.PeriodFromStoredStart,
 		"Symptoms":                              viewData.Symptoms,
 		"PrimarySymptoms":                       viewData.PrimarySymptoms,
 		"ExtraSymptoms":                         viewData.ExtraSymptoms,
@@ -145,6 +159,7 @@ func (handler *Handler) buildDayEditorPartialData(ctx context.Context, user *mod
 		"ManualCycleStartPotentialImplantation": viewData.ManualCycleStartPolicy.PotentialImplantation,
 		"ShowFutureCycleStartNotice":            viewData.ShowFutureCycleStartNotice,
 		"ShowCycleStartSuggestion":              viewData.ShowCycleStartSuggestion,
+		"ShowCycleStartQuestion":                viewData.ShowCycleStartQuestion,
 		"ShowSpottingCycleWarning":              viewData.ShowSpottingCycleWarning,
 		"EditMode":                              editMode,
 		"IsOwner":                               viewData.IsOwner,
@@ -167,20 +182,34 @@ func buildBBTFieldViewData(messages map[string]string, unit string) bbtFieldView
 	symbol := services.TemperatureUnitSymbol(resolvedUnit)
 	minLabel := fmt.Sprintf("%.2f", min)
 	maxLabel := fmt.Sprintf("%.2f", max)
+	// The input attributes stay machine-readable at two decimals; the copy the
+	// owner reads drops the padding zeros (34-43 °C, 93.2-109.4 °F).
+	minText := trimTemperatureLabelZeros(minLabel)
+	maxText := trimTemperatureLabelZeros(maxLabel)
 
 	return bbtFieldViewData{
 		Unit:       resolvedUnit,
 		Symbol:     symbol,
 		Min:        minLabel,
 		Max:        maxLabel,
-		RangeHint:  formatBBTLocalizedMessage(messages, "dashboard.bbt_range_hint", "Allowed range: %s-%s %s.", minLabel, maxLabel, symbol),
-		RangeError: formatBBTLocalizedMessage(messages, "dashboard.bbt_range_error", "Enter a value between %s and %s %s.", minLabel, maxLabel, symbol),
+		RangeHint:  formatBBTLocalizedMessage(messages, "dashboard.bbt_range_hint", "Allowed range: %s-%s %s.", minText, maxText, symbol),
+		RangeError: formatBBTLocalizedMessage(messages, "dashboard.bbt_range_error", "Enter a value between %s and %s %s.", minText, maxText, symbol),
 	}
 }
 
+// trimTemperatureLabelZeros drops the padding a fixed two-decimal format adds:
+// "34.00" reads as "34", "93.20" as "93.2". A label without a decimal point is
+// returned untouched, so the trim can never eat an integer's own zeros.
+func trimTemperatureLabelZeros(label string) string {
+	if !strings.Contains(label, ".") {
+		return label
+	}
+	return strings.TrimSuffix(strings.TrimRight(label, "0"), ".")
+}
+
 func formatBBTLocalizedMessage(messages map[string]string, key string, fallback string, min string, max string, symbol string) string {
-	pattern := translateMessage(messages, key)
-	if pattern == "" || pattern == key {
+	pattern, translated := lookupMessage(messages, key)
+	if !translated {
 		pattern = fallback
 	}
 	return fmt.Sprintf(pattern, min, max, symbol)

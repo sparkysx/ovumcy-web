@@ -34,16 +34,16 @@ func BenchmarkBuildCycleStats(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		_ = BuildCycleStats(logs, now)
+		_ = BuildCycleStats(logs, now, BoundaryContext{})
 	}
 }
 
-func BenchmarkDetectCycleStarts(b *testing.B) {
+func BenchmarkCycleBoundaries(b *testing.B) {
 	logs := benchCycleLogs(24)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		_ = DetectCycleStarts(logs)
+		_ = CycleBoundaries(logs, BoundaryContext{})
 	}
 }
 

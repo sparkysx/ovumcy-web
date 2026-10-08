@@ -2,6 +2,7 @@ package services
 
 import (
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/ovumcy/ovumcy-web/internal/models"
@@ -29,7 +30,7 @@ func manualCycleStartMaxDate(now time.Time, location *time.Location) time.Time {
 		location = time.UTC
 	}
 	today := DateAtLocation(now.In(location), location)
-	return today.AddDate(0, 0, manualCycleStartFutureDays)
+	return AddCalendarDays(today, manualCycleStartFutureDays, location)
 }
 
 func IsAllowedManualCycleStartDate(day time.Time, now time.Time, location *time.Location) bool {
@@ -44,21 +45,70 @@ func IsAllowedManualCycleStartDate(day time.Time, now time.Time, location *time.
 	return !day.After(manualCycleStartMaxDate(now, location))
 }
 
+// ErrDayPeriodDateInvalid refuses a day write that records a period on a day
+// past the bound a cycle start may be marked on. It wraps
+// ErrManualCycleStartDateInvalid, so every transport answers it with the
+// cycle-start refusal and its localized message: a period turned on is the
+// start of bleeding, the question that refusal already answers.
+var ErrDayPeriodDateInvalid = fmt.Errorf("%w: a period recorded past the cycle-start bound", ErrManualCycleStartDateInvalid)
+
+// ErrDayPregnancyTestDateInvalid refuses a day write that records a
+// pregnancy-test result past the same bound. It deliberately does not wrap
+// ErrManualCycleStartDateInvalid: the write names no cycle start, so it carries
+// a refusal and a message of its own.
+var ErrDayPregnancyTestDateInvalid = errors.New("pregnancy test date invalid")
+
+// validateDayObservationDate decides whether a day write may store payload over
+// stored on day. A period and a pregnancy-test result are observations, so a
+// write that records one is held to the bound a cycle start is
+// (IsAllowedManualCycleStartDate: today plus manualCycleStartFutureDays in the
+// owner's zone). Only what the write records is held to it: turning the period
+// on, or storing a test result the day does not already carry. A write that
+// leaves both as stored — a partial write not naming them, a full write
+// re-stating them — and one that clears them go through, so an entry stored
+// ahead of the bound before it existed stays as stored and stays editable.
+//
+// The refusal names what the write records: ErrDayPeriodDateInvalid when it
+// turns the period on (also when it records a test result beside it), else
+// ErrDayPregnancyTestDateInvalid.
+//
+// It runs inside UpsertDayEntry, against the row the write locked, so every
+// writer of a day inherits it. day is the canonical UTC-midnight write key.
+func validateDayObservationDate(stored models.DailyLog, payload DayEntryInput, day time.Time, now time.Time, location *time.Location) error {
+	recordsPeriod := payload.IsPeriod && !stored.IsPeriod
+	recordsTest := payload.PregnancyTest != models.PregnancyTestNone &&
+		payload.PregnancyTest != NormalizeDayPregnancyTest(stored.PregnancyTest)
+	if !recordsPeriod && !recordsTest {
+		return nil
+	}
+	if IsAllowedManualCycleStartDate(CalendarDay(day, location), now, location) {
+		return nil
+	}
+	if recordsPeriod {
+		return ErrDayPeriodDateInvalid
+	}
+	return ErrDayPregnancyTestDateInvalid
+}
+
 func ResolveManualCycleStartPolicy(user *models.User, logs []models.DailyLog, day time.Time, now time.Time, location *time.Location) ManualCycleStartPolicy {
 	if location == nil {
 		location = time.UTC
 	}
 
-	targetDay := DateAtLocation(day.In(location), location)
-	if targetDay.IsZero() {
+	// The refusal reads the RAW input, like IsAllowedManualCycleStartDate
+	// above: DateAtLocation has no zero short-circuit, so a projected zero day
+	// is an ordinary year-1 calendar day in every zone with a non-zero offset
+	// and IsZero() answers false there.
+	if day.IsZero() {
 		return ManualCycleStartPolicy{}
 	}
 
+	targetDay := DateAtLocation(day, location)
 	policy := ManualCycleStartPolicy{
 		ConflictDate: findCompetingCycleStart(logs, targetDay, location),
 	}
 
-	previousStart := LatestCycleStartAnchorBeforeOrOn(user, logs, targetDay.AddDate(0, 0, -1), location)
+	previousStart := LatestCycleStartAnchorBeforeOrOn(user, logs, AddCalendarDays(targetDay, -1, location), location)
 	if previousStart.IsZero() {
 		return policy
 	}
@@ -77,15 +127,56 @@ func ResolveManualCycleStartPolicy(user *models.User, logs []models.DailyLog, da
 }
 
 func potentialImplantationGapDays(user *models.User, logs []models.DailyLog, targetDay time.Time, previousStart time.Time) (int, bool) {
-	filtered := filterLogsNotAfter(logs, targetDay.AddDate(0, 0, -1))
-	stats := BuildCycleStats(filtered, targetDay.Add(-time.Second))
+	filtered := filterLogsNotAfter(logs, AddCalendarDays(targetDay, -1, targetDay.Location()))
+	boundaryCtx := BoundaryContextFor(user, time.Time{})
+	stats := BuildCycleStats(filtered, targetDay.Add(-time.Second), boundaryCtx)
+
+	// The hint is read off the closing cycle's PROJECTED ovulation, so it may
+	// only be offered where every other surface would still publish that
+	// projection on the day being logged: the whole fertility gate, not one of
+	// its signals. Unpredictable-cycle mode and a pregnancy pause withhold the
+	// ovulation this hint counts from everywhere else; the pause is resolved
+	// here because BuildCycleStats alone never sets it. Past the overdue
+	// verdict a bleed logged is a late period, not a bleed a week after a known
+	// ovulation. Where the median sits above the mean (28/60/60) the gate
+	// answers on day 57 while the projected ovulation, placed from the median,
+	// still leaves days 57-58 inside the implantation gap.
+	//
+	// The fourth signal is the first-cycle floor, and it is the reason the gate
+	// runs BEFORE any length is resolved: with fewer than two recorded cycle
+	// starts there is no observed length at all, and predictedCycleLength would
+	// answer with models.DefaultCycleLength — an ovulation date, and then a
+	// "six to twelve days after it" caution, whose only source is the
+	// onboarding slider. Where configuration defaults are the only source,
+	// suppression is the floor and a qualifier is not enough
+	// (docs/SECURITY_INVARIANTS.md -> medical safety). Past this return the
+	// length is always the account's own median.
+	gateStats := stats
+	gateStats.CurrentCycleDay = CalendarDaysBetween(previousStart, targetDay) + 1
+	if _, paused := ResolvePregnancyPause(filtered, boundaryCtx); paused {
+		gateStats.PregnancyPaused = true
+	}
+	if FertilityProjectionSuppressed(user, gateStats) {
+		return 0, false
+	}
+
 	cycleLength := predictedCycleLength(stats.MedianCycleLength, stats.AverageCycleLength)
+	// codecov:ignore:start -- unreachable from this caller, kept as a floor for
+	// a future statistic that can report "unknown". stats are computed HERE by
+	// BuildCycleStats, and the first-cycle floor above has already returned for
+	// every history with fewer than two detected cycle starts, so the starts
+	// left here are distinct sorted calendar days (every observed length >= 1 ->
+	// median > 0). Callers that pass CALLER-BUILT CycleStats can still drive
+	// predictedCycleLength to 0 with a fractional average in (0, 0.5) —
+	// applyProjectedBaseline is that shape and its guards are live — which is
+	// why these two are left in place rather than removed.
 	if cycleLength <= 0 {
 		cycleLength = DashboardCycleReferenceLength(user, stats)
 	}
 	if cycleLength <= 0 {
 		return 0, false
 	}
+	// codecov:ignore:end
 
 	window := PredictCycleWindow(previousStart, cycleLength, stats.LutealPhase)
 	if !window.Calculable || window.OvulationDate.IsZero() {
@@ -104,22 +195,40 @@ func potentialImplantationGapDays(user *models.User, logs []models.DailyLog, tar
 	return 0, false
 }
 
-func LatestCycleStartAnchorBeforeOrOn(user *models.User, logs []models.DailyLog, day time.Time, location *time.Location) time.Time {
+func ShouldSuggestManualCycleStart(user *models.User, logs []models.DailyLog, logEntry models.DailyLog, day time.Time, now time.Time, location *time.Location) bool {
+	return logEntry.IsPeriod && cycleStartGapSuggestsNewCycle(user, logs, logEntry, day, now, location)
+}
+
+// ShouldAskCycleStartQuestion reports whether the day form asks, inline next to
+// the period toggle, whether a new cycle begins on this day.
+//
+// It is the suggestion policy above evaluated on the day as the form is about
+// to leave it, which is why the stored IsPeriod flag must not gate it: bleeding
+// starting is one event, so the question belongs to the toggle being turned on,
+// and on a day marked as a period day for the first time the persisted entry
+// still reads IsPeriod=false while the form renders. A day that already carries
+// a competing cycle start inside its period cluster is excluded — answering yes
+// there would have to replace that start, which is the separate manual control's
+// confirmation flow, not a calm one-tap question.
+func ShouldAskCycleStartQuestion(user *models.User, logs []models.DailyLog, logEntry models.DailyLog, day time.Time, now time.Time, location *time.Location) bool {
 	if location == nil {
 		location = time.UTC
 	}
-
-	targetDay := DateAtLocation(day.In(location), location)
-	explicitStart := latestExplicitCycleStartBeforeOrOn(logs, targetDay, location)
-	return latestCycleStartAnchorBeforeOrOn(user, explicitStart, targetDay, location)
+	if !cycleStartGapSuggestsNewCycle(user, logs, logEntry, day, now, location) {
+		return false
+	}
+	return findCompetingCycleStart(logs, DateAtLocation(day.In(location), location), location).IsZero()
 }
 
-func ShouldSuggestManualCycleStart(user *models.User, logs []models.DailyLog, logEntry models.DailyLog, day time.Time, now time.Time, location *time.Location) bool {
-	if !logEntry.IsPeriod || logEntry.CycleStart || !IsAllowedManualCycleStartDate(day, now, location) {
+// cycleStartGapSuggestsNewCycle is the shared core: this day may be marked as a
+// cycle start, is not one already, and sits far enough past the previous anchor
+// that a new cycle is plausible.
+func cycleStartGapSuggestsNewCycle(user *models.User, logs []models.DailyLog, logEntry models.DailyLog, day time.Time, now time.Time, location *time.Location) bool {
+	if logEntry.CycleStart || !IsAllowedManualCycleStartDate(day, now, location) {
 		return false
 	}
 
-	anchor := LatestCycleStartAnchorBeforeOrOn(user, logs, day.AddDate(0, 0, -1), location)
+	anchor := LatestCycleStartAnchorBeforeOrOn(user, logs, AddCalendarDays(day, -1, location), location)
 	if anchor.IsZero() {
 		return false
 	}
@@ -137,7 +246,9 @@ func findCompetingCycleStart(logs []models.DailyLog, day time.Time, location *ti
 
 	conflict := time.Time{}
 	for _, logEntry := range logs {
-		if !logEntry.CycleStart {
+		// Only a mark the boundary rule reads competes: a mark on a non-period,
+		// spotting or uncertain day opens no cycle, so it is nothing to replace.
+		if !logEntry.CycleStart || !logEntry.IsPeriod || logEntry.IsUncertain || isSpottingDay(logEntry) {
 			continue
 		}
 
@@ -145,7 +256,7 @@ func findCompetingCycleStart(logs []models.DailyLog, day time.Time, location *ti
 		if sameCalendarDay(logDay, day) {
 			continue
 		}
-		if logDay.Before(clusterStart) || logDay.After(clusterEnd) {
+		if !withinPeriodCluster(logDay, clusterStart, clusterEnd) {
 			continue
 		}
 		if conflict.IsZero() || logDay.Before(conflict) {
@@ -161,11 +272,23 @@ func manualCycleStartClusterBounds(logs []models.DailyLog, day time.Time, locati
 	hypotheticalLogs := logsWithSyntheticPeriodDay(logs, targetDay)
 	clusters := buildPeriodClusters(hypotheticalLogs)
 	for _, cluster := range clusters {
-		if !targetDay.Before(cluster.Start) && !targetDay.After(cluster.End) {
+		if withinPeriodCluster(targetDay, cluster.Start, cluster.End) {
 			return cluster.Start, cluster.End, true
 		}
 	}
 	return time.Time{}, time.Time{}, false
+}
+
+// withinPeriodCluster reports whether a calendar day falls inside the bounds
+// buildPeriodClusters produced. Those bounds are UTC-midnight values (dateOnly)
+// while the days compared against them are location-midnight working values, so
+// the day is re-anchored to UTC-midnight first. Comparing the two midnights
+// directly is an instant comparison under a non-zero UTC offset, which places a
+// day on the edge of its own cluster outside it — ahead of UTC the first day,
+// behind UTC the last one (issue #48 class).
+func withinPeriodCluster(day time.Time, clusterStart time.Time, clusterEnd time.Time) bool {
+	canonicalDay := dateOnly(day)
+	return !canonicalDay.Before(clusterStart) && !canonicalDay.After(clusterEnd)
 }
 
 func logsWithSyntheticPeriodDay(logs []models.DailyLog, day time.Time) []models.DailyLog {

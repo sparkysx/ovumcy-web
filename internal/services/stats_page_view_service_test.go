@@ -12,10 +12,10 @@ import (
 func TestBuildStatsPageViewDataOwnerBuildsTrendBaselineAndSymptomSummaries(t *testing.T) {
 	dayReader := &stubStatsDayReader{
 		logsForRange: []models.DailyLog{
-			{Date: mustParseStatsServiceDay(t, "2026-01-01"), IsPeriod: true},
-			{Date: mustParseStatsServiceDay(t, "2026-01-29"), IsPeriod: true},
-			{Date: mustParseStatsServiceDay(t, "2026-02-26"), IsPeriod: true},
-			{Date: mustParseStatsServiceDay(t, "2026-03-26"), IsPeriod: true},
+			{Date: mustParseStatsServiceDay(t, "2026-01-01"), IsPeriod: true, CycleStart: true},
+			{Date: mustParseStatsServiceDay(t, "2026-01-29"), IsPeriod: true, CycleStart: true},
+			{Date: mustParseStatsServiceDay(t, "2026-02-26"), IsPeriod: true, CycleStart: true},
+			{Date: mustParseStatsServiceDay(t, "2026-03-26"), IsPeriod: true, CycleStart: true},
 		},
 		logsForAll: []models.DailyLog{{ID: 1}},
 	}
@@ -38,10 +38,10 @@ func TestBuildStatsPageViewDataOwnerBuildsTrendBaselineAndSymptomSummaries(t *te
 
 func TestBuildStatsPageViewDataIrregularNoticeRespectsUserMode(t *testing.T) {
 	logs := []models.DailyLog{
-		{Date: mustParseStatsServiceDay(t, "2026-01-01"), IsPeriod: true},
-		{Date: mustParseStatsServiceDay(t, "2026-01-25"), IsPeriod: true},
-		{Date: mustParseStatsServiceDay(t, "2026-03-10"), IsPeriod: true},
-		{Date: mustParseStatsServiceDay(t, "2026-04-20"), IsPeriod: true},
+		{Date: mustParseStatsServiceDay(t, "2026-01-01"), IsPeriod: true, CycleStart: true},
+		{Date: mustParseStatsServiceDay(t, "2026-01-25"), IsPeriod: true, CycleStart: true},
+		{Date: mustParseStatsServiceDay(t, "2026-03-10"), IsPeriod: true, CycleStart: true},
+		{Date: mustParseStatsServiceDay(t, "2026-04-20"), IsPeriod: true, CycleStart: true},
 	}
 	service := NewStatsService(&stubStatsDayReader{logsForRange: logs}, &stubStatsSymptomReader{})
 	now := mustParseStatsServiceDay(t, "2026-04-25")
@@ -96,13 +96,13 @@ func TestBuildStatsPageViewDataShowsIrregularInsufficientDataNotice(t *testing.T
 
 func TestBuildStatsPageViewDataBuildsRecentCycleFactorContextForVariablePatterns(t *testing.T) {
 	logs := []models.DailyLog{
-		{Date: mustParseStatsServiceDay(t, "2026-01-01"), IsPeriod: true},
+		{Date: mustParseStatsServiceDay(t, "2026-01-01"), IsPeriod: true, CycleStart: true},
 		{Date: mustParseStatsServiceDay(t, "2026-01-03"), CycleFactorKeys: []string{models.CycleFactorStress}},
-		{Date: mustParseStatsServiceDay(t, "2026-01-25"), IsPeriod: true},
+		{Date: mustParseStatsServiceDay(t, "2026-01-25"), IsPeriod: true, CycleStart: true},
 		{Date: mustParseStatsServiceDay(t, "2026-01-28"), CycleFactorKeys: []string{models.CycleFactorTravel}},
-		{Date: mustParseStatsServiceDay(t, "2026-03-10"), IsPeriod: true},
+		{Date: mustParseStatsServiceDay(t, "2026-03-10"), IsPeriod: true, CycleStart: true},
 		{Date: mustParseStatsServiceDay(t, "2026-03-12"), CycleFactorKeys: []string{models.CycleFactorStress}},
-		{Date: mustParseStatsServiceDay(t, "2026-04-20"), IsPeriod: true},
+		{Date: mustParseStatsServiceDay(t, "2026-04-20"), IsPeriod: true, CycleStart: true},
 	}
 	service := NewStatsService(&stubStatsDayReader{logsForRange: logs, logsForAll: logs}, &stubStatsSymptomReader{})
 	now := mustParseStatsServiceDay(t, "2026-04-25")
@@ -123,7 +123,9 @@ func TestBuildStatsPageViewDataKeepsRecentBaselineWhenOlderCycleStartsExist(t *t
 		{Date: mustParseStatsServiceDay(t, "2026-01-03"), CycleFactorKeys: []string{models.CycleFactorStress}},
 		{Date: mustParseStatsServiceDay(t, "2026-01-25"), IsPeriod: true, CycleStart: true},
 		{Date: mustParseStatsServiceDay(t, "2026-01-28"), CycleFactorKeys: []string{models.CycleFactorTravel}},
-		{Date: mustParseStatsServiceDay(t, "2026-03-10"), IsPeriod: true, CycleStart: true},
+		// Unmarked lone day before the stored start: it joins the stored start's
+		// cluster, which opens at the stored start (the newer baseline).
+		{Date: mustParseStatsServiceDay(t, "2026-03-10"), IsPeriod: true},
 		{Date: mustParseStatsServiceDay(t, "2026-03-12"), CycleFactorKeys: []string{models.CycleFactorStress}},
 	}
 	service := NewStatsService(&stubStatsDayReader{logsForRange: logs, logsForAll: logs}, &stubStatsSymptomReader{})
@@ -151,8 +153,8 @@ func TestBuildStatsPageViewDataKeepsRecentBaselineWhenOlderCycleStartsExist(t *t
 
 func TestBuildStatsPageViewDataKeepsInsightsHiddenUntilSecondCompletedCycle(t *testing.T) {
 	logs := []models.DailyLog{
-		{Date: mustParseStatsServiceDay(t, "2026-01-01"), IsPeriod: true},
-		{Date: mustParseStatsServiceDay(t, "2026-01-29"), IsPeriod: true},
+		{Date: mustParseStatsServiceDay(t, "2026-01-01"), IsPeriod: true, CycleStart: true},
+		{Date: mustParseStatsServiceDay(t, "2026-01-29"), IsPeriod: true, CycleStart: true},
 	}
 	service := NewStatsService(&stubStatsDayReader{logsForRange: logs}, &stubStatsSymptomReader{})
 	now := mustParseStatsServiceDay(t, "2026-02-10")
@@ -300,28 +302,28 @@ func newStatsPatternAndBBTTestFixture(t *testing.T) (*StatsService, *models.User
 	t.Helper()
 
 	logs := []models.DailyLog{
-		{Date: mustParseStatsServiceDay(t, "2026-01-01"), IsPeriod: true},
+		{Date: mustParseStatsServiceDay(t, "2026-01-01"), IsPeriod: true, CycleStart: true},
 		{Date: mustParseStatsServiceDay(t, "2026-01-02"), SymptomIDs: []uint{1}},
 		{Date: mustParseStatsServiceDay(t, "2026-01-05"), SymptomIDs: []uint{2}},
-		{Date: mustParseStatsServiceDay(t, "2026-01-29"), IsPeriod: true},
+		{Date: mustParseStatsServiceDay(t, "2026-01-29"), IsPeriod: true, CycleStart: true},
 		{Date: mustParseStatsServiceDay(t, "2026-01-30"), SymptomIDs: []uint{1}},
 		{Date: mustParseStatsServiceDay(t, "2026-02-02"), SymptomIDs: []uint{2}},
-		{Date: mustParseStatsServiceDay(t, "2026-02-26"), IsPeriod: true},
+		{Date: mustParseStatsServiceDay(t, "2026-02-26"), IsPeriod: true, CycleStart: true},
 		{Date: mustParseStatsServiceDay(t, "2026-02-27"), SymptomIDs: []uint{1}},
 		{Date: mustParseStatsServiceDay(t, "2026-02-28"), SymptomIDs: []uint{1}},
 		{Date: mustParseStatsServiceDay(t, "2026-03-02"), SymptomIDs: []uint{2}},
 		{Date: mustParseStatsServiceDay(t, "2026-03-04"), SymptomIDs: []uint{3}},
 		// Current cycle: 6-day coverline window Mar26-31 (max 36.50), then a
 		// 3-day rise Apr1-3 → first high day 7, marker on day 6.
-		{Date: mustParseStatsServiceDay(t, "2026-03-26"), IsPeriod: true, BBT: models.NewBBT(36.40)},
-		{Date: mustParseStatsServiceDay(t, "2026-03-27"), BBT: models.NewBBT(36.45)},
-		{Date: mustParseStatsServiceDay(t, "2026-03-28"), BBT: models.NewBBT(36.50)},
-		{Date: mustParseStatsServiceDay(t, "2026-03-29"), BBT: models.NewBBT(36.42)},
-		{Date: mustParseStatsServiceDay(t, "2026-03-30"), BBT: models.NewBBT(36.43)},
-		{Date: mustParseStatsServiceDay(t, "2026-03-31"), BBT: models.NewBBT(36.44)},
-		{Date: mustParseStatsServiceDay(t, "2026-04-01"), BBT: models.NewBBT(36.72)},
-		{Date: mustParseStatsServiceDay(t, "2026-04-02"), BBT: models.NewBBT(36.74)},
-		{Date: mustParseStatsServiceDay(t, "2026-04-03"), BBT: models.NewBBT(36.76)},
+		{Date: mustParseStatsServiceDay(t, "2026-03-26"), IsPeriod: true, CycleStart: true, BBT: new(36.40)},
+		{Date: mustParseStatsServiceDay(t, "2026-03-27"), BBT: new(36.45)},
+		{Date: mustParseStatsServiceDay(t, "2026-03-28"), BBT: new(36.50)},
+		{Date: mustParseStatsServiceDay(t, "2026-03-29"), BBT: new(36.42)},
+		{Date: mustParseStatsServiceDay(t, "2026-03-30"), BBT: new(36.43)},
+		{Date: mustParseStatsServiceDay(t, "2026-03-31"), BBT: new(36.44)},
+		{Date: mustParseStatsServiceDay(t, "2026-04-01"), BBT: new(36.72)},
+		{Date: mustParseStatsServiceDay(t, "2026-04-02"), BBT: new(36.74)},
+		{Date: mustParseStatsServiceDay(t, "2026-04-03"), BBT: new(36.76)},
 	}
 
 	service := NewStatsService(
@@ -506,5 +508,173 @@ func TestShouldShowStatsLongCycleNotice(t *testing.T) {
 				t.Fatalf("shouldShowStatsLongCycleNotice(%v) = %v, want %v", testCase.lengths, got, testCase.want)
 			}
 		})
+	}
+}
+
+// TestBuildStatsPageViewDataDropsSuppressedPredictionsFromThePublishedStats
+// pins that the view model this page publishes carries no forward-looking value
+// the display policy refuses. Suppression used to be a template obligation — one
+// boolean beside the full CycleStats it was supposed to hide — so a new partial,
+// a JSON view or a debug dump of the struct could publish a predicted next
+// period for an owner whose whole page says no prediction can be made.
+//
+// Both anchors are fixtures this test owns: the identical regular owner must
+// come back POPULATED and the unpredictable one EMPTY, so the case cannot pass
+// by clearing (or by never computing) everything.
+func TestBuildStatsPageViewDataDropsSuppressedPredictionsFromThePublishedStats(t *testing.T) {
+	// Explicit cycle starts, so the owner has a real anchor and the projection
+	// this test is about is the baseline path's, not a detection leftover.
+	logs := []models.DailyLog{
+		{Date: mustParseStatsServiceDay(t, "2026-01-01"), IsPeriod: true, CycleStart: true},
+		{Date: mustParseStatsServiceDay(t, "2026-01-29"), IsPeriod: true, CycleStart: true},
+		{Date: mustParseStatsServiceDay(t, "2026-02-26"), IsPeriod: true, CycleStart: true},
+		{Date: mustParseStatsServiceDay(t, "2026-03-26"), IsPeriod: true, CycleStart: true},
+	}
+	now := mustParseStatsServiceDay(t, "2026-04-05")
+	build := func(user *models.User) StatsPageViewData {
+		t.Helper()
+		service := NewStatsService(&stubStatsDayReader{logsForRange: logs}, &stubStatsSymptomReader{})
+		viewData, err := service.BuildStatsPageViewData(context.Background(), user, "en", "Cycle %d", now, time.UTC, 12)
+		if err != nil {
+			t.Fatalf("BuildStatsPageViewData() unexpected error: %v", err)
+		}
+		return viewData
+	}
+
+	regular := build(&models.User{ID: 300, Role: models.RoleOwner, CycleLength: 28})
+	if regular.Stats.NextPeriodStart.IsZero() || regular.Stats.OvulationDate.IsZero() ||
+		regular.Stats.FertilityWindowStart.IsZero() || regular.Stats.FertilityWindowEnd.IsZero() {
+		t.Fatalf("anchor: a regular owner must receive projected dates, got %+v", regular.Stats)
+	}
+
+	suppressed := build(&models.User{ID: 301, Role: models.RoleOwner, CycleLength: 28, UnpredictableCycle: true})
+	if !suppressed.PredictionDisabled {
+		t.Fatalf("expected PredictionDisabled=true for an unpredictable owner")
+	}
+	for name, value := range map[string]time.Time{
+		"NextPeriodStart":      suppressed.Stats.NextPeriodStart,
+		"OvulationDate":        suppressed.Stats.OvulationDate,
+		"FertilityWindowStart": suppressed.Stats.FertilityWindowStart,
+		"FertilityWindowEnd":   suppressed.Stats.FertilityWindowEnd,
+	} {
+		if !value.IsZero() {
+			t.Fatalf("expected Stats.%s to be cleared under suppression, got %s", name, value.Format("2006-01-02"))
+		}
+	}
+	if suppressed.Stats.CurrentFertility == FertilityStatusFertile {
+		t.Fatalf("expected no fertile claim in the published stats under suppression")
+	}
+	if suppressed.Stats.MedianCycleLength != regular.Stats.MedianCycleLength || suppressed.Stats.LastPeriodStart.IsZero() {
+		t.Fatalf("expected the RECORDED history to survive suppression, got %+v", suppressed.Stats)
+	}
+}
+
+// TestBuildStatsPageViewDataPairsTheReliabilityLabelAndHint pins that the
+// reliability heading and its hint describe ONE state of the account. They used
+// to come from two independent expressions gated at different cycle counts, so
+// an irregular-cycle owner at exactly two completed cycles read "Early estimate"
+// beside the hint written for a variable pattern.
+func TestBuildStatsPageViewDataPairsTheReliabilityLabelAndHint(t *testing.T) {
+	testCases := []struct {
+		name            string
+		completedCycles int
+		irregularSpread bool
+		irregularMode   bool
+		wantLabelKey    string
+		wantHintKey     string
+	}{
+		{
+			name:            "irregular mode at the basic-insights floor stays early",
+			completedCycles: 2,
+			irregularMode:   true,
+			wantLabelKey:    "stats.reliability.early",
+			wantHintKey:     "stats.reliability.hint",
+		},
+		{
+			name:            "irregular mode at the pattern minimum turns variable",
+			completedCycles: 3,
+			irregularMode:   true,
+			wantLabelKey:    "stats.reliability.variable",
+			wantHintKey:     "stats.reliability.hint_variable",
+		},
+		{
+			name:            "observed spread at the pattern minimum turns variable",
+			completedCycles: 3,
+			irregularSpread: true,
+			wantLabelKey:    "stats.reliability.variable",
+			wantHintKey:     "stats.reliability.hint_variable",
+		},
+		{
+			name:            "regular history below the recent window is building",
+			completedCycles: 4,
+			wantLabelKey:    "stats.reliability.building",
+			wantHintKey:     "stats.reliability.hint",
+		},
+		{
+			name:            "regular history at the recent window is stable",
+			completedCycles: 6,
+			wantLabelKey:    "stats.reliability.stable",
+			wantHintKey:     "stats.reliability.hint",
+		},
+	}
+
+	for index, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			logs := statspageviewserviceCovLogsWithNCompletedCycles(t, testCase.completedCycles)
+			if testCase.irregularSpread {
+				// The spread fixture already carries two completed cycles (14d, 35d).
+				logs = statspageviewserviceCovIrregularSpreadLogs(t, testCase.completedCycles-2)
+			}
+			service := NewStatsService(&stubStatsDayReader{logsForRange: logs}, &stubStatsSymptomReader{})
+			now := logs[len(logs)-1].Date.AddDate(0, 0, 5)
+
+			viewData, err := service.BuildStatsPageViewData(context.Background(),
+				&models.User{ID: uint(400 + index), Role: models.RoleOwner, CycleLength: 28, IrregularCycle: testCase.irregularMode},
+				"en", "Cycle %d", now, time.UTC, 12,
+			)
+			if err != nil {
+				t.Fatalf("BuildStatsPageViewData() unexpected error: %v", err)
+			}
+			if !viewData.ShowPredictionReliability {
+				t.Fatalf("expected the reliability block to be shown at %d completed cycles", testCase.completedCycles)
+			}
+			if viewData.PredictionReliabilityLabelKey != testCase.wantLabelKey ||
+				viewData.PredictionReliabilityHintKey != testCase.wantHintKey {
+				t.Fatalf("reliability pair = (%q, %q), want (%q, %q)",
+					viewData.PredictionReliabilityLabelKey, viewData.PredictionReliabilityHintKey,
+					testCase.wantLabelKey, testCase.wantHintKey)
+			}
+		})
+	}
+}
+
+// TestStatsPerimenopauseHintFollowsTheAgeBracketAlone pins the rule the hint
+// actually implements. Its copy is educational and conditional — it ASKS the
+// owner to watch for persistent 7-day differences — so the bracket is the whole
+// gate, and no amount of regular cycle data withdraws it. A variability gate
+// added here would turn an invitation to look into a claim about the account.
+func TestStatsPerimenopauseHintFollowsTheAgeBracketAlone(t *testing.T) {
+	regularLogs := statspageviewserviceCovLogsWithNCompletedCycles(t, 6)
+	variableLogs := statspageviewserviceCovIrregularSpreadLogs(t, 3)
+
+	build := func(user *models.User, logs []models.DailyLog) StatsPageViewData {
+		t.Helper()
+		service := NewStatsService(&stubStatsDayReader{logsForRange: logs}, &stubStatsSymptomReader{})
+		now := logs[len(logs)-1].Date.AddDate(0, 0, 5)
+		viewData, err := service.BuildStatsPageViewData(context.Background(), user, "en", "Cycle %d", now, time.UTC, 12)
+		if err != nil {
+			t.Fatalf("BuildStatsPageViewData() unexpected error: %v", err)
+		}
+		return viewData
+	}
+
+	steady45Plus := build(&models.User{ID: 500, Role: models.RoleOwner, CycleLength: 28, AgeGroup: models.AgeGroup45Plus}, regularLogs)
+	if !steady45Plus.ShowPerimenopauseHint {
+		t.Fatalf("expected the hint for a 45+ owner whose cycles are perfectly regular")
+	}
+
+	variableUnder40 := build(&models.User{ID: 501, Role: models.RoleOwner, CycleLength: 28, AgeGroup: models.AgeGroupUnder40}, variableLogs)
+	if variableUnder40.ShowPerimenopauseHint {
+		t.Fatalf("expected no hint below the 45+ bracket however variable the cycles are")
 	}
 }

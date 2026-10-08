@@ -46,12 +46,13 @@ type DailyLog struct {
 	Notes           string
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
-}
 
-// NewBBT wraps a measured basal body temperature as a nullable pointer. A nil
-// BBT means "not measured"; use this helper to build a measured value.
-func NewBBT(value float64) *float64 {
-	return &value
+	// HasSpottingSymptom is read-time context, never persisted: the owner's
+	// built-in "Spotting" symptom is among SymptomIDs. A symptom is a per-owner
+	// catalog row, so only the repository that loads the day can resolve it; the
+	// cycle-boundary rule reads the flag to tell a spotting-only day from a
+	// bleeding day without a catalog lookup of its own.
+	HasSpottingSymptom bool `gorm:"-"`
 }
 
 func (logEntry *DailyLog) BeforeSave(*gorm.DB) error {

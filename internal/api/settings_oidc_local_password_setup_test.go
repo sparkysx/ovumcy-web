@@ -36,16 +36,35 @@ type oidcStepupFixture struct {
 
 func newOIDCStepupFixture(t *testing.T, email string) *oidcStepupFixture {
 	t.Helper()
+	return newOIDCStepupFixtureWithAudit(t, email, false)
+}
+
+// newOIDCStepupFixtureWithAudit builds the same fixture with the audit stream
+// switchable, so an attribution regression can read the security-event lines
+// the step-up callbacks emit.
+func newOIDCStepupFixtureWithAudit(t *testing.T, email string, auditLogEnabled bool) *oidcStepupFixture {
+	t.Helper()
+	return newOIDCStepupFixtureWithOptions(t, email, onboardingTestAppOptions{auditLogEnabled: auditLogEnabled}, nil)
+}
+
+// newOIDCStepupFixtureWithOptions builds the fixture on top of options. When
+// wrap is set, the app gets the service it returns in place of the stub, so a
+// race regression can route a workflow method through the real service while
+// the stub keeps recording the step-up start the callback helpers read back.
+func newOIDCStepupFixtureWithOptions(t *testing.T, email string, options onboardingTestAppOptions, wrap func(*stubOIDCWorkflowService) OIDCWorkflowService) *oidcStepupFixture {
+	t.Helper()
 
 	stub := newStubOIDCWorkflowService(true)
 	stub.localPublicAuthEnabled = true
 	stub.reauthURL = "https://id.example.com/authorize?prompt=login"
 
-	app, database := newOnboardingTestAppWithOptions(t, onboardingTestAppOptions{
-		enableCSRF:   true,
-		cookieSecure: true,
-		oidcService:  stub,
-	})
+	options.enableCSRF = true
+	options.cookieSecure = true
+	options.oidcService = stub
+	if wrap != nil {
+		options.oidcService = wrap(stub)
+	}
+	app, database := newOnboardingTestAppWithOptions(t, options)
 
 	user := models.User{
 		Email:               strings.ToLower(strings.TrimSpace(email)),
@@ -136,7 +155,7 @@ func decodeStepupRedirectJSON(t *testing.T, body []byte) string {
 	return target
 }
 
-func extractStepupCallbackState(t *testing.T, fixture *oidcStepupFixture, stepupCookieHeader string) string {
+func extractStepupCallbackState(t *testing.T, fixture *oidcStepupFixture) string {
 	t.Helper()
 	// We only need the State value that the stub recorded — the cookie is
 	// opaque to the test code but the stub captured the same string the
@@ -275,7 +294,7 @@ func TestOIDCCompleteLocalPasswordSetupFinalizesOnFreshReauth(t *testing.T) {
 	startResponse := fixture.postStart(t, "EvenStronger2", "EvenStronger2")
 	defer func() { _ = startResponse.Body.Close() }()
 	stepupCookie := readStepupCookie(t, startResponse)
-	state := extractStepupCallbackState(t, fixture, stepupCookie)
+	state := extractStepupCallbackState(t, fixture)
 
 	callbackResponse := postOIDCStepupCallback(t, fixture, stepupCookie, state, "callback-code")
 	defer func() { _ = callbackResponse.Body.Close() }()
@@ -286,9 +305,7 @@ func TestOIDCCompleteLocalPasswordSetupFinalizesOnFreshReauth(t *testing.T) {
 	if fixture.oidcStub.lastReauthUserID != fixture.user.ID {
 		t.Fatalf("expected ValidateReauthExchange to be called with user %d, got %d", fixture.user.ID, fixture.oidcStub.lastReauthUserID)
 	}
-	if fixture.oidcStub.lastReauthMaxAge == 0 {
-		t.Fatal("expected max-age to be passed into ValidateReauthExchange")
-	}
+	fixture.oidcStub.assertReauthExchangeMatchesStart(t, "callback-code")
 
 	var persisted models.User
 	if err := fixture.database.First(&persisted, fixture.user.ID).Error; err != nil {
@@ -314,7 +331,7 @@ func TestOIDCCompleteLocalPasswordSetupRejectsStaleReauth(t *testing.T) {
 	startResponse := fixture.postStart(t, "EvenStronger2", "EvenStronger2")
 	defer func() { _ = startResponse.Body.Close() }()
 	stepupCookie := readStepupCookie(t, startResponse)
-	state := extractStepupCallbackState(t, fixture, stepupCookie)
+	state := extractStepupCallbackState(t, fixture)
 
 	callbackResponse := postOIDCStepupCallback(t, fixture, stepupCookie, state, "callback-code")
 	defer func() { _ = callbackResponse.Body.Close() }()
@@ -344,7 +361,7 @@ func TestOIDCCompleteLocalPasswordSetupRejectsIdentityMismatch(t *testing.T) {
 	startResponse := fixture.postStart(t, "EvenStronger2", "EvenStronger2")
 	defer func() { _ = startResponse.Body.Close() }()
 	stepupCookie := readStepupCookie(t, startResponse)
-	state := extractStepupCallbackState(t, fixture, stepupCookie)
+	state := extractStepupCallbackState(t, fixture)
 
 	callbackResponse := postOIDCStepupCallback(t, fixture, stepupCookie, state, "callback-code")
 	defer func() { _ = callbackResponse.Body.Close() }()
@@ -359,5 +376,124 @@ func TestOIDCCompleteLocalPasswordSetupRejectsIdentityMismatch(t *testing.T) {
 	}
 	if persisted.LocalAuthEnabled {
 		t.Fatal("identity-mismatch reauth must not enable local auth")
+	}
+}
+
+// TestOIDCCompleteLocalPasswordSetupHandsTheRevealOverSameOrigin covers the far
+// end of the flow the tests above walk: the enrollment ends at the
+// recovery-code reveal, and that reveal spends the account's one-time mark, so
+// it is guarded on Fetch Metadata — only a same-origin initiator may claim it
+// (TestRecoveryCodeRevealRefusesAForeignRequestWithoutSpendingTheMark pins the
+// refusal). Sec-Fetch-Site describes the whole redirect CHAIN, and the callback
+// this flow finishes on is a cross-site POST the provider makes, so a 303 from
+// here reached /recovery-code still labelled off-origin: the guard refused, the
+// owner was sent to her dashboard, and the code she had just minted was gone
+// with no way back to it. The lane that caught it is opt-in and skipped in
+// default CI, which is why the refusal survived a green pipeline.
+//
+// The fix is a same-origin document, not an exemption — the interstitial's own
+// navigation is initiated by this origin, so the label the guard reads becomes
+// true rather than excused, and an attacker's page still cannot produce one.
+// What this test pins is the shape that makes that possible: the callback must
+// not hand the browser a redirect it would follow while the chain is still
+// off-origin.
+func TestOIDCCompleteLocalPasswordSetupHandsTheRevealOverSameOrigin(t *testing.T) {
+	t.Parallel()
+
+	fixture := newOIDCStepupFixture(t, "settings-stepup-reveal-handoff@example.com")
+	fixture.oidcStub.reauthErr = nil
+
+	startResponse := fixture.postStart(t, "EvenStronger2", "EvenStronger2")
+	defer func() { _ = startResponse.Body.Close() }()
+	stepupCookie := readStepupCookie(t, startResponse)
+	state := extractStepupCallbackState(t, fixture)
+
+	// The provider's form_post lands here as a cross-site top-level navigation.
+	// The callback handler reads no Fetch Metadata itself, so these headers do
+	// not decide the assertions below — they state the condition the assertions
+	// are only meaningful under, which is the one the live lane reproduced.
+	form := url.Values{"state": {state}, "code": {"callback-code"}}
+	request := httptest.NewRequest(http.MethodPost, "/auth/oidc/callback", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Accept", "text/html,application/xhtml+xml")
+	request.Header.Set("Cookie", joinCookieHeader(fixture.authCookie, stepupCookie))
+	crossSiteNavigation.applyTo(request)
+
+	bounceResponse := mustAppResponse(t, fixture.app, request)
+	defer func() { _ = bounceResponse.Body.Close() }()
+
+	// A cross-site callback completes nothing: SameSite=Lax withholds the
+	// session cookie from it, so the step-up hands over to a same-origin
+	// document first. All it may carry here is the sealed continuation — no
+	// reveal, no re-minted session, and no redirect into a guarded route
+	// (which would still be labelled cross-site when it arrived).
+	assertStatusCode(t, bounceResponse, http.StatusOK)
+	if location := bounceResponse.Header.Get("Location"); location != "" {
+		t.Fatalf("the bounce must hand over through a document, not a redirect; got Location %q", location)
+	}
+	if handoff := mustReadBodyString(t, bounceResponse.Body); !strings.Contains(handoff, oidcCallbackContinuePath) {
+		t.Fatalf("expected the hand-off document to navigate to %s, got %q", oidcCallbackContinuePath, handoff)
+	}
+	if reveal := responseCookie(bounceResponse.Cookies(), recoveryCodeCookieName); reveal != nil && strings.TrimSpace(reveal.Value) != "" {
+		t.Fatal("the bounce must not mint the reveal before the owner's session has been identified")
+	}
+	continuationCookie := responseCookie(bounceResponse.Cookies(), oidcStepupContinuationCookieName)
+	if continuationCookie == nil || strings.TrimSpace(continuationCookie.Value) == "" {
+		t.Fatal("expected the cross-site callback to seal a step-up continuation")
+	}
+
+	// The continue leg is the navigation that hand-off document starts, so it
+	// is same-origin — which is what lets the route carry the first-party
+	// guard and still admit the owner's own return.
+	continueRequest := httptest.NewRequest(http.MethodGet, oidcCallbackContinuePath, nil)
+	continueRequest.Header.Set("Accept", "text/html,application/xhtml+xml")
+	continueRequest.Header.Set("Cookie", joinCookieHeader(fixture.authCookie, cookiePair(continuationCookie)))
+	sameOriginNavigation.applyTo(continueRequest)
+
+	callbackResponse := mustAppResponse(t, fixture.app, continueRequest)
+	defer func() { _ = callbackResponse.Body.Close() }()
+
+	assertStatusCode(t, callbackResponse, http.StatusOK)
+	if location := callbackResponse.Header.Get("Location"); location != "" {
+		t.Fatalf("the completion must not redirect into the guarded reveal from an off-origin chain; got Location %q", location)
+	}
+	if contentType := callbackResponse.Header.Get("Content-Type"); !strings.HasPrefix(contentType, "text/html") {
+		t.Fatalf("expected a same-origin html handoff, got content-type %q", contentType)
+	}
+	body := mustReadBodyString(t, callbackResponse.Body)
+	if !strings.Contains(body, `http-equiv="refresh"`) {
+		t.Fatalf("expected a meta-refresh handoff, got %q", body)
+	}
+	if !strings.Contains(body, "/recovery-code") {
+		t.Fatalf("expected the handoff to target the reveal surface, got %q", body)
+	}
+
+	// The reveal itself still has to ride the response, and the session with it:
+	// finalizing bumps AuthSessionVersion, so the handoff navigation carries the
+	// re-minted auth cookie or lands on /login instead.
+	revealCookie := responseCookie(callbackResponse.Cookies(), recoveryCodeCookieName)
+	if revealCookie == nil || strings.TrimSpace(revealCookie.Value) == "" {
+		t.Fatal("expected the callback to seal the one-time reveal cookie")
+	}
+	authCookie := responseCookie(callbackResponse.Cookies(), authCookieName)
+	if authCookie == nil || strings.TrimSpace(authCookie.Value) == "" {
+		t.Fatal("expected the callback to re-mint the auth cookie the handoff navigation carries")
+	}
+
+	// And the navigation the handoff produces — same-origin, because this
+	// origin's own document started it — reveals the code. This half is a
+	// completeness check on the handoff, not the regression: the request is
+	// hand-built here, so only the shape asserted above separates the fixed
+	// callback from the broken one.
+	revealed := recoveryCodePageWithHeaders(
+		t,
+		fixture.app,
+		joinCookieHeader(cookiePair(authCookie), cookiePair(revealCookie)),
+		sameOriginNavigation,
+	)
+	defer func() { _ = revealed.Body.Close() }()
+	assertStatusCode(t, revealed, http.StatusOK)
+	if page := mustReadBodyString(t, revealed.Body); !strings.Contains(page, "OVUM-") {
+		t.Fatal("expected the owner's freshly minted recovery code to be revealed")
 	}
 }

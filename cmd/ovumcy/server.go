@@ -43,8 +43,8 @@ const (
 	// records serialize to ~8-12 MiB, so 16 MiB keeps the documented import
 	// capacity reachable over HTTP with headroom, while still bounding the body
 	// far below fiber's per-connection buffers. Exceeding it yields a mapped 413
-	// (ovumcyErrorHandler → api.RespondRequestEntityTooLarge) rather than a bare
-	// fasthttp error.
+	// (newOvumcyErrorHandler → handler.RespondTransportError, stable key
+	// "request_too_large") rather than a bare fasthttp error.
 	maxRequestBodyBytes = 16 << 20
 
 	// staticAssetMaxAgeSeconds is the Cache-Control max-age (1 hour) fiber sets
@@ -71,7 +71,9 @@ const (
 // If new code here starts making a decision (not just wiring an
 // already-tested collaborator), pull it into its own tested function instead.
 func newFiberApp(config runtimeConfig, handler *api.Handler) *fiber.App {
-	app := fiber.New(fiberConfig(config))
+	appConfig := fiberConfig(config.Proxy, handler)
+	appConfig.ReadBufferSize = config.ReadBufferSize
+	app := fiber.New(appConfig)
 	configureFiberMiddleware(app, config, handler)
 	registerStaticContentTypes()
 	app.Use("/static", newStaticAssetHandler())
@@ -109,17 +111,23 @@ func newStaticAssetHandler() fiber.Handler {
 	})
 }
 
-func fiberConfig(config runtimeConfig) fiber.Config {
+func fiberConfig(proxy proxySettings, handler *api.Handler) fiber.Config {
 	appConfig := fiber.Config{
-		AppName:        "Ovumcy",
-		ErrorHandler:   ovumcyErrorHandler,
-		BodyLimit:      maxRequestBodyBytes,
-		ReadBufferSize: config.ReadBufferSize,
-		ReadTimeout:    30 * time.Second,
-		WriteTimeout:   60 * time.Second,
-		IdleTimeout:    120 * time.Second,
+		AppName:      "Ovumcy",
+		ErrorHandler: newOvumcyErrorHandler(handler),
+		BodyLimit:    maxRequestBodyBytes,
+		ReadTimeout:  30 * time.Second,
+		// Socket deadlines, not work budgets. fasthttp arms the write deadline
+		// only after the handler has returned, so WriteTimeout caps writing a
+		// finished response and never how long the handler took to build it.
+		// What bounds a request inside the app is api.RequestBudget, an
+		// independent constant sized by the widest legitimate request; the two
+		// share a value today and change for unrelated reasons. Pinned by
+		// TestWriteTimeoutBoundsTheResponseWriteNotTheHandler.
+		WriteTimeout: 60 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
-	if !config.Proxy.Enabled {
+	if !proxy.Enabled {
 		return appConfig
 	}
 	// Fiber v3 collapses v2's EnableTrustedProxyCheck+TrustedProxies into
@@ -128,31 +136,69 @@ func fiberConfig(config runtimeConfig) fiber.Config {
 	// Proxies must list only literal IPs/CIDRs (no Loopback/Private/LinkLocal
 	// convenience flags) so fiber's trusted set stays byte-for-byte identical to
 	// the boundary trustedProxyMatcher parses for the rate-limit key generator.
-	appConfig.ProxyHeader = config.Proxy.Header
+	appConfig.ProxyHeader = proxy.Header
 	appConfig.TrustProxy = true
 	appConfig.EnableIPValidation = true
-	appConfig.TrustProxyConfig = fiber.TrustProxyConfig{Proxies: config.Proxy.TrustedProxies}
+	appConfig.TrustProxyConfig = fiber.TrustProxyConfig{Proxies: proxy.TrustedProxies}
 	return appConfig
 }
 
-// ovumcyErrorHandler is the top-level Fiber error handler. It preserves the
-// status and message of explicit *fiber.Error values (app-controlled and safe,
-// for example the 403 raised by the CSRF middleware) but never forwards a raw
-// error or recovered panic value to the client, since those can carry internal
-// detail such as table names, file paths, or driver messages.
-func ovumcyErrorHandler(c fiber.Ctx, err error) error {
-	var fiberErr *fiber.Error
-	if errors.As(err, &fiberErr) {
-		// A body exceeding BodyLimit is raised by fiber's core before any app
-		// middleware/handler runs, so route it through the shared error-spec
-		// negotiation (JSON envelope / localized HTMX fragment with a stable
-		// key) instead of leaking fasthttp's bare "Request Entity Too Large".
-		if fiberErr.Code == fiber.StatusRequestEntityTooLarge {
-			return api.RespondRequestEntityTooLarge(c)
+// newOvumcyErrorHandler builds the top-level Fiber error handler, closed over
+// the composition root's single *api.Handler. It answers EVERY error in the
+// app's own format: an explicit *fiber.Error keeps its status and is rendered
+// through the shared mapped-error negotiation (handler.RespondTransportError →
+// JSON envelope for API clients, localized status fragment for HTMX and for a
+// plain HTML navigation submitting POST /lang), while anything else — a raw
+// error, a recovered panic — becomes a generic 500 rendered the same way.
+// Handlers and middleware therefore return the *fiber.Error rather than
+// answering it themselves, so the request log's safe_error still records why
+// the request was refused.
+//
+// This runs on requests fiber never routed at all — a request head or body
+// that overflowed before any middleware ran — so it cannot assume
+// LanguageMiddleware has resolved the request's locale catalogue.
+// handler.RespondTransportError and handler.RespondRequestHeadersTooLarge
+// resolve it themselves before rendering either markup arm, so the localized
+// fragment still carries real copy rather than the raw machine key.
+//
+// Only the status crosses the boundary. Neither the *fiber.Error's message nor
+// the raw error's text reaches the body: framework messages are bare English
+// that no client can branch on, and raw errors can carry internal detail such as
+// table names, file paths, or driver messages. The client receives the app's
+// stable key instead.
+//
+// The envelope is app-wide by contract, not a courtesy extended to whichever
+// rejections happened to be noticed — a mixed format costs every client a second
+// parse path, and the pre-routing rejections that used to be the only mapped
+// ones (413, 431) are simply the two the framework raises most visibly. See
+// docs/SECURITY_INVARIANTS.md for the surrounding transport invariants.
+//
+// The same pre-routing path means securityHeadersMiddleware never ran, yet a
+// body-limit 413 on a plain form route renders the full refusal page — scripts,
+// forms, the CSRF meta tag — so the handler stamps the security headers itself.
+// HSTS is left to the routed responses: this constructor has no runtime config,
+// and the policy a browser already holds does not depend on one refused request.
+func newOvumcyErrorHandler(handler *api.Handler) fiber.ErrorHandler {
+	return func(c fiber.Ctx, err error) error {
+		setSecurityHeaders(c, false)
+		var fiberErr *fiber.Error
+		if !errors.As(err, &fiberErr) {
+			return handler.RespondTransportError(c, fiber.StatusInternalServerError)
 		}
-		return c.Status(fiberErr.Code).SendString(fiberErr.Message)
+		// A request head that overflows the read buffer answers through the same
+		// mapped spec as everything else — RespondRequestHeadersTooLarge resolves the
+		// identical 431 entry — plus an explicit log line. Without that line the
+		// rejection is effectively invisible to the operator: the head never parsed,
+		// so by the time the request logger runs the context carries no method or
+		// path and the entry reads "404 | GET | /" — indistinguishable from ordinary
+		// not-found noise, while the user is looking at a 431. Nothing about the
+		// request is logged; there is nothing parsed to log.
+		if fiberErr.Code == fiber.StatusRequestHeaderFieldsTooLarge {
+			log.Printf("request rejected: 431 request header fields too large — the request head did not fit the server read buffer")
+			return handler.RespondRequestHeadersTooLarge(c)
+		}
+		return handler.RespondTransportError(c, fiberErr.Code)
 	}
-	return c.Status(fiber.StatusInternalServerError).SendString("Internal Server Error")
 }
 
 func configureFiberMiddleware(app *fiber.App, config runtimeConfig, handler *api.Handler) {
@@ -164,11 +210,22 @@ func configureFiberMiddleware(app *fiber.App, config runtimeConfig, handler *api
 	app.Use(recover.New())
 	app.Use(newRequestLogger(nil))
 	app.Use(compress.New())
+	// Ahead of every limiter and CSRF, behind only app-wide Use middleware: both
+	// must key on the verb a form's _method makes the router run. See
+	// api.MethodOverride for why nothing route-specific may precede it.
+	app.Use(api.MethodOverride(handler))
+	// The per-IP logout row refuses BEFORE the handler, so every request it
+	// counts could keep a session alive. It counts only answers below 400: a
+	// neighbour behind the same address (NAT) spending it with unauthenticated
+	// or token-less DELETEs would otherwise hold every other owner's API
+	// sign-out refused until the window ends. Successful logouts still spend
+	// it, and each account's own budget behind it bounds them per owner.
 	app.Use(limiter.New(limiter.Config{
-		Next:         rateLimitOnlyFor(fiber.MethodDelete, "/api/v1/sessions/current"),
-		Max:          config.RateLimits.LogoutMax,
-		Expiration:   config.RateLimits.LogoutWindow,
-		KeyGenerator: keyGen,
+		Next:               rateLimitOnlyFor(fiber.MethodDelete, "/api/v1/sessions/current"),
+		Max:                config.RateLimits.LogoutMax,
+		Expiration:         config.RateLimits.LogoutWindow,
+		SkipFailedRequests: true,
+		KeyGenerator:       keyGen,
 		LimitReached: newAuthRateLimitHandler(handler, authRateLimitConfig{
 			ErrorCode: "too_many_logout_attempts",
 		}),
@@ -200,6 +257,35 @@ func configureFiberMiddleware(app *fiber.App, config runtimeConfig, handler *api
 			ErrorCode: "too_many_forgot_password_attempts",
 		}),
 	}))
+	// WEB-70: the 2FA login challenge and the password-reset redeem each verify
+	// a credential and used to draw on the /api catch-all alone (300/min) —
+	// wide enough for a TOTP challenge hammered across many accounts behind one
+	// address, or a redeem probing reset tokens with no service-level attempt
+	// budget behind it at all (bcrypt on the new password runs only after
+	// ResolveUserByResetToken accepts the token; the challenge pays no bcrypt).
+	// The ceiling bounds that guessing directly. Same credential ceiling and
+	// per-minute rate as login/register/forgot-password above, and registered
+	// before the /api catch-all below for the same reason those three are:
+	// mounted after it, the wider catch-all budget would refuse first on every
+	// request past its own count and this row would never be the one answering.
+	app.Use(limiter.New(limiter.Config{
+		Next:         rateLimitOnlyFor(fiber.MethodPost, "/api/v1/sessions/2fa-challenge"),
+		Max:          config.RateLimits.TOTPChallengeMax,
+		Expiration:   config.RateLimits.TOTPChallengeWindow,
+		KeyGenerator: keyGen,
+		LimitReached: newAuthRateLimitHandler(handler, authRateLimitConfig{
+			ErrorCode: "too_many_totp_challenge_attempts",
+		}),
+	}))
+	app.Use(limiter.New(limiter.Config{
+		Next:         rateLimitOnlyFor(fiber.MethodPost, "/api/v1/password-resets/redeem"),
+		Max:          config.RateLimits.PasswordResetRedeemMax,
+		Expiration:   config.RateLimits.PasswordResetRedeemWindow,
+		KeyGenerator: keyGen,
+		LimitReached: newAuthRateLimitHandler(handler, authRateLimitConfig{
+			ErrorCode: "too_many_password_reset_redeem_attempts",
+		}),
+	}))
 	app.Use("/auth/oidc", limiter.New(limiter.Config{
 		Max:          config.RateLimits.LoginMax,
 		Expiration:   config.RateLimits.LoginWindow,
@@ -207,6 +293,19 @@ func configureFiberMiddleware(app *fiber.App, config runtimeConfig, handler *api
 		LimitReached: newAuthRateLimitHandler(handler, authRateLimitConfig{
 			ErrorCode: "too_many_sso_attempts",
 		}),
+	}))
+	// POST /lang is the one unauthenticated route outside /api that reads a
+	// request body, so the /api budget above does not reach it. CSRF keeps a
+	// browser-origin attacker out, but it is not a volume control, and a body
+	// reader on an unauthenticated path should not be the single surface in the
+	// app with no cap at all. It costs a cookie write, so it takes the ordinary
+	// API budget rather than a knob of its own.
+	app.Use(limiter.New(limiter.Config{
+		Next:         rateLimitOnlyFor(fiber.MethodPost, api.LanguageSwitchPath),
+		Max:          config.RateLimits.APIMax,
+		Expiration:   config.RateLimits.APIWindow,
+		KeyGenerator: keyGen,
+		LimitReached: newAPIRateLimitHandler(handler),
 	}))
 	app.Use("/api", limiter.New(limiter.Config{
 		Max:          config.RateLimits.APIMax,
@@ -217,12 +316,41 @@ func configureFiberMiddleware(app *fiber.App, config runtimeConfig, handler *api
 	// Per-IP limiter for the cookieless calendar-feed endpoint. It is not under
 	// /api, so the /api limiter does not cover it; a public, tokened polling
 	// surface must be independently capped so a leaked/guessed URL cannot be
-	// hammered. Reuses the same spoof-proof key generator and the API budget.
+	// hammered. Reuses the same spoof-proof key generator, but NOT the API
+	// budget: this is the only cap on the surface, and since migration 032 moved
+	// verification to a keyed MAC it bounds request count plus the residual
+	// bcrypt of a pre-032 row. Keep it small — a calendar client polls once per
+	// refresh interval, not hundreds of times a minute.
+	//
+	// app.Use is prefix-matched and method-agnostic, so mounting it on the bare
+	// prefix alone would also spend this small budget on a bare "/calendar/feed",
+	// a trailing slash, a nested path segment, or a POST — none of which reach
+	// ServeCalendarFeed's verification at all, so none of them are what this
+	// budget exists to bound. Next scopes it to api.IsCalendarFeedRequest, the
+	// same predicate the CSRF and language skips below key on, so the three can
+	// never disagree about which requests are "the feed".
 	app.Use(api.CalendarFeedRateLimitPrefix, limiter.New(limiter.Config{
-		Max:          config.RateLimits.APIMax,
-		Expiration:   config.RateLimits.APIWindow,
+		Next:         func(c fiber.Ctx) bool { return !api.IsCalendarFeedRequest(c.Method(), c.Path()) },
+		Max:          config.RateLimits.CalendarFeedMax,
+		Expiration:   config.RateLimits.CalendarFeedWindow,
 		KeyGenerator: keyGen,
 		LimitReached: newCalendarFeedRateLimitHandler(handler),
+	}))
+	// WEB-14 SEC-H5: GET /calendar builds the month grid, sized independently of
+	// the request by the clamp and iteration cap in internal/services
+	// (CalendarMaximumNavigableMonth, maxProjectedCyclesInGrid) — but it is an
+	// authenticated page outside /api, so the APIMax limiter above never
+	// reaches it, and it had no cap of its own at all. Keyed the same as every
+	// other authenticated-session limiter (keyGen). rateLimitOnlyFor keeps this
+	// scoped to exactly GET (and its HEAD twin) /calendar, the same reasoning POST /lang's mount
+	// above documents — /calendar/day/:date shares the prefix but not the
+	// grid-building cost this budget exists to bound, and must not spend it.
+	app.Use(limiter.New(limiter.Config{
+		Next:         rateLimitOnlyFor(fiber.MethodGet, "/calendar"),
+		Max:          config.RateLimits.CalendarMax,
+		Expiration:   config.RateLimits.CalendarWindow,
+		KeyGenerator: keyGen,
+		LimitReached: newCalendarPageRateLimitHandler(handler),
 	}))
 	app.Use(handler.LanguageMiddleware)
 	app.Use(csrf.New(csrfMiddlewareConfig(config.CookieSecure, handler)))
@@ -251,26 +379,53 @@ func newRequestLogger(output io.Writer) fiber.Handler {
 
 func securityHeadersMiddleware(enableStrictTransportSecurity bool) fiber.Handler {
 	return func(c fiber.Ctx) error {
-		c.Set(headerXContentTypeOptions, xContentTypeOptionsNoSniff)
-		c.Set(headerReferrerPolicy, referrerPolicyStrictOrigin)
-		c.Set(headerPermissionsPolicy, permissionsPolicyDefault)
-		c.Set(headerCrossOriginOpenerPolicy, crossOriginOpenerPolicyDefault)
-		c.Set(headerXFrameOptions, xFrameOptionsDeny)
-		c.Set(headerContentSecurityPolicy, contentSecurityPolicyDefault)
-		if enableStrictTransportSecurity {
-			c.Set(headerStrictTransportSecurity, strictTransportSecurityDefault)
-		}
-		if !strings.HasPrefix(c.Path(), "/static") {
-			c.Set("Cache-Control", "no-store")
-		}
+		setSecurityHeaders(c, enableStrictTransportSecurity)
 		return c.Next()
+	}
+}
+
+func setSecurityHeaders(c fiber.Ctx, enableStrictTransportSecurity bool) {
+	c.Set(headerXContentTypeOptions, xContentTypeOptionsNoSniff)
+	c.Set(headerReferrerPolicy, referrerPolicyStrictOrigin)
+	c.Set(headerPermissionsPolicy, permissionsPolicyDefault)
+	c.Set(headerCrossOriginOpenerPolicy, crossOriginOpenerPolicyDefault)
+	c.Set(headerXFrameOptions, xFrameOptionsDeny)
+	c.Set(headerContentSecurityPolicy, contentSecurityPolicyDefault)
+	if enableStrictTransportSecurity {
+		c.Set(headerStrictTransportSecurity, strictTransportSecurityDefault)
+	}
+	if !strings.HasPrefix(c.Path(), "/static") {
+		c.Set("Cache-Control", "no-store")
 	}
 }
 
 func csrfMiddlewareConfig(cookieSecure bool, handler *api.Handler) csrf.Config {
 	return csrf.Config{
+		// Two unrelated skips share this predicate. The OIDC callback clause is
+		// the sole exemption from CSRF VALIDATION: a mutating POST route the
+		// middleware would otherwise reject for carrying no token, protected
+		// instead by the sealed one-time state cookie (see
+		// csrf_exemption_guard_test.go, which walks every mutating route and
+		// expects exactly this one).
+		//
+		// The calendar-feed clause validates nothing to begin with: GET and HEAD
+		// are safe methods, and fiber's csrf.New only ever reaches its
+		// validation arm for the unsafe ones. What it skips is the SAFE-METHOD
+		// arm's own side effect — on every GET or HEAD without a matching
+		// cookie, csrf.New mints a fresh token and unconditionally sets it,
+		// calendar clients included, which is the Set-Cookie the cookieless
+		// feed's own contract forbids on every outcome
+		// (docs/SECURITY_INVARIANTS.md → Calendar feed subscription). So this
+		// is not a second validation exemption, and csrfGuardExpectedExemptions
+		// in csrf_exemption_guard_test.go stays a single mutating route. See
+		// api.IsCalendarFeedRequest's own godoc for why a mutating verb, or a
+		// neighbour that merely shares the prefix's characters, never reaches
+		// this skip.
 		Next: func(c fiber.Ctx) bool {
-			return c.Method() == fiber.MethodPost && c.Path() == security.OIDCCallbackPath
+			if c.Method() == fiber.MethodPost && c.Path() == security.OIDCCallbackPath {
+				return true
+			}
+			return api.IsCalendarFeedRequest(c.Method(), c.Path())
 		},
 		// Fiber v3 removed KeyLookup and ContextKey: the token source is now a
 		// typed extractors.Extractor (see api.CSRFTokenExtractor, form-then-

@@ -22,8 +22,8 @@ var (
 type OnboardingUserRepository interface {
 	FindByID(ctx context.Context, userID uint) (models.User, error)
 	SaveOnboardingStep1(ctx context.Context, userID uint, start time.Time) error
-	SaveOnboardingStep2(ctx context.Context, userID uint, cycleLength int, periodLength int, autoPeriodFill bool, irregularCycle bool, ageGroup string, usageGoal string) error
-	CompleteOnboarding(ctx context.Context, userID uint, startDay time.Time, periodLength int, autoPeriodFill bool) error
+	SaveOnboardingStep2(ctx context.Context, userID uint, cycleLength int, periodLength int, autoPeriodFill bool, irregularCycle bool, usageGoal string) error
+	CompleteOnboarding(ctx context.Context, userID uint, startDay time.Time, fillEndDay time.Time, autoPeriodFill bool) error
 }
 
 type OnboardingService struct {
@@ -70,7 +70,11 @@ func (service *OnboardingService) ValidateAndParseStep1StartDate(raw string, now
 	return CalendarDay(parsed, time.UTC), nil
 }
 
-func (service *OnboardingService) SaveStep2(ctx context.Context, userID uint, cycleLength int, periodLength int, autoPeriodFill bool, irregularCycle bool, ageGroup string, usageGoal string) (int, int, error) {
+// SaveStep2 persists the cycle defaults collected by the second onboarding
+// step plus the usage goal. The age bracket is deliberately NOT among them:
+// onboarding stopped asking for it, and the column is owned by the settings
+// cycle form alone, so a step-2 save can never overwrite an answer given there.
+func (service *OnboardingService) SaveStep2(ctx context.Context, userID uint, cycleLength int, periodLength int, autoPeriodFill bool, irregularCycle bool, usageGoal string) (int, int, error) {
 	safeCycleLength, safePeriodLength := SanitizeOnboardingCycleAndPeriod(cycleLength, periodLength)
 	if err := service.users.SaveOnboardingStep2(
 		ctx,
@@ -79,7 +83,6 @@ func (service *OnboardingService) SaveStep2(ctx context.Context, userID uint, cy
 		safePeriodLength,
 		autoPeriodFill,
 		irregularCycle,
-		NormalizeAgeGroup(ageGroup),
 		NormalizeUsageGoal(usageGoal),
 	); err != nil {
 		return 0, 0, err
@@ -87,21 +90,24 @@ func (service *OnboardingService) SaveStep2(ctx context.Context, userID uint, cy
 	return safeCycleLength, safePeriodLength, nil
 }
 
-func (service *OnboardingService) ParseAndNormalizeStep2Input(cycleRaw string, periodRaw string, autoPeriodFill bool, irregularCycle bool, ageGroup string, usageGoal string) (int, int, bool, bool, string, string, error) {
+// ParseAndNormalizeStep2Input normalizes the raw step-2 submission. An unset or
+// unknown usage goal resolves to the neutral default, which is what the visible
+// skip action submits.
+func (service *OnboardingService) ParseAndNormalizeStep2Input(cycleRaw string, periodRaw string, autoPeriodFill bool, irregularCycle bool, usageGoal string) (int, int, bool, bool, string, error) {
 	cycleLength, err := strconv.Atoi(strings.TrimSpace(cycleRaw))
 	if err != nil {
-		return 0, 0, false, false, "", "", ErrOnboardingStep2InputInvalid
+		return 0, 0, false, false, "", ErrOnboardingStep2InputInvalid
 	}
 	periodLength, err := strconv.Atoi(strings.TrimSpace(periodRaw))
 	if err != nil {
-		return 0, 0, false, false, "", "", ErrOnboardingStep2InputInvalid
+		return 0, 0, false, false, "", ErrOnboardingStep2InputInvalid
 	}
 
 	safeCycleLength, safePeriodLength := SanitizeOnboardingCycleAndPeriod(cycleLength, periodLength)
-	return safeCycleLength, safePeriodLength, autoPeriodFill, irregularCycle, NormalizeAgeGroup(ageGroup), NormalizeUsageGoal(usageGoal), nil
+	return safeCycleLength, safePeriodLength, autoPeriodFill, irregularCycle, NormalizeUsageGoal(usageGoal), nil
 }
 
-func (service *OnboardingService) CompleteOnboardingForUser(ctx context.Context, userID uint, location *time.Location) (time.Time, error) {
+func (service *OnboardingService) CompleteOnboardingForUser(ctx context.Context, userID uint, now time.Time, location *time.Location) (time.Time, error) {
 	current, err := service.users.FindByID(ctx, userID)
 	if err != nil {
 		return time.Time{}, err
@@ -112,7 +118,13 @@ func (service *OnboardingService) CompleteOnboardingForUser(ctx context.Context,
 
 	startDay := CalendarDay(*current.LastPeriodStart, time.UTC)
 	_, periodLength := SanitizeOnboardingCycleAndPeriod(current.CycleLength, current.PeriodLength)
-	if err := service.users.CompleteOnboarding(ctx, userID, startDay, periodLength, current.AutoPeriodFill); err != nil {
+	// The seeded period stops at the owner's local today, on the same bound as
+	// the day auto-fill: a period still in progress is recorded only through the
+	// day the owner has reached, never ahead of it. The bound is resolved in the
+	// owner's location and handed over as the UTC-midnight calendar day the
+	// repository iterates.
+	fillEndDay := CalendarDay(periodFillLastDay(startDay, periodLength, now, location), time.UTC)
+	if err := service.users.CompleteOnboarding(ctx, userID, startDay, fillEndDay, current.AutoPeriodFill); err != nil {
 		return time.Time{}, err
 	}
 	return startDay, nil
@@ -166,8 +178,12 @@ func ClampOnboardingPeriodLength(value int) int {
 	return value
 }
 
+// MinOnboardingCycleLength is the shortest cycle length onboarding and Settings
+// accept.
+const MinOnboardingCycleLength = 15
+
 func IsValidOnboardingCycleLength(value int) bool {
-	return value >= 15 && value <= 90
+	return value >= MinOnboardingCycleLength && value <= 90
 }
 
 func IsValidOnboardingPeriodLength(value int) bool {
@@ -188,18 +204,31 @@ func ResolveCycleAndPeriodDefaults(cycleLength int, periodLength int) (int, int)
 	return resolvedCycleLength, resolvedPeriodLength
 }
 
+// OnboardingStartDateWindowDays is how far back step 1 accepts a last-period
+// start, in days before today. It is also the number the range error states in
+// every locale ("within the last 60 days"), and the two are held together by
+// TestOnboardingRangeCopyStatesTheEnforcedWindow.
+const OnboardingStartDateWindowDays = 60
+
+// OnboardingDateBounds returns the window step 1 accepts, which is also the
+// window the date picker offers: the last OnboardingStartDateWindowDays days,
+// ending today.
+//
+// The floor used to be raised to 1 January of the current year whenever that
+// was the later of the two, which made the accepted window one single day on
+// 1 January and shorter than the copy promised through all of January and
+// February. Completion is impossible without a start date
+// (ValidateOnboardingCompletionEligibility), so an owner onboarding in that
+// stretch could only proceed by entering a date they knew to be wrong — and
+// that date anchors the first cycle and every estimate built on it. The window
+// crossing into the previous calendar year is the point, not a side effect.
 func OnboardingDateBounds(now time.Time, location *time.Location) (time.Time, time.Time) {
 	if location == nil {
 		location = time.UTC
 	}
 
 	today := DateAtLocation(now.In(location), location)
-	minDate := time.Date(today.Year(), time.January, 1, 0, 0, 0, 0, location)
-	sixtyDaysAgo := today.AddDate(0, 0, -60)
-	if sixtyDaysAgo.After(minDate) {
-		minDate = sixtyDaysAgo
-	}
-	return minDate, today
+	return AddCalendarDays(today, -OnboardingStartDateWindowDays, location), today
 }
 
 func RequiresOnboarding(user *models.User) bool {

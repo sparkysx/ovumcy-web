@@ -1,0 +1,211 @@
+package services
+
+import (
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/ovumcy/ovumcy-web/internal/models"
+	"golang.org/x/crypto/bcrypt"
+)
+
+// The 2FA disable budget is exercised through the same verify every re-auth
+// uses; these helpers only spell its admission, booking and reset in the shape
+// the rate-limit tests were written against.
+
+// newDisableBudgetSettings is a SettingsService wired the way bootstrap wires
+// it, the owner of the budget the 2FA disable confirmation draws.
+func newDisableBudgetSettings(secretKey []byte, limiter *AttemptLimiter) *SettingsService {
+	settings := NewSettingsService(nil)
+	settings.ConfigureReauthAttempts(secretKey, limiter, DefaultSettingsReauthAttemptsLimit, DefaultSettingsReauthAttemptsWindow)
+	return settings
+}
+
+func checkDisableBudget(svc *SettingsService, clientKey string, userID uint, now time.Time) error {
+	attempt := ReauthAttempt{ClientKey: clientKey, UserID: userID, Now: now}
+	return svc.SettingsReauthBudget().verify(attempt, func() error { return nil })
+}
+
+func recordDisableFailure(svc *SettingsService, clientKey string, userID uint, now time.Time) {
+	attempt := ReauthAttempt{ClientKey: clientKey, UserID: userID, Now: now}
+	svc.SettingsReauthBudget().bookFailure(attempt)
+}
+
+func resetDisableBudget(svc *SettingsService, clientKey string, userID uint) {
+	svc.SettingsReauthBudget().Reset(ReauthAttempt{ClientKey: clientKey, UserID: userID})
+}
+
+type reauthBudgetFixture struct {
+	settings *SettingsService
+	totp     *TOTPService
+	user     *models.User
+	attempt  ReauthAttempt
+}
+
+const reauthBudgetFixturePassword = "StrongPass1"
+
+// newReauthBudgetFixture wires both budgets onto ONE shared limiter and one key,
+// the way bootstrap does, so a draw that landed in the wrong scope would show.
+func newReauthBudgetFixture(t *testing.T) reauthBudgetFixture {
+	t.Helper()
+	secretKey := []byte("reauth-budget-routing-secret-32b!")
+	limiter := NewAttemptLimiter()
+	settings := NewSettingsService(nil)
+	settings.ConfigureReauthAttempts(secretKey, limiter, DefaultSettingsReauthAttemptsLimit, DefaultSettingsReauthAttemptsWindow)
+	hash, err := bcrypt.GenerateFromPassword([]byte(reauthBudgetFixturePassword), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("hash the fixture password: %v", err)
+	}
+	return reauthBudgetFixture{
+		settings: settings,
+		totp:     NewTOTPService(&stubTOTPUserRepo{}, secretKey, limiter),
+		user:     &models.User{ID: 42, PasswordHash: string(hash), LocalAuthEnabled: true},
+		attempt:  ReauthAttempt{ClientKey: "198.51.100.7", UserID: 42, Now: time.Now()},
+	}
+}
+
+func (fixture reauthBudgetFixture) spend(t *testing.T, budget ReauthBudget, limit int) {
+	t.Helper()
+	for range limit {
+		if err := fixture.settings.VerifyReauth(budget, fixture.attempt, fixture.user, "WrongPassword1"); !errors.Is(err, ErrSettingsPasswordInvalid) {
+			t.Fatalf("wrong password = %v, want ErrSettingsPasswordInvalid", err)
+		}
+	}
+}
+
+// TestPasswordReauthsShareOneAccountBudget pins that every password re-auth of
+// one account draws ONE budget: wrong passwords spent through VerifyReauth (the
+// 2FA disable confirmation's entry) refuse VerifyReauthPassword (the settings
+// actions' entry), and the reverse. Two budgets would hand a stolen session
+// twice the guesses at one password hash that the sign-in form allows.
+func TestPasswordReauthsShareOneAccountBudget(t *testing.T) {
+	t.Run("VerifyReauthPassword spent refuses VerifyReauth", func(t *testing.T) {
+		fixture := newReauthBudgetFixture(t)
+		for range DefaultSettingsReauthAttemptsLimit {
+			if _, err := fixture.settings.VerifyReauthPassword(fixture.attempt, fixture.user, "WrongPassword1"); !errors.Is(err, ErrSettingsPasswordInvalid) {
+				t.Fatalf("wrong password = %v, want ErrSettingsPasswordInvalid", err)
+			}
+		}
+
+		if err := fixture.settings.VerifyReauth(fixture.settings.SettingsReauthBudget(), fixture.attempt, fixture.user, reauthBudgetFixturePassword); !errors.Is(err, ErrSettingsReauthRateLimited) {
+			t.Fatalf("correct password on VerifyReauth after spending VerifyReauthPassword = %v, want ErrSettingsReauthRateLimited", err)
+		}
+	})
+	t.Run("VerifyReauth spent refuses VerifyReauthPassword", func(t *testing.T) {
+		fixture := newReauthBudgetFixture(t)
+		fixture.spend(t, fixture.settings.SettingsReauthBudget(), DefaultSettingsReauthAttemptsLimit)
+
+		if _, err := fixture.settings.VerifyReauthPassword(fixture.attempt, fixture.user, reauthBudgetFixturePassword); !errors.Is(err, ErrSettingsReauthRateLimited) {
+			t.Fatalf("correct password on VerifyReauthPassword after spending VerifyReauth = %v, want ErrSettingsReauthRateLimited", err)
+		}
+	})
+	t.Run("the two entries together get no more than one limit", func(t *testing.T) {
+		fixture := newReauthBudgetFixture(t)
+		fixture.spend(t, fixture.settings.SettingsReauthBudget(), DefaultSettingsReauthAttemptsLimit-2)
+		for range 2 {
+			if _, err := fixture.settings.VerifyReauthPassword(fixture.attempt, fixture.user, "WrongPassword1"); !errors.Is(err, ErrSettingsPasswordInvalid) {
+				t.Fatalf("wrong password = %v, want ErrSettingsPasswordInvalid", err)
+			}
+		}
+
+		if err := fixture.settings.VerifyReauth(fixture.settings.SettingsReauthBudget(), fixture.attempt, fixture.user, reauthBudgetFixturePassword); !errors.Is(err, ErrSettingsReauthRateLimited) {
+			t.Fatalf("VerifyReauth after a split spend of one limit = %v, want ErrSettingsReauthRateLimited", err)
+		}
+		if _, err := fixture.settings.VerifyReauthPassword(fixture.attempt, fixture.user, reauthBudgetFixturePassword); !errors.Is(err, ErrSettingsReauthRateLimited) {
+			t.Fatalf("VerifyReauthPassword after a split spend of one limit = %v, want ErrSettingsReauthRateLimited", err)
+		}
+	})
+}
+
+// TestVerifyReauthLeavesTheResetToTheCaller pins the split between the verify
+// step and the reset: a correct password through VerifyReauth keeps the count it
+// found, and only budget.Reset clears it. VerifyReauthPassword, the settings.reauth
+// verify, keeps the count too: the settings actions clear it after their write.
+func TestVerifyReauthLeavesTheResetToTheCaller(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		budget  func(reauthBudgetFixture) ReauthBudget
+		limit   int
+		limited error
+	}{
+		{"settings.reauth", func(fixture reauthBudgetFixture) ReauthBudget { return fixture.settings.SettingsReauthBudget() }, DefaultSettingsReauthAttemptsLimit, ErrSettingsReauthRateLimited},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newReauthBudgetFixture(t)
+			budget := tc.budget(fixture)
+			fixture.spend(t, budget, tc.limit-1)
+			if err := fixture.settings.VerifyReauth(budget, fixture.attempt, fixture.user, reauthBudgetFixturePassword); err != nil {
+				t.Fatalf("correct password one short of the limit = %v, want nil", err)
+			}
+			fixture.spend(t, budget, 1)
+			if err := fixture.settings.VerifyReauth(budget, fixture.attempt, fixture.user, reauthBudgetFixturePassword); !errors.Is(err, tc.limited) {
+				t.Fatalf("verify after a success and one more failure = %v, want %v: a successful verify cleared the count, and the reset is the caller's step", err, tc.limited)
+			}
+			budget.Reset(fixture.attempt)
+			if err := fixture.settings.VerifyReauth(budget, fixture.attempt, fixture.user, reauthBudgetFixturePassword); err != nil {
+				t.Fatalf("correct password after Reset = %v, want nil", err)
+			}
+		})
+	}
+
+	fixture := newReauthBudgetFixture(t)
+	fixture.spend(t, fixture.settings.SettingsReauthBudget(), DefaultSettingsReauthAttemptsLimit-1)
+	if _, err := fixture.settings.VerifyReauthPassword(fixture.attempt, fixture.user, reauthBudgetFixturePassword); err != nil {
+		t.Fatalf("VerifyReauthPassword one short of the limit = %v, want nil", err)
+	}
+	fixture.spend(t, fixture.settings.SettingsReauthBudget(), 1)
+	if _, err := fixture.settings.VerifyReauthPassword(fixture.attempt, fixture.user, reauthBudgetFixturePassword); !errors.Is(err, ErrSettingsReauthRateLimited) {
+		t.Fatalf("VerifyReauthPassword after a success and one more failure = %v, want ErrSettingsReauthRateLimited: the verify cleared the count before the caller's write", err)
+	}
+}
+
+// TestReauthBudgetsKeepAccountsOnOneAddressApart pins the keying every budget
+// shares: an account that spends its budget from an address leaves another
+// account behind the same address (a household NAT) its full budget, while the
+// spent account stays refused.
+func TestReauthBudgetsKeepAccountsOnOneAddressApart(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		budget  func(reauthBudgetFixture) ReauthBudget
+		limit   int
+		limited error
+	}{
+		{"settings.reauth", func(fixture reauthBudgetFixture) ReauthBudget { return fixture.settings.SettingsReauthBudget() }, DefaultSettingsReauthAttemptsLimit, ErrSettingsReauthRateLimited},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newReauthBudgetFixture(t)
+			budget := tc.budget(fixture)
+			fixture.spend(t, budget, tc.limit)
+
+			if err := fixture.settings.VerifyReauth(budget, fixture.attempt, fixture.user, reauthBudgetFixturePassword); !errors.Is(err, tc.limited) {
+				t.Fatalf("anchor: correct password on the spent account = %v, want %v", err, tc.limited)
+			}
+			neighbour := *fixture.user
+			neighbour.ID = fixture.user.ID + 1
+			neighbourAttempt := fixture.attempt
+			neighbourAttempt.UserID = neighbour.ID
+			if err := fixture.settings.VerifyReauth(budget, neighbourAttempt, &neighbour, reauthBudgetFixturePassword); err != nil {
+				t.Fatalf("correct password for another account on the same address = %v, want nil", err)
+			}
+			if err := fixture.settings.VerifyReauth(budget, fixture.attempt, fixture.user, reauthBudgetFixturePassword); !errors.Is(err, tc.limited) {
+				t.Fatalf("correct password on the spent account after its neighbour's = %v, want %v: the two accounts share a bucket", err, tc.limited)
+			}
+		})
+	}
+}
+
+// TestVerifyReauthTrimsAndLeavesABlankSubmissionUncounted pins the trim and the
+// blank refusal every budget shares: surrounding whitespace is not part of the
+// password, and a blank one is refused without drawing either budget.
+func TestVerifyReauthTrimsAndLeavesABlankSubmissionUncounted(t *testing.T) {
+	fixture := newReauthBudgetFixture(t)
+	budget := fixture.settings.SettingsReauthBudget()
+	for range DefaultSettingsReauthAttemptsLimit + 1 {
+		if err := fixture.settings.VerifyReauth(budget, fixture.attempt, fixture.user, " \t "); !errors.Is(err, ErrSettingsPasswordMissing) {
+			t.Fatalf("blank password = %v, want ErrSettingsPasswordMissing", err)
+		}
+	}
+	if err := fixture.settings.VerifyReauth(budget, fixture.attempt, fixture.user, "  "+reauthBudgetFixturePassword+"\t"); err != nil {
+		t.Fatalf("correct password with surrounding whitespace after blanks = %v, want nil", err)
+	}
+}

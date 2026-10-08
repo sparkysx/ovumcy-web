@@ -14,12 +14,23 @@ on:
     branches:
       - main
   pull_request:
+  # Merge-queue validation runs: every workflow that owns a required status
+  # check must also report on merge_group, or a queued merge waits forever.
+  merge_group:
   schedule:
     - cron: "47 3 * * 1"
   workflow_dispatch:
 
 permissions:
   contents: read
+
+# Cancel a superseded run when new commits land on the same PR, so a rapid
+# string of fixup pushes doesn't queue every intermediate run to completion.
+# Only cancels pull_request runs — push (main), the weekly schedule, and
+# workflow_dispatch always run to completion.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   gitleaks:
@@ -29,8 +40,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           # Full history so the scheduled/push run also re-checks commits that
           # were already merged, matching CodeQL/security's full-checkout scope.
           # gitleaks itself is pointed at full history via --log-opts=--all below.
@@ -38,6 +50,11 @@ jobs:
 
       - name: Prepare security artifact directory
         run: mkdir -p .tmp/security
+
+      - name: Pull gitleaks image
+        uses: ./.github/actions/docker-pull-retry
+        with:
+          image: ${{ env.GITLEAKS_IMAGE }}
 
       - name: Run gitleaks (full history)
         # --log-opts=--all scans every commit reachable from any ref, not just

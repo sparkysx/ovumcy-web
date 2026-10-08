@@ -9,12 +9,17 @@
 # or subjective rules:
 #   - copyloopvar: flags loop-variable copies made redundant by Go 1.22
 #     per-iteration loop variables; pure dead code under go 1.26.
+#   - forbidigo: one pattern, strconv.ParseUint in internal/api production
+#     code; the reason is at its settings below.
 #   - intrange: canonical Go 1.22 `for i := range n` counting loops instead
 #     of the three-clause form.
 #   - misspell: objective spelling fixes in comments and strings; locale left
 #     at the default, matching the codebase's existing spelling.
 #   - unconvert: removes type conversions that are no-ops; they only obscure
 #     the actual types in security-relevant code.
+#   - nolintlint: the zero-suppression line below, asked of the tree rather
+#     than of a reviewer. What it reaches and what it does not is in the
+#     paragraph on that line, further down.
 #
 # Evaluated against the codebase and deliberately NOT enabled:
 #   - gocritic: its default set flags intentional test patterns here (mapKey
@@ -28,12 +33,75 @@
 # The repo carries zero //nolint directives; keep it that way. If a new
 # finding is a false positive, prefer narrowing the linter's settings here
 # (with a comment) over inline suppressions.
+#
+# nolintlint is what now stands behind that line, and being exact about how far
+# it reaches matters more than the fact it is on. It reports a directive that is
+# bare, that carries no explanation, or that is unused — and "unused" is judged
+# against the linters THIS config runs. Two consequences follow, both measured
+# against v2.12.2 rather than read off the documentation:
+#   - a well-formed directive for an enabled linter that really does suppress a
+#     finding passes; there is no setting that refuses one.
+#   - a directive naming a linter golangci-lint does not run is invisible to it.
+#     `//nolint:gosec` is that case here: gosec is not enabled below, it runs in
+#     its own workflow, and two such directives had accumulated in the tree
+#     suppressing nothing on either path. They were removed by hand in the same
+#     change that added this linter, because the linter would not have found
+#     them.
+# So the last step from "no junk suppressions" to "none at all" stays a reading
+# of the diff. What is no longer a reading of the diff is everything below it.
 version: "2"
 
 linters:
   default: standard
   enable:
     - copyloopvar
+    - forbidigo
     - intrange
     - misspell
+    - nolintlint
     - unconvert
+  exclusions:
+    # `npm ci` installs at least one package that ships Go sources of its own
+    # (`flatted`, a Go port beside its JavaScript), and a bare `golangci-lint
+    # run` walks straight into it: five findings — 2 govet, 3 intrange — in a
+    # file nothing here calls, that is untracked, and that the next install
+    # overwrites. Scoping the run by hand hides them and hides nothing else,
+    # but only for whoever remembers to; the config is where it belongs, so
+    # the plain command is the correct command.
+    paths:
+      - node_modules
+    rules:
+      # forbidigo carries one pattern, for internal/api production code only.
+      # path-except is not separator-normalized on Windows (v2.13.2, unlike
+      # path), so a bare `internal/api/` there suppresses every finding.
+      - path-except: internal[/\\]api[/\\]
+        linters: [forbidigo]
+      - path: _test\.go$
+        linters: [forbidigo]
+      - path: internal/api/input_validation_uint_helpers\.go$
+        linters: [forbidigo]
+  settings:
+    forbidigo:
+      # A path id parsed at bitSize 64 and converted to uint truncates on a
+      # 32-bit target (CodeQL go/incorrect-integer-conversion). forbidigo sees
+      # the call, not its arguments, so every ParseUint is refused here and
+      # parseRequestUint, which parses at strconv.IntSize, is the one exemption.
+      forbid:
+        - pattern: ^strconv\.ParseUint$
+          msg: use parseRequestUint (internal/api/input_validation_uint_helpers.go), which parses at strconv.IntSize
+    nolintlint:
+      # Every knob the linter has, all pointing the same way: a directive must
+      # name its linters, explain itself, and actually suppress something.
+      # allow-unused stays at its default rather than being dropped as noise: a
+      # directive that suppresses nothing is the shape an inline suppression
+      # decays into once the finding it was written for is fixed elsewhere, and
+      # it outlives the reviewer who would have caught it going in.
+      require-specific: true
+      require-explanation: true
+      allow-unused: false
+    misspell:
+      # Localized copy asserted by backend regressions is not English prose:
+      # "successivo" is Italian for "next" (it.json month-navigation label),
+      # which misspell's default locale reads as a misspelling of "succession".
+      ignore-rules:
+        - successivo

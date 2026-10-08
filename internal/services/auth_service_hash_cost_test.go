@@ -79,14 +79,14 @@ func TestNewPasswordHashesUseConfiguredCost(t *testing.T) {
 		}
 	})
 
-	t.Run("ForceResetPasswordByEmail writes hash at target cost", func(t *testing.T) {
+	t.Run("ForceResetPasswordByID writes hash at target cost", func(t *testing.T) {
 		repo := &stubAuthUserRepo{
-			existsByEmail:   true,
-			findByEmailUser: models.User{ID: 5, Email: "owner@example.com", Role: models.RoleOwner},
+			findByIDOptionalFound: true,
+			findByIDOptionalUser:  models.User{ID: 5, Email: "owner@example.com", Role: models.RoleOwner},
 		}
 		service := NewAuthService(repo)
-		if err := service.ForceResetPasswordByEmail(context.Background(), "owner@example.com", "StrongPass1"); err != nil {
-			t.Fatalf("ForceResetPasswordByEmail: %v", err)
+		if err := service.ForceResetPasswordByID(context.Background(), 5, "StrongPass1"); err != nil {
+			t.Fatalf("ForceResetPasswordByID: %v", err)
 		}
 		if got := mustBcryptCost(t, repo.updatedPasswordHash); got != passwordHashCost {
 			t.Fatalf("force-reset hash cost = %d, want %d", got, passwordHashCost)
@@ -96,7 +96,7 @@ func TestNewPasswordHashesUseConfiguredCost(t *testing.T) {
 
 // TestAuthenticateCredentialsRehashesStaleCost is the opportunistic-rehash
 // contract: a valid login against a below-target (legacy cost-10) hash upgrades
-// the stored hash to passwordHashCost via UpdatePasswordHashOnly (which does NOT
+// the stored hash to passwordHashCost via UpgradePasswordHashCAS (which does NOT
 // bump auth_session_version — the session that just authenticated must survive).
 func TestAuthenticateCredentialsRehashesStaleCost(t *testing.T) {
 	legacyHash, err := bcrypt.GenerateFromPassword([]byte("StrongPass1"), bcrypt.DefaultCost)
@@ -104,13 +104,15 @@ func TestAuthenticateCredentialsRehashesStaleCost(t *testing.T) {
 		t.Fatalf("hash password: %v", err)
 	}
 	repo := &stubAuthUserRepo{
-		findByEmailUser: models.User{
-			ID:                 77,
-			Email:              "login@example.com",
-			PasswordHash:       string(legacyHash),
-			LocalAuthEnabled:   true,
-			Role:               models.RoleOwner,
-			AuthSessionVersion: 3,
+		emailMatches: []models.User{
+			{
+				ID:                 77,
+				Email:              "login@example.com",
+				PasswordHash:       string(legacyHash),
+				LocalAuthEnabled:   true,
+				Role:               models.RoleOwner,
+				AuthSessionVersion: 3,
+			},
 		},
 	}
 	service := NewAuthService(repo)
@@ -119,13 +121,18 @@ func TestAuthenticateCredentialsRehashesStaleCost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AuthenticateCredentials: %v", err)
 	}
-	if repo.updateHashOnlyCalls != 1 {
-		t.Fatalf("expected exactly 1 opportunistic rehash write, got %d", repo.updateHashOnlyCalls)
+	if repo.upgradeHashCalls != 1 {
+		t.Fatalf("expected exactly 1 opportunistic rehash write, got %d", repo.upgradeHashCalls)
 	}
-	if repo.updateHashOnlyUserID != 77 {
-		t.Fatalf("rehash targeted user %d, want 77", repo.updateHashOnlyUserID)
+	if repo.upgradeHashUserID != 77 {
+		t.Fatalf("rehash targeted user %d, want 77", repo.upgradeHashUserID)
 	}
-	if got := mustBcryptCost(t, repo.updateHashOnlyHash); got != passwordHashCost {
+	// The write is conditioned on the hash this login verified, not on
+	// anything read later.
+	if repo.upgradeHashOld != string(legacyHash) {
+		t.Fatal("rehash was conditioned on a hash other than the one the login compared against")
+	}
+	if got := mustBcryptCost(t, repo.upgradeHashNew); got != passwordHashCost {
 		t.Fatalf("rehash wrote cost %d, want %d", got, passwordHashCost)
 	}
 	// The returned user reflects the upgraded hash so a caller that reissues a
@@ -134,7 +141,7 @@ func TestAuthenticateCredentialsRehashesStaleCost(t *testing.T) {
 		t.Fatalf("returned user hash cost = %d, want %d", got, passwordHashCost)
 	}
 	// The upgraded hash still verifies the same password.
-	if bcrypt.CompareHashAndPassword([]byte(repo.updateHashOnlyHash), []byte("StrongPass1")) != nil {
+	if bcrypt.CompareHashAndPassword([]byte(repo.upgradeHashNew), []byte("StrongPass1")) != nil {
 		t.Fatal("upgraded hash no longer verifies the original password")
 	}
 }
@@ -148,12 +155,14 @@ func TestAuthenticateCredentialsSkipsRehashAtTargetCost(t *testing.T) {
 		t.Fatalf("hash password: %v", err)
 	}
 	repo := &stubAuthUserRepo{
-		findByEmailUser: models.User{
-			ID:               77,
-			Email:            "login@example.com",
-			PasswordHash:     string(currentHash),
-			LocalAuthEnabled: true,
-			Role:             models.RoleOwner,
+		emailMatches: []models.User{
+			{
+				ID:               77,
+				Email:            "login@example.com",
+				PasswordHash:     string(currentHash),
+				LocalAuthEnabled: true,
+				Role:             models.RoleOwner,
+			},
 		},
 	}
 	service := NewAuthService(repo)
@@ -161,8 +170,8 @@ func TestAuthenticateCredentialsSkipsRehashAtTargetCost(t *testing.T) {
 	if _, err := service.AuthenticateCredentials(context.Background(), "login@example.com", "StrongPass1"); err != nil {
 		t.Fatalf("AuthenticateCredentials: %v", err)
 	}
-	if repo.updateHashOnlyCalls != 0 {
-		t.Fatalf("expected no rehash write at target cost, got %d", repo.updateHashOnlyCalls)
+	if repo.upgradeHashCalls != 0 {
+		t.Fatalf("expected no rehash write at target cost, got %d", repo.upgradeHashCalls)
 	}
 }
 
@@ -175,12 +184,14 @@ func TestAuthenticateCredentialsWrongPasswordDoesNotRehash(t *testing.T) {
 		t.Fatalf("hash password: %v", err)
 	}
 	repo := &stubAuthUserRepo{
-		findByEmailUser: models.User{
-			ID:               77,
-			Email:            "login@example.com",
-			PasswordHash:     string(legacyHash),
-			LocalAuthEnabled: true,
-			Role:             models.RoleOwner,
+		emailMatches: []models.User{
+			{
+				ID:               77,
+				Email:            "login@example.com",
+				PasswordHash:     string(legacyHash),
+				LocalAuthEnabled: true,
+				Role:             models.RoleOwner,
+			},
 		},
 	}
 	service := NewAuthService(repo)
@@ -188,8 +199,8 @@ func TestAuthenticateCredentialsWrongPasswordDoesNotRehash(t *testing.T) {
 	if _, err := service.AuthenticateCredentials(context.Background(), "login@example.com", "WrongPass2"); err == nil {
 		t.Fatal("expected error for wrong password")
 	}
-	if repo.updateHashOnlyCalls != 0 {
-		t.Fatalf("expected no rehash write on wrong password, got %d", repo.updateHashOnlyCalls)
+	if repo.upgradeHashCalls != 0 {
+		t.Fatalf("expected no rehash write on wrong password, got %d", repo.upgradeHashCalls)
 	}
 }
 
@@ -205,8 +216,8 @@ func TestRehashPasswordIfStaleDefensiveBranches(t *testing.T) {
 	t.Run("nil user is a no-op", func(t *testing.T) {
 		repo := &stubAuthUserRepo{}
 		NewAuthService(repo).rehashPasswordIfStale(context.Background(), nil, "StrongPass1")
-		if repo.updateHashOnlyCalls != 0 {
-			t.Fatalf("expected no write for nil user, got %d", repo.updateHashOnlyCalls)
+		if repo.upgradeHashCalls != 0 {
+			t.Fatalf("expected no write for nil user, got %d", repo.upgradeHashCalls)
 		}
 	})
 
@@ -214,8 +225,8 @@ func TestRehashPasswordIfStaleDefensiveBranches(t *testing.T) {
 		repo := &stubAuthUserRepo{}
 		user := &models.User{ID: 0, PasswordHash: string(legacyHash)}
 		NewAuthService(repo).rehashPasswordIfStale(context.Background(), user, "StrongPass1")
-		if repo.updateHashOnlyCalls != 0 {
-			t.Fatalf("expected no write for unsaved user, got %d", repo.updateHashOnlyCalls)
+		if repo.upgradeHashCalls != 0 {
+			t.Fatalf("expected no write for unsaved user, got %d", repo.upgradeHashCalls)
 		}
 	})
 
@@ -223,8 +234,8 @@ func TestRehashPasswordIfStaleDefensiveBranches(t *testing.T) {
 		repo := &stubAuthUserRepo{}
 		user := &models.User{ID: 7, PasswordHash: "not-a-bcrypt-hash"}
 		NewAuthService(repo).rehashPasswordIfStale(context.Background(), user, "StrongPass1")
-		if repo.updateHashOnlyCalls != 0 {
-			t.Fatalf("expected no write for unparseable hash, got %d", repo.updateHashOnlyCalls)
+		if repo.upgradeHashCalls != 0 {
+			t.Fatalf("expected no write for unparseable hash, got %d", repo.upgradeHashCalls)
 		}
 	})
 
@@ -233,14 +244,14 @@ func TestRehashPasswordIfStaleDefensiveBranches(t *testing.T) {
 		user := &models.User{ID: 7, PasswordHash: string(legacyHash)}
 		tooLong := strings.Repeat("a", 80) // bcrypt hard-fails above 72 bytes
 		NewAuthService(repo).rehashPasswordIfStale(context.Background(), user, tooLong)
-		if repo.updateHashOnlyCalls != 0 {
-			t.Fatalf("expected no write when re-hashing fails, got %d", repo.updateHashOnlyCalls)
+		if repo.upgradeHashCalls != 0 {
+			t.Fatalf("expected no write when re-hashing fails, got %d", repo.upgradeHashCalls)
 		}
 	})
 }
 
 // TestAuthenticateCredentialsRehashFailureDoesNotFailLogin proves the rehash is
-// best-effort: a write error from UpdatePasswordHashOnly is swallowed and the
+// best-effort: a write error from UpgradePasswordHashCAS is swallowed and the
 // login still succeeds.
 func TestAuthenticateCredentialsRehashFailureDoesNotFailLogin(t *testing.T) {
 	legacyHash, err := bcrypt.GenerateFromPassword([]byte("StrongPass1"), bcrypt.DefaultCost)
@@ -248,13 +259,15 @@ func TestAuthenticateCredentialsRehashFailureDoesNotFailLogin(t *testing.T) {
 		t.Fatalf("hash password: %v", err)
 	}
 	repo := &stubAuthUserRepo{
-		updateHashOnlyErr: context.DeadlineExceeded,
-		findByEmailUser: models.User{
-			ID:               77,
-			Email:            "login@example.com",
-			PasswordHash:     string(legacyHash),
-			LocalAuthEnabled: true,
-			Role:             models.RoleOwner,
+		upgradeHashErr: context.DeadlineExceeded,
+		emailMatches: []models.User{
+			{
+				ID:               77,
+				Email:            "login@example.com",
+				PasswordHash:     string(legacyHash),
+				LocalAuthEnabled: true,
+				Role:             models.RoleOwner,
+			},
 		},
 	}
 	service := NewAuthService(repo)
@@ -263,12 +276,48 @@ func TestAuthenticateCredentialsRehashFailureDoesNotFailLogin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected login to succeed despite rehash write error, got %v", err)
 	}
-	if repo.updateHashOnlyCalls != 1 {
-		t.Fatalf("expected the rehash write to be attempted once, got %d", repo.updateHashOnlyCalls)
+	if repo.upgradeHashCalls != 1 {
+		t.Fatalf("expected the rehash write to be attempted once, got %d", repo.upgradeHashCalls)
 	}
 	// On write failure the returned struct keeps the legacy hash (no phantom
 	// in-memory upgrade that never hit the DB).
 	if got := mustBcryptCost(t, user.PasswordHash); got != bcrypt.DefaultCost {
 		t.Fatalf("returned hash cost = %d, want unchanged %d after failed write", got, bcrypt.DefaultCost)
+	}
+}
+
+// TestAuthenticateCredentialsLostRehashRaceKeepsTheVerifiedHash covers the
+// (false, nil) outcome: a credential write won between the compare and the
+// upgrade. The login still succeeds, and the returned struct keeps the hash it
+// verified — adopting the upgrade would hand the caller a hash the row never
+// received.
+func TestAuthenticateCredentialsLostRehashRaceKeepsTheVerifiedHash(t *testing.T) {
+	legacyHash, err := bcrypt.GenerateFromPassword([]byte("StrongPass1"), bcrypt.DefaultCost)
+	if err != nil {
+		t.Fatalf("hash password: %v", err)
+	}
+	repo := &stubAuthUserRepo{
+		upgradeHashLost: true,
+		emailMatches: []models.User{
+			{
+				ID:               77,
+				Email:            "login@example.com",
+				PasswordHash:     string(legacyHash),
+				LocalAuthEnabled: true,
+				Role:             models.RoleOwner,
+			},
+		},
+	}
+	service := NewAuthService(repo)
+
+	user, err := service.AuthenticateCredentials(context.Background(), "login@example.com", "StrongPass1")
+	if err != nil {
+		t.Fatalf("expected login to succeed despite a lost rehash race, got %v", err)
+	}
+	if repo.upgradeHashCalls != 1 {
+		t.Fatalf("expected the rehash write to be attempted once, got %d", repo.upgradeHashCalls)
+	}
+	if user.PasswordHash != string(legacyHash) {
+		t.Fatal("returned user carries a hash other than the verified one after a lost race")
 	}
 }

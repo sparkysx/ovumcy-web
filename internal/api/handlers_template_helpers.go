@@ -31,6 +31,9 @@ func newTemplateFuncMap() template.FuncMap {
 		"cervicalMucusLabel": func(messages map[string]string, value string) string {
 			return translateMessage(messages, services.CervicalMucusTranslationKey(value))
 		},
+		"usageGoalLabel": func(messages map[string]string, value string) string {
+			return translateMessage(messages, services.UsageGoalTranslationKey(value))
+		},
 		"pregnancyTestLabel": func(messages map[string]string, value string) string {
 			return translateMessage(messages, services.PregnancyTestTranslationKey(value))
 		},
@@ -49,11 +52,14 @@ func newTemplateFuncMap() template.FuncMap {
 			}
 			return translateMessage(messages, key)
 		},
-		"symptomGroup": services.SymptomGroup,
-		"roleLabel": func(messages map[string]string, role string) string {
-			return translateMessage(messages, services.RoleTranslationKey(role))
-		},
 		"moodEmoji": services.MoodEmoji,
+		"moodScale": services.DayMoodScale,
+		// An off-scale value has no name key, and translateMessage answers an
+		// empty key with an empty string — the no-data label is the caller's.
+		"moodLabel": func(messages map[string]string, value int) string {
+			return translateMessage(messages, services.MoodTranslationKey(value))
+		},
+		"moodLabelKey": services.MoodTranslationKey,
 		"hasBBT": func(value *float64) bool {
 			return value != nil && services.IsValidDayBBT(value)
 		},
@@ -66,9 +72,6 @@ func newTemplateFuncMap() template.FuncMap {
 		"isActiveRoute":         isActiveTemplateRoute,
 		"hasSymptom":            hasTemplateSymptom,
 		"hasCycleFactor":        hasTemplateCycleFactor,
-		"statusOK": func(message string) template.HTML {
-			return httpx.StatusOKTemplateHTML(message)
-		},
 		"dismissibleStatusOK": func(messages map[string]string, message string) template.HTML {
 			return httpx.DismissibleStatusOKTemplateHTML(message, localizedStatusDismissLabel(messages))
 		},

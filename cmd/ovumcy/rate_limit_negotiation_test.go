@@ -21,7 +21,21 @@ import (
 	"github.com/ovumcy/ovumcy-web/internal/i18n"
 	"github.com/ovumcy/ovumcy-web/internal/security"
 	"github.com/ovumcy/ovumcy-web/internal/services"
+	"gorm.io/gorm"
 )
+
+// rateLimitTestSecretKey is the app-level secret the test handler is built
+// with (bootstrap.BuildDependencies): callers that need to mint a real
+// calendar-feed token against this same handler's database (services.GenerateCalendarFeedToken)
+// reuse this constant rather than a second hardcoded copy that could drift.
+const rateLimitTestSecretKey = "test-secret-key"
+
+// rateLimitTestHandlerSecretKey is api.NewHandler's own secret argument below
+// (distinct from rateLimitTestSecretKey, the bootstrap.BuildDependencies
+// app-level secret): it is what seals/opens every cookie the handler writes,
+// including the flash cookies, so a caller decoding one of those must derive
+// its cipher from THIS constant.
+const rateLimitTestHandlerSecretKey = "0123456789abcdef0123456789abcdef"
 
 func newRateLimitTestI18nManager(t *testing.T) *i18n.Manager {
 	t.Helper()
@@ -34,6 +48,33 @@ func newRateLimitTestI18nManager(t *testing.T) *i18n.Manager {
 }
 
 func newRateLimitTestHandler(t *testing.T) *api.Handler {
+	t.Helper()
+
+	handler, _ := newRateLimitTestHandlerAndDB(t)
+	return handler
+}
+
+// newRateLimitTestHandlerAndDB is newRateLimitTestHandler plus the backing
+// database, for callers that need to seed a row (e.g. arm a real calendar-feed
+// token with services.GenerateCalendarFeedToken([]byte(rateLimitTestSecretKey)))
+// against the exact handler under test rather than a disconnected database.
+func newRateLimitTestHandlerAndDB(t *testing.T) (*api.Handler, *gorm.DB) {
+	t.Helper()
+
+	return newRateLimitTestHandlerAndDBAtLocation(t, time.UTC)
+}
+
+// newRateLimitTestHandlerAndDBAtLocation is newRateLimitTestHandlerAndDB with
+// the handler's own instance zone parameterized instead of hardcoded to
+// time.UTC — for a caller whose fixture depends on the instance zone being
+// something OTHER than UTC (a request-timezone-signal probe needs a poller-
+// claimed zone with a real offset gap from its baseline; UTC would need one
+// exceeding fiber's own +14 ceiling, which no real zone reaches).
+// runtimeConfig.Location — the argument newFiberApp otherwise takes — is
+// composition-root config for session cookies and has no effect here:
+// handler.location is fixed at construction, by api.NewHandler's own second
+// argument, the moment this builds it.
+func newRateLimitTestHandlerAndDBAtLocation(t *testing.T, location *time.Location) (*api.Handler, *gorm.DB) {
 	t.Helper()
 
 	tempDB, err := os.CreateTemp("", "ovumcy-rate-limit-*.db")
@@ -58,11 +99,11 @@ func newRateLimitTestHandler(t *testing.T) *api.Handler {
 	i18nManager := newRateLimitTestI18nManager(t)
 
 	handler, err := api.NewHandler(
-		"0123456789abcdef0123456789abcdef",
-		time.UTC,
+		rateLimitTestHandlerSecretKey,
+		location,
 		i18nManager,
 		false,
-		bootstrap.BuildDependencies(db.NewRepositories(database), []byte("test-secret-key"), i18nManager, bootstrap.Options{
+		bootstrap.BuildDependencies(db.NewRepositories(database), []byte(rateLimitTestSecretKey), i18nManager, bootstrap.Options{
 			RegistrationMode: services.RegistrationModeOpen,
 			OIDCConfig:       security.OIDCConfig{},
 			LoginAttempts:    bootstrap.AttemptLimit{Max: 8, Window: 15 * time.Minute},
@@ -74,7 +115,7 @@ func newRateLimitTestHandler(t *testing.T) *api.Handler {
 	if err != nil {
 		t.Fatalf("init rate-limit test handler: %v", err)
 	}
-	return handler
+	return handler, database
 }
 
 func TestAuthRateLimitHandlerTreatsJSONContentTypeAsJSONRequest(t *testing.T) {
@@ -107,6 +148,11 @@ func TestAuthRateLimitHandlerTreatsJSONContentTypeAsJSONRequest(t *testing.T) {
 	}
 }
 
+// TestAuthRateLimitHandlerRedirectUsesSealedFlashCookie pins the WEB-40 round 5
+// fix: every limiter in cmd/ovumcy/server.go runs before csrf.New, so a
+// token-less, cross-site-reachable POST that trips this one must never write
+// the shared page flash slot — only the CSRF-exempt one, with fixed keys, and
+// never the request's own form value.
 func TestAuthRateLimitHandlerRedirectUsesSealedFlashCookie(t *testing.T) {
 	handler := newRateLimitTestHandler(t)
 	app := fiber.New()
@@ -131,9 +177,13 @@ func TestAuthRateLimitHandlerRedirectUsesSealedFlashCookie(t *testing.T) {
 		t.Fatalf("expected redirect to /login, got %q", location)
 	}
 
-	flashCookie := testResponseCookie(response.Cookies(), "ovumcy_flash")
+	if pageFlashCookie := testResponseCookie(response.Cookies(), "ovumcy_flash"); pageFlashCookie != nil && pageFlashCookie.Value != "" {
+		t.Fatalf("did not expect the rate limiter to write the page flash cookie, got %q", pageFlashCookie.Value)
+	}
+
+	flashCookie := testResponseCookie(response.Cookies(), "ovumcy_flash_exempt")
 	if flashCookie == nil {
-		t.Fatal("expected flash cookie in redirect response")
+		t.Fatal("expected exempt flash cookie in redirect response")
 	}
 	if strings.Contains(flashCookie.Value, "rate-limit@example.com") {
 		t.Fatalf("did not expect sealed flash cookie to expose email in plaintext: %q", flashCookie.Value)
@@ -162,15 +212,27 @@ func TestOIDCRateLimitHandlerRedirectUsesSealedFlashCookie(t *testing.T) {
 		t.Fatalf("expected redirect to /login, got %q", location)
 	}
 
-	flashCookie := testResponseCookie(response.Cookies(), "ovumcy_flash")
+	// The SSO limiter is mounted on the whole /auth/oidc prefix with no method
+	// filter, so a cross-site top-level GET navigation can trip it carrying no
+	// CSRF token or first-party proof (WEB-40): it must write only the
+	// CSRF-exempt channel, never the shared page slot a same-origin navigation
+	// may have pending.
+	if pageFlashCookie := testResponseCookie(response.Cookies(), "ovumcy_flash"); pageFlashCookie != nil && pageFlashCookie.Value != "" {
+		t.Fatalf("did not expect the rate limiter to write the page flash cookie, got %q", pageFlashCookie.Value)
+	}
+
+	flashCookie := testResponseCookie(response.Cookies(), "ovumcy_flash_exempt")
 	if flashCookie == nil {
-		t.Fatal("expected flash cookie in redirect response")
+		t.Fatal("expected exempt flash cookie in redirect response")
 	}
 	if strings.Contains(flashCookie.Value, "access_denied") {
 		t.Fatalf("did not expect sealed flash cookie to expose provider error in plaintext: %q", flashCookie.Value)
 	}
 }
 
+// TestSettingsAPIRateLimitHandlerRedirectsToSettings also pins WEB-40 round 5:
+// the /api catch-all limiter reaches this path before csrf.New runs too, so
+// its refusal must land in the exempt slot, never the page slot.
 func TestSettingsAPIRateLimitHandlerRedirectsToSettings(t *testing.T) {
 	handler := newRateLimitTestHandler(t)
 	app := fiber.New()
@@ -191,6 +253,13 @@ func TestSettingsAPIRateLimitHandlerRedirectsToSettings(t *testing.T) {
 	}
 	if location := response.Header.Get("Location"); location != "/settings" {
 		t.Fatalf("expected redirect to /settings, got %q", location)
+	}
+
+	if pageFlashCookie := testResponseCookie(response.Cookies(), "ovumcy_flash"); pageFlashCookie != nil && pageFlashCookie.Value != "" {
+		t.Fatalf("did not expect the rate limiter to write the page flash cookie, got %q", pageFlashCookie.Value)
+	}
+	if testResponseCookie(response.Cookies(), "ovumcy_flash_exempt") == nil {
+		t.Fatal("expected exempt flash cookie in redirect response")
 	}
 }
 
@@ -224,6 +293,127 @@ func TestAPIRateLimitHandlerReturnsStatusErrorMarkupForHTMX(t *testing.T) {
 	}
 	if !strings.Contains(rendered, "Too many requests.") {
 		t.Fatalf("expected localized generic rate-limit message, got %q", rendered)
+	}
+}
+
+// TestCalendarFeedLimiterUsesItsOwnBudgetNotTheAPIBudget pins the WIRING, not the
+// config: it drives the real configureFiberMiddleware and proves the feed prefix
+// is capped by CalendarFeedMax while /api still gets APIMax. The config-level
+// test cannot catch a revert that leaves the new field in place but passes
+// APIMax to the feed limiter — this one can, because the two budgets are set far
+// apart and the feed must trip first.
+func TestCalendarFeedLimiterUsesItsOwnBudgetNotTheAPIBudget(t *testing.T) {
+	handler := newRateLimitTestHandler(t)
+	// fiberConfig, not a bare fiber.New(): the wiring under test is the shipped
+	// app's, and the routing flags the shipped config carries are what decide
+	// which spellings of a path reach a route at all (see
+	// rate_limit_scope_guard_test.go).
+	app := fiber.New(fiberConfig(proxySettings{}, handler))
+	configureFiberMiddleware(app, runtimeConfig{
+		RateLimits: rateLimitSettings{
+			APIMax:             100,
+			APIWindow:          time.Minute,
+			CalendarFeedMax:    2,
+			CalendarFeedWindow: time.Minute,
+		},
+	}, handler)
+	app.Get(api.CalendarFeedRateLimitPrefix+"/:token.ics", func(c fiber.Ctx) error {
+		return c.SendStatus(fiber.StatusNoContent)
+	})
+	app.Get("/api/v1/ping", func(c fiber.Ctx) error {
+		return c.SendStatus(fiber.StatusNoContent)
+	})
+
+	get := func(t *testing.T, target string) int {
+		t.Helper()
+		response, err := app.Test(httptest.NewRequest(http.MethodGet, target, nil), testConfigNoTimeout)
+		if err != nil {
+			t.Fatalf("request %s failed: %v", target, err)
+		}
+		defer func() { _ = response.Body.Close() }()
+		return response.StatusCode
+	}
+
+	const feedTarget = api.CalendarFeedRateLimitPrefix + "/ABCDEFGHJKLMNPQRSTUVWXYZ23456789ABCDEFGHJKLMNP12.ics"
+	for i := 1; i <= 2; i++ {
+		if status := get(t, feedTarget); status != http.StatusNoContent {
+			t.Fatalf("feed request %d within budget: got %d, want 204", i, status)
+		}
+	}
+	if status := get(t, feedTarget); status != http.StatusTooManyRequests {
+		t.Fatalf("feed request past its budget of 2: got %d, want 429 — the feed limiter is not using CalendarFeedMax", status)
+	}
+
+	// Control: the API budget is untouched by the feed's exhaustion, proving the
+	// two limiters keep separate buckets rather than one shared budget.
+	if status := get(t, "/api/v1/ping"); status != http.StatusNoContent {
+		t.Fatalf("api request after the feed budget was spent: got %d, want 204", status)
+	}
+}
+
+// TestLanguageSwitchIsRateLimited pins the cap on POST /lang. It is the one
+// unauthenticated route outside /api that reads a request body, so the /api
+// limiter's path prefix does not reach it and it was previously the only
+// body-reading surface in the app with no volume control at all. CSRF keeps a
+// cross-origin attacker out but is not a cap.
+//
+// The control at the end is what proves the two limiters keep separate buckets
+// rather than one shared counter — without it, a passing 429 could equally mean
+// the /api limiter had been consumed.
+func TestLanguageSwitchIsRateLimited(t *testing.T) {
+	handler := newRateLimitTestHandler(t)
+	// Built on the shipped fiberConfig for the reason above: the spelling
+	// variants of /lang this test does not send are covered by the sweep in
+	// rate_limit_scope_guard_test.go, and both need the shipped routing flags.
+	app := fiber.New(fiberConfig(proxySettings{}, handler))
+	configureFiberMiddleware(app, runtimeConfig{
+		RateLimits: rateLimitSettings{
+			APIMax:    2,
+			APIWindow: time.Minute,
+		},
+	}, handler)
+	app.Post("/lang", func(c fiber.Ctx) error {
+		return c.SendStatus(fiber.StatusNoContent)
+	})
+	app.Get("/lang", func(c fiber.Ctx) error {
+		return c.SendStatus(fiber.StatusNoContent)
+	})
+	app.Get("/api/v1/ping", func(c fiber.Ctx) error {
+		return c.SendStatus(fiber.StatusNoContent)
+	})
+
+	send := func(t *testing.T, method, target string) int {
+		t.Helper()
+		response, err := app.Test(httptest.NewRequest(method, target, nil), testConfigNoTimeout)
+		if err != nil {
+			t.Fatalf("%s %s failed: %v", method, target, err)
+		}
+		defer func() { _ = response.Body.Close() }()
+		return response.StatusCode
+	}
+
+	// The limiter is registered ahead of the CSRF middleware, so a token-less
+	// POST is counted and then refused by CSRF (403). That ordering is the point:
+	// the cap has to bound requests that never reach the handler, which is
+	// exactly what an unauthenticated flood looks like. Within budget the CSRF
+	// refusal is what comes back; past it, the limiter answers first.
+	for i := 1; i <= 2; i++ {
+		if status := send(t, http.MethodPost, "/lang"); status != http.StatusForbidden {
+			t.Fatalf("POST /lang request %d within budget: got %d, want the CSRF refusal 403", i, status)
+		}
+	}
+	if status := send(t, http.MethodPost, "/lang"); status != http.StatusTooManyRequests {
+		t.Fatalf("POST /lang past its budget of 2: got %d, want 429 — the language switch is uncapped", status)
+	}
+
+	// The limiter is scoped to the mutating method: reading a page must not be
+	// refused because someone spent the switch budget.
+	if status := send(t, http.MethodGet, "/lang"); status != http.StatusNoContent {
+		t.Fatalf("GET /lang after the POST budget was spent: got %d, want 204", status)
+	}
+	// Control: the /api budget is untouched.
+	if status := send(t, http.MethodGet, "/api/v1/ping"); status != http.StatusNoContent {
+		t.Fatalf("api request after the /lang budget was spent: got %d, want 204", status)
 	}
 }
 
@@ -326,12 +516,14 @@ func TestAPIRateLimitHandlerReturnsJSONForGenericBrowserRequests(t *testing.T) {
 	}
 }
 
-// TestCalendarFeedRateLimitHandlerReturnsBare429AndRedactsToken drives the
-// calendar-feed LimitReached handler (newCalendarFeedRateLimitHandler). The feed
-// has no UI, so the handler must return a bare 429; and because it logs the hit
-// via logRateLimitHit → SafeRequestLogPath, the log line must carry the masked
-// route template, never the token value.
-func TestCalendarFeedRateLimitHandlerReturnsBare429AndRedactsToken(t *testing.T) {
+// TestCalendarFeedRateLimitHandlerAnswers429AndRedactsToken drives the
+// calendar-feed LimitReached handler (newCalendarFeedRateLimitHandler). The
+// feed has no UI, so the handler answers 429 through the shared limiter
+// path — never a calendar body a client would try to parse; the body shape
+// itself is owned by the envelope tests above. And because it logs the hit
+// via logRateLimitHit → SafeRequestLogPath, the log line must carry the
+// masked route template, never the token value.
+func TestCalendarFeedRateLimitHandlerAnswers429AndRedactsToken(t *testing.T) {
 	originalWriter := log.Writer()
 	defer log.SetOutput(originalWriter)
 	var output bytes.Buffer
@@ -344,7 +536,7 @@ func TestCalendarFeedRateLimitHandlerReturnsBare429AndRedactsToken(t *testing.T)
 	app.Get(api.CalendarFeedRateLimitPrefix+"/:token.ics", newCalendarFeedRateLimitHandler(handler))
 
 	const feedToken = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789ABCDEFGHJKLMNP"
-	request := httptest.NewRequest(http.MethodGet, "/calendar/feed/"+feedToken+".ics", nil)
+	request := httptest.NewRequest(http.MethodGet, api.CalendarFeedRateLimitPrefix+"/"+feedToken+".ics", nil)
 	response, err := app.Test(request, testConfigNoTimeout)
 	if err != nil {
 		t.Fatalf("calendar-feed rate-limit request failed: %v", err)
@@ -352,7 +544,7 @@ func TestCalendarFeedRateLimitHandlerReturnsBare429AndRedactsToken(t *testing.T)
 	defer func() { _ = response.Body.Close() }()
 
 	if response.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("expected bare 429 from the feed rate-limit handler, got %d", response.StatusCode)
+		t.Fatalf("expected 429 from the feed rate-limit handler, got %d", response.StatusCode)
 	}
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
@@ -368,5 +560,74 @@ func TestCalendarFeedRateLimitHandlerReturnsBare429AndRedactsToken(t *testing.T)
 	}
 	if !strings.Contains(logLine, ":token.ics") {
 		t.Fatalf("expected masked route template in rate-limit log, got %q", logLine)
+	}
+}
+
+// TestRateLimitRefusalsAnswerEveryRoutableSpellingLikeTheLowercaseOne drives
+// the real app past a spent budget with each spelling the router sends to the
+// same handler. The limiters already count /LANG and /lang/ against the /lang
+// budget; the refusal must also TAKE the branch the lowercase spelling takes,
+// or a variant gets JSON painted into the window where the lowercase form gets
+// markup, or an envelope where it gets its flash redirect. The lowercase
+// spelling in each row is the positive control.
+func TestRateLimitRefusalsAnswerEveryRoutableSpellingLikeTheLowercaseOne(t *testing.T) {
+	handler := newRateLimitTestHandler(t)
+
+	cases := []struct {
+		name      string
+		method    string
+		spellings []string
+		location  string
+	}{
+		{name: "language switch page form", method: http.MethodPost, spellings: []string{"/lang", "/LANG", "/lang/"}},
+		{name: "settings form behind the api limiter", method: http.MethodPatch, spellings: []string{"/api/v1/users/current/profile", "/API/v1/users/current/profile", "/api/v1/users/current/profile/"}, location: "/settings"},
+		{name: "auth form behind the api limiter", method: http.MethodPost, spellings: []string{"/api/v1/sessions", "/API/v1/sessions", "/api/v1/sessions/"}, location: "/login"},
+	}
+	for _, testCase := range cases {
+		for _, spelling := range testCase.spellings {
+			t.Run(testCase.name+" "+spelling, func(t *testing.T) {
+				app := newFiberApp(runtimeConfig{
+					Location:        time.UTC,
+					DefaultLanguage: "en",
+					RateLimits: rateLimitSettings{
+						LoginMax:    100,
+						LoginWindow: time.Minute,
+						APIMax:      1,
+						APIWindow:   time.Minute,
+					},
+				}, handler)
+
+				var response *http.Response
+				for attempt := 1; attempt <= 2; attempt++ {
+					request := httptest.NewRequest(testCase.method, spelling, strings.NewReader(""))
+					request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+					request.Header.Set("Accept", "text/html,application/xhtml+xml")
+					var err error
+					response, err = app.Test(request, testConfigNoTimeout)
+					if err != nil {
+						t.Fatalf("%s %s attempt %d failed: %v", testCase.method, spelling, attempt, err)
+					}
+					if attempt == 1 {
+						_ = response.Body.Close()
+					}
+				}
+				defer func() { _ = response.Body.Close() }()
+				body := string(mustReadAll(t, response))
+
+				if testCase.location != "" {
+					if response.StatusCode != http.StatusSeeOther || response.Header.Get("Location") != testCase.location {
+						t.Fatalf("%s %s past its budget answered %d (Location %q, body %q), want 303 to %s like the lowercase spelling",
+							testCase.method, spelling, response.StatusCode, response.Header.Get("Location"), body, testCase.location)
+					}
+					return
+				}
+				if response.StatusCode != http.StatusTooManyRequests {
+					t.Fatalf("%s %s past its budget answered %d, want 429", testCase.method, spelling, response.StatusCode)
+				}
+				if contentType := response.Header.Get("Content-Type"); !strings.Contains(contentType, fiber.MIMETextHTML) || strings.Contains(body, `"error_detail"`) {
+					t.Fatalf("%s %s past its budget answered %q %q, want the page-form status fragment like the lowercase spelling", testCase.method, spelling, contentType, body)
+				}
+			})
+		}
 	}
 }

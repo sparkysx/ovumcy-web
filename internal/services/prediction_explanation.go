@@ -29,8 +29,28 @@ func predictionExplanationPrimaryKey(user *models.User, cycleContext DashboardCy
 		return "prediction.explainer.irregular_sparse"
 	case user != nil && user.IrregularCycle && (cycleContext.DisplayNextPeriodUseRange || cycleContext.DisplayOvulationUseRange):
 		return "prediction.explainer.irregular_ranges"
-	case user != nil && !user.IrregularCycle && cycleContext.DisplayNextPeriodUseRange:
-		return "prediction.explainer.variable_ranges"
+	// The first-cycle floor is what makes the cycle ribbon go quiet past the
+	// menstrual block, and nothing on the page said so. It sits BELOW the
+	// irregular branches deliberately: an irregular owner in the sparse tier has
+	// no completed cycle either, and that sentence names the number of cycles
+	// the rest of that screen is already counting to. Displacing it would have
+	// traded a more specific answer for a more general one. What is left here is
+	// the owner who had no explanation at all.
+	case cycleContext.AwaitingFirstCycle:
+		return "prediction.explainer.awaiting_first_cycle"
+	// The next tier up for a regular owner: one or two completed cycles. The
+	// fertility half is still withheld, and the sentence names the number the
+	// floor counts to. Irregular owners never carry it (their sparse branch
+	// above answers first, and the context flag excludes them).
+	case cycleContext.AwaitingMoreCycles:
+		return "prediction.explainer.awaiting_more_cycles"
+	// A regular owner with at least one completed cycle behind them gets no
+	// explainer even when the prediction renders as a range: the range is the
+	// affordance, and since wave 2 the next-period line names the quantity it
+	// shows ("start window"). A sentence saying the range is a range restated
+	// the surface instead of adding to it. The first cycle is the exception the
+	// branch above now takes, and it is not about how the range is drawn — it is
+	// that the fertility half behind it is withheld entirely.
 	default:
 		return ""
 	}

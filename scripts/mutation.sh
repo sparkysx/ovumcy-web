@@ -9,44 +9,49 @@
 #
 # Modes:
 #   baseline        Full run over the high-value packages. Slow (hours). Run
-#                   locally or nightly; writes per-package JSON under .tmp/mutation/
-#                   and a committed score summary under .mutation/.
+#                   locally or by the weekly CI job; writes per-package JSON under
+#                   .tmp/mutation/ and a committed score summary under .mutation/.
 #   diff [ref]      Mutate only code changed vs <ref> (default origin/main).
 #                   Fast enough for CI. Advisory: never fails the build.
-#   verify-shards   Proves the internal/api shard partition is exact: every
-#                   non-test .go file lands in exactly one shard, no gaps, no
-#                   overlaps. No gremlins/network dependency — pure file-listing
-#                   arithmetic, safe to run in any CI job or locally.
-#   merge-api-shards [in-dir] [out-file]
-#                   Combines the internal_api_1..N shard JSON reports (once
-#                   downloaded from their CI artifacts) into one
-#                   internal_api.json, via scripts/mutationmerge (go run).
+#   verify-shards   Proves every registered shard partition is exact — for each
+#                   entry in SHARDED_PKGS, every non-test .go file lands in
+#                   exactly one shard, no gaps, no overlaps. No gremlins/network
+#                   dependency — pure file-listing arithmetic, safe to run in any
+#                   CI job or locally.
+#   merge-shards <base> [in-dir] [out-file]
+#                   Combines a registered package's <base>_1..N shard JSON
+#                   reports (once downloaded from their CI artifacts) into one
+#                   <base>.json, via scripts/mutationmerge (go run).
 #
 # The test-suite auditor consumes the JSON output
 # to triage survivors into "real test gap" vs "equivalent mutant".
 #
 # Mutation testing is scoped to business-logic + security + transport packages.
-# internal/api is the largest package (~8.5k source lines) and carries heavy
-# integration tests against a real database, so it is by far the slowest target
-# here — budget accordingly (see MUTATION_WORKERS below and the weekly CI job).
+# internal/services is the largest of them (11.5k source lines against
+# internal/api's 8.1k), but internal/api is the slowest: it carries heavy
+# integration tests against a real database, and each mutant re-runs them. Both
+# are sharded for that reason — budget accordingly (see MUTATION_WORKERS below
+# and the weekly CI job).
 #
-# internal/api sharding (issue #161): a single unsharded internal_api run blew
+# Sharding (issue #161): a single unsharded internal_api run blew
 # past the 3h CI timeout (manual run 28741574692: killed at 3h0m16s, having
 # reached only ~85% of the package's files with a steady, non-decelerating
-# mutant rate — internal/services, a comparably-sized target, finished its
+# mutant rate — internal/services, at least as large a target, finished its
 # *whole* run in 1h53m, so internal/api's heavier DB-integration tests are the
 # bottleneck, not raw file count). gremlins has no package-subdivision or
 # --include-files flag, but `unleash` does support repeatable --exclude-files
 # <regexp> (matched against each candidate file's basename within the target
 # package). That is the only file-subset mechanism the installed gremlins
-# v0.6.0 exposes, so sharding partitions internal/api's own non-test .go files
-# into API_SHARD_COUNT groups and, for shard N, excludes every file that is NOT
-# in group N. The partition is computed at run time from a live directory
-# listing (never a hardcoded file list) so it self-heals as files are
-# added/removed — see api_shard_files below. Round-robin assignment (file
-# index modulo shard count over the sorted file list) balances shard weight
-# better than contiguous alphabetical blocks, since large handler_* files
-# cluster together mid-alphabet.
+# v0.6.0 exposes, so sharding partitions a registered package's own non-test .go
+# files into the shard count SHARDED_PKGS declares for it and, for shard N,
+# excludes every file that is NOT in group N. The partition is computed at run
+# time from a live directory listing (never a hardcoded file list) so it
+# self-heals as files are added/removed — see shard_files below. Files are
+# dealt by WEIGHT, not by count (scripts/mutationpartition): each is weighed by
+# the operators gremlins' default mutators rewrite and dealt heaviest first to
+# the lightest shard. Round-robin by file count, the earlier rule, left the
+# five internal/services shards holding 462..868 candidates (tree of
+# 2026-09-25), so the heaviest cells hit the 3h cap while others idled.
 
 set -euo pipefail
 
@@ -65,13 +70,59 @@ TARGETS=(
 # internal/api and internal/services are each sharded (see header comment):
 # both outgrew the 3h CI timeout as a single unsharded job (internal/api first,
 # issue #161; internal/services once its integration/property suites expanded).
-# Shard counts were picked for comfortable margin — 5 shards gives each one a
-# small (~17–22-file) slice with room to spare even under a pessimistic
-# multi-hour full-package estimate. Keep this registry in sync with the matrix
-# in .github/workflows/mutation.yml. Entries are "slug-base:package-dir:count".
+# Shard counts come from the weekly runs of 2026-08-31..09-21, where 5 shards
+# each left every internal/api cell at the 180-minute cap with 52-96% of its
+# files reached. Measured on those logs, one mutation candidate costs about
+# 1.24 wall-minutes in internal/api and 0.41 in internal/services at 2 workers,
+# plus gremlins' coverage run (up to ~9 and ~2 minutes). The 0.41 estimate
+# undershot: run 36138463409 (2026-09-25, 10 internal/services shards
+# near-equal at ~290 weight each) actually took 101-172 wall-minutes on the 8
+# that finished (rate up to 0.594/weight, not 0.41); the other 2
+# (internal_services_6, _7 — no single file heavier than 97 of either shard's
+# ~289) hit the 180-minute cap still running, which only lower-bounds their
+# rate — >= 180/289 ≈ 0.623/weight, with no upper bound, since the cap cut
+# them off before one showed. 14 shards brings internal/services to ~207
+# weight each: at that lower bound the slow cells land near ~129 minutes, and
+# the 180-minute cap tolerates up to ~0.87/weight (180/207) — about 1.4x the
+# lower bound — before a cell hits it again. The next dispatched run is the
+# confirmation either way.
+#
+# internal/api's own 14-shard split (weight ~94-95 each, near-perfectly even —
+# see scripts/mutationpartition) still wasn't enough: run 36274821938
+# (2026-09-27, WEB-88, following WEB-78's baseline) cancelled internal_api_12
+# and _13 at the 180-minute cap while still running (jobs
+# 108495416352/108495416342), which only lower-bounds their rate at
+# >= 180/94 ≈ 1.915/weight, no upper bound — higher than every one of the
+# other 12 internal_api shards that finished on the same run at the same
+# ~94-95 weight each (0.52-1.63/weight), the same "a completed shard's rate
+# understates the one that hit the cap" pattern internal_services showed on
+# 2026-09-25. 20 shards brings internal/api to ~66-67 weight each: the cap
+# then tolerates up to ~2.7/weight (180/67) — about 1.4x that lower bound,
+# the same margin ratio internal_services' 10->14 split used. The next
+# dispatched run is the confirmation either way.
+#
+# 20 was not enough either: runs 36351058682 and 36413106904 (2026-09-27/28)
+# both cancelled internal_api_20 at the cap, and _18 took 151 minutes, at an
+# identical ~65-66 weight per shard. Wall time per shard ranged 28..>180 minutes
+# on that even weight (0.4..>2.77 min/weight), so the token-count weight ranks
+# files badly: it ignores which tests cover a file, and a handler that only the
+# DB-backed step-up/OIDC suites reach costs several times a helper the fast
+# tests kill. Per-shard wall times cannot give a per-file rate, so 30 shards
+# were the first answer: ~43-44 weight each, the slowest observed rate
+# (>=2.77/weight) near 122 minutes plus the whole-package coverage pass (up to
+# ~9), a ~1.4x margin to the cap. Run 36942283202 then showed the weight itself
+# is what misranks: gremlins stamps every mutant's verdict, so each file's cost
+# is recoverable from the gaps between verdicts. scripts/mutationpartition
+# scales each file's weight by that measured rate (its costs.json); on the
+# measured files the heaviest internal/api shard falls from 145 to ~123 minutes
+# and internal/services from past the cap to ~129. One file (stats_page_helpers.go,
+# ~110 minutes alone) bounds how far any split can go. Re-measure after a run
+# that cancels a cell. Keep this registry in sync
+# with the matrix in .github/workflows/mutation.yml. Entries are
+# "slug-base:package-dir:count".
 SHARDED_PKGS=(
-  "internal_api:./internal/api:5"
-  "internal_services:./internal/services:5"
+  "internal_api:./internal/api:30"
+  "internal_services:./internal/services:14"
 )
 
 # shard_pkg_field <slug-base> <dir|count> looks up a sharded package's directory
@@ -115,12 +166,16 @@ shard_files() {
 }
 
 # shard_select <pkg-dir> <shard-num> <shard-count> prints the basenames assigned
-# to shard <shard-num> (1-based), via round-robin: the file at sorted index i
-# (0-based) goes to shard (i % shard-count) + 1.
+# to shard <shard-num> (1-based). scripts/mutationpartition deals shard_files'
+# own list by estimated mutation weight; it reads the names from that list, so
+# the partition and verify-shards' proof of it can never see different
+# populations. A failure (no Go toolchain, an unreadable file, a name it
+# refuses) is a non-zero status here, which every caller must check: an empty
+# selection read as success would exclude every file from the shard.
 shard_select() {
   local pkg_dir="$1" shard_num="$2" total="$3"
-  shard_files "$pkg_dir" | awk -v shard="$shard_num" -v total="$total" \
-    'NR % total == shard % total'
+  shard_files "$pkg_dir" | go run ./scripts/mutationpartition \
+    -dir "$pkg_dir" -shard "$shard_num" -of "$total"
 }
 
 # shard_exclude_args <pkg-dir> <shard-num> <shard-count> prints one
@@ -135,7 +190,7 @@ shard_select() {
 shard_exclude_args() {
   local pkg_dir="$1" shard_num="$2" total="$3"
   local keep_list
-  keep_list="$(shard_select "$pkg_dir" "$shard_num" "$total")"
+  keep_list="$(shard_select "$pkg_dir" "$shard_num" "$total")" || return 1
   while IFS= read -r fname; do
     [[ -z "$fname" ]] && continue
     if ! grep -qxF "$fname" <<<"$keep_list"; then
@@ -170,15 +225,45 @@ verify_one_partition() {
   local base="$1" pkg_dir="$2" total="$3"
   local total_count union_file
   echo ">> verifying $base partition ($pkg_dir, $total shards)"
+  # Checked before counting, because the count cannot tell the two apart and
+  # `|| rc=1` at the call site disables set -e for this whole function: a
+  # missing directory makes `find` fail, `wc -l` still prints 0, and the
+  # refusal below would report a registered package as EMPTY when the real
+  # fault is that its path is gone. Two outcomes, two messages.
+  if [[ ! -d "$pkg_dir" ]]; then
+    echo "::error::$base ($pkg_dir) is not a directory — the SHARDED_PKGS entry names a path that does not exist" >&2
+    return 1
+  fi
   total_count="$(shard_files "$pkg_dir" | wc -l | tr -d ' ')"
+  # A registered sharded package with zero non-test .go files is a
+  # misconfiguration (stale SHARDED_PKGS entry, wrong path, files moved away),
+  # not a legitimate empty partition: the union-vs-total comparison below would
+  # accept 0 == 0 as "no gaps, no overlaps" and print OK having verified
+  # nothing. A single shard within a non-empty package coming up empty (more
+  # shards than files) stays legitimate and is not rejected here — only the
+  # whole-population case is.
+  if [[ "$total_count" -eq 0 ]]; then
+    echo "::error::$base ($pkg_dir) has zero non-test .go files — a registered sharded package must not be empty" >&2
+    return 1
+  fi
   union_file="$(mktemp)"
 
   local shard_num
   for ((shard_num = 1; shard_num <= total; shard_num++)); do
-    local count
-    count="$(shard_select "$pkg_dir" "$shard_num" "$total" | grep -c . || true)"
+    local selected count
+    # One partition call per shard, checked: `|| rc=1` at the call site has
+    # turned set -e off in this function, so an unchecked failure would read
+    # as an empty shard and surface only as a "gap" naming the wrong cause.
+    if ! selected="$(shard_select "$pkg_dir" "$shard_num" "$total")"; then
+      echo "::error::$base: could not compute shard $shard_num of $total (scripts/mutationpartition failed)" >&2
+      rm -f "$union_file"
+      return 1
+    fi
+    count="$(grep -c . <<<"$selected" || true)"
     echo ">> shard $shard_num: $count files"
-    shard_select "$pkg_dir" "$shard_num" "$total" >>"$union_file"
+    if [[ -n "$selected" ]]; then
+      printf '%s\n' "$selected" >>"$union_file"
+    fi
   done
 
   local union_count dup_count overlap_found=0
@@ -211,7 +296,7 @@ verify_one_partition() {
 
 run_baseline() {
   # Optional single package slug (e.g. "internal_security", or a shard slug
-  # "internal_api_1".."internal_api_5" / "internal_services_1".."internal_services_5")
+  # "internal_api_<n>" / "internal_services_<n>", n up to the SHARDED_PKGS count)
   # to run just one target — used by CI's per-target matrix jobs so each gets a
   # fresh runner instead of accumulating disk/cache across all targets.
   local only="${1:-}"
@@ -221,7 +306,16 @@ run_baseline() {
   # mutate a *subset* of a package's files rather than a distinct package path,
   # via repeated --exclude-files on the same target. The slug base selects the
   # package directory and shard count from the SHARDED_PKGS registry.
-  if [[ "$only" =~ ^(internal_api|internal_services)_([0-9]+)$ ]]; then
+  # The shard number is matched WITHOUT a leading zero on purpose, so the set
+  # this accepts is exactly the "base_1..N" the unmatched-target error below
+  # advertises. Accepting "08" was worse than cosmetic: `(( 08 > total ))`
+  # fails on the octal literal, that failure is inside an `if` condition where
+  # set -e does not apply, the test therefore reads false, and the shard is
+  # accepted — then `awk 'NR % total == shard % total'` reads "08" as 8 and
+  # runs shard 3's files under shard 8's name, reporting success. A typoed CI
+  # matrix entry passing green is the very thing this dispatch is meant to
+  # refuse.
+  if [[ "$only" =~ ^(internal_api|internal_services)_([1-9][0-9]*)$ ]]; then
     local base="${BASH_REMATCH[1]}"
     local shard_num="${BASH_REMATCH[2]}"
     local pkg_dir total
@@ -234,11 +328,45 @@ run_baseline() {
       echo "error: shard '$only' out of range (1..$total)" >&2
       exit 2
     fi
+    # The same zero-population refusal verify_one_partition applies, at the
+    # site that actually runs gremlins. shard_exclude_args names the files to
+    # EXCLUDE, so a package with no non-test .go files yields an empty array
+    # and the invocation below degrades into a full, unsharded run of the
+    # package under a shard's name — reporting success for work no shard was
+    # supposed to do. Checked here rather than trusted from verify-shards:
+    # that is a separate command nobody is required to have run.
+    # Same two outcomes verify_one_partition separates, and separated here for
+    # the same reason: without this, a registry entry whose directory has moved
+    # kills the run with a bare `find: ... No such file or directory` (pipefail
+    # carries it out of the assignment below), leaving the operator to work out
+    # that the fault is a stale registry rather than a broken package.
+    if [[ ! -d "$pkg_dir" ]]; then
+      echo "error: $base ($pkg_dir) is not a directory — the SHARDED_PKGS entry names a path that does not exist" >&2
+      exit 1
+    fi
+    local shard_population
+    shard_population="$(shard_files "$pkg_dir" | wc -l | tr -d ' ')"
+    if [[ "$shard_population" -eq 0 ]]; then
+      echo "error: $base ($pkg_dir) has zero non-test .go files, so shard $shard_num would mutate the whole package rather than its own slice" >&2
+      exit 1
+    fi
     local slug="$only"
     echo ">> baseline mutation: $pkg_dir (shard $shard_num/$total)"
     echo ">> shard $shard_num files:"
     shard_select "$pkg_dir" "$shard_num" "$total" | sed 's/^/     /'
-    mapfile -t exclude_args < <(shard_exclude_args "$pkg_dir" "$shard_num" "$total")
+    # Taken through a checked command substitution, not `mapfile < <(...)`: a
+    # process substitution's status is never read, so a partition that failed
+    # there would arrive as an EMPTY exclusion list — and an empty list turns
+    # this shard into a full, unsharded run of the package under its name.
+    local exclusions
+    exclusions="$(shard_exclude_args "$pkg_dir" "$shard_num" "$total")" || {
+      echo "error: could not compute the exclusions for $slug (scripts/mutationpartition failed)" >&2
+      exit 1
+    }
+    local -a exclude_args=()
+    if [[ -n "$exclusions" ]]; then
+      mapfile -t exclude_args <<<"$exclusions"
+    fi
     "$GREMLINS" unleash "$pkg_dir" \
       --workers "$WORKERS" \
       --output "$TMP_DIR/${slug}.json" \
@@ -247,17 +375,37 @@ run_baseline() {
     return
   fi
 
+  local matched=0
   for pkg in "${TARGETS[@]}"; do
     local slug
     slug="$(echo "$pkg" | sed 's#^\./##; s#/#_#g')"
     if [[ -n "$only" && "$slug" != "$only" ]]; then
       continue
     fi
+    matched=1
     echo ">> baseline mutation: $pkg"
     "$GREMLINS" unleash "$pkg" \
       --workers "$WORKERS" \
       --output "$TMP_DIR/${slug}.json"
   done
+  # A pkg-slug argument that matches neither a plain TARGETS slug nor a
+  # registered shard form (handled in the branch above) must not report
+  # success: silently running zero mutation targets and still printing
+  # "baseline JSON written" would let a typoed CI matrix entry pass green
+  # having tested nothing.
+  if [[ "$matched" -eq 0 ]]; then
+    echo "error: '$only' does not match any baseline target" >&2
+    echo "valid targets:" >&2
+    for pkg in "${TARGETS[@]}"; do
+      echo "  $(echo "$pkg" | sed 's#^\./##; s#/#_#g')" >&2
+    done
+    for entry in "${SHARDED_PKGS[@]}"; do
+      local base dir count
+      IFS=: read -r base dir count <<<"$entry"
+      echo "  ${base}_1..${count}" >&2
+    done
+    exit 2
+  fi
   echo ">> baseline JSON written to $TMP_DIR/ (commit a summary into $BASELINE_DIR/ once reviewed)"
 }
 
@@ -282,10 +430,21 @@ merge_shards() {
   local base="${1:?merge-shards requires a slug base (internal_api | internal_services)}"
   local in_dir="${2:-.tmp/mutation-shards}"
   local out_file="${3:-$TMP_DIR/${base}.json}"
+  # -expect reuses the SHARDED_PKGS registry above as the single source of
+  # truth for how many shards this base owes — the same count verify-shards
+  # already checks the partition against — so a shard whose guard failed and
+  # whose upload was skipped makes the merge fail loudly instead of quietly
+  # publishing a partial report under the complete report's name.
+  local expect
+  expect="$(shard_pkg_field "$base" count)" || {
+    echo "error: '$base' is not a registered sharded package (see SHARDED_PKGS)" >&2
+    exit 1
+  }
   go run ./scripts/mutationmerge \
     -in "$in_dir" \
     -glob "${base}_*.json" \
-    -out "$out_file"
+    -out "$out_file" \
+    -expect "$expect"
 }
 
 main() {

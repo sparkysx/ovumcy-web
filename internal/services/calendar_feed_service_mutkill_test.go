@@ -25,23 +25,31 @@ func (r *mutkillFeedDayReader) FetchLogsForUser(_ context.Context, _ uint, from 
 	return r.logs, nil
 }
 
-// TestResolveFeedLoadsHistoryWindowBeforeToday kills the
-// calendar_feed_service.go:110 INVERT_NEGATIVES and ARITHMETIC_BASE survivors on:
+// TestResolveFeedLoadsHistoryWindowBeforeToday kills the INVERT_NEGATIVES and
+// ARITHMETIC_BASE survivors on the year offset of the history window the feed
+// requests. That offset used to be the feed's own arithmetic in
+// calendar_feed_service.go and now lives in StatsOverviewRange (stats_service.go):
 //
-//	from := today.AddDate(-calendarFeedStatsWindowYears, 0, 0)
+//	return now.AddDate(-statsOverviewWindowYears, 0, 0), now
 //
-// Both mutants flip the sign of the year offset, so `from` lands two years in the
-// FUTURE, producing an inverted [today+2y, today] window that would load NONE of
-// the owner's cycle history and silently degrade every prediction the feed emits.
+// ResolveFeed reads it with `from, to := StatsOverviewRange(today)`, so the
+// mutated line is the one in StatsOverviewRange, not in the feed. Both mutants
+// flip the sign of the year offset, so `from` lands two years in the FUTURE,
+// producing an inverted [today+2y, today] window that would load NONE of the
+// owner's cycle history and silently degrade every prediction the feed emits.
 // The shared day-reader stub ignores `from`, so no existing test observed the
-// lower bound — which is why both survived.
+// lower bound — which is why both survived. The request is also compared with
+// StatsOverviewRange's own answer: a feed that went back to its own arithmetic
+// would pass the span check and still fail the second comparison the day the
+// window rule changes.
 func TestResolveFeedLoadsHistoryWindowBeforeToday(t *testing.T) {
 	user, token := armedFeedUser(t, 77, "2026-03-02")
 	days := &mutkillFeedDayReader{logs: predictableFeedLogs(t)}
 	svc := NewCalendarFeedService(
-		&stubFeedUserReader{selector: user.CalendarFeedSelector, user: user},
+		&stubFeedUserStore{selector: user.CalendarFeedSelector, user: user},
 		days,
 		stubFeedDisclaimer{text: "d"},
+		[]byte(calendarFeedTestSecretKey),
 	)
 
 	now := mustParseDashboardDay(t, "2026-03-20")
@@ -53,12 +61,22 @@ func TestResolveFeedLoadsHistoryWindowBeforeToday(t *testing.T) {
 	}
 
 	// The upper bound is the owner's today; the lower bound must be exactly
-	// calendarFeedStatsWindowYears BEFORE it — in the past, never after.
-	wantFrom := days.requestedTo.AddDate(-calendarFeedStatsWindowYears, 0, 0)
+	// statsOverviewWindowYears BEFORE it — in the past, never after.
+	if !days.requestedTo.Equal(now) {
+		t.Fatalf("log-window upper bound = %s, want the owner's today %s",
+			days.requestedTo.Format("2006-01-02"), now.Format("2006-01-02"))
+	}
+	wantFrom := days.requestedTo.AddDate(-statsOverviewWindowYears, 0, 0)
 	if !days.requestedFrom.Equal(wantFrom) {
 		t.Fatalf("log-window lower bound = %s, want %s (%d years before today %s)",
 			days.requestedFrom.Format("2006-01-02"), wantFrom.Format("2006-01-02"),
-			calendarFeedStatsWindowYears, days.requestedTo.Format("2006-01-02"))
+			statsOverviewWindowYears, days.requestedTo.Format("2006-01-02"))
+	}
+	statsFrom, statsTo := StatsOverviewRange(days.requestedTo)
+	if !days.requestedFrom.Equal(statsFrom) || !days.requestedTo.Equal(statsTo) {
+		t.Fatalf("log window = [%s, %s], want StatsOverviewRange's [%s, %s]",
+			days.requestedFrom.Format("2006-01-02"), days.requestedTo.Format("2006-01-02"),
+			statsFrom.Format("2006-01-02"), statsTo.Format("2006-01-02"))
 	}
 	if !days.requestedFrom.Before(days.requestedTo) {
 		t.Fatalf("log-window lower bound %s must precede the upper bound %s",

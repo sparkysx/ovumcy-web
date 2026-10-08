@@ -21,12 +21,12 @@
 {{end}}
 {{define "settings_custom_symptom_card"}}
 <div
-  class="journal-panel settings-symptom-card space-y-4"
+  class="card-quiet card-fit space-y-4"
   data-custom-symptom-row
   data-symptom-id="{{.Symptom.ID}}"
   data-symptom-name="{{.Symptom.Name}}"
   data-symptom-state="{{if .Symptom.IsActive}}active{{else}}archived{{end}}">
-  <div class="settings-symptom-card-header">
+  <div class="settings-symptom-header">
     <div class="min-w-0 space-y-1">
       <div class="flex items-center gap-2 min-w-0">
         <span class="text-sm" aria-hidden="true">{{.FormIcon}}</span>
@@ -43,11 +43,12 @@
     action="/api/v1/symptoms/{{.Symptom.ID}}"
     method="post"
     hx-patch="/api/v1/symptoms/{{.Symptom.ID}}"
-    hx-target="#settings-symptoms-section"
+    hx-target="#settings-symptoms"
     hx-swap="outerHTML"
     class="settings-symptom-form"
     data-symptom-edit-form>
     <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+    <input type="hidden" name="_method" value="PATCH">
 
     <div class="settings-symptom-grid">
       <div class="settings-symptom-field settings-symptom-name-field">
@@ -74,7 +75,7 @@
     </div>
 
     {{if .ErrorMessage}}
-    <div class="status-error flex items-center gap-2" data-symptom-row-error><span aria-hidden="true">⚠️</span><span>{{.ErrorMessage}}</span></div>
+    <div class="status-error flex items-center gap-2" data-symptom-row-error><span aria-hidden="true">{{template "icon" "alert"}}</span><span>{{.ErrorMessage}}</span></div>
     {{end}}
     {{if .SuccessMessage}}{{dismissibleStatusOK $.Messages .SuccessMessage}}{{end}}
 
@@ -83,17 +84,18 @@
     </div>
   </form>
 
-  <div class="settings-symptom-card-actions">
+  <div class="settings-symptom-actions">
     {{if .Symptom.IsActive}}
     <form
       action="/api/v1/symptoms/{{.Symptom.ID}}"
       method="post"
       hx-delete="/api/v1/symptoms/{{.Symptom.ID}}"
-      hx-target="#settings-symptoms-section"
+      hx-target="#settings-symptoms"
       hx-swap="outerHTML"
-      data-confirm="{{t $.Messages "settings.symptoms.confirm_hide"}}"
+      hx-confirm="{{t $.Messages "settings.symptoms.confirm_hide"}}"
       data-confirm-accept="{{t $.Messages "settings.symptoms.hide"}}">
       <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+      <input type="hidden" name="_method" value="DELETE">
       <button type="submit" class="btn-secondary">{{t $.Messages "settings.symptoms.hide"}}</button>
     </form>
     {{else}}
@@ -101,7 +103,7 @@
       action="/api/v1/symptoms/{{.Symptom.ID}}/restore"
       method="post"
       hx-post="/api/v1/symptoms/{{.Symptom.ID}}/restore"
-      hx-target="#settings-symptoms-section"
+      hx-target="#settings-symptoms"
       hx-swap="outerHTML">
       <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
       <button type="submit" class="btn-secondary">{{t $.Messages "settings.symptoms.restore"}}</button>
@@ -111,17 +113,20 @@
 </div>
 {{end}}
 {{define "settings_symptoms_section_content"}}
-<section id="settings-symptoms-section" class="journal-card p-5 sm:p-6 space-y-5" data-settings-symptoms>
-  <div>
-    <h2 class="journal-subtitle">🧩 {{t .Messages "settings.symptoms.title"}}</h2>
-    <p class="journal-muted mt-2 text-sm">{{t .Messages "settings.symptoms.subtitle"}}</p>
-  </div>
+{{/* This card replaces ITSELF through htmx (hx-swap="outerHTML"), so the
+     replacement must carry the disclosure attributes too — it arrives open,
+     which is right: the owner just acted inside it. */}}
+<details id="settings-symptoms" class="card settings-section p-4 sm:p-5 space-y-4" data-settings-symptoms data-settings-section open>
+  <summary class="settings-section-summary">
+    <h2 class="journal-subtitle"><span aria-hidden="true">{{template "icon" "list"}}</span> {{t .Messages "settings.symptoms.title"}}</h2>
+  </summary>
+  <p class="journal-muted mt-1 text-sm">{{t .Messages "settings.symptoms.subtitle"}}</p>
 
   <form
     action="/api/v1/symptoms"
     method="post"
     hx-post="/api/v1/symptoms"
-    hx-target="#settings-symptoms-section"
+    hx-target="#settings-symptoms"
     hx-swap="outerHTML"
     class="settings-symptom-form"
     data-symptom-create-form>
@@ -153,7 +158,7 @@
     </div>
 
     {{if .SymptomErrorMessage}}
-    <div class="status-error flex items-center gap-2"><span aria-hidden="true">⚠️</span><span>{{.SymptomErrorMessage}}</span></div>
+    <div class="status-error flex items-center gap-2" data-symptom-create-error><span aria-hidden="true">{{template "icon" "alert"}}</span><span>{{.SymptomErrorMessage}}</span></div>
     {{end}}
     {{if .SymptomStatusMessage}}{{dismissibleStatusOK .Messages .SymptomStatusMessage}}{{end}}
 
@@ -164,12 +169,10 @@
 
   <div class="space-y-4">
     {{if .HasCustomSymptoms}}
-    <div class="space-y-3" data-symptom-group="active">
-      <div class="space-y-1">
-        <h3 class="field-label">{{t .Messages "settings.symptoms.active_heading"}}</h3>
-        <p class="journal-muted text-sm">{{t .Messages "settings.symptoms.active_hint"}}</p>
-      </div>
-      <div class="space-y-3">
+    <div class="space-y-2" data-symptom-group="active">
+      {{/* No helper line: the one that used to sit here restated "Active". */}}
+      <h3 class="field-label field-label-lg">{{t .Messages "settings.symptoms.active_heading"}}</h3>
+      <div class="space-y-2">
         {{range .ActiveCustomSymptoms}}
         {{template "settings_custom_symptom_card" (dict
           "Messages" $.Messages
@@ -185,23 +188,23 @@
       </div>
     </div>
     {{else if .HasArchivedSymptoms}}
-    <div class="journal-panel space-y-2" data-symptom-empty-state="active">
+    <div class="card-quiet space-y-2" data-symptom-empty-state="active">
       <p class="field-label">{{t .Messages "settings.symptoms.active_heading"}}</p>
       <p class="journal-muted text-sm">{{t .Messages "settings.symptoms.empty_active"}}</p>
     </div>
     {{else}}
-    <div class="journal-panel space-y-2" data-symptom-empty-state="empty">
+    <div class="card-quiet space-y-2" data-symptom-empty-state="empty">
       <p class="journal-muted text-sm">{{t .Messages "settings.symptoms.empty"}}</p>
     </div>
     {{end}}
 
     {{if .HasArchivedSymptoms}}
-    <div class="space-y-3" data-symptom-group="archived">
+    <div class="space-y-2" data-symptom-group="archived">
       <div class="space-y-1">
-        <h3 class="field-label">{{t .Messages "settings.symptoms.archived_heading"}}</h3>
+        <h3 class="field-label field-label-lg">{{t .Messages "settings.symptoms.archived_heading"}}</h3>
         <p class="journal-muted text-sm">{{t .Messages "settings.symptoms.archived_hint"}}</p>
       </div>
-      <div class="space-y-3">
+      <div class="space-y-2">
         {{range .ArchivedCustomSymptoms}}
         {{template "settings_custom_symptom_card" (dict
           "Messages" $.Messages
@@ -218,5 +221,5 @@
     </div>
     {{end}}
   </div>
-</section>
+</details>
 {{end}}

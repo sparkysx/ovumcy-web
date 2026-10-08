@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -131,6 +132,74 @@ func TestRegisterPickupTokenRepositoryIssuePurgesExpiredRows(t *testing.T) {
 	}
 }
 
+// TestRegisterPickupTokenRepositoryPeek covers the read-only Peek contract:
+// unlike Consume, a successful Peek must NOT spend the token, so a live
+// token stays consumable by a following Consume. Peek shares Consume's
+// indistinguishable-outcomes contract for missing/consumed/expired rows —
+// see Peek's own doc comment.
+func TestRegisterPickupTokenRepositoryPeek(t *testing.T) {
+	database := openSQLiteForMigrationBootstrapTest(t, filepath.Join(t.TempDir(), "pickup-peek.db"))
+	repo := NewRegisterPickupTokenRepository(database)
+	base := time.Now().UTC().Truncate(time.Second)
+
+	assertPeek := func(nonce string, at time.Time, wantUserID uint, wantOK bool) {
+		t.Helper()
+		userID, ok, err := repo.Peek(context.Background(), nonce, at)
+		requireNoErr(t, err, "peek "+nonce)
+		if ok != wantOK || userID != wantUserID {
+			t.Fatalf("peek %q = (%d, %t), want (%d, %t)", nonce, userID, ok, wantUserID, wantOK)
+		}
+	}
+
+	// Live token: Peek reports it without spending it, so a following Consume
+	// still succeeds exactly once.
+	requireNoErr(t, repo.Issue(context.Background(), "peek-live", 42, base.Add(5*time.Minute)), "issue peek-live")
+	assertPeek("peek-live", base, 42, true)
+	assertPeek("peek-live", base, 42, true)
+	assertPickupConsume(t, repo, "peek-live", base, 42, true)
+	assertPickupConsume(t, repo, "peek-live", base, 0, false)
+
+	// Consumed token: Peek must not resurrect it.
+	requireNoErr(t, repo.Issue(context.Background(), "peek-consumed", 43, base.Add(5*time.Minute)), "issue peek-consumed")
+	assertPickupConsume(t, repo, "peek-consumed", base, 43, true)
+	assertPeek("peek-consumed", base, 0, false)
+
+	// Expired token.
+	requireNoErr(t, repo.Issue(context.Background(), "peek-expired", 44, base.Add(-1*time.Minute)), "issue peek-expired")
+	assertPeek("peek-expired", base, 0, false)
+
+	// Unknown / blank / whitespace nonce.
+	assertPeek("peek-does-not-exist", base, 0, false)
+	assertPeek("", base, 0, false)
+	assertPeek("   ", base, 0, false)
+
+	// A zero `now` is treated as the current time, so a token whose TTL is
+	// still ahead of the real clock is reported live.
+	requireNoErr(t, repo.Issue(context.Background(), "peek-zero-now", 45, time.Now().UTC().Add(5*time.Minute)), "issue peek-zero-now")
+	assertPeek("peek-zero-now", time.Time{}, 45, true)
+
+	// A row whose user_id is 0: the schema has no CHECK forbidding it (only
+	// NOT NULL, which 0 satisfies), and Issue's own validation is the only
+	// barrier — bypassed here with a direct insert to reach the row.UserID
+	// == 0 branch. Peek must refuse it exactly like a missing row.
+	requireNoErr(t, database.Exec(
+		"INSERT INTO register_pickup_tokens (nonce, user_id, expires_at, created_at) VALUES (?, 0, ?, ?)",
+		"peek-zero-user", base.Add(5*time.Minute), base,
+	).Error, "insert zero-user-id row")
+	assertPeek("peek-zero-user", base, 0, false)
+
+	// Repository errors propagate: a closed connection surfaces from Peek
+	// instead of being folded into the not-found outcome.
+	sqlDB, err := database.DB()
+	if err != nil {
+		t.Fatalf("database.DB(): %v", err)
+	}
+	requireNoErr(t, sqlDB.Close(), "close sql db")
+	if _, _, err := repo.Peek(context.Background(), "peek-live", base); err == nil {
+		t.Fatal("expected Peek on a closed database to fail")
+	}
+}
+
 // TestOIDCLogoutStateRepositorySaveFindTTL covers the OIDC logout-state
 // persistence: save/find round-trip, session_id upsert, not-found, targeted
 // delete, and TTL sweep.
@@ -139,7 +208,7 @@ func TestRegisterPickupTokenRepositoryIssuePurgesExpiredRows(t *testing.T) {
 // find-and-check blocks out of the scenario.
 func assertLogoutState(t *testing.T, repo *OIDCLogoutStateRepository, sessionID string, wantOK bool, wantEndpoint, wantHint string) {
 	t.Helper()
-	got, ok, err := repo.FindBySessionID(context.Background(), sessionID)
+	got, ok, err := repo.FindBySessionID(context.Background(), sessionID, ttlLogoutStateOwnerID)
 	requireNoErr(t, err, "find "+sessionID)
 	if ok != wantOK {
 		t.Fatalf("find %q ok=%t, want %t", sessionID, ok, wantOK)
@@ -157,6 +226,7 @@ func TestOIDCLogoutStateRepositorySaveFindTTL(t *testing.T) {
 	newState := func(sessionID, endpoint, hint string, expiresAt time.Time) *models.OIDCLogoutState {
 		return &models.OIDCLogoutState{
 			SessionID:             sessionID,
+			UserID:                ttlLogoutStateOwnerID,
 			EndSessionEndpoint:    endpoint,
 			IDTokenHint:           hint,
 			PostLogoutRedirectURL: "https://ovumcy.example.com/login",
@@ -178,7 +248,7 @@ func TestOIDCLogoutStateRepositorySaveFindTTL(t *testing.T) {
 	assertLogoutState(t, repo, "nope", false, "", "")
 
 	// Targeted delete.
-	requireNoErr(t, repo.DeleteBySessionID(context.Background(), "sess-1"), "delete")
+	requireNoErr(t, repo.DeleteBySessionID(context.Background(), "sess-1", ttlLogoutStateOwnerID), "delete")
 	assertLogoutState(t, repo, "sess-1", false, "", "")
 
 	// TTL sweep drops only expired rows.
@@ -187,4 +257,80 @@ func TestOIDCLogoutStateRepositorySaveFindTTL(t *testing.T) {
 	requireNoErr(t, repo.DeleteExpired(context.Background(), base), "delete expired")
 	assertLogoutState(t, repo, "stale", false, "", "")
 	assertLogoutState(t, repo, "valid", true, "", "")
+}
+
+// ttlLogoutStateOwnerID is the owner every row in
+// TestOIDCLogoutStateRepositorySaveFindTTL belongs to; the scenario there is
+// about persistence and TTL, so it stays with one owner throughout.
+const ttlLogoutStateOwnerID uint = 7
+
+// TestOIDCLogoutStateRepositoryScopesReadsAndDeletesToTheOwner pins the
+// privacy boundary on the OIDC logout-state table: an instance may host more
+// than one independent owner, and end-session material (the raw id_token_hint
+// among it) is per-owner data. A session id is not a secret the way that hint
+// is — it travels in a sealed cookie and is echoed back — so the predicate
+// pairs it with the owner rather than trusting it alone.
+//
+// The row here belongs to owner B. Owner A asking for it by the very session
+// id it is keyed on must see nothing, and owner A's delete must leave it
+// standing. Both assertions are negative, so each has its positive anchor in
+// the same test: owner B reads the row back and owner B's delete removes it —
+// without those, a repository that found and deleted nothing at all would pass.
+func TestOIDCLogoutStateRepositoryScopesReadsAndDeletesToTheOwner(t *testing.T) {
+	database := openSQLiteForMigrationBootstrapTest(t, filepath.Join(t.TempDir(), "logout-owner.db"))
+	repo := NewOIDCLogoutStateRepository(database)
+	ctx := context.Background()
+
+	const (
+		ownerA    uint = 11
+		ownerB    uint = 12
+		sessionID      = "sess-owned-by-b"
+	)
+
+	requireNoErr(t, repo.Save(ctx, &models.OIDCLogoutState{
+		SessionID:             sessionID,
+		UserID:                ownerB,
+		EndSessionEndpoint:    "https://id.example.com/logout",
+		IDTokenHint:           "owner-b-id-token",
+		PostLogoutRedirectURL: "https://ovumcy.example.com/login",
+		ExpiresAt:             time.Now().Add(time.Hour).UTC(),
+	}), "save owner B state")
+
+	got, found, err := repo.FindBySessionID(ctx, sessionID, ownerA)
+	requireNoErr(t, err, "owner A find")
+	if found {
+		t.Fatalf("owner %d read owner %d's provider-logout state by session id: the lookup is not scoped to the owner (got %#v)", ownerA, ownerB, got)
+	}
+
+	requireNoErr(t, repo.DeleteBySessionID(ctx, sessionID, ownerA), "owner A delete")
+	if _, stillThere, err := repo.FindBySessionID(ctx, sessionID, ownerB); err != nil || !stillThere {
+		t.Fatalf("owner %d's delete removed owner %d's row: the delete is not scoped to the owner (found=%t, err=%v)", ownerA, ownerB, stillThere, err)
+	}
+
+	// A zero owner is invalid input, never "any owner": were it widened, the
+	// two refusals above would be one forgotten argument away from undone.
+	if _, found, err := repo.FindBySessionID(ctx, sessionID, 0); !errors.Is(err, ErrOIDCLogoutStateUnattributed) || found {
+		t.Fatalf("find with no owner must be refused, got found=%t err=%v", found, err)
+	}
+	if err := repo.DeleteBySessionID(ctx, sessionID, 0); !errors.Is(err, ErrOIDCLogoutStateUnattributed) {
+		t.Fatalf("delete with no owner must be refused, got %v", err)
+	}
+	if err := repo.Save(ctx, &models.OIDCLogoutState{
+		SessionID:          "sess-unattributed",
+		EndSessionEndpoint: "https://id.example.com/logout",
+		IDTokenHint:        "hint",
+		ExpiresAt:          time.Now().Add(time.Hour).UTC(),
+	}); !errors.Is(err, ErrOIDCLogoutStateUnattributed) {
+		t.Fatalf("saving a row no owner can be reached by must be refused, got %v", err)
+	}
+
+	// Positive anchors: owner B's own read and delete work, so the refusals
+	// above are about the owner and not about a repository that does nothing.
+	if _, found, err := repo.FindBySessionID(ctx, sessionID, ownerB); err != nil || !found {
+		t.Fatalf("owner %d must read their own state back (found=%t, err=%v)", ownerB, found, err)
+	}
+	requireNoErr(t, repo.DeleteBySessionID(ctx, sessionID, ownerB), "owner B delete")
+	if _, found, err := repo.FindBySessionID(ctx, sessionID, ownerB); err != nil || found {
+		t.Fatalf("owner %d's own delete must remove their row (found=%t, err=%v)", ownerB, found, err)
+	}
 }

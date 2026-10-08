@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
-	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -28,16 +27,15 @@ type AuthSessionClaims struct {
 	jwt.RegisteredClaims
 }
 
-func BuildAuthSessionToken(secretKey []byte, userID uint, role string, ttl time.Duration, now time.Time) (string, error) {
-	token, _, err := BuildAuthSessionTokenWithVersionAndSessionID(secretKey, userID, role, 1, ttl, now)
-	return token, err
-}
-
-func BuildAuthSessionTokenWithVersion(secretKey []byte, userID uint, role string, sessionVersion int, ttl time.Duration, now time.Time) (string, error) {
-	token, _, err := BuildAuthSessionTokenWithVersionAndSessionID(secretKey, userID, role, sessionVersion, ttl, now)
-	return token, err
-}
-
+// BuildAuthSessionTokenWithVersionAndSessionID mints an auth session token and
+// returns the session id it embedded. It is the only builder: a caller that has
+// no use for the session id discards it, rather than reaching for a wrapper that
+// hides which session was created.
+//
+// The role travels into the claims unchecked on purpose. Whether a role may hold
+// a web session is decided by ValidateSupportedWebUser at the two places that
+// matter — where the api layer issues a cookie, and where ResolveAuthSession
+// admits one — so this stays a pure minting primitive.
 func BuildAuthSessionTokenWithVersionAndSessionID(secretKey []byte, userID uint, role string, sessionVersion int, ttl time.Duration, now time.Time) (string, string, error) {
 	if userID == 0 {
 		return "", "", ErrAuthSessionTokenInvalidUserID
@@ -65,8 +63,9 @@ func BuildAuthSessionTokenWithVersionAndSessionID(secretKey []byte, userID uint,
 		},
 	}
 
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	rawToken, signErr := token.SignedString(secretKey)
+	// Signed under the auth-session key domain (its own HKDF-derived key, `aud`
+	// and `typ`), never under SECRET_KEY itself: see authTokenDomain.
+	rawToken, signErr := signAuthSessionClaims(secretKey, &claims)
 	if signErr != nil {
 		return "", "", signErr
 	}
@@ -82,16 +81,7 @@ func ParseAuthSessionToken(secretKey []byte, rawToken string, now time.Time) (*A
 	}
 
 	claims := &AuthSessionClaims{}
-	parser := jwt.NewParser(
-		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
-		jwt.WithTimeFunc(func() time.Time { return now }),
-	)
-	token, err := parser.ParseWithClaims(rawToken, claims, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method")
-		}
-		return secretKey, nil
-	})
+	token, err := authSessionTokenDomain.parse(secretKey, rawToken, claims, now)
 	if err != nil {
 		if errors.Is(err, jwt.ErrTokenExpired) {
 			return nil, ErrAuthSessionTokenExpired
@@ -118,6 +108,13 @@ func GenerateAuthSessionID() (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(buffer), nil
+}
+
+// AuthSessionVersionsMatch reports whether a version a grant was minted at is
+// still the account's current one. Both sides are normalized, so a legacy zero
+// on the row compares as 1 — the same reading ResolveAuthSession applies.
+func AuthSessionVersionsMatch(granted int, current int) bool {
+	return NormalizeAuthSessionVersion(granted) == NormalizeAuthSessionVersion(current)
 }
 
 func NormalizeAuthSessionVersion(version int) int {

@@ -27,12 +27,29 @@ func predictableFeedUser(t *testing.T, lastPeriodStart string) *models.User {
 
 func predictableFeedLogs(t *testing.T) []models.DailyLog {
 	t.Helper()
-	// Three prior cycle starts ~28 days apart establish an observed, stable
-	// cadence so predictions are enabled (not sparse/unpredictable).
+	// Four cycle starts 28 days apart are three completed cycles — the history
+	// the fertility half needs before the feed may send an ovulation date.
 	return []models.DailyLog{
-		{Date: mustParseDashboardDay(t, "2026-01-05"), IsPeriod: true},
-		{Date: mustParseDashboardDay(t, "2026-02-02"), IsPeriod: true},
-		{Date: mustParseDashboardDay(t, "2026-03-02"), IsPeriod: true},
+		{Date: mustParseDashboardDay(t, "2025-12-08"), IsPeriod: true, CycleStart: true},
+		{Date: mustParseDashboardDay(t, "2026-01-05"), IsPeriod: true, CycleStart: true},
+		{Date: mustParseDashboardDay(t, "2026-02-02"), IsPeriod: true, CycleStart: true},
+		{Date: mustParseDashboardDay(t, "2026-03-02"), IsPeriod: true, CycleStart: true},
+	}
+}
+
+// dayBoundaryFeedLogs is predictableFeedLogs shifted so the projected ovulation
+// of the current cycle lands exactly on 2026-03-10: four cycle starts 28 days
+// apart ending 2026-02-25, and ovulation = cycle start + (28 - 14) - 1. A feed
+// rendered with "today" = 2026-03-10 keeps that event; one rendered with "today"
+// = 2026-03-11 drops it as past. That single-day difference is what makes the
+// owner-vs-request timezone choice observable in the .ics body itself.
+func dayBoundaryFeedLogs(t *testing.T) []models.DailyLog {
+	t.Helper()
+	return []models.DailyLog{
+		{Date: mustParseDashboardDay(t, "2025-12-03"), IsPeriod: true, CycleStart: true},
+		{Date: mustParseDashboardDay(t, "2025-12-31"), IsPeriod: true, CycleStart: true},
+		{Date: mustParseDashboardDay(t, "2026-01-28"), IsPeriod: true, CycleStart: true},
+		{Date: mustParseDashboardDay(t, "2026-02-25"), IsPeriod: true, CycleStart: true},
 	}
 }
 
@@ -79,7 +96,7 @@ func TestBuildCalendarFeedICSEmitsNeutralEventsWithDisclaimer(t *testing.T) {
 		Logs:       predictableFeedLogs(t),
 		Now:        now,
 		Location:   time.UTC,
-		Disclaimer: "These are estimates, not medical advice or a method of contraception.",
+		Disclaimer: "Predictions are estimates, not medical advice or a method of contraception.",
 	}))
 
 	// Structural RFC 5545 markers (never localized copy).
@@ -98,7 +115,7 @@ func TestBuildCalendarFeedICSEmitsNeutralEventsWithDisclaimer(t *testing.T) {
 	assertNeutralSummaries(t, body)
 
 	// Disclaimer must be present in a DESCRIPTION line (medical-safety).
-	if !strings.Contains(body, "DESCRIPTION:These are estimates") {
+	if !strings.Contains(body, "DESCRIPTION:Predictions are estimates") {
 		t.Fatalf("expected medical-safety disclaimer in DESCRIPTION, got:\n%s", body)
 	}
 }
@@ -174,6 +191,79 @@ func TestBuildCalendarFeedICSSuppressesForUnpredictableCycle(t *testing.T) {
 	if strings.Contains(body, "BEGIN:VEVENT") {
 		t.Fatalf("unpredictable-cycle mode must suppress ALL prediction events, got:\n%s", body)
 	}
+}
+
+// TestBuildCalendarFeedICSSuppressesForOverdueCycle covers the third
+// medical-safety gate on the feed: an account whose cycle has run past its own
+// reference length by more than a week emits no prediction events.
+//
+// This is the surface where the phantom travelled furthest — the builder projects
+// three cycles ahead, so an overdue account pushed up to six invented all-day
+// events into whatever third-party calendar client holds the subscription, where
+// they outlive any in-app correction. The 2026-03-02 anchor with a 28-day cadence
+// puts "today" = 2026-04-25 on cycle day 55 against a 28-day reference.
+//
+// The first subtest is the positive anchor: the same account, same logs, a date
+// inside the reference length still gets its events, so the suppressed case
+// cannot pass by emitting nothing for an unrelated reason.
+func TestBuildCalendarFeedICSSuppressesForOverdueCycle(t *testing.T) {
+	user := predictableFeedUser(t, "2026-03-02")
+	logs := predictableFeedLogs(t)
+
+	renderFeed := func(now time.Time) string {
+		return string(BuildCalendarFeedICS(CalendarFeedICSInput{
+			User:       user,
+			Logs:       logs,
+			Now:        now,
+			Location:   time.UTC,
+			Disclaimer: "disclaimer",
+		}))
+	}
+
+	t.Run("a cycle inside its reference length still emits events", func(t *testing.T) {
+		body := renderFeed(mustParseDashboardDay(t, "2026-03-20"))
+		if !strings.Contains(body, "BEGIN:VEVENT") {
+			t.Fatalf("expected prediction events inside the reference length, got:\n%s", body)
+		}
+	})
+
+	t.Run("an overdue cycle without a thermal shift emits no event", func(t *testing.T) {
+		now := mustParseDashboardDay(t, "2026-04-25")
+
+		stats := NewStatsService(nil, nil).BuildCycleStatsFromLogs(user, logs, now, time.UTC)
+		if !DashboardCycleOverdue(user, stats) {
+			t.Fatalf("test setup expects an overdue cycle: cycle day %d against reference %d",
+				stats.CurrentCycleDay, DashboardCycleReferenceLength(user, stats))
+		}
+
+		body := renderFeed(now)
+		if strings.Contains(body, "BEGIN:VEVENT") {
+			t.Fatalf("an overdue cycle must suppress ALL prediction events, got:\n%s", body)
+		}
+		// The subscription must not break: with no prediction and no confirmed
+		// day to publish, suppression is the well-formed empty VCALENDAR a client
+		// keeps polling.
+		for _, marker := range []string{"BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:" + calendarFeedProductID, "END:VCALENDAR"} {
+			if !strings.Contains(body, marker) {
+				t.Fatalf("expected a well-formed empty VCALENDAR carrying %q, got:\n%s", marker, body)
+			}
+		}
+	})
+
+	// The overdue gate withholds projections, not the day the owner's own
+	// temperatures confirmed: that one event survives it, and nothing else does.
+	t.Run("an overdue cycle with a thermal shift emits only the confirmed day", func(t *testing.T) {
+		shiftUser, shiftLogs, _ := outboundConfirmedFixture(t, true)
+		now := mustParseDashboardDay(t, "2026-04-10")
+		if stats := BuildCycleStatsFromLogs(shiftUser, shiftLogs, now, time.UTC); !DashboardCycleOverdue(shiftUser, stats) {
+			t.Fatalf("test setup expects an overdue cycle: cycle day %d", stats.CurrentCycleDay)
+		}
+
+		events := calendarFeedEvents(CalendarFeedICSInput{User: shiftUser, Logs: shiftLogs, Now: now, Location: time.UTC})
+		if len(events) != 1 || events[0].kind != calendarFeedKindOvulation || CalendarDayKey(events[0].date) != "2026-03-11" {
+			t.Fatalf("overdue feed events = %#v, want exactly the confirmed ovulation on 2026-03-11", events)
+		}
+	})
 }
 
 func TestBuildCalendarFeedICSHandlesNoBaseline(t *testing.T) {
@@ -337,6 +427,136 @@ func cmpStringSets(a, b []string) string {
 		}
 	}
 	return ""
+}
+
+// TestBuildCalendarFeedICSWithAnEmptyDisclaimerStillEmitsEveryEvent records the
+// current behaviour when the localized disclaimer resolves to "": the builder has
+// no runtime guard, so every VEVENT is still written, each with an empty
+// DESCRIPTION line. This CONTRADICTS the documented invariant that every event
+// carries the medical-safety disclaimer: the invariant currently rests on the
+// locale catalogue never resolving to "" (guarded by a catalogue sweep), not on
+// this builder. The test pins the gap so closing it (suppress the feed, or refuse
+// the empty text) is a deliberate change that updates it.
+func TestBuildCalendarFeedICSWithAnEmptyDisclaimerStillEmitsEveryEvent(t *testing.T) {
+	input := CalendarFeedICSInput{
+		User:       predictableFeedUser(t, "2026-03-02"),
+		Logs:       predictableFeedLogs(t),
+		Now:        mustParseDashboardDay(t, "2026-03-20"),
+		Location:   time.UTC,
+		Disclaimer: "",
+	}
+
+	body := string(BuildCalendarFeedICS(input))
+	events := strings.Count(body, "BEGIN:VEVENT")
+	if events == 0 {
+		t.Fatalf("fixture: the feed must project events:\n%s", body)
+	}
+	if got := strings.Count(body, "\r\nDESCRIPTION:\r\n"); got != events {
+		t.Fatalf("pinned: an empty disclaimer is currently emitted as an empty DESCRIPTION on every event (%d of %d); closing the gap should update this test\n%s", got, events, body)
+	}
+
+	input.Disclaimer = "estimate only"
+	control := string(BuildCalendarFeedICS(input))
+	if got := strings.Count(control, "\r\nDESCRIPTION:estimate only\r\n"); got != events {
+		t.Fatalf("control: a non-empty disclaimer reaches every event: %d of %d", got, events)
+	}
+}
+
+// TestBuildCalendarFeedICSProjectsExactlyThreeCyclesAheadAsSingleDays pins the
+// CURRENT horizon on purpose, as a decision to revisit rather than a statement of
+// approval. The feed chains next-period events two and three cycles beyond the
+// first (and an ovulation event per cycle still ahead), each a single all-day date
+// with no widened range. The calendar grid's rule against widening chained cycles
+// concerns the START RANGE only (a spread drawn around a projection of a
+// projection); the grid itself also chains single projected days across the visible
+// month, so the feed's far dates are the same kind of claim, not a wider one. What
+// stays unbounded by data confidence is the count: three cycles, whatever the
+// number of completed cycles behind them.
+func TestBuildCalendarFeedICSProjectsExactlyThreeCyclesAheadAsSingleDays(t *testing.T) {
+	body := string(BuildCalendarFeedICS(CalendarFeedICSInput{
+		User:       predictableFeedUser(t, "2026-03-02"),
+		Logs:       predictableFeedLogs(t),
+		Now:        mustParseDashboardDay(t, "2026-03-20"),
+		Location:   time.UTC,
+		Disclaimer: "estimate only",
+	}))
+
+	var periods []time.Time
+	for _, uid := range extractICSUIDs(t, body) {
+		if rest, ok := strings.CutPrefix(uid, "period-"); ok {
+			periods = append(periods, mustParseDashboardDay(t, rest[:4]+"-"+rest[4:6]+"-"+rest[6:8]))
+		}
+	}
+	if len(periods) != 3 {
+		t.Fatalf("expected exactly three projected period events (this cycle's end and the two after it), got %d:\n%s", len(periods), body)
+	}
+	for i := 1; i < len(periods); i++ {
+		if gap := CalendarDaysBetween(periods[i-1], periods[i]); gap != 28 {
+			t.Fatalf("chained period events are one cycle apart, got %d days between #%d and #%d", gap, i, i+1)
+		}
+	}
+	// 2026-03-02 + 28 days is the first projected start; the third is 56 days later.
+	if want := mustParseDashboardDay(t, "2026-03-30"); !periods[0].Equal(want) {
+		t.Fatalf("first projected period = %s, want %s", periods[0].Format("2006-01-02"), want.Format("2006-01-02"))
+	}
+
+	// Ovulation: cycle 0's day (2026-03-16) is already behind now, so the two
+	// chained cycles carry one each.
+	ovulations := 0
+	for _, uid := range extractICSUIDs(t, body) {
+		if strings.HasPrefix(uid, "ovulation-") {
+			ovulations++
+		}
+	}
+	if ovulations != 2 {
+		t.Fatalf("expected exactly two projected ovulation events (cycles 1 and 2), got %d:\n%s", ovulations, body)
+	}
+
+	// Every event is a single all-day date: DTEND is the day after DTSTART.
+	pairs := regexp.MustCompile(`DTSTART;VALUE=DATE:(\d{8})\r\nDTEND;VALUE=DATE:(\d{8})`).FindAllStringSubmatch(body, -1)
+	if len(pairs) != strings.Count(body, "BEGIN:VEVENT") {
+		t.Fatalf("every event has a DTSTART/DTEND pair: %d of %d", len(pairs), strings.Count(body, "BEGIN:VEVENT"))
+	}
+	for _, pair := range pairs {
+		start, _ := time.Parse("20060102", pair[1])
+		end, _ := time.Parse("20060102", pair[2])
+		if end.Sub(start) != 24*time.Hour {
+			t.Fatalf("event %s..%s is not a single all-day date", pair[1], pair[2])
+		}
+	}
+}
+
+// The test below pins CURRENT behaviour — a decision to revisit, not approval:
+// the feed's period horizon does not shrink with the data behind it, while the
+// ovulation events wait for three completed cycles.
+func TestBuildCalendarFeedICSOfAnAccountWithOneCompletedCycleProjectsThreePeriodsAndNoOvulation(t *testing.T) {
+	logs := []models.DailyLog{
+		{Date: mustParseDashboardDay(t, "2026-02-02"), IsPeriod: true, CycleStart: true},
+		{Date: mustParseDashboardDay(t, "2026-03-02"), IsPeriod: true, CycleStart: true},
+	}
+	now := mustParseDashboardDay(t, "2026-03-20")
+	user := predictableFeedUser(t, "2026-03-02")
+
+	if got := BuildCycleStatsFromLogs(user, logs, now, time.UTC).CompletedCycleCount; got != 1 {
+		t.Fatalf("fixture: the account must hold exactly one completed cycle, got %d", got)
+	}
+
+	body := string(BuildCalendarFeedICS(CalendarFeedICSInput{User: user, Logs: logs, Now: now, Location: time.UTC, Disclaimer: "estimate only"}))
+	periods, ovulations := 0, 0
+	for _, uid := range extractICSUIDs(t, body) {
+		if strings.HasPrefix(uid, "period-") {
+			periods++
+		}
+		if strings.HasPrefix(uid, "ovulation-") {
+			ovulations++
+		}
+	}
+	if periods != 3 {
+		t.Fatalf("one completed cycle projects three period events, got %d:\n%s", periods, body)
+	}
+	if ovulations != 0 {
+		t.Fatalf("one completed cycle is below the three-cycle fertility floor, so no ovulation event may be sent, got %d:\n%s", ovulations, body)
+	}
 }
 
 func TestBuildCalendarFeedICSProjectsMultipleCyclesAndEscapesDescription(t *testing.T) {

@@ -14,9 +14,9 @@ import (
 // ON CONFLICT (key) update) rather than erroring on the primary-key collision or
 // appending a second row.
 func TestAppStateRepositoryRoundTripAndUpsert(t *testing.T) {
-	database, err := OpenSQLite(filepath.Join(t.TempDir(), "app-state.db"))
+	database, err := OpenDatabase(migratedSQLiteConfig(t, filepath.Join(t.TempDir(), "app-state.db")))
 	if err != nil {
-		t.Fatalf("OpenSQLite() unexpected error: %v", err)
+		t.Fatalf("OpenDatabase() unexpected error: %v", err)
 	}
 	t.Cleanup(func() {
 		if sqlDB, dbErr := database.DB(); dbErr == nil {
@@ -57,12 +57,100 @@ func TestAppStateRepositoryRoundTripAndUpsert(t *testing.T) {
 	}
 }
 
+// TestAppStateRepositoryDeleteRemovesTheKeyAndToleratesAMissingOne covers the
+// contract the calendar-feed restore fence relies on: a marker that is there is
+// gone afterwards, and deleting one that was never written is not an error. The
+// fence erases its unanchored stamp on every boot that records a token and its
+// token half on every boot without a usable fence, without reading first, so an
+// absent key raising an error would turn every ordinary first boot — and every
+// unfenced start after the first — into a failed start.
+func TestAppStateRepositoryDeleteRemovesTheKeyAndToleratesAMissingOne(t *testing.T) {
+	database, err := OpenDatabase(migratedSQLiteConfig(t, filepath.Join(t.TempDir(), "app-state-delete.db")))
+	if err != nil {
+		t.Fatalf("OpenDatabase() unexpected error: %v", err)
+	}
+	t.Cleanup(func() {
+		if sqlDB, dbErr := database.DB(); dbErr == nil {
+			_ = sqlDB.Close()
+		}
+	})
+	repo := NewAppStateRepository(database)
+	ctx := context.Background()
+	key := models.AppStateKeyCalendarFeedFenceUnanchored
+
+	if err := repo.Delete(ctx, key); err != nil {
+		t.Fatalf("Delete() of a key that was never written must be a no-op, got %v", err)
+	}
+
+	if err := repo.Set(ctx, key, "booted without a usable fence"); err != nil {
+		t.Fatalf("Set() unexpected error: %v", err)
+	}
+	if _, ok, err := repo.Get(ctx, key); err != nil || !ok {
+		t.Fatalf("expected the marker to be readable before the delete, got ok=%v err=%v", ok, err)
+	}
+
+	if err := repo.Delete(ctx, key); err != nil {
+		t.Fatalf("Delete() unexpected error: %v", err)
+	}
+	if value, ok, err := repo.Get(ctx, key); err != nil || ok || value != "" {
+		t.Fatalf("expected the marker to be gone, got value=%q ok=%v err=%v", value, ok, err)
+	}
+
+	// A second delete of the same key is the boot after the one that erased it.
+	if err := repo.Delete(ctx, key); err != nil {
+		t.Fatalf("Delete() must stay idempotent, got %v", err)
+	}
+
+	// A blank key deletes nothing rather than every row, which is the one way
+	// this method could quietly destroy the markers other subsystems own.
+	if err := repo.Set(ctx, models.AppStateKeyLastReminderRunDate, "2026-07-05"); err != nil {
+		t.Fatalf("Set() unexpected error: %v", err)
+	}
+	if err := repo.Delete(ctx, "   "); err != nil {
+		t.Fatalf("Delete() with a blank key must be a no-op, got %v", err)
+	}
+	if _, ok, err := repo.Get(ctx, models.AppStateKeyLastReminderRunDate); err != nil || !ok {
+		t.Fatalf("a blank key must match no row at all, got ok=%v err=%v", ok, err)
+	}
+}
+
+// TestAppStateRepositoryDeleteIsIdempotentOnPostgres repeats the missing-key,
+// repeat-delete, and blank-key shapes above against the Postgres tree: the
+// fence's Delete call is engine-independent, so the guarantee it relies on has
+// to hold on both. Skips without Docker unless OVUMCY_REQUIRE_POSTGRES=1 (see
+// startPostgresTestConfig).
+func TestAppStateRepositoryDeleteIsIdempotentOnPostgres(t *testing.T) {
+	database := openPostgresForMigrationBootstrapTest(t, startPostgresTestConfig(t))
+	repo := NewAppStateRepository(database)
+	ctx := context.Background()
+	key := models.AppStateKeyCalendarFeedFenceUnanchored
+
+	if err := repo.Delete(ctx, key); err != nil {
+		t.Fatalf("Delete() of a key that was never written must be a no-op, got %v", err)
+	}
+	if err := repo.Set(ctx, key, "booted without a usable fence"); err != nil {
+		t.Fatalf("Set() unexpected error: %v", err)
+	}
+	if err := repo.Delete(ctx, key); err != nil {
+		t.Fatalf("Delete() unexpected error: %v", err)
+	}
+	if _, ok, err := repo.Get(ctx, key); err != nil || ok {
+		t.Fatalf("expected the marker to be gone, ok=%v err=%v", ok, err)
+	}
+	if err := repo.Delete(ctx, key); err != nil {
+		t.Fatalf("Delete() must stay idempotent, got %v", err)
+	}
+	if err := repo.Delete(ctx, "   "); err != nil {
+		t.Fatalf("Delete() with a blank key must be a no-op, got %v", err)
+	}
+}
+
 // TestAppStateRepositoryRejectsBlankKey covers the guard: an empty/whitespace key
 // is not a valid marker. Get treats it as missing; Set refuses it.
 func TestAppStateRepositoryRejectsBlankKey(t *testing.T) {
-	database, err := OpenSQLite(filepath.Join(t.TempDir(), "app-state-blank.db"))
+	database, err := OpenDatabase(migratedSQLiteConfig(t, filepath.Join(t.TempDir(), "app-state-blank.db")))
 	if err != nil {
-		t.Fatalf("OpenSQLite() unexpected error: %v", err)
+		t.Fatalf("OpenDatabase() unexpected error: %v", err)
 	}
 	t.Cleanup(func() {
 		if sqlDB, dbErr := database.DB(); dbErr == nil {
@@ -86,9 +174,9 @@ func TestAppStateRepositoryRejectsBlankKey(t *testing.T) {
 // relies on this so a real DB failure fails its catch-up safe rather than
 // silently reading "never ran".
 func TestAppStateRepositoryGetSurfacesNonNotFoundError(t *testing.T) {
-	database, err := OpenSQLite(filepath.Join(t.TempDir(), "app-state-closed.db"))
+	database, err := OpenDatabase(migratedSQLiteConfig(t, filepath.Join(t.TempDir(), "app-state-closed.db")))
 	if err != nil {
-		t.Fatalf("OpenSQLite() unexpected error: %v", err)
+		t.Fatalf("OpenDatabase() unexpected error: %v", err)
 	}
 	repo := NewAppStateRepository(database)
 

@@ -7,28 +7,40 @@ import (
 )
 
 const (
-	authCookieName               = "ovumcy_auth"
-	languageCookieName           = "ovumcy_lang"
-	timezoneCookieName           = "ovumcy_tz"
-	timezoneHeaderName           = "X-Ovumcy-Timezone"
-	flashCookieName              = "ovumcy_flash"
+	authCookieName     = "ovumcy_auth"
+	languageCookieName = "ovumcy_lang"
+	timezoneCookieName = "ovumcy_tz"
+	timezoneHeaderName = "X-Ovumcy-Timezone"
+	flashCookieName    = "ovumcy_flash"
+	// exemptFlashCookieName is the second flash channel: every write reachable
+	// through a request the CSRF middleware never validates — the OIDC
+	// callback's sole exemption, its unguarded query-mode GET twin, and the
+	// requireFirstPartyRequest refusals that themselves fire on the
+	// cross-site request the guard exists to name — seals into this cookie
+	// instead of flashCookieName's, so it can never overwrite or erase a
+	// pending same-origin flash (WEB-40). See flash.go.
+	exemptFlashCookieName        = "ovumcy_flash_exempt"
 	recoveryCodeCookieName       = "ovumcy_recovery_code"
 	calendarFeedRevealCookieName = "ovumcy_calendar_feed"
 	registerPickupCookieName     = "ovumcy_register_pickup"
 	resetPasswordCookieName      = "ovumcy_reset_password" // #nosec G101 -- cookie name contains "password" but is not a secret or credential.
 	oidcStateCookieName          = "ovumcy_oidc_auth"
 	oidcStepupCookieName         = "ovumcy_oidc_stepup"
-	oidcLinkPendingCookieName    = "ovumcy_oidc_link_pending"
-	oidcLogoutBridgeCookieName   = "ovumcy_oidc_logout_bridge"
-	totpPendingCookieName        = "ovumcy_totp_pending"
-	totpSetupCookieName          = "ovumcy_totp_setup"
-	oidcLogoutBridgePath         = "/auth/oidc/logout"
-	oidcLogoutBridgeRedirectPath = "/auth/oidc/logout/redirect"
-	contextUserKey               = "current_user"
-	contextAuthSessionKey        = "current_auth_session"
-	contextLanguageKey           = "current_language"
-	contextMessagesKey           = "current_messages"
-	contextLocationKey           = "current_location"
+	// Carries an already-validated cross-site step-up across the same-site
+	// bounce (oidc_stepup_continuation.go); the continue route below is the
+	// only reader.
+	oidcStepupContinuationCookieName = "ovumcy_oidc_stepup_continue"
+	oidcCallbackContinuePath         = "/auth/oidc/callback/continue"
+	oidcLogoutBridgeCookieName       = "ovumcy_oidc_logout_bridge"
+	totpPendingCookieName            = "ovumcy_totp_pending"
+	totpSetupCookieName              = "ovumcy_totp_setup"
+	oidcLogoutBridgePath             = "/auth/oidc/logout"
+	oidcLogoutBridgeRedirectPath     = "/auth/oidc/logout/redirect"
+	contextUserKey                   = "current_user"
+	contextAuthSessionKey            = "current_auth_session"
+	contextLanguageKey               = "current_language"
+	contextMessagesKey               = "current_messages"
+	contextLocationKey               = "current_location"
 )
 
 func currentUser(c fiber.Ctx) (*models.User, bool) {

@@ -3,7 +3,6 @@ package services
 import (
 	"errors"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/ovumcy/ovumcy-web/internal/models"
 )
@@ -26,6 +25,7 @@ var (
 )
 
 func NormalizeDayEntryInput(input DayEntryInput) (DayEntryInput, error) {
+	input = dropPreservedDayEntryFields(input)
 	if !IsValidDayFlow(input.Flow) {
 		return input, ErrInvalidDayFlow
 	}
@@ -50,6 +50,9 @@ func NormalizeDayEntryInput(input DayEntryInput) (DayEntryInput, error) {
 	}
 	if !input.IsPeriod {
 		input.Flow = models.FlowNone
+		// A cycle start is the first day of bleeding, so the inline answer only
+		// means anything on a day that is being saved as a period day.
+		input.ConfirmCycleStart = false
 	}
 	input.Flow = NormalizeDayFlow(input.Flow)
 	input.SexActivity = NormalizeDaySexActivity(input.SexActivity)
@@ -59,6 +62,29 @@ func NormalizeDayEntryInput(input DayEntryInput) (DayEntryInput, error) {
 	input.BBT = normalizeStoredDayBBT(input.BBT)
 	input.Notes = TrimDayNotes(input.Notes)
 	return input, nil
+}
+
+// dropPreservedDayEntryFields neutralises every field this write marked
+// Preserve*, before the validation above ever reads one. A preserved field's
+// incoming value is not this write's subject — the save replaces it with the
+// value already stored — so it may not reject the day, and merging against an
+// EMPTY stored row is exactly that neutralisation: the same path an update
+// takes with the real row, run against no row at all, so the drop and the merge
+// cannot come to list different fields.
+//
+// Transport declines to read a hidden field at all (parseDayPayload), so no
+// HTTP request delivers a value here any more; keeping the rule in the service
+// is what makes it the service's own rather than a property of one transport.
+// Even before that, only bbt and cycle factors could refuse a day this way —
+// transport normalizes sex activity and cervical mucus to a valid spelling on
+// the way in and merely trims notes — and all five are dropped so the rule does
+// not have to be re-derived from what each transport happens to sanitize.
+//
+// On a day that does not exist yet there is nothing to merge, and this is then
+// the whole answer: a hidden field starts neutral instead of storing a value
+// the account can neither see nor correct.
+func dropPreservedDayEntryFields(input DayEntryInput) DayEntryInput {
+	return mergePreservedDayEntryInput(models.DailyLog{}, input)
 }
 
 func NormalizeDayFlow(flow string) string {
@@ -89,13 +115,28 @@ func IsValidDayMood(value int) bool {
 	return value == 0 || (value >= MinDayMood && value <= MaxDayMood)
 }
 
+// TrimDayNotes caps a note at MaxDayNotesLength CHARACTERS, the unit the notes
+// textareas declare through maxlength. Measured in bytes the same number cut
+// what the browser had already accepted, silently: 2000 typed Cyrillic
+// characters are 4000 bytes and came back as roughly 1000 characters.
+//
+// HTML maxlength counts UTF-16 code units, so a character (rune) count is at
+// worst MORE permissive than the browser — an astral character is one rune and
+// two code units — and the server therefore never truncates a value the browser
+// was willing to submit.
+//
+// Ranging over the string yields the byte offset of each character's first
+// byte, so a single pass both counts and locates the cut: an over-limit value
+// is sliced at the offset of the character after the cap — always a character
+// boundary — and a value at or under the cap falls out of the loop and is
+// returned whole.
 func TrimDayNotes(value string) string {
-	if len(value) <= MaxDayNotesLength {
-		return value
+	characters := 0
+	for index := range value {
+		if characters == MaxDayNotesLength {
+			return value[:index]
+		}
+		characters++
 	}
-	end := MaxDayNotesLength
-	for end > 0 && !utf8.RuneStart(value[end]) {
-		end--
-	}
-	return value[:end]
+	return value
 }

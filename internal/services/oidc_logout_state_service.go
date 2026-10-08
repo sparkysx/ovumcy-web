@@ -10,10 +10,25 @@ import (
 
 const defaultOIDCLogoutStateTTL = 7 * 24 * time.Hour
 
+// ErrOIDCLogoutStateUnattributed is returned when a logout-state read, write
+// or delete arrives without the owner it acts for. The store refuses the same
+// input; this service refuses it too, because the store is an interface and
+// the guarantee must not depend on which implementation is wired in
+// (`docs/SECURITY_INVARIANTS.md`). Neither pre-check is redundant with the
+// other: dropping the one here would leave the refusal to whatever store is
+// wired in, and a store written later need not have one.
+// Regression: TestOIDCLogoutStateServiceRefusesAnAbsentOwner.
+//
+// It is the shared value from internal/models, not a second one with the same
+// text: this package cannot import internal/db, and a redeclaration would
+// leave errors.Is false across the layer boundary for the very error being
+// tested for.
+var ErrOIDCLogoutStateUnattributed = models.ErrOIDCLogoutStateUnattributed
+
 type OIDCLogoutStateStore interface {
 	Save(ctx context.Context, state *models.OIDCLogoutState) error
-	FindBySessionID(ctx context.Context, sessionID string) (models.OIDCLogoutState, bool, error)
-	DeleteBySessionID(ctx context.Context, sessionID string) error
+	FindBySessionID(ctx context.Context, sessionID string, userID uint) (models.OIDCLogoutState, bool, error)
+	DeleteBySessionID(ctx context.Context, sessionID string, userID uint) error
 	DeleteExpired(ctx context.Context, cutoff time.Time) error
 }
 
@@ -25,6 +40,10 @@ func NewOIDCLogoutStateService(store OIDCLogoutStateStore) *OIDCLogoutStateServi
 	return &OIDCLogoutStateService{store: store}
 }
 
+// Save persists the provider-logout material for one session. The owner rides
+// in state.UserID and is required: a row nobody owns is invisible to the
+// owner-scoped reads below and to account erasure, which deletes these rows by
+// user_id.
 func (service *OIDCLogoutStateService) Save(ctx context.Context, sessionID string, state OIDCLogoutState, now time.Time) error {
 	if service == nil || service.store == nil {
 		return nil
@@ -32,6 +51,9 @@ func (service *OIDCLogoutStateService) Save(ctx context.Context, sessionID strin
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
 		return nil
+	}
+	if state.UserID == 0 {
+		return ErrOIDCLogoutStateUnattributed
 	}
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -54,22 +76,29 @@ func (service *OIDCLogoutStateService) Save(ctx context.Context, sessionID strin
 	})
 }
 
-func (service *OIDCLogoutStateService) Load(ctx context.Context, sessionID string, now time.Time) (OIDCLogoutState, bool, error) {
-	return service.load(ctx, sessionID, now, false)
+// Load reads the logout state a session id carries for the given owner. Both
+// operands are required; userID is never inferred from the record.
+func (service *OIDCLogoutStateService) Load(ctx context.Context, sessionID string, userID uint, now time.Time) (OIDCLogoutState, bool, error) {
+	return service.load(ctx, sessionID, userID, now, false)
 }
 
-func (service *OIDCLogoutStateService) Consume(ctx context.Context, sessionID string, now time.Time) (OIDCLogoutState, bool, error) {
-	return service.load(ctx, sessionID, now, true)
+// Consume is Load plus the one-time delete of the row it returned.
+func (service *OIDCLogoutStateService) Consume(ctx context.Context, sessionID string, userID uint, now time.Time) (OIDCLogoutState, bool, error) {
+	return service.load(ctx, sessionID, userID, now, true)
 }
 
-func (service *OIDCLogoutStateService) Delete(ctx context.Context, sessionID string) error {
+// Delete removes one owner's logout state for a session id.
+func (service *OIDCLogoutStateService) Delete(ctx context.Context, sessionID string, userID uint) error {
 	if service == nil || service.store == nil {
 		return nil
 	}
-	return service.store.DeleteBySessionID(ctx, strings.TrimSpace(sessionID))
+	if userID == 0 {
+		return ErrOIDCLogoutStateUnattributed
+	}
+	return service.store.DeleteBySessionID(ctx, strings.TrimSpace(sessionID), userID)
 }
 
-func (service *OIDCLogoutStateService) load(ctx context.Context, sessionID string, now time.Time, consume bool) (OIDCLogoutState, bool, error) {
+func (service *OIDCLogoutStateService) load(ctx context.Context, sessionID string, userID uint, now time.Time, consume bool) (OIDCLogoutState, bool, error) {
 	if service == nil || service.store == nil {
 		return OIDCLogoutState{}, false, nil
 	}
@@ -77,34 +106,58 @@ func (service *OIDCLogoutStateService) load(ctx context.Context, sessionID strin
 	if sessionID == "" {
 		return OIDCLogoutState{}, false, nil
 	}
-	if now.IsZero() {
-		now = time.Now().UTC()
+	if userID == 0 {
+		return OIDCLogoutState{}, false, ErrOIDCLogoutStateUnattributed
 	}
-	now = now.UTC()
+	now = effectiveLogoutStateTime(now)
 
 	if err := service.store.DeleteExpired(ctx, now); err != nil {
 		return OIDCLogoutState{}, false, err
 	}
 
-	record, found, err := service.store.FindBySessionID(ctx, sessionID)
+	record, found, err := service.store.FindBySessionID(ctx, sessionID, userID)
 	if err != nil || !found {
 		return OIDCLogoutState{}, false, err
 	}
+	if record.UserID != userID {
+		// The store's own predicate already excludes this row; re-checking here
+		// keeps the guarantee with the service rather than with whichever store
+		// happens to be wired in.
+		return OIDCLogoutState{}, false, nil
+	}
+
+	return service.resolve(ctx, sessionID, record, now, consume)
+}
+
+// resolve applies the expiry check and the optional one-time delete to a
+// record the caller has already established belongs to the owner it acts for.
+func (service *OIDCLogoutStateService) resolve(ctx context.Context, sessionID string, record models.OIDCLogoutState, now time.Time, consume bool) (OIDCLogoutState, bool, error) {
 	if !record.ExpiresAt.IsZero() && !record.ExpiresAt.After(now) {
-		if deleteErr := service.store.DeleteBySessionID(ctx, sessionID); deleteErr != nil {
+		if deleteErr := service.store.DeleteBySessionID(ctx, sessionID, record.UserID); deleteErr != nil {
 			return OIDCLogoutState{}, false, deleteErr
 		}
 		return OIDCLogoutState{}, false, nil
 	}
 	if consume {
-		if err := service.store.DeleteBySessionID(ctx, sessionID); err != nil {
+		if err := service.store.DeleteBySessionID(ctx, sessionID, record.UserID); err != nil {
 			return OIDCLogoutState{}, false, err
 		}
 	}
 
 	return OIDCLogoutState{
+		// The owner travels with the state: a caller that re-saves it onto a
+		// new session id (session rotation) carries the attribution forward
+		// instead of re-supplying it from somewhere else.
+		UserID:                record.UserID,
 		EndSessionEndpoint:    strings.TrimSpace(record.EndSessionEndpoint),
 		IDTokenHint:           strings.TrimSpace(record.IDTokenHint),
 		PostLogoutRedirectURL: strings.TrimSpace(record.PostLogoutRedirectURL),
 	}, true, nil
+}
+
+func effectiveLogoutStateTime(now time.Time) time.Time {
+	if now.IsZero() {
+		return time.Now().UTC()
+	}
+	return now.UTC()
 }

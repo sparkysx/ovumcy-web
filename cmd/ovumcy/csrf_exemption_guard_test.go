@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/ovumcy/ovumcy-web/internal/api"
 	"github.com/ovumcy/ovumcy-web/internal/security"
 )
 
@@ -162,6 +163,81 @@ func TestCSRFExemptionListIsExactlyOneRoute(t *testing.T) {
 	}
 }
 
+// TestCSRFPredicateSkipsTheCookielessFeedGETAndHEADWithoutWideningTheMutatingExemptions
+// covers the predicate's OTHER clause: the one that stops csrf.New from
+// minting and setting its own cookie on the cookieless calendar feed (a safe
+// method it was never going to validate anyway — see the Next comment on
+// csrfMiddlewareConfig). That clause is not in csrfGuardExpectedExemptions
+// because it exempts no mutating route; TestCSRFExemptionListIsExactlyOneRoute
+// above proves that count stayed at exactly one by construction, since it
+// walks only state-mutating routes and the feed registers none. This test
+// pins the other half directly: the predicate skips the feed's GET and HEAD
+// (app.Get registers both — fiber's csrf.New mints its safe-method cookie for
+// either), does NOT skip a mutating verb under the same path prefix, and does
+// not widen past the route's own shape to a path merely sharing its prefix.
+func TestCSRFPredicateSkipsTheCookielessFeedGETAndHEADWithoutWideningTheMutatingExemptions(t *testing.T) {
+	next := csrfMiddlewareConfig(false, newRateLimitTestHandler(t)).Next
+	if next == nil {
+		t.Fatal("csrfMiddlewareConfig.Next is nil")
+	}
+
+	// The shipped fiberConfig, not a bare fiber.New(): CaseSensitive and
+	// StrictRouting are both off there, and this predicate has to agree with
+	// the router's own normalization of the probed spellings, not a
+	// coincidentally-matching default.
+	probe := fiber.New(fiberConfig(proxySettings{}, nil))
+	probe.Use(func(c fiber.Ctx) error {
+		if next(c) {
+			return c.SendStatus(fiber.StatusTeapot)
+		}
+		return c.SendStatus(fiber.StatusOK)
+	})
+	isExempt := func(method string, path string) bool {
+		t.Helper()
+		request := httptest.NewRequest(method, path, strings.NewReader(""))
+		response, err := probe.Test(request, testConfigNoTimeout)
+		if err != nil {
+			t.Fatalf("probe %s %s: %v", method, path, err)
+		}
+		defer func() { _ = response.Body.Close() }()
+		return response.StatusCode == fiber.StatusTeapot
+	}
+
+	const feedTarget = api.CalendarFeedRateLimitPrefix + "/ABCDEFGHJKLMNPQRSTUVWXYZ23456789ABCDEFGHJKLMNP12.ics"
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		if !isExempt(method, feedTarget) {
+			t.Errorf("expected %s %s to skip the CSRF middleware (no token issuance on the cookieless feed)", method, feedTarget)
+		}
+	}
+
+	// A mutating verb under the same prefix — hypothetical today, since
+	// internal/api/routes.go registers no such route — must still be
+	// validated. Widening the predicate's method check would silently exempt
+	// one from CSRF the day it's added.
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete} {
+		if isExempt(method, feedTarget) {
+			t.Errorf("expected %s %s to stay CSRF-validated: the feed clause must be GET/HEAD-only", method, feedTarget)
+		}
+	}
+
+	// Neighbouring paths must not be swept in by a loosened prefix check: one
+	// that merely starts with "/calendar", one that continues every character
+	// of the feed prefix without its separator, the bare prefix itself (with
+	// and without a trailing slash) and a nested segment beneath it — none of
+	// these name the feed's own route shape.
+	for _, neighbour := range []string{
+		"/calendar/day/2026-01-15",
+		api.CalendarFeedRateLimitPrefix + "back",
+		api.CalendarFeedRateLimitPrefix,
+		api.CalendarFeedRateLimitPrefix + "/",
+		api.CalendarFeedRateLimitPrefix + "/a/b.ics",
+	} {
+		if isExempt(http.MethodGet, neighbour) {
+			t.Errorf("expected GET %s to stay outside the feed's CSRF skip — the prefix must not over-match", neighbour)
+		}
+	}
+}
+
 // TestCSRFDeniesEveryMutatingRouteWithoutToken is the behavioral half of the
 // guard: with the production middleware chain mounted, a token-less request to
 // EVERY state-mutating route must be refused with the CSRF 403 before any
@@ -169,6 +245,12 @@ func TestCSRFExemptionListIsExactlyOneRoute(t *testing.T) {
 // handler (the OIDC callback is protected by the sealed one-time state cookie
 // and, lacking one, redirects to /login). This also fails if the CSRF
 // middleware is ever unmounted from the composition root.
+//
+// Each refusal is also required to carry the mapped envelope. The refusal is
+// raised once, by the middleware, for every route in the table, so this is the
+// route-wide sweep behind the app-wide envelope contract: a regression that
+// restores the framework's bare "Forbidden" fails here on every mutating route
+// rather than on whichever one a hand-written test happened to name.
 func TestCSRFDeniesEveryMutatingRouteWithoutToken(t *testing.T) {
 	app := newCSRFGuardTestApp(t)
 
@@ -200,6 +282,11 @@ func TestCSRFDeniesEveryMutatingRouteWithoutToken(t *testing.T) {
 			if response.StatusCode != http.StatusForbidden {
 				t.Fatalf("expected CSRF 403 for token-less %s, got %d — if this route was consciously exempted, update csrfGuardExpectedExemptions and SECURITY.md together", key, response.StatusCode)
 			}
+			body := mustReadAll(t, response)
+			if strings.TrimSpace(string(body)) == "Forbidden" {
+				t.Fatalf("%s answered the CSRF refusal with fiber's bare text; the mapped envelope is app-wide", key)
+			}
+			assertTransportErrorEnvelope(t, body, "forbidden", "forbidden")
 		})
 		covered++
 	}

@@ -71,13 +71,13 @@ func TestImportServiceRoundTripPreservesEntries(t *testing.T) {
 		{
 			UserID: source.ID, Date: time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC),
 			IsPeriod: true, CycleStart: true, IsUncertain: true, Flow: models.FlowHeavy, Mood: 3,
-			SexActivity: models.SexActivityProtected, BBT: models.NewBBT(36.7), CervicalMucus: models.CervicalMucusCreamy,
+			SexActivity: models.SexActivityProtected, BBT: new(36.7), CervicalMucus: models.CervicalMucusCreamy,
 			PregnancyTest: models.PregnancyTestNegative, CycleFactorKeys: []string{models.CycleFactorStress, models.CycleFactorTravel},
 			SymptomIDs: []uint{crampsID, moodSwingsID, customID}, Notes: "heavy day",
 		},
 		{
 			UserID: source.ID, Date: time.Date(2026, time.March, 5, 0, 0, 0, 0, time.UTC),
-			Mood: 5, BBT: models.NewBBT(36.9), PregnancyTest: models.PregnancyTestPositive,
+			Mood: 5, BBT: new(36.9), PregnancyTest: models.PregnancyTestPositive,
 			SymptomIDs: []uint{swellingID}, CycleFactorKeys: []string{},
 		},
 	}
@@ -208,6 +208,50 @@ func TestImportServiceRejectsDuplicateDatesWithinFile(t *testing.T) {
 	}
 }
 
+// TestImportServiceRejectsADateTheRequestZoneNeverHad keeps a row naming a
+// calendar day the request zone skipped entirely (Pacific/Apia crossed the date
+// line and never had 2011-12-30) on the same per-row path as any other invalid
+// row: counted as rejected and skipped, never silently written onto the previous
+// day. The neighbouring valid row still imports, so one bad row does not refuse
+// the file.
+func TestImportServiceRejectsADateTheRequestZoneNeverHad(t *testing.T) {
+	apia, err := time.LoadLocation("Pacific/Apia")
+	if err != nil {
+		t.Fatalf("load Pacific/Apia: %v", err)
+	}
+
+	_, database := newDayServiceIntegration(t)
+	repositories := db.NewRepositories(database)
+	symptomService := NewSymptomService(repositories.Symptoms)
+	user := createDayServiceTestUser(t, database, "import-nonexistent-day@example.com")
+
+	payload := importPayload{Entries: []ExportJSONEntry{
+		{Date: "2011-12-30", Period: true, Flow: models.FlowMedium, CycleFactors: []string{}},
+		{Date: "2011-12-28", Period: true, Flow: models.FlowMedium, CycleFactors: []string{}},
+	}}
+	raw, _ := json.Marshal(payload)
+
+	importService := newImportServiceIntegration(t, database, symptomService)
+	result, err := importService.ImportJSON(context.Background(), user.ID, raw, apia)
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if result.Added != 1 || result.Rejected != 1 {
+		t.Fatalf("expected 1 added / 1 rejected, got %+v", result)
+	}
+
+	var stored []models.DailyLog
+	if err := database.Where("user_id = ?", user.ID).Find(&stored).Error; err != nil {
+		t.Fatalf("load days: %v", err)
+	}
+	if len(stored) != 1 {
+		t.Fatalf("expected exactly one imported day, got %d", len(stored))
+	}
+	if key := CalendarDayKey(stored[0].Date); key != "2011-12-28" {
+		t.Fatalf("expected only 2011-12-28 imported, got %s — the rejected row landed on a day the file never named", key)
+	}
+}
+
 func TestImportServiceRejectsMalformedPayload(t *testing.T) {
 	importService := NewImportService(nil, nil, nil, nil)
 	if _, err := importService.ImportJSON(context.Background(), 1, []byte("{not json"), time.UTC); err != ErrImportMalformed {
@@ -225,6 +269,44 @@ func TestImportServiceRejectsTooLargePayload(t *testing.T) {
 	importService := NewImportService(nil, nil, nil, nil)
 	if _, err := importService.ImportJSON(context.Background(), 1, raw, time.UTC); err != ErrImportTooLarge {
 		t.Fatalf("expected ErrImportTooLarge, got %v", err)
+	}
+}
+
+// TestImportServiceRefusesOversizedPayloadBeforeMaterialisingInvalidEntries
+// proves the entry-count refusal fires before any entry is decoded into
+// ExportJSONEntry: every entry here has a field of the wrong JSON type
+// ("date" is a number, not a string), so a per-entry typed decode would fail
+// with ErrImportMalformed for each one. If ImportJSON still answers
+// ErrImportTooLarge, the count was checked against the raw top-level split,
+// not against a result that required decoding — decoding never ran, because
+// decoding this payload can only fail. Induced-red: moving the count check
+// back to after the per-entry decode loop (the pre-fix order) turns this red
+// with ErrImportMalformed instead.
+func TestImportServiceRefusesOversizedPayloadBeforeMaterialisingInvalidEntries(t *testing.T) {
+	rawEntry := `{"date":12345}`
+	entries := make([]string, MaxImportEntries+1)
+	for i := range entries {
+		entries[i] = rawEntry
+	}
+	raw := []byte(`{"entries":[` + strings.Join(entries, ",") + `]}`)
+
+	importService := NewImportService(nil, nil, nil, nil)
+	if _, err := importService.ImportJSON(context.Background(), 1, raw, time.UTC); err != ErrImportTooLarge {
+		t.Fatalf("expected ErrImportTooLarge, got %v", err)
+	}
+}
+
+// TestImportServiceStillRejectsMalformedEntryTypeUnderTheCap is the
+// companion to the oversized case above: the same wrong-typed "date" field,
+// but at a count within MaxImportEntries, must still fail as malformed —
+// proving the count-first check did not loosen validation for payloads that
+// pass the cap.
+func TestImportServiceStillRejectsMalformedEntryTypeUnderTheCap(t *testing.T) {
+	raw := []byte(`{"entries":[{"date":12345}]}`)
+
+	importService := NewImportService(nil, nil, nil, nil)
+	if _, err := importService.ImportJSON(context.Background(), 1, raw, time.UTC); err != ErrImportMalformed {
+		t.Fatalf("expected ErrImportMalformed, got %v", err)
 	}
 }
 
@@ -369,7 +451,7 @@ func TestImportServiceSanitizesGarbageValues(t *testing.T) {
 
 	payload := importPayload{Entries: []ExportJSONEntry{
 		{
-			Date: "2026-10-01", Period: true, Flow: "ZZZ", MoodRating: 999, BBT: models.NewBBT(9999),
+			Date: "2026-10-01", Period: true, Flow: "ZZZ", MoodRating: 999, BBT: new(9999.0),
 			SexActivity: "??", CervicalMucus: "??", PregnancyTest: "??",
 			CycleFactors: []string{"not_a_factor"},
 		},
@@ -563,6 +645,32 @@ func TestImportServiceScopesResolvedSymptomsToImportingOwner(t *testing.T) {
 	if len(logsB) != 0 {
 		t.Fatalf("owner B gained %d unexpected day logs from owner A's import", len(logsB))
 	}
+
+	// And B's CATALOG is untouched: the name collision must not rename, archive, or
+	// duplicate B's row. Asserting only B's logs left that half of the invariant
+	// unproven — a resolver that "reused" B's row by renaming it, or archived it to
+	// free the name, would have passed everything above.
+	catalogB, err := symptomService.FetchSymptoms(context.Background(), ownerB.ID)
+	if err != nil {
+		t.Fatalf("fetch owner B catalog: %v", err)
+	}
+	sharedRowsForB := 0
+	for _, symptom := range catalogB {
+		if normalizeSymptomNameKey(symptom.Name) != "shared name" {
+			continue
+		}
+		sharedRowsForB++
+		if symptom.ID != bSymptom.ID {
+			t.Fatalf("owner A's import added a second %q row (id %d) to owner B's catalog", symptom.Name, symptom.ID)
+		}
+		if symptom.Name != bSymptom.Name {
+			t.Fatalf("owner B's symptom was renamed to %q, want %q", symptom.Name, bSymptom.Name)
+		}
+	}
+	// Exactly one, still live: zero would mean B's row was archived or deleted.
+	if sharedRowsForB != 1 {
+		t.Fatalf("expected owner B to still own exactly one live %q row, found %d", bSymptom.Name, sharedRowsForB)
+	}
 }
 
 // TestImportServiceBBTCompatibilityAcrossLegacyAndCurrentPayloads pins the
@@ -667,5 +775,29 @@ func assertExportEntryHasBBT(t *testing.T, entry ExportJSONEntry, want string) {
 	}
 	if !strings.Contains(string(marshaled), "\"bbt\":"+want) {
 		t.Fatalf("expected %s export entry to include bbt:%s, got %s", entry.Date, want, marshaled)
+	}
+}
+
+// TestImportServiceRoundsAnImportedBBTOntoTheStoredGrid pins the second writer
+// of a stored reading to the same precision as a day save: a restored file may
+// carry any decimal expansion, and the shift detector compares readings on the
+// ten-thousandths grid every other writer rounds to.
+func TestImportServiceRoundsAnImportedBBTOntoTheStoredGrid(t *testing.T) {
+	dayService, database := newDayServiceIntegration(t)
+	symptomService := NewSymptomService(db.NewRepositories(database).Symptoms)
+	user := createDayServiceTestUser(t, database, "import-bbt-grid@example.com")
+
+	raw := []byte(`{"entries":[{"date":"2026-07-05","period":false,"bbt":36.123456,"cycle_factors":[]}]}`)
+	importService := newImportServiceIntegration(t, database, symptomService)
+	if _, err := importService.ImportJSON(context.Background(), user.ID, raw, time.UTC); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	stored, err := dayService.FetchLogByDate(context.Background(), user.ID, mustParseExportDay(t, "2026-07-05"), time.UTC)
+	if err != nil {
+		t.Fatalf("reload imported day: %v", err)
+	}
+	if stored.BBT == nil || *stored.BBT != 36.1235 {
+		t.Fatalf("expected the imported reading rounded to 36.1235, got %v", stored.BBT)
 	}
 }

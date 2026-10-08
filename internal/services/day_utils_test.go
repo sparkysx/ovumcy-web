@@ -7,6 +7,10 @@ import (
 	"github.com/ovumcy/ovumcy-web/internal/models"
 )
 
+func dayHasDataBBT(value float64) *float64 {
+	return &value
+}
+
 func TestDayHasData(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -43,6 +47,35 @@ func TestDayHasData(t *testing.T) {
 			entry: models.DailyLog{PregnancyTest: models.PregnancyTestPositive},
 			want:  true,
 		},
+		// One row per tracked field, each carrying nothing else: a day whose
+		// only content is intimacy, a temperature or a mucus observation is a
+		// day with data. Without these three the corresponding branches could
+		// all be deleted at once and the table stayed green, which meant an
+		// empty-looking day could be cleared out from under a value the owner
+		// had entered.
+		{
+			name:  "sex activity present",
+			entry: models.DailyLog{SexActivity: models.SexActivityProtected},
+			want:  true,
+		},
+		{
+			name:  "bbt present",
+			entry: models.DailyLog{BBT: dayHasDataBBT(36.6)},
+			want:  true,
+		},
+		{
+			name:  "cervical mucus present",
+			entry: models.DailyLog{CervicalMucus: models.CervicalMucusCreamy},
+			want:  true,
+		},
+		// An out-of-range stored temperature is not a reading: DayHasData asks
+		// IsValidDayBBT, so this row keeps the branch from degrading into a
+		// bare nil check.
+		{
+			name:  "out of range bbt is not data",
+			entry: models.DailyLog{Flow: models.FlowNone, BBT: dayHasDataBBT(200)},
+			want:  false,
+		},
 		{
 			name:  "empty entry",
 			entry: models.DailyLog{Flow: models.FlowNone},
@@ -61,9 +94,10 @@ func TestDayHasData(t *testing.T) {
 
 func TestIsAutoFilledPeriodCandidate(t *testing.T) {
 	tests := []struct {
-		name  string
-		entry models.DailyLog
-		want  bool
+		name       string
+		entry      models.DailyLog
+		propagated string
+		want       bool
 	}{
 		{
 			name:  "bare period day",
@@ -71,9 +105,55 @@ func TestIsAutoFilledPeriodCandidate(t *testing.T) {
 			want:  true,
 		},
 		{
-			name:  "bare period day with propagated flow",
-			entry: models.DailyLog{IsPeriod: true, Flow: models.FlowLight},
+			name:  "period day with the none flow",
+			entry: models.DailyLog{IsPeriod: true, Flow: models.FlowNone},
 			want:  true,
+		},
+		{
+			name:       "bare period day with propagated flow",
+			entry:      models.DailyLog{IsPeriod: true, Flow: models.FlowLight},
+			propagated: models.FlowLight,
+			want:       true,
+		},
+		{
+			name:       "flow differing from the propagated one",
+			entry:      models.DailyLog{IsPeriod: true, Flow: models.FlowHeavy},
+			propagated: models.FlowMedium,
+			want:       false,
+		},
+		{
+			name:  "flow beside an anchor that carried none",
+			entry: models.DailyLog{IsPeriod: true, Flow: models.FlowHeavy},
+			want:  false,
+		},
+		{
+			name:  "spotting beside an anchor that carried none",
+			entry: models.DailyLog{IsPeriod: true, Flow: models.FlowSpotting},
+			want:  false,
+		},
+		{
+			name:       "spotting is bare when the anchor carried it",
+			entry:      models.DailyLog{IsPeriod: true, Flow: models.FlowSpotting},
+			propagated: models.FlowSpotting,
+			want:       true,
+		},
+		{
+			name:       "propagated flow spelled with case and padding",
+			entry:      models.DailyLog{IsPeriod: true, Flow: models.FlowLight},
+			propagated: " Light ",
+			want:       true,
+		},
+		{
+			name:       "stored flow spelled with case and padding",
+			entry:      models.DailyLog{IsPeriod: true, Flow: " MEDIUM "},
+			propagated: models.FlowMedium,
+			want:       true,
+		},
+		{
+			name:       "padded propagated flow still differs from another flow",
+			entry:      models.DailyLog{IsPeriod: true, Flow: models.FlowHeavy},
+			propagated: " Light ",
+			want:       false,
 		},
 		{
 			name:  "non-period day",
@@ -122,7 +202,7 @@ func TestIsAutoFilledPeriodCandidate(t *testing.T) {
 		},
 		{
 			name:  "period day with bbt reading",
-			entry: models.DailyLog{IsPeriod: true, BBT: models.NewBBT(36.5)},
+			entry: models.DailyLog{IsPeriod: true, BBT: new(36.5)},
 			want:  false,
 		},
 		{
@@ -134,7 +214,7 @@ func TestIsAutoFilledPeriodCandidate(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := IsAutoFilledPeriodCandidate(tt.entry); got != tt.want {
+			if got := IsAutoFilledPeriodCandidate(tt.entry, tt.propagated); got != tt.want {
 				t.Fatalf("IsAutoFilledPeriodCandidate() = %v, want %v", got, tt.want)
 			}
 		})
@@ -210,6 +290,113 @@ func TestDateAtLocationShiftsToNextLocalDayAcrossUTCBoundary(t *testing.T) {
 	}
 	if day.Hour() != 0 || day.Minute() != 0 || day.Second() != 0 {
 		t.Fatalf("expected normalized local midnight, got %s", day.Format(time.RFC3339))
+	}
+}
+
+// TestCalendarDayKeyRoundTripsAcrossMidnightDSTTransitions pins the one
+// property every date-only surface depends on: the YYYY-MM-DD key a helper is
+// handed must be the YYYY-MM-DD key it returns. In a UTC-minus zone whose DST
+// jump lands exactly on midnight, local midnight does not exist and time.Date
+// normalizes the nonexistent wall clock BACKWARD into the previous calendar
+// day, so the spring-forward date could not be entered at all: the onboarding
+// anchor, the day entry and the export row all shifted one day earlier.
+//
+// The list carries three midnight-transition zones on their own transition
+// dates, a positive-offset zone (which normalizes forward and was never
+// affected), a zone whose jump is at 02:00 (midnight exists), and UTC (no
+// transitions at all) so a future change that breaks the unaffected zones is
+// caught here too.
+func TestCalendarDayKeyRoundTripsAcrossMidnightDSTTransitions(t *testing.T) {
+	cases := []struct {
+		zone string
+		day  string
+		note string
+	}{
+		{zone: "America/Santiago", day: "2026-09-06", note: "UTC-4 -> UTC-3 jump at 00:00"},
+		{zone: "America/Havana", day: "2026-03-08", note: "UTC-5 -> UTC-4 jump at 00:00"},
+		{zone: "America/Asuncion", day: "2024-10-06", note: "UTC-4 -> UTC-3 jump at 00:00 (last DST year)"},
+		{zone: "Asia/Beirut", day: "2026-03-29", note: "control: positive offset, jump at 00:00"},
+		{zone: "Europe/Berlin", day: "2026-03-29", note: "control: jump at 02:00, midnight exists"},
+		{zone: "UTC", day: "2026-03-08", note: "control: no transitions"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.zone+" "+tc.day, func(t *testing.T) {
+			location, err := time.LoadLocation(tc.zone)
+			if err != nil {
+				t.Fatalf("load %s: %v", tc.zone, err)
+			}
+			reference, err := time.Parse("2006-01-02", tc.day)
+			if err != nil {
+				t.Fatalf("parse reference day %s: %v", tc.day, err)
+			}
+			year, month, day := reference.Date()
+
+			// The single parse entry point for date inputs.
+			parsed, err := ParseDayDate(tc.day, location)
+			if err != nil {
+				t.Fatalf("ParseDayDate(%s, %s): %v", tc.day, tc.zone, err)
+			}
+			if got := parsed.Format("2006-01-02"); got != tc.day {
+				t.Errorf("ParseDayDate(%s, %s) = %s, want %s (%s)", tc.day, tc.zone, got, tc.day, tc.note)
+			}
+			// The returned instant is the day's FIRST existing instant: one
+			// nanosecond earlier is already the previous calendar day.
+			if got := parsed.Add(-time.Nanosecond).Format("2006-01-02"); got == tc.day {
+				t.Errorf("ParseDayDate(%s, %s) = %s is not the first instant of the day",
+					tc.day, tc.zone, parsed.Format(time.RFC3339))
+			}
+
+			// A date-only stored value (persisted at UTC-midnight) rebuilt in
+			// the request-local zone.
+			stored := time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
+			if got := CalendarDay(stored, location).Format("2006-01-02"); got != tc.day {
+				t.Errorf("CalendarDay(%s, %s) = %s, want %s (%s)", tc.day, tc.zone, got, tc.day, tc.note)
+			}
+
+			// An instant inside the local calendar day projected back onto it.
+			instant := time.Date(year, month, day, 12, 0, 0, 0, location).UTC()
+			if got := DateAtLocation(instant, location).Format("2006-01-02"); got != tc.day {
+				t.Errorf("DateAtLocation(local noon of %s, %s) = %s, want %s (%s)",
+					tc.day, tc.zone, got, tc.day, tc.note)
+			}
+
+			// The canonical storage shape: parse in the request zone, persist
+			// at UTC-midnight, read the key back.
+			if got := CalendarDayKey(CalendarDay(parsed, time.UTC)); got != tc.day {
+				t.Errorf("CalendarDayKey(CalendarDay(ParseDayDate(%s, %s), UTC)) = %s, want %s",
+					tc.day, tc.zone, got, tc.day)
+			}
+		})
+	}
+}
+
+// TestCalendarDayKeepsStdlibResolutionForACalendarDayThatNeverExisted covers
+// the one case the transition lookup cannot repair: a zone that skips a whole
+// calendar day. Pacific/Apia jumped from 2011-12-29 23:59:59 UTC-10 straight
+// to 2011-12-31 00:00 UTC+14, so no instant at all exists on 2011-12-30. The
+// helper must not reach for the next transition there (that lands on a
+// different day) and keeps time.Date's own resolution instead.
+//
+// This is the contract for a STORED value being rebuilt, where there is no
+// error channel to report the gap on. It is not the contract for user input:
+// ParseDayDate refuses the same date with ErrDayDateNonexistent rather than
+// returning the previous day as a successful parse
+// (TestParseDayDateRefusesACalendarDayTheZoneNeverHad).
+func TestCalendarDayKeepsStdlibResolutionForACalendarDayThatNeverExisted(t *testing.T) {
+	apia, err := time.LoadLocation("Pacific/Apia")
+	if err != nil {
+		t.Fatalf("load Pacific/Apia: %v", err)
+	}
+
+	stored := time.Date(2011, time.December, 30, 0, 0, 0, 0, time.UTC)
+	got := CalendarDay(stored, apia)
+
+	if key := got.Format("2006-01-02"); key != "2011-12-29" {
+		t.Fatalf("CalendarDay(2011-12-30, Pacific/Apia) = %s, want the stdlib resolution 2011-12-29", key)
+	}
+	if got.Location() != apia {
+		t.Fatalf("expected location Pacific/Apia, got %s", got.Location())
 	}
 }
 

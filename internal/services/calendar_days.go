@@ -7,28 +7,66 @@ import (
 )
 
 type CalendarDayState struct {
-	Date                 time.Time
-	DateString           string
-	Day                  int
-	InMonth              bool
-	IsToday              bool
-	IsFuture             bool
-	OpenEditDirectly     bool
-	IsPeriod             bool
-	IsPredicted          bool
-	IsPreFertile         bool
-	IsFertility          bool
-	IsFertilityPeak      bool
-	IsFertilityEdge      bool
-	IsOvulation          bool
-	IsTentativeOvulation bool
-	HasData              bool
-	HasSex               bool
+	Date       time.Time
+	DateString string
+	Day        int
+	InMonth    bool
+	IsToday    bool
+
+	OpenEditDirectly bool
+	IsPeriod         bool
+	IsPredicted      bool
+	// IsPredictedStartWindow marks a day the next period may START on — the
+	// range the dashboard prints as "Next period: X — Y". It is a different
+	// quantity from IsPredicted (a projected bleeding day), so it is carried
+	// separately rather than folded into it.
+	IsPredictedStartWindow bool
+	IsPreFertile           bool
+	IsFertility            bool
+	IsFertilityPeak        bool
+	IsFertilityEdge        bool
+	IsOvulation            bool
+	IsTentativeOvulation   bool
+	// IsPredictedFertileOverlap marks a day on which the projected period band
+	// and the fertile window are BOTH true. Both facts are real at once — a
+	// short cycle with a long average period puts expected bleeding inside the
+	// six days before ovulation — so neither flag above is cleared for it: this
+	// is a derived reading of the two, and the only thing it decides is which
+	// single fill the cell paints, which is otherwise a precedence ladder that
+	// would drop the fertile half silently.
+	//
+	// The BAND, not the start window: the two are different quantities, so this
+	// stays the band's own conjunction and every consumer can tell which one it
+	// has. The start window has fertile days of its own — on an irregular cycle
+	// it runs from the shortest observed cycle to the longest and reaches days
+	// the band never covers — and the ladder in internal/api resolves those from
+	// IsPredictedStartWindow and the edge-or-peak pair below, the same
+	// membership this flag is built from. Folding the window in here would hand
+	// every consumer one flag for two facts instead.
+	IsPredictedFertileOverlap bool
+	HasData                   bool
+	HasSex                    bool
+	// Selectable is false on a grid cell whose date ParseDayDate refuses, such
+	// as the 9999-12-31 and year-10000 days on the December 9999 grid. The cell
+	// is drawn, but a day request for it could only fail.
+	Selectable bool
 }
+
+// calendarLogReadDays is how far either side of the month the calendar's
+// projections and historical pass read.
+const calendarLogReadDays = 70
+
+// calendarLogMarginDays is the load beyond the days the calendar reads. The
+// cycle-boundary rule needs two consecutive period days (or a mark) to open a
+// cycle, so a bleeding run cut by the edge of the loaded slice would lose its
+// qualification. The margin keeps every run that touches the read window whole:
+// a bleeding run is at most a few weeks of days, far inside it.
+const calendarLogMarginDays = 30
 
 func CalendarLogRange(monthStart time.Time) (time.Time, time.Time) {
 	monthEnd := monthStart.AddDate(0, 1, -1)
-	return monthStart.AddDate(0, 0, -70), monthEnd.AddDate(0, 0, 70)
+	reach := calendarLogReadDays + calendarLogMarginDays
+	return monthStart.AddDate(0, 0, -reach), monthEnd.AddDate(0, 0, reach)
 }
 
 func BuildCalendarDayStates(user *models.User, monthStart time.Time, logs []models.DailyLog, stats CycleStats, now time.Time, location *time.Location) []CalendarDayState {
@@ -37,29 +75,70 @@ func BuildCalendarDayStates(user *models.User, monthStart time.Time, logs []mode
 		weekStart = NormalizeWeekStart(user.WeekStartsOn)
 	}
 	gridStart, gridEnd := calendarGridBounds(monthStart, weekStart)
-	latestLogByDate, hasDataMap := buildCalendarLogMaps(logs, location)
-	predictedPeriodMap, preFertileMap, fertilityEdgeMap, fertilityPeakMap, ovulationMap, tentativeOvulationMap := buildCalendarPredictionMaps(user, logs, stats, gridEnd, now, location)
+	latestLogByDate, hasDataMap := buildCalendarLogMaps(logs)
+	// The owner's onboarding start is a recorded cycle boundary, so the grid
+	// draws its day as recorded (CycleBoundaries is the one rule that says so)
+	// instead of leaving it to the projection or to a blank cell. A day logged
+	// there without a period (a mood, a symptom) is still painted as recorded:
+	// every un-mark of that day — un-ticking its period in the day editor or
+	// the dashboard's Today form (both show it ticked when the day has no row
+	// and post a hidden field saying so), or deleting the day — clears the
+	// stored start in the same write, so a start that is still stored is still
+	// the owner's. A write that never showed that tick (a mood-only JSON PUT)
+	// is not an un-mark.
+	if onboardingDay := OnboardingBoundaryDay(BoundaryContextFor(user, DateAtLocation(now, location))); !onboardingDay.IsZero() {
+		key := CalendarDayKey(onboardingDay)
+		entry := latestLogByDate[key]
+		if !entry.IsPeriod {
+			entry.Date = onboardingDay
+			entry.IsPeriod = true
+			latestLogByDate[key] = entry
+		}
+	}
+	// The projection bound keeps the request-local shape it has always had:
+	// appendPredictedCycles compares it against a CalendarDay value built in
+	// the same location, so both operands stay start-of-day in one zone.
+	predictionMaps := buildCalendarPredictionMaps(user, logs, stats, CalendarDay(gridEnd, location), now, location)
 
-	todayKey := DateAtLocation(now, location).Format("2006-01-02")
+	today := DateAtLocation(now, location)
 
-	days := make([]CalendarDayState, 0, 42)
-	for day := gridStart; !day.After(gridEnd); day = day.AddDate(0, 0, 1) {
-		days = append(days, buildCalendarDayState(day, monthStart, todayKey, latestLogByDate, hasDataMap, predictedPeriodMap, preFertileMap, fertilityEdgeMap, fertilityPeakMap, ovulationMap, tentativeOvulationMap))
+	// The grid is a run of CALENDAR days, so it is counted and stepped as
+	// calendar days rather than by adding 24h-ish increments to an instant and
+	// testing that instant against a bound. CalendarDaysBetween compares only
+	// the calendar components of the two bounds, and the step runs over
+	// UTC-anchored days, where no midnight is ever skipped.
+	gridDayCount := CalendarDaysBetween(gridStart, gridEnd) + 1
+	days := make([]CalendarDayState, 0, gridDayCount)
+	for offset := range gridDayCount {
+		day := gridStart.AddDate(0, 0, offset)
+		days = append(days, buildCalendarDayState(day, monthStart, today, latestLogByDate, hasDataMap, predictionMaps))
 	}
 
 	return days
 }
 
+// calendarGridBounds returns the first and last calendar day of the month grid,
+// both inclusive and both anchored at UTC midnight — the package's canonical
+// shape for a date-only value.
+//
+// The arithmetic deliberately leaves the request timezone: in a UTC-minus zone
+// whose DST jump lands on midnight (America/Santiago 2026-09-06,
+// America/Havana 2026-03-08) local midnight does not exist on that date, and
+// AddDate resolves the missing wall clock BACKWARD into the previous calendar
+// day. A bound built that way names the wrong day, and a grid stepped from it
+// emits that day twice and drops the last day of the range. UTC has no
+// transitions, so the same arithmetic there is exact for every zone.
 func calendarGridBounds(monthStart time.Time, weekStart string) (time.Time, time.Time) {
-	monthEnd := monthStart.AddDate(0, 1, -1)
-	startOffset := weekStartOffset(monthStart.Weekday(), weekStart)
+	firstOfMonth := CalendarDay(monthStart, time.UTC)
+	monthEnd := firstOfMonth.AddDate(0, 1, -1)
+	startOffset := weekStartOffset(firstOfMonth.Weekday(), weekStart)
 	endOffset := weekStartOffset(monthEnd.Weekday(), weekStart)
-	gridStart := monthStart.AddDate(0, 0, -startOffset)
+	gridStart := firstOfMonth.AddDate(0, 0, -startOffset)
 	gridEnd := monthEnd.AddDate(0, 0, 6-endOffset)
 	return gridStart, gridEnd
 }
 
-func buildCalendarLogMaps(logs []models.DailyLog, location *time.Location) (map[string]models.DailyLog, map[string]bool) {
+func buildCalendarLogMaps(logs []models.DailyLog) (map[string]models.DailyLog, map[string]bool) {
 	latestLogByDate := make(map[string]models.DailyLog)
 	hasDataMap := make(map[string]bool)
 	for _, logEntry := range logs {
@@ -73,36 +152,170 @@ func buildCalendarLogMaps(logs []models.DailyLog, location *time.Location) (map[
 	return latestLogByDate, hasDataMap
 }
 
-func buildCalendarPredictionMaps(user *models.User, logs []models.DailyLog, stats CycleStats, gridEnd time.Time, now time.Time, location *time.Location) (map[string]bool, map[string]bool, map[string]bool, map[string]bool, map[string]bool, map[string]bool) {
-	predictedPeriodMap := make(map[string]bool)
-	preFertileMap := make(map[string]bool)
-	fertilityEdgeMap := make(map[string]bool)
-	fertilityPeakMap := make(map[string]bool)
-	ovulationMap := make(map[string]bool)
-	tentativeOvulationMap := make(map[string]bool)
-
-	if DashboardPredictionDisabled(user) || stats.PregnancyPaused {
-		return predictedPeriodMap, preFertileMap, fertilityEdgeMap, fertilityPeakMap, ovulationMap, tentativeOvulationMap
-	}
-
-	appendCurrentBaselinePeriod(predictedPeriodMap, stats, location)
-	appendCurrentBaselinePreFertile(preFertileMap, stats, location)
-	appendFertilityWindow(fertilityEdgeMap, fertilityPeakMap, stats.FertilityWindowStart, stats.FertilityWindowEnd, stats.OvulationDate)
-	appendCalendarSingleDate(ovulationMap, stats.OvulationDate)
-	appendPredictedCycles(predictedPeriodMap, preFertileMap, fertilityEdgeMap, fertilityPeakMap, ovulationMap, stats, gridEnd, location)
-	appendHistoricalCycles(preFertileMap, fertilityEdgeMap, fertilityPeakMap, ovulationMap, logs, stats, user, location)
-	appendCurrentCycleBBTSignal(user, logs, stats, now, ovulationMap, tentativeOvulationMap, location)
-
-	return predictedPeriodMap, preFertileMap, fertilityEdgeMap, fertilityPeakMap, ovulationMap, tentativeOvulationMap
+// calendarPredictionMaps is the per-day lookup the grid paints from: one set
+// per projected concept, keyed by "2006-01-02". Named fields rather than a
+// tuple of same-typed maps — the set grew to seven when the predicted start
+// window arrived, and a positional swap between two map[string]bool arguments
+// compiles silently.
+type calendarPredictionMaps struct {
+	predictedPeriod     map[string]bool
+	predictedStartRange map[string]bool
+	preFertile          map[string]bool
+	fertilityEdge       map[string]bool
+	fertilityPeak       map[string]bool
+	ovulation           map[string]bool
+	tentativeOvulation  map[string]bool
 }
 
-func appendCurrentBaselinePeriod(predictedPeriodMap map[string]bool, stats CycleStats, location *time.Location) {
+func newCalendarPredictionMaps() calendarPredictionMaps {
+	return calendarPredictionMaps{
+		predictedPeriod:     make(map[string]bool),
+		predictedStartRange: make(map[string]bool),
+		preFertile:          make(map[string]bool),
+		fertilityEdge:       make(map[string]bool),
+		fertilityPeak:       make(map[string]bool),
+		ovulation:           make(map[string]bool),
+		tentativeOvulation:  make(map[string]bool),
+	}
+}
+
+func buildCalendarPredictionMaps(user *models.User, logs []models.DailyLog, stats CycleStats, gridEnd time.Time, now time.Time, location *time.Location) calendarPredictionMaps {
+	maps := newCalendarPredictionMaps()
+	predictedPeriodMap := maps.predictedPeriod
+	preFertileMap := maps.preFertile
+	fertilityEdgeMap := maps.fertilityEdge
+	fertilityPeakMap := maps.fertilityPeak
+	ovulationMap := maps.ovulation
+	tentativeOvulationMap := maps.tentativeOvulation
+
+	// Medical-safety suppression gate, the shared predicate every projected
+	// surface gates on (PredictionsSuppressed): unpredictable-cycle mode, a
+	// pregnancy pause, irregular-cycle mode with fewer than three completed
+	// cycles (DashboardAwaitingIrregularHistory — the dashboard's "needs more
+	// cycles"), or a cycle running past the account's own cycle length by
+	// more than a week (DashboardCycleOverdue). Past that point
+	// stats.NextPeriodStart is a date the account's own data no longer supports:
+	// appendPredictedCycles chains from it, so the grid painted a predicted period
+	// in the PAST — one that never happened — and then a phantom window every
+	// cycle length after it. Every prediction map stays empty here; the recorded
+	// facts (logged period days, has-data, sex activity) are read elsewhere and
+	// are untouched.
+	//
+	// One marker survives a suppressed tier: the solid ovulation marker on a day
+	// the owner's own temperatures confirmed. That day was never chained from
+	// NextPeriodStart, and whether it may be named is decided in ONE place, the
+	// gate inside ConfirmedCurrentCycleOvulation (ConfirmedOvulationWithheld) —
+	// today it lets the day through under the overdue signal alone. The grid
+	// asks that owner under EITHER gate, not only the whole-projection one: the
+	// dashboard and the JSON overview ask it under the fertility gate too, and a
+	// grid that asked only here would hide a day they name the moment a
+	// fertility-only signal stopped withholding it. No window, peak band or
+	// pre-fertile shading comes with it.
+	fertilitySuppressed := FertilityProjectionSuppressed(user, stats)
+	confirmedUnderSuppression := time.Time{}
+	if fertilitySuppressed {
+		if confirmed, ok := ConfirmedCurrentCycleOvulation(user, logs, stats, DateAtLocation(now, location), location); ok {
+			ovulationMap[CalendarDayKey(confirmed)] = true
+			confirmedUnderSuppression = confirmed
+		}
+	}
+	if PredictionsSuppressed(user, stats) {
+		return maps
+	}
+
+	// The fertility half of the projection carries the extra completed-cycle
+	// floor: until three cycles have been observed, the fertile window, the peak
+	// band and the ovulation day ahead rest on the onboarding slider or on one or
+	// two observed lengths, so the grid paints none of them projected forward
+	// (FertilityProjectionSuppressed). The historical pass below stays outside
+	// that floor: a completed past cycle has its own record, and it reads
+	// PredictionsSuppressed above like inferred history everywhere. The predicted
+	// period days keep their anchor in a recorded cycle start and stay — narrowed
+	// off a confirmed day the marker above names, so a band never shades that cell.
+
+	// The CURRENT cycle's window follows a thermal shift the owner's own
+	// temperatures confirm — the same triple (day, window, status) the dashboard
+	// and the JSON API publish, resolved once so the grid cannot shade the
+	// projected window under a solid marker the BBT pass below has already moved
+	// onto the confirmed day. The projected cycles chained after it (line
+	// 379/404) keep the model's arithmetic: a confirmation is about this cycle
+	// only. The resolver reads the same gate as the branch it sits in, so it
+	// changes which days are shaded and never whether any are.
+	currentStats, _ := ResolveConfirmedCycleStats(user, logs, stats, DateAtLocation(now, location), location)
+
+	currentOvulationDay := confirmedUnderSuppression
+	if !fertilitySuppressed {
+		currentOvulationDay = currentStats.OvulationDate
+	}
+	appendCurrentBaselinePeriod(predictedPeriodMap, stats, currentOvulationDay, location)
+	if !fertilitySuppressed {
+		appendCurrentBaselinePreFertile(preFertileMap, currentStats, location)
+		appendFertilityWindow(fertilityEdgeMap, fertilityPeakMap, currentStats.FertilityWindowStart, currentStats.FertilityWindowEnd, currentStats.OvulationDate)
+		appendCalendarSingleDate(ovulationMap, currentStats.OvulationDate)
+	}
+	appendPredictedCycles(predictedPeriodMap, preFertileMap, fertilityEdgeMap, fertilityPeakMap, ovulationMap, stats, gridEnd, location, !fertilitySuppressed)
+	appendPredictedStartRange(maps.predictedStartRange, user, stats, DateAtLocation(now, location), location)
+	appendHistoricalCycles(preFertileMap, fertilityEdgeMap, fertilityPeakMap, ovulationMap, logs, stats, user, BoundaryContextFor(user, DateAtLocation(now, location)), location)
+	if !fertilitySuppressed {
+		// The BBT pass only ever downgrades the projected ovulation day to
+		// "tentative", so with the fertility maps withheld it would reintroduce
+		// the very day the floor just removed, one shade lighter.
+		appendCurrentCycleBBTSignal(user, logs, stats, now, ovulationMap, tentativeOvulationMap, location)
+	}
+
+	return maps
+}
+
+// appendPredictedStartRange marks the days the NEXT period may start on. That
+// range is the quantity the dashboard prints as "Next period: X — Y", while the
+// shaded predicted-period days are the projected bleeding itself: two different
+// facts that shared one shading on the grid until wave 3.
+//
+// It reads the header's own answer — ResolveProjectionRanges on the projection
+// DashboardUpcomingPredictions names — rather than deriving a second range, so
+// a day is marked only where the dashboard shows a range (enough completed
+// cycles for the spread to mean something), and never once the suppression
+// signals above have emptied the projected maps. That projection stays on the
+// running cycle until the overdue gate, so the window sits around the same day
+// as the grid's own predicted period band (stats.NextPeriodStart), and is the
+// one the header, the webhook and the .ics feed send. Only that one cycle
+// carries a window: the cycles chained after it are projections of a
+// projection, and widening those would present manufactured spread as measured
+// spread.
+func appendPredictedStartRange(startRangeMap map[string]bool, user *models.User, stats CycleStats, today time.Time, location *time.Location) {
+	prediction := DashboardUpcomingPredictions(stats, user, today, DashboardProjectionCycleLength(user, stats))
+	ranges := ResolveProjectionRanges(user, stats, CalendarDay(prediction.NextPeriodStart, location), location)
+	if !ranges.NextPeriodUseRange {
+		return
+	}
+	appendCalendarDateRange(startRangeMap, ranges.NextPeriodStart, ranges.NextPeriodEnd)
+}
+
+// appendCurrentBaselinePeriod shades the CURRENT cycle's projected period band.
+// ovulationDay is the day the grid is about to mark as the ovulation, or the
+// zero time when the grid marks none (fertility withheld): the band is a
+// projection of the average period length, and shading it over a day the same
+// grid marks as the ovulation — and shades as fertile — puts two answers on one
+// cell. The published day wins, exactly as it does in resolveCyclePhase; a day
+// the owner LOGGED as bleeding is drawn from the log, not from this map, and is
+// untouched. Only this cycle is clamped: appendPredictedCycles keeps the model's
+// own arithmetic for the cycles chained after it.
+func appendCurrentBaselinePeriod(predictedPeriodMap map[string]bool, stats CycleStats, ovulationDay time.Time, location *time.Location) {
 	if stats.LastPeriodStart.IsZero() {
 		return
 	}
 
+	cycleStart := CalendarDay(stats.LastPeriodStart, location)
 	periodLength := predictedPeriodLength(stats.AveragePeriodLength)
-	appendPredictedPeriod(predictedPeriodMap, CalendarDay(stats.LastPeriodStart, location), periodLength)
+	if !ovulationDay.IsZero() {
+		if daysToOvulation := CalendarDaysBetween(cycleStart, CalendarDay(ovulationDay, location)); daysToOvulation < periodLength {
+			periodLength = daysToOvulation
+		}
+	}
+	if periodLength <= 0 {
+		return
+	}
+	appendPredictedPeriod(predictedPeriodMap, cycleStart, periodLength)
 }
 
 func appendCurrentBaselinePreFertile(preFertileMap map[string]bool, stats CycleStats, location *time.Location) {
@@ -112,7 +325,7 @@ func appendCurrentBaselinePreFertile(preFertileMap map[string]bool, stats CycleS
 
 	cycleStart := CalendarDay(stats.LastPeriodStart, location)
 	periodLength := predictedPeriodLength(stats.AveragePeriodLength)
-	preFertileStart := cycleStart.AddDate(0, 0, periodLength)
+	preFertileStart := AddCalendarDays(cycleStart, periodLength, location)
 
 	fertilityStart := CalendarDay(stats.FertilityWindowStart, location)
 	if fertilityStart.IsZero() {
@@ -121,23 +334,65 @@ func appendCurrentBaselinePreFertile(preFertileMap map[string]bool, stats CycleS
 		if !window.Calculable || window.FertilityWindowStart.IsZero() {
 			return
 		}
+		// A window whose ovulation falls after 9999-12-31 is withheld as a whole
+		// (clearUnspellableCycleWindow), and its lead-in goes with it.
+		if projectedDay(window.OvulationDate).IsZero() {
+			return
+		}
 		fertilityStart = window.FertilityWindowStart
 	}
 
-	preFertileEnd := fertilityStart.AddDate(0, 0, -1)
+	preFertileEnd := AddCalendarDays(fertilityStart, -1, location)
 	appendCalendarDateRange(preFertileMap, preFertileStart, preFertileEnd)
 }
 
-func appendCalendarDateRange(target map[string]bool, start time.Time, end time.Time) {
+// forEachCalendarDay visits `count` consecutive calendar days starting on the
+// calendar date of `start`, ascending, each day exactly once. It is the single
+// stepping point for the builders that fill the prediction maps.
+//
+// The walk is calendar-day arithmetic, never instant arithmetic. Adding 24h-ish
+// increments to a location-midnight instant breaks in a zone whose DST jump
+// lands on midnight (America/Santiago 2026-09-06, America/Havana 2026-03-08):
+// the missing wall clock resolves BACKWARD into the previous calendar day, so
+// the step writes that day's key a second time and the range loses a day — the
+// transition day itself when the caller indexes by offset, the range's last day
+// when it walks to a bound. Re-anchoring to UTC midnight — the same move
+// CalendarDaysBetween makes on its operands — removes the transition from the
+// walk entirely. The visited days carry calendar components only; every caller
+// reads them through CalendarDayKey or CalendarDaysBetween, so the anchoring
+// zone is not observable.
+func forEachCalendarDay(start time.Time, count int, visit func(day time.Time)) {
+	if start.IsZero() || count <= 0 {
+		return
+	}
+	day := CalendarDay(start, time.UTC)
+	for range count {
+		visit(day)
+		day = day.AddDate(0, 0, 1)
+	}
+}
+
+// calendarRangeLength is the number of calendar days in the inclusive range
+// [start, end], or zero when the range is empty. The comparison is by calendar
+// day, not by instant: the two bounds routinely carry different midnight shapes
+// (a request-location midnight against the UTC midnight PredictCycleWindow
+// produces), and compared as instants in a UTC-minus zone the location-midnight
+// bound sits hours past the UTC-midnight one on the same date.
+func calendarRangeLength(start time.Time, end time.Time) int {
 	if start.IsZero() || end.IsZero() {
-		return
+		return 0
 	}
-	if end.Before(start) {
-		return
+	span := CalendarDaysBetween(start, end)
+	if span < 0 {
+		return 0
 	}
-	for day := start; !day.After(end); day = day.AddDate(0, 0, 1) {
-		target[day.Format("2006-01-02")] = true
-	}
+	return span + 1
+}
+
+func appendCalendarDateRange(target map[string]bool, start time.Time, end time.Time) {
+	forEachCalendarDay(start, calendarRangeLength(start, end), func(day time.Time) {
+		target[CalendarDayKey(day)] = true
+	})
 }
 
 func appendCalendarSingleDate(target map[string]bool, day time.Time) {
@@ -147,29 +402,67 @@ func appendCalendarSingleDate(target map[string]bool, day time.Time) {
 }
 
 func appendFertilityWindow(fertilityEdgeMap map[string]bool, fertilityPeakMap map[string]bool, start time.Time, end time.Time, ovulationDate time.Time) {
-	if start.IsZero() || end.IsZero() || end.Before(start) {
-		return
-	}
-	for day := start; !day.After(end); day = day.AddDate(0, 0, 1) {
+	forEachCalendarDay(start, calendarRangeLength(start, end), func(day time.Time) {
 		offset := CalendarDaysBetween(day, ovulationDate)
 		if offset >= 0 && offset <= 2 {
-			fertilityPeakMap[day.Format("2006-01-02")] = true
-			continue
+			fertilityPeakMap[CalendarDayKey(day)] = true
+			return
 		}
-		fertilityEdgeMap[day.Format("2006-01-02")] = true
-	}
+		fertilityEdgeMap[CalendarDayKey(day)] = true
+	})
 }
 
-func appendPredictedCycles(predictedPeriodMap map[string]bool, preFertileMap map[string]bool, fertilityEdgeMap map[string]bool, fertilityPeakMap map[string]bool, ovulationMap map[string]bool, stats CycleStats, gridEnd time.Time, location *time.Location) {
+// maxProjectedCyclesInGrid hard-caps how many cycles appendPredictedCycles will
+// chain, independent of gridEnd. gridEnd descends from the requested calendar
+// month, which callers are expected to clamp to CalendarMaximumNavigableMonth
+// (three years out) before reaching here — at the shortest cycle length the
+// loop steps by (one day), that clamp alone bounds the loop to ~1096
+// iterations. This cap is defense-in-depth for WEB-14 SEC-H5, not the primary
+// bound: it protects the loop's own cost regardless of whether a caller
+// upstream clamped gridEnd, so a bound on the request can never again be the
+// only thing standing between a month value and an unbounded chain.
+const maxProjectedCyclesInGrid = 4000
+
+// appendPredictedCycles chains the projected cycles across the visible grid.
+// includeFertility is false in the first-cycle tier: the chained period days
+// still descend from a recorded anchor, while the window inside each of them
+// would be the onboarding slider projected forward one cycle at a time.
+func appendPredictedCycles(predictedPeriodMap map[string]bool, preFertileMap map[string]bool, fertilityEdgeMap map[string]bool, fertilityPeakMap map[string]bool, ovulationMap map[string]bool, stats CycleStats, gridEnd time.Time, location *time.Location, includeFertility bool) {
 	if stats.NextPeriodStart.IsZero() {
 		return
 	}
 
 	predictedCycleLength := predictedCycleLength(stats.MedianCycleLength, stats.AverageCycleLength)
+	if predictedCycleLength <= 0 {
+		// The loop below advances the cursor by exactly this value, so a
+		// non-positive step never moves it, never falsifies the bound, and
+		// fills the prediction maps until the process dies. Zero is a real
+		// return of predictedCycleLength (an average under 0.5 rounds to it),
+		// and its other stepping caller, applyProjectedBaseline, guards it too
+		// — the termination of this loop is this function's business, not the
+		// callee's.
+		//
+		// codecov:ignore -- defensive: unreachable from production stats today.
+		// Both writers of NextPeriodStart derive median and average from the
+		// same observed lengths, so either both are zero (and the default
+		// applies) or both describe at least one real cycle.
+		// Regression: TestAppendPredictedCyclesTerminatesOnANonPositiveStep.
+		return
+	}
 	predictedPeriodLength := predictedPeriodLength(stats.AveragePeriodLength)
-	for cycleStart := CalendarDay(stats.NextPeriodStart, location); !cycleStart.After(gridEnd); cycleStart = cycleStart.AddDate(0, 0, predictedCycleLength) {
+	// The bound is a CALENDAR-DAY comparison, not an instant one: cycleStart
+	// comes from CalendarDay and gridEnd from plain AddDate arithmetic, and in
+	// a zone whose DST jump skips midnight the two carry different start-of-day
+	// shapes (01:00 local against 00:00). Compared as instants, a projected
+	// cycle falling exactly on the last grid day reads as past the grid and its
+	// markers are never painted.
+	cycleStart := CalendarDay(stats.NextPeriodStart, location)
+	for cycles := 0; cycles < maxProjectedCyclesInGrid && CalendarDaysBetween(cycleStart, gridEnd) >= 0; cycles++ {
 		appendPredictedPeriod(predictedPeriodMap, cycleStart, predictedPeriodLength)
-		appendPredictedWindow(preFertileMap, fertilityEdgeMap, fertilityPeakMap, ovulationMap, cycleStart, predictedCycleLength, predictedPeriodLength, stats.LutealPhase)
+		if includeFertility {
+			appendPredictedWindow(preFertileMap, fertilityEdgeMap, fertilityPeakMap, ovulationMap, cycleStart, predictedCycleLength, predictedPeriodLength, stats.LutealPhase, location)
+		}
+		cycleStart = AddCalendarDays(cycleStart, predictedCycleLength, location)
 	}
 }
 
@@ -180,16 +473,15 @@ func appendPredictedCycles(predictedPeriodMap map[string]bool, preFertileMap map
 // predicted-cycles paths instead. Gated on the user's ShowHistoricalPhases
 // preference so that the upstream behavior (predictions only) remains the
 // default for users who want it.
-func appendHistoricalCycles(preFertileMap map[string]bool, fertilityEdgeMap map[string]bool, fertilityPeakMap map[string]bool, ovulationMap map[string]bool, logs []models.DailyLog, stats CycleStats, user *models.User, location *time.Location) {
+func appendHistoricalCycles(preFertileMap map[string]bool, fertilityEdgeMap map[string]bool, fertilityPeakMap map[string]bool, ovulationMap map[string]bool, logs []models.DailyLog, stats CycleStats, user *models.User, boundaryCtx BoundaryContext, location *time.Location) {
 	if user == nil || !user.ShowHistoricalPhases {
 		return
 	}
 
-	starts := make([]time.Time, 0, len(logs))
-	for _, log := range logs {
-		if log.CycleStart {
-			starts = append(starts, CalendarDay(log.Date, location))
-		}
+	boundaries := CycleBoundaries(logs, boundaryCtx)
+	starts := make([]time.Time, 0, len(boundaries))
+	for _, boundary := range boundaries {
+		starts = append(starts, CalendarDay(boundary, location))
 	}
 	if len(starts) < 2 {
 		return
@@ -209,7 +501,7 @@ func appendHistoricalCycles(preFertileMap map[string]bool, fertilityEdgeMap map[
 		if !window.Calculable {
 			continue
 		}
-		preFertileStart := cycleStart.AddDate(0, 0, periodLength)
+		preFertileStart := AddCalendarDays(cycleStart, periodLength, location)
 		preFertileEnd := window.FertilityWindowStart.AddDate(0, 0, -1)
 		appendCalendarDateRange(preFertileMap, preFertileStart, preFertileEnd)
 		ovulationMap[window.OvulationDate.Format("2006-01-02")] = true
@@ -218,27 +510,53 @@ func appendHistoricalCycles(preFertileMap map[string]bool, fertilityEdgeMap map[
 }
 
 func appendPredictedPeriod(predictedPeriodMap map[string]bool, cycleStart time.Time, predictedPeriodLength int) {
-	for offset := range predictedPeriodLength {
-		day := cycleStart.AddDate(0, 0, offset)
-		predictedPeriodMap[day.Format("2006-01-02")] = true
-	}
+	forEachCalendarDay(cycleStart, predictedPeriodLength, func(day time.Time) {
+		predictedPeriodMap[CalendarDayKey(day)] = true
+	})
 }
 
-func appendPredictedWindow(preFertileMap map[string]bool, fertilityEdgeMap map[string]bool, fertilityPeakMap map[string]bool, ovulationMap map[string]bool, cycleStart time.Time, predictedCycleLength int, predictedPeriodLength int, lutealPhase int) {
+func appendPredictedWindow(preFertileMap map[string]bool, fertilityEdgeMap map[string]bool, fertilityPeakMap map[string]bool, ovulationMap map[string]bool, cycleStart time.Time, predictedCycleLength int, predictedPeriodLength int, lutealPhase int, location *time.Location) {
 	window := PredictCycleWindow(cycleStart, predictedCycleLength, ResolveLutealPhase(lutealPhase))
 	if !window.Calculable {
 		return
 	}
+	// Withheld as a whole once its ovulation falls after 9999-12-31, exactly
+	// as the current cycle's window is (clearUnspellableCycleWindow).
+	if projectedDay(window.OvulationDate).IsZero() {
+		return
+	}
 
-	preFertileStart := cycleStart.AddDate(0, 0, predictedPeriodLength)
+	// cycleStart arrives from appendPredictedCycles as a REQUEST-ZONE midnight,
+	// so this step needs the same treatment as its siblings; location is
+	// threaded in for it. window.FertilityWindowStart on the next line is a
+	// PredictCycleWindow output and therefore already UTC-anchored, where the
+	// step is exact — the two lines look asymmetric because their operands are.
+	preFertileStart := AddCalendarDays(cycleStart, predictedPeriodLength, location)
 	preFertileEnd := window.FertilityWindowStart.AddDate(0, 0, -1)
 	appendCalendarDateRange(preFertileMap, preFertileStart, preFertileEnd)
 	ovulationMap[window.OvulationDate.Format("2006-01-02")] = true
 	appendFertilityWindow(fertilityEdgeMap, fertilityPeakMap, window.FertilityWindowStart, window.FertilityWindowEnd, window.OvulationDate)
 }
 
+// CalendarCanDrawTentativeOvulation answers, for one owner, whether the grid
+// can mark a projected ovulation day as not yet confirmed by a temperature
+// shift. It is the owner-level half of the gate appendCurrentCycleBBTSignal
+// applies (the other half is the recorded cycle anchor, a property of the
+// data, not of the owner), and the calendar legend asks it too, so the legend
+// promises the dash exactly when the grid can draw it.
+func CalendarCanDrawTentativeOvulation(user *models.User) bool {
+	return user != nil && user.TrackBBT
+}
+
 func appendCurrentCycleBBTSignal(user *models.User, logs []models.DailyLog, stats CycleStats, now time.Time, ovulationMap map[string]bool, tentativeOvulationMap map[string]bool, location *time.Location) {
-	if user == nil || !user.TrackBBT || stats.LastPeriodStart.IsZero() || stats.OvulationDate.IsZero() || stats.NextPeriodStart.IsZero() {
+	// The PROJECTED ovulation date is no longer a precondition, only the subject
+	// of the downgrade below: a projection the model withheld (a median cycle too
+	// short to place an ovulation, so no ovulation date and no next period start)
+	// used to silence the grid about a shift the owner's own temperatures had
+	// already confirmed. The window derived from a confirmed day needs no
+	// projection, so the pass now runs on the recorded anchor alone and simply
+	// has nothing to downgrade when there is no projected day.
+	if !CalendarCanDrawTentativeOvulation(user) || stats.LastPeriodStart.IsZero() {
 		return
 	}
 
@@ -248,42 +566,67 @@ func appendCurrentCycleBBTSignal(user *models.User, logs []models.DailyLog, stat
 		return
 	}
 
-	ovulationSignal := inferBBTOvulationDate(filterLogsNotAfter(logs, today), cycleStart, CalendarDay(stats.NextPeriodStart, location), location)
-	if !ovulationSignal.IsZero() {
+	ovulationSignal, confirmed := ConfirmedCurrentCycleOvulation(user, logs, stats, today, location)
+	if !stats.OvulationDate.IsZero() {
+		projectedKey := CalendarDayKey(stats.OvulationDate)
+		delete(ovulationMap, projectedKey)
+		if !confirmed {
+			tentativeOvulationMap[projectedKey] = true
+		}
+	}
+	if !confirmed {
 		return
 	}
 
-	key := CalendarDayKey(stats.OvulationDate)
-	delete(ovulationMap, key)
-	tentativeOvulationMap[key] = true
+	// A detected shift CONFIRMS an ovulation that has already happened; it never
+	// predicts one. So the solid marker belongs on the day the detector named,
+	// not on the projection that day just superseded. Leaving it on
+	// stats.OvulationDate is how the grid and the stats chart came to name two
+	// different days for one shift: probableOvulationMarkerIndex marks the same
+	// firstHighDay-1 day this inference returns, so the chart moved and only the
+	// grid stayed behind on the model's date.
+	ovulationMap[CalendarDayKey(ovulationSignal)] = true
 }
 
-func buildCalendarDayState(day time.Time, monthStart time.Time, todayKey string, latestLogByDate map[string]models.DailyLog, hasDataMap map[string]bool, predictedPeriodMap map[string]bool, preFertileMap map[string]bool, fertilityEdgeMap map[string]bool, fertilityPeakMap map[string]bool, ovulationMap map[string]bool, tentativeOvulationMap map[string]bool) CalendarDayState {
+func buildCalendarDayState(day time.Time, monthStart time.Time, today time.Time, latestLogByDate map[string]models.DailyLog, hasDataMap map[string]bool, predictions calendarPredictionMaps) CalendarDayState {
+	// The December 9999 grid fills its last week with year-10000 cells. They are
+	// drawn, but no projection is named on them (projectedDay): an empty set of
+	// maps reads false for every key.
+	if projectedDay(day).IsZero() {
+		predictions = calendarPredictionMaps{}
+	}
 	key := day.Format("2006-01-02")
 	entry, hasEntry := latestLogByDate[key]
-	isOvulation := ovulationMap[key]
-	isTentativeOvulation := tentativeOvulationMap[key]
-	isFertilityPeak := fertilityPeakMap[key]
-	isFertilityEdge := fertilityEdgeMap[key]
+	isOvulation := predictions.ovulation[key]
+	isTentativeOvulation := predictions.tentativeOvulation[key]
+	isFertilityPeak := predictions.fertilityPeak[key]
+	isFertilityEdge := predictions.fertilityEdge[key]
+	isPredictedPeriod := predictions.predictedPeriod[key]
+	isPredictedStartWindow := predictions.predictedStartRange[key]
 	openEditDirectly := !hasDataMap[key]
 
 	return CalendarDayState{
-		Date:                 day,
-		DateString:           key,
-		Day:                  day.Day(),
-		InMonth:              day.Month() == monthStart.Month(),
-		IsToday:              key == todayKey,
-		IsFuture:             key > todayKey,
-		OpenEditDirectly:     openEditDirectly,
-		IsPeriod:             hasEntry && entry.IsPeriod,
-		IsPredicted:          predictedPeriodMap[key],
-		IsPreFertile:         preFertileMap[key],
-		IsFertility:          (isFertilityEdge || isFertilityPeak) && !isOvulation && !isTentativeOvulation,
-		IsFertilityPeak:      isFertilityPeak,
-		IsFertilityEdge:      isFertilityEdge,
-		IsOvulation:          isOvulation,
-		IsTentativeOvulation: isTentativeOvulation,
-		HasData:              hasDataMap[key],
-		HasSex:               hasEntry && NormalizeDaySexActivity(entry.SexActivity) != models.SexActivityNone,
+		Date:                   day,
+		DateString:             key,
+		Day:                    day.Day(),
+		InMonth:                day.Month() == monthStart.Month(),
+		IsToday:                CalendarDaysBetween(today, day) == 0,
+		OpenEditDirectly:       openEditDirectly,
+		IsPeriod:               hasEntry && entry.IsPeriod,
+		IsPredicted:            isPredictedPeriod,
+		IsPredictedStartWindow: isPredictedStartWindow,
+		IsPreFertile:           predictions.preFertile[key],
+		IsFertility:            (isFertilityEdge || isFertilityPeak) && !isOvulation && !isTentativeOvulation,
+		IsFertilityPeak:        isFertilityPeak,
+		IsFertilityEdge:        isFertilityEdge,
+		IsOvulation:            isOvulation,
+		IsTentativeOvulation:   isTentativeOvulation,
+		// The window's own membership, edge or peak, is what makes the day
+		// fertile — not IsFertility, which is already the narrowed reading that
+		// stands down on the ovulation day and on its tentative form.
+		IsPredictedFertileOverlap: isPredictedPeriod && (isFertilityEdge || isFertilityPeak),
+		HasData:                   hasDataMap[key],
+		HasSex:                    hasEntry && NormalizeDaySexActivity(entry.SexActivity) != models.SexActivityNone,
+		Selectable:                dayDateAccepted(day),
 	}
 }

@@ -17,6 +17,11 @@ coverage
 coverage.*
 *.coverprofile
 profile.cov
+# rapid writes a reproduction failfile per failing property test under the
+# package's testdata/rapid/<TestName>/. Only that subdirectory — the rest of
+# testdata/ is tracked fixtures (the shared cycle-prediction golden vectors).
+# Needs the leading **/ to match below the repo root.
+**/testdata/rapid/
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
@@ -49,7 +54,6 @@ Thumbs.db
 *.swo
 
 # Local and generated artifacts
-.tmp_*/
 .tmp*/
 .local/
 test-results/
@@ -58,3 +62,24 @@ docs/screenshots/ovumcy-social-preview.png
 scripts/take-screenshots.mjs
 scripts/record-demo.mjs
 docs/demo.mp4
+
+# Files the deployment documentation tells the operator to create in the
+# working copy, and which carry a secret or personal data once they exist:
+# the file-backed app secret key and the OIDC CA bundle mounted by
+# docker-compose.yml, private keys and keystores in any of the shapes a
+# reverse-proxy or an identity provider hands out, and the database dumps and
+# volume archives of the backup contract in docs/self-hosted.md, which that
+# document requires be treated as sensitive health data. Ignoring the class is
+# what keeps an inattentive `git add` from committing one.
+#
+# Deliberately NOT `*.sql` or `*.tgz` on their own: migrations/ is tracked SQL,
+# so a bare extension rule would swallow a new migration silently. The backup
+# contract writes into backups/, and that is the path this covers.
+secrets/
+certs/
+backups/
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
